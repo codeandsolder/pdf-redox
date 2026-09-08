@@ -30,6 +30,20 @@ fn push_risk(
     e.0 += count;
 }
 
+fn document_info_text<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Option<String>> {
+    let info = pdf.trailer().try_get_key(b"/Info")?;
+    if info.is_null() {
+        return Ok(None);
+    }
+    let value = info.try_get_key(key)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let bytes = value.try_get_utf8_value()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    Ok((!text.is_empty()).then_some(text))
+}
+
 fn record_payload(map: &mut HashMap<[u8; 32], (usize, usize)>, bytes: &[u8]) {
     let hash: [u8; 32] = Sha256::digest(bytes).into();
     let entry = map.entry(hash).or_insert((0, bytes.len()));
@@ -121,6 +135,18 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         object_count: objects.len(),
         ..PdfAnalysis::default()
     };
+    match document_info_text(&mut pdf, b"/Producer") {
+        Ok(value) => out.producer = value,
+        Err(error) => out
+            .warnings
+            .push(format!("Producer metadata analysis skipped: {error}")),
+    }
+    match document_info_text(&mut pdf, b"/Creator") {
+        Ok(value) => out.creator = value,
+        Err(error) => out
+            .warnings
+            .push(format!("Creator metadata analysis skipped: {error}")),
+    }
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();

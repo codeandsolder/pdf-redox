@@ -11,6 +11,8 @@ const FAILURE_EXAMPLE_LIMIT: usize = 100;
 pub(crate) struct CorpusFileSummary {
     path: String,
     input_bytes: usize,
+    producer: Option<String>,
+    creator: Option<String>,
     pages: usize,
     objects: usize,
     streams: usize,
@@ -36,6 +38,8 @@ impl CorpusFileSummary {
         Self {
             path: display_path(root, path),
             input_bytes: analysis.input_bytes,
+            producer: analysis.producer.clone(),
+            creator: analysis.creator.clone(),
             pages: analysis.page_count,
             objects: analysis.object_count,
             streams: analysis.stream_count,
@@ -68,8 +72,25 @@ struct CorpusFailure {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct ProducerStats {
+    documents: u64,
+    input_bytes: u64,
+    flate_recompress_potential_saving_bytes: u64,
+    non_image_flate_recompress_potential_saving_bytes: u64,
+    duplicate_stream_wasted_bytes: u64,
+    duplicate_image_wasted_bytes: u64,
+    duplicate_form_wasted_bytes: u64,
+    duplicate_font_wasted_bytes: u64,
+    inline_image_bytes: u64,
+    duplicate_inline_image_wasted_bytes: u64,
+    hidden_text_findings: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
 struct CorpusTotals {
     input_bytes: u64,
+    documents_with_producer: u64,
+    documents_with_creator: u64,
     pages: u64,
     objects: u64,
     streams: u64,
@@ -118,6 +139,9 @@ pub(crate) struct CorpusReport {
     analyzed: usize,
     failed: usize,
     totals: CorpusTotals,
+    producer_counts: BTreeMap<String, u64>,
+    creator_counts: BTreeMap<String, u64>,
+    producer_stats: BTreeMap<String, ProducerStats>,
     filter_counts: BTreeMap<String, u64>,
     risk_counts: BTreeMap<RiskKind, u64>,
     documents_with_risk: BTreeMap<RiskKind, u64>,
@@ -155,6 +179,9 @@ pub(crate) fn analyze_corpus(
     files.sort();
 
     let mut totals = CorpusTotals::default();
+    let mut producer_counts = BTreeMap::new();
+    let mut creator_counts = BTreeMap::new();
+    let mut producer_stats = BTreeMap::new();
     let mut filter_counts = BTreeMap::new();
     let mut risk_counts = BTreeMap::new();
     let mut documents_with_risk = BTreeMap::new();
@@ -186,6 +213,12 @@ pub(crate) fn analyze_corpus(
         };
 
         accumulate_totals(&mut totals, &analysis);
+        accumulate_producer_context(
+            &analysis,
+            &mut producer_counts,
+            &mut creator_counts,
+            &mut producer_stats,
+        );
         accumulate_counts(
             &analysis,
             &mut filter_counts,
@@ -231,6 +264,9 @@ pub(crate) fn analyze_corpus(
         analyzed,
         failed,
         totals,
+        producer_counts,
+        creator_counts,
+        producer_stats,
         filter_counts,
         risk_counts,
         documents_with_risk,
@@ -293,6 +329,8 @@ fn push_failure(root: &Path, path: &Path, error: String, failures: &mut Vec<Corp
 
 fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
     totals.input_bytes += analysis.input_bytes as u64;
+    totals.documents_with_producer += u64::from(analysis.producer.is_some());
+    totals.documents_with_creator += u64::from(analysis.creator.is_some());
     totals.pages += analysis.page_count as u64;
     totals.objects += analysis.object_count as u64;
     totals.streams += analysis.stream_count as u64;
@@ -343,6 +381,36 @@ fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
     totals.incremental_updates += analysis.incremental_update_count as u64;
     totals.hidden_text_findings += analysis.hidden_text.len() as u64;
     totals.warnings += analysis.warnings.len() as u64;
+}
+
+fn accumulate_producer_context(
+    analysis: &PdfAnalysis,
+    producer_counts: &mut BTreeMap<String, u64>,
+    creator_counts: &mut BTreeMap<String, u64>,
+    producer_stats: &mut BTreeMap<String, ProducerStats>,
+) {
+    if let Some(creator) = &analysis.creator {
+        *creator_counts.entry(creator.clone()).or_default() += 1;
+    }
+    let Some(producer) = &analysis.producer else {
+        return;
+    };
+    *producer_counts.entry(producer.clone()).or_default() += 1;
+    let stats = producer_stats.entry(producer.clone()).or_default();
+    stats.documents += 1;
+    stats.input_bytes += analysis.input_bytes as u64;
+    stats.flate_recompress_potential_saving_bytes +=
+        analysis.flate_recompress_potential_saving_bytes as u64;
+    stats.non_image_flate_recompress_potential_saving_bytes +=
+        analysis.non_image_flate_recompress_potential_saving_bytes as u64;
+    stats.duplicate_stream_wasted_bytes += analysis.duplicate_stream_payload_wasted_bytes as u64;
+    stats.duplicate_image_wasted_bytes += analysis.duplicate_image_payload_wasted_bytes as u64;
+    stats.duplicate_form_wasted_bytes += analysis.duplicate_form_payload_wasted_bytes as u64;
+    stats.duplicate_font_wasted_bytes += analysis.duplicate_font_payload_wasted_bytes as u64;
+    stats.inline_image_bytes += analysis.inline_image_bytes as u64;
+    stats.duplicate_inline_image_wasted_bytes +=
+        analysis.duplicate_inline_image_payload_wasted_bytes as u64;
+    stats.hidden_text_findings += analysis.hidden_text.len() as u64;
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -129,6 +129,10 @@ pub struct HiddenTextFinding {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PdfAnalysis {
     pub input_bytes: usize,
+    /// UTF-8 view of `/Info /Producer`, when present.
+    pub producer: Option<String>,
+    /// UTF-8 view of `/Info /Creator`, when present.
+    pub creator: Option<String>,
     pub page_count: usize,
     pub object_count: usize,
     pub stream_count: usize,
