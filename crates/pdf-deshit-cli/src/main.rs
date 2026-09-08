@@ -1,3 +1,5 @@
+mod corpus;
+
 use clap::{Parser, ValueEnum};
 use pdf_deshit::{Config, OutputProfile, PrivacyLevel, analyze_pdf, optimize_pdf};
 use std::path::PathBuf;
@@ -36,6 +38,12 @@ struct Args {
     remove_active_content: bool,
     #[arg(long)]
     remove_signatures: bool,
+    /// Recursively analyze every PDF below INPUT and emit one aggregate JSON report.
+    #[arg(long)]
+    corpus: bool,
+    /// Number of per-file worst cases retained in each corpus ranking.
+    #[arg(long, default_value_t = 20)]
+    corpus_top: usize,
     #[arg(long)]
     analyze_only: bool,
     #[arg(long)]
@@ -44,6 +52,12 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = Args::parse();
+    if a.corpus {
+        let report = corpus::analyze_corpus(&a.input, a.corpus_top)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let input = std::fs::read(&a.input)?;
     if a.analyze_only {
         let r = analyze_pdf(&input)?;
