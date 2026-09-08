@@ -18,7 +18,15 @@ pub(crate) struct CorpusFileSummary {
     font_program_bytes: usize,
     metadata_stream_bytes: usize,
     duplicate_stream_wasted_bytes: usize,
+    duplicate_image_wasted_bytes: usize,
+    duplicate_form_wasted_bytes: usize,
+    duplicate_font_wasted_bytes: usize,
+    inline_images: usize,
+    inline_image_bytes: usize,
+    duplicate_inline_image_wasted_bytes: usize,
+    resource_pruning_auto_triggered: bool,
     flate_recompress_potential_saving_bytes: usize,
+    non_image_flate_recompress_potential_saving_bytes: usize,
     hidden_text_findings: usize,
     incremental_updates: usize,
 }
@@ -35,8 +43,18 @@ impl CorpusFileSummary {
             font_program_bytes: analysis.font_program_bytes,
             metadata_stream_bytes: analysis.metadata_stream_bytes,
             duplicate_stream_wasted_bytes: analysis.duplicate_stream_payload_wasted_bytes,
+            duplicate_image_wasted_bytes: analysis.duplicate_image_payload_wasted_bytes,
+            duplicate_form_wasted_bytes: analysis.duplicate_form_payload_wasted_bytes,
+            duplicate_font_wasted_bytes: analysis.duplicate_font_payload_wasted_bytes,
+            inline_images: analysis.inline_image_count,
+            inline_image_bytes: analysis.inline_image_bytes,
+            duplicate_inline_image_wasted_bytes: analysis
+                .duplicate_inline_image_payload_wasted_bytes,
+            resource_pruning_auto_triggered: analysis.resource_pruning_auto_triggered,
             flate_recompress_potential_saving_bytes: analysis
                 .flate_recompress_potential_saving_bytes,
+            non_image_flate_recompress_potential_saving_bytes: analysis
+                .non_image_flate_recompress_potential_saving_bytes,
             hidden_text_findings: analysis.hidden_text.len(),
             incremental_updates: analysis.incremental_update_count,
         }
@@ -65,9 +83,28 @@ struct CorpusTotals {
     metadata_stream_bytes: u64,
     duplicate_stream_payload_groups: u64,
     duplicate_stream_payload_wasted_bytes: u64,
+    duplicate_image_payload_groups: u64,
+    duplicate_image_payload_wasted_bytes: u64,
+    duplicate_form_payload_groups: u64,
+    duplicate_form_payload_wasted_bytes: u64,
+    duplicate_font_payload_groups: u64,
+    duplicate_font_payload_wasted_bytes: u64,
+    inline_images: u64,
+    inline_image_bytes: u64,
+    duplicate_inline_image_payload_groups: u64,
+    duplicate_inline_image_payload_wasted_bytes: u64,
+    documents_with_inline_images: u64,
+    documents_with_duplicate_inline_images: u64,
+    documents_with_duplicate_images: u64,
+    documents_with_duplicate_forms: u64,
+    documents_with_duplicate_fonts: u64,
+    resource_pruning_auto_triggered_documents: u64,
     flate_streams: u64,
     flate_recompress_candidates: u64,
     flate_recompress_potential_saving_bytes: u64,
+    non_image_flate_streams: u64,
+    non_image_flate_recompress_candidates: u64,
+    non_image_flate_recompress_potential_saving_bytes: u64,
     incremental_updates: u64,
     hidden_text_findings: u64,
     warnings: u64,
@@ -91,7 +128,13 @@ pub(crate) struct CorpusReport {
     warning_counts: BTreeMap<String, u64>,
     largest_files: Vec<CorpusFileSummary>,
     top_flate_recompress_savings: Vec<CorpusFileSummary>,
+    top_non_image_flate_recompress_savings: Vec<CorpusFileSummary>,
     top_duplicate_stream_waste: Vec<CorpusFileSummary>,
+    top_duplicate_image_waste: Vec<CorpusFileSummary>,
+    top_duplicate_form_waste: Vec<CorpusFileSummary>,
+    top_duplicate_font_waste: Vec<CorpusFileSummary>,
+    top_inline_image_payload: Vec<CorpusFileSummary>,
+    top_duplicate_inline_image_waste: Vec<CorpusFileSummary>,
     top_metadata_payload: Vec<CorpusFileSummary>,
     top_font_payload: Vec<CorpusFileSummary>,
     top_hidden_text: Vec<CorpusFileSummary>,
@@ -159,14 +202,27 @@ pub(crate) fn analyze_corpus(
 
     let analyzed = summaries.len();
     let largest_files = top_by(&summaries, top, |row| row.input_bytes);
-    let top_flate_recompress_savings = top_by(&summaries, top, |row| {
+    let top_flate_recompress_savings = top_nonzero_by(&summaries, top, |row| {
         row.flate_recompress_potential_saving_bytes
     });
+    let top_non_image_flate_recompress_savings = top_nonzero_by(&summaries, top, |row| {
+        row.non_image_flate_recompress_potential_saving_bytes
+    });
     let top_duplicate_stream_waste =
-        top_by(&summaries, top, |row| row.duplicate_stream_wasted_bytes);
-    let top_metadata_payload = top_by(&summaries, top, |row| row.metadata_stream_bytes);
-    let top_font_payload = top_by(&summaries, top, |row| row.font_program_bytes);
-    let top_hidden_text = top_by(&summaries, top, |row| row.hidden_text_findings);
+        top_nonzero_by(&summaries, top, |row| row.duplicate_stream_wasted_bytes);
+    let top_duplicate_image_waste =
+        top_nonzero_by(&summaries, top, |row| row.duplicate_image_wasted_bytes);
+    let top_duplicate_form_waste =
+        top_nonzero_by(&summaries, top, |row| row.duplicate_form_wasted_bytes);
+    let top_duplicate_font_waste =
+        top_nonzero_by(&summaries, top, |row| row.duplicate_font_wasted_bytes);
+    let top_inline_image_payload = top_nonzero_by(&summaries, top, |row| row.inline_image_bytes);
+    let top_duplicate_inline_image_waste = top_nonzero_by(&summaries, top, |row| {
+        row.duplicate_inline_image_wasted_bytes
+    });
+    let top_metadata_payload = top_nonzero_by(&summaries, top, |row| row.metadata_stream_bytes);
+    let top_font_payload = top_nonzero_by(&summaries, top, |row| row.font_program_bytes);
+    let top_hidden_text = top_nonzero_by(&summaries, top, |row| row.hidden_text_findings);
 
     Ok(CorpusReport {
         root: root.display().to_string(),
@@ -185,7 +241,13 @@ pub(crate) fn analyze_corpus(
         warning_counts,
         largest_files,
         top_flate_recompress_savings,
+        top_non_image_flate_recompress_savings,
         top_duplicate_stream_waste,
+        top_duplicate_image_waste,
+        top_duplicate_form_waste,
+        top_duplicate_font_waste,
+        top_inline_image_payload,
+        top_duplicate_inline_image_waste,
         top_metadata_payload,
         top_font_payload,
         top_hidden_text,
@@ -245,10 +307,39 @@ fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
     totals.duplicate_stream_payload_groups += analysis.duplicate_stream_payload_groups as u64;
     totals.duplicate_stream_payload_wasted_bytes +=
         analysis.duplicate_stream_payload_wasted_bytes as u64;
+    totals.duplicate_image_payload_groups += analysis.duplicate_image_payload_groups as u64;
+    totals.duplicate_image_payload_wasted_bytes +=
+        analysis.duplicate_image_payload_wasted_bytes as u64;
+    totals.duplicate_form_payload_groups += analysis.duplicate_form_payload_groups as u64;
+    totals.duplicate_form_payload_wasted_bytes +=
+        analysis.duplicate_form_payload_wasted_bytes as u64;
+    totals.duplicate_font_payload_groups += analysis.duplicate_font_payload_groups as u64;
+    totals.duplicate_font_payload_wasted_bytes +=
+        analysis.duplicate_font_payload_wasted_bytes as u64;
+    totals.inline_images += analysis.inline_image_count as u64;
+    totals.inline_image_bytes += analysis.inline_image_bytes as u64;
+    totals.duplicate_inline_image_payload_groups +=
+        analysis.duplicate_inline_image_payload_groups as u64;
+    totals.duplicate_inline_image_payload_wasted_bytes +=
+        analysis.duplicate_inline_image_payload_wasted_bytes as u64;
+    totals.documents_with_inline_images += u64::from(analysis.inline_image_count > 0);
+    totals.documents_with_duplicate_inline_images +=
+        u64::from(analysis.duplicate_inline_image_payload_groups > 0);
+    totals.documents_with_duplicate_images +=
+        u64::from(analysis.duplicate_image_payload_groups > 0);
+    totals.documents_with_duplicate_forms += u64::from(analysis.duplicate_form_payload_groups > 0);
+    totals.documents_with_duplicate_fonts += u64::from(analysis.duplicate_font_payload_groups > 0);
+    totals.resource_pruning_auto_triggered_documents +=
+        u64::from(analysis.resource_pruning_auto_triggered);
     totals.flate_streams += analysis.flate_stream_count as u64;
     totals.flate_recompress_candidates += analysis.flate_recompress_candidate_count as u64;
     totals.flate_recompress_potential_saving_bytes +=
         analysis.flate_recompress_potential_saving_bytes as u64;
+    totals.non_image_flate_streams += analysis.non_image_flate_stream_count as u64;
+    totals.non_image_flate_recompress_candidates +=
+        analysis.non_image_flate_recompress_candidate_count as u64;
+    totals.non_image_flate_recompress_potential_saving_bytes +=
+        analysis.non_image_flate_recompress_potential_saving_bytes as u64;
     totals.incremental_updates += analysis.incremental_update_count as u64;
     totals.hidden_text_findings += analysis.hidden_text.len() as u64;
     totals.warnings += analysis.warnings.len() as u64;
@@ -309,6 +400,21 @@ fn top_by(
     key: impl Fn(&CorpusFileSummary) -> usize,
 ) -> Vec<CorpusFileSummary> {
     let mut rows = summaries.to_vec();
+    rows.sort_unstable_by_key(|row| Reverse(key(row)));
+    rows.truncate(count);
+    rows
+}
+
+fn top_nonzero_by(
+    summaries: &[CorpusFileSummary],
+    count: usize,
+    key: impl Fn(&CorpusFileSummary) -> usize,
+) -> Vec<CorpusFileSummary> {
+    let mut rows = summaries
+        .iter()
+        .filter(|row| key(row) > 0)
+        .cloned()
+        .collect::<Vec<_>>();
     rows.sort_unstable_by_key(|row| Reverse(key(row)));
     rows.truncate(count);
     rows
