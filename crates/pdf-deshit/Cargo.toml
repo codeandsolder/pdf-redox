@@ -1,0 +1,17 @@
+[package]
+name = "pdf-deshit"
+description = "Pure-Rust PDF normalization, optimization, diagnostics, and privacy scrubbing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flpdf.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+serde.workspace = true
+thiserror.workspace = true

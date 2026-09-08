@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF Deshittifier</title>
+  <meta name="description" content="Fix bloated PDFs locally in your browser. No upload, no account, no analytics.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>PDF Deshittifier</h1>
+    <p>Fix bloated and weird PDFs. Everything runs locally in your browser.</p>
+  </header>
+
+  <section class="panel">
+    <label class="drop" id="drop">
+      <input id="file" type="file" accept="application/pdf,.pdf">
+      <strong>Choose a PDF</strong>
+      <span>or drop it here</span>
+    </label>
+
+    <div class="row">
+      <label>Mode
+        <select id="profile">
+          <option value="optimize">Optimize only — no intended visual changes</option>
+          <option value="perceptual">Smaller — lossy allowed when visually equivalent</option>
+          <option value="print">Print — optimize rasters for physical output</option>
+        </select>
+      </label>
+    </div>
+
+    <details>
+      <summary>Privacy scrub</summary>
+      <label>Level
+        <select id="privacy">
+          <option value="none">Off</option>
+          <option value="metadata">Metadata — XMP, Info, IDs, JPEG metadata</option>
+          <option value="best-effort">Best effort — fresh rewrite + hidden metadata cleanup</option>
+        </select>
+      </label>
+      <p class="hint">Best effort is not a secrecy proof. Visible content and some unusual hidden structures can still contain identifying information.</p>
+    </details>
+
+    <section id="hidden-review" class="review hidden" aria-labelledby="hidden-review-title">
+      <h2 id="hidden-review-title">Invisible text review</h2>
+      <p id="hidden-summary" class="hint"></p>
+      <div id="hidden-groups"></div>
+    </section>
+
+    <button id="go" disabled>Deshittify</button>
+    <div id="status" aria-live="polite"></div>
+  </section>
+
+  <section id="result" class="panel hidden">
+    <h2>Done</h2>
+    <dl>
+      <div><dt>Before</dt><dd id="before">—</dd></div>
+      <div><dt>After</dt><dd id="after">—</dd></div>
+      <div><dt>Saved</dt><dd id="saved">—</dd></div>
+    </dl>
+    <a id="download" class="button" download>Download PDF</a>
+    <details>
+      <summary>What was weird?</summary>
+      <pre id="report"></pre>
+    </details>
+  </section>
+
+  <footer>No upload. No account. No tracking. Source is Rust + WebAssembly.</footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

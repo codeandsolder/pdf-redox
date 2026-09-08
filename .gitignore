@@ -1,0 +1,9 @@
+/target/
+/.cargo/
+/.rustup/
+/vendor/
+/web/pkg/
+*.pdf
+*.zip
+*.bak.*
+.DS_Store

@@ -1,0 +1,19 @@
+[package]
+name = "pdf-deshit-cli"
+description = "CLI for pdf-deshit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pdf-deshit"
+path = "src/main.rs"
+
+[dependencies]
+pdf-deshit = { path = "../pdf-deshit" }
+clap.workspace = true
+serde_json.workspace = true
