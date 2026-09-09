@@ -1,0 +1,55 @@
+[package]
+name = "flpdf"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+rust-version.workspace = true
+description = "A pure-Rust PDF toolkit modeled on qpdf — read, rewrite, linearize, and inspect PDFs."
+documentation = "https://docs.rs/flpdf"
+keywords = ["pdf", "qpdf", "parser", "linearization"]
+categories = ["parser-implementations", "encoding"]
+
+[dependencies]
+thiserror.workspace = true
+flate2.workspace = true
+aes.workspace = true
+cbc.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hex.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+stacker.workspace = true
+same-file.workspace = true
+# Not used directly: `ar_archive_writer` is `stacker`'s transitive
+# build-dependency (via `psm`). Declaring it here is what makes the
+# `=0.5.1` MSRV pin in the workspace `[workspace.dependencies]` an active
+# resolver constraint — a `[workspace.dependencies]` entry alone is inert
+# unless some member's manifest actually inherits it (verified: `cargo
+# update -p ar_archive_writer --precise 0.5.2` succeeds without this line).
+ar_archive_writer.workspace = true
+libjpeg-turbo-rs.workspace = true
+flpdf-libjpeg-compat = { path = "../flpdf-libjpeg-compat", version = "0.5.1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_System_Time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+flate2.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Internal cross-crate hooks used only by the qpdf test-driver compatibility
+# binary. Normal library builds do not expose or compile this oracle plumbing.
+qtest-driver = []
+qpdf-libjpeg-compat = ["dep:flpdf-libjpeg-compat", "flpdf-libjpeg-compat/system-libjpeg"]
+# Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
+# matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
+# tests only — production builds stay Pure Rust (miniz_oxide).
+qpdf-zlib-compat = ["flate2/zlib"]

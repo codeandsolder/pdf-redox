@@ -1,0 +1,168 @@
+//! qpdf correspondence: `QPDF_encryption.cc:700-716,860-904` crypt-filter interpretation and `/CF` table construction.
+#![allow(dead_code)]
+
+use super::state::{EncryptionMode, EncryptionState};
+use crate::error::{EncryptedError, Result};
+use crate::ObjectHandle;
+use std::collections::{BTreeMap, HashMap};
+
+/// Crypt-filter method from PDF 1.7 `/CFM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CryptFilterMethod {
+    V2,
+    AesV2,
+    Identity,
+}
+
+/// One named `/CF` dictionary entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CryptFilter {
+    pub name: String,
+    pub cfm: CryptFilterMethod,
+    pub length_bits: Option<i64>,
+}
+
+/// Result of resolving a use-site selector against `/CF`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CryptFilterRef<'a> {
+    Identity,
+    Named(&'a CryptFilter),
+}
+
+/// `/StmF`, `/StrF`, and `/EFF` selectors with qpdf's `/EFF` fallback.
+#[derive(Debug, Clone)]
+pub(crate) struct V4UseSiteSelectors {
+    pub stm_f: Option<String>,
+    pub str_f: Option<String>,
+    pub eff: Option<String>,
+}
+
+impl V4UseSiteSelectors {
+    pub(crate) fn eff_or_stm(&self) -> Option<&str> {
+        self.eff.as_deref().or(self.stm_f.as_deref())
+    }
+}
+
+/// Resolve a named crypt filter for a use site.
+pub(crate) fn select_crypt_filter<'a>(
+    cf_table: &'a HashMap<String, CryptFilter>,
+    name: Option<&str>,
+) -> Result<CryptFilterRef<'a>> {
+    match name {
+        None | Some("Identity") => Ok(CryptFilterRef::Identity),
+        Some(name) => cf_table
+            .get(name)
+            .map(CryptFilterRef::Named)
+            .ok_or_else(|| {
+                EncryptedError::Malformed {
+                    reason: format!("/CF entry '{name}' not found"),
+                }
+                .into()
+            }),
+    }
+}
+
+/// Map a crypt-filter method to the Standard handler's object-key algorithm.
+pub(crate) fn cfm_to_object_key_alg(cfm: CryptFilterMethod) -> Option<super::keys::ObjectKeyAlg> {
+    match cfm {
+        CryptFilterMethod::V2 => Some(super::keys::ObjectKeyAlg::Rc4),
+        CryptFilterMethod::AesV2 => Some(super::keys::ObjectKeyAlg::Aes),
+        CryptFilterMethod::Identity => None,
+    }
+}
+
+fn interpret_cf_name(
+    crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
+    filter: Option<&[u8]>,
+) -> EncryptionMode {
+    let Some(filter) = filter else {
+        return EncryptionMode::Identity;
+    };
+    if let Some(mode) = crypt_filters.get(filter) {
+        return *mode;
+    }
+    if filter == b"Identity" {
+        EncryptionMode::Identity
+    } else {
+        EncryptionMode::Unknown
+    }
+}
+
+/// qpdf `QPDF::interpretCF` at the lazy `ObjectHandle` boundary.
+pub(crate) fn interpret_cf_from_handle(
+    encryption: &EncryptionState,
+    cf: &ObjectHandle,
+) -> Result<EncryptionMode> {
+    interpret_cf_selector_from_handle(&encryption.crypt_filters, cf)
+}
+
+/// Resolve a `/StmF`, `/StrF`, or `/EFF` selector against a parsed handle
+/// crypt-filter table.
+pub(crate) fn interpret_cf_selector_from_handle(
+    crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
+    cf: &ObjectHandle,
+) -> Result<EncryptionMode> {
+    let filter = cf.try_as_name()?;
+    Ok(interpret_cf_name(crypt_filters, filter.as_deref()))
+}
+
+/// Parse qpdf's `/CF` table directly from the canonical encryption handle.
+/// The caller has already resolved `encrypt`; child dictionary and `/CFM`
+/// handles retain their qpdf identity and are resolved only at the accessor
+/// that needs their value.
+pub(crate) fn crypt_filter_modes_from_handle(
+    encrypt: &ObjectHandle,
+    v: i64,
+) -> Result<BTreeMap<Vec<u8>, EncryptionMode>> {
+    let mut modes = BTreeMap::new();
+    if !matches!(v, 4 | 5) {
+        return Ok(modes);
+    }
+    let cf = encrypt.try_get_key(b"/CF")?;
+    let Some(cf) = cf.try_as_dictionary()? else {
+        return Ok(modes);
+    };
+    for (name, value) in cf {
+        let Some(filter) = value.try_as_dictionary()? else {
+            continue;
+        };
+        let mut mode = EncryptionMode::Identity;
+        let cfm = filter
+            .get(b"/CFM".as_slice())
+            .cloned()
+            .unwrap_or_else(ObjectHandle::null);
+        cfm.try_dereference()?;
+        if let Some(cfm) = cfm.try_as_name()? {
+            mode = match cfm.as_slice() {
+                b"V2" => EncryptionMode::Rc4,
+                b"AESV2" => EncryptionMode::Aes128,
+                b"AESV3" => EncryptionMode::Aes256,
+                _ => EncryptionMode::Unknown,
+            };
+        }
+        let selector = name.strip_prefix(b"/").unwrap_or(&name).to_vec();
+        modes.insert(selector, mode);
+    }
+    Ok(modes)
+}
+
+/// Report `/CF/StdCF/CFM` without materializing the encryption dictionary.
+pub(crate) fn crypt_filter_method_from_handle(encrypt: &ObjectHandle) -> Result<Option<String>> {
+    let cf = encrypt.try_get_key(b"/CF")?;
+    let Some(cf) = cf.try_as_dictionary()? else {
+        return Ok(None);
+    };
+    let Some(std_cf) = cf.get(b"/StdCF".as_slice()).cloned() else {
+        return Ok(None);
+    };
+    let Some(std_cf) = std_cf.try_as_dictionary()? else {
+        return Ok(None);
+    };
+    let Some(cfm) = std_cf.get(b"/CFM".as_slice()).cloned() else {
+        return Ok(None);
+    };
+    cfm.try_dereference()?;
+    Ok(cfm
+        .try_as_name()?
+        .map(|name| String::from_utf8_lossy(&name).into_owned()))
+}

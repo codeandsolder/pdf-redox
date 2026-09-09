@@ -301,8 +301,6 @@ dependencies = [
 [[package]]
 name = "flpdf"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f9f800b4f59fb3b5482679c97f05ed57740a387e4a18f9c3023ef835a8dc42e"
 dependencies = [
  "aes",
  "ar_archive_writer",

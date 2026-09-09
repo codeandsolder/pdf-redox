@@ -1,0 +1,835 @@
+//! qpdf correspondence: QPDF.cc document-construction entry points (`emptyPDF()`, `processFile()`, and `processMemoryFile()`) and their shared construction orchestration.
+//!
+//! Rust splits QPDF.cc construction into `engine.rs` while retaining the single `Pdf<R>` type.
+
+use crate::cache::ObjectCache;
+// Used by the public factory API's intra-doc links.
+#[allow(unused_imports)]
+use crate::error::EncryptedError;
+use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
+use crate::reader::{PdfOpenOptions, ReopenableFile};
+use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
+#[allow(unused_imports)]
+use crate::{Error, ObjectHandle, XrefForm};
+use crate::{Pdf, Result};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read, Seek};
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Track whether a bootstrap source has reached its first read operation.
+/// `load_xref_state_with_options` seeks to the beginning before reading the
+/// whole source, so the caller must distinguish a seek failure from a failed
+/// read before applying qpdf's `FileInputSource::read` wording.
+struct BootstrapReadTracker<'a, R> {
+    reader: &'a mut R,
+    read_attempted: bool,
+}
+
+impl<R> BootstrapReadTracker<'_, R> {
+    fn new(reader: &mut R) -> BootstrapReadTracker<'_, R> {
+        BootstrapReadTracker {
+            reader,
+            read_attempted: false,
+        }
+    }
+}
+
+impl<R: Read> Read for BootstrapReadTracker<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.read_attempted = true;
+        self.reader.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for BootstrapReadTracker<'_, R> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.reader.seek(position)
+    }
+}
+
+/// qpdf's initial `findFirst` scan asks its `FileInputSource` for 1024 bytes
+/// (`libqpdf/QPDF.cc:430-438`). A file-backed Rust bootstrap currently reads
+/// the source eagerly, so convert an I/O failure from that read into the same
+/// `QPDFExc` message before the generic `Error::Io` display adds platform text.
+fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Error) -> Error {
+    if description.is_empty() || !read_attempted || !matches!(&error, Error::Io(_)) {
+        return error;
+    }
+    let mut message = description.to_vec();
+    message.extend_from_slice(b": read 1024 bytes");
+    Error::SystemBytes(message)
+}
+
+fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Result<Vec<u8>> {
+    let mut tracked = BootstrapReadTracker::new(reader);
+    let result = (|| {
+        tracked.seek(std::io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        tracked.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    result.map_err(|error: std::io::Error| {
+        qpdf_initial_read_error(description, tracked.read_attempted, error.into())
+    })
+}
+
+static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
+// Upper bound on read-to-end fallbacks during object resolution (see
+// `resolution_fallbacks_remaining`). Each fallback may scan to EOF, so the total
+// fallback work is bounded by this many file scans — O(file size), not the
+// quadratic cost an unbounded read-to-end per object would incur. 64 tolerates a
+// handful of corrupt/overlapping offsets in an otherwise valid file while still
+// defeating a flood of objects whose bodies run to EOF.
+const MAX_RESOLUTION_FALLBACKS: u32 = 64;
+
+impl<R: Read + Seek> Pdf<R> {
+    /// Construct qpdf's default, unprocessed document.
+    ///
+    /// qpdf's `QPDF()` leaves both its trailer and input source uninitialized;
+    /// `emptyPDF()` is a separate operation that processes a canonical empty
+    /// file (`libqpdf/QPDF.cc:198-213,278-293`). This constructor preserves
+    /// that distinction. The resolver owns an explicit invalid input-source
+    /// state, so construction does not require a byte buffer or a sentinel
+    /// reader.
+    pub fn uninitialized() -> Self {
+        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let resolver = ResolverHandle::new_uninitialized(
+            ResolverWarningOptions::new(crate::QPDFLogger::default_logger(), false, Vec::new()),
+            unique_id,
+        );
+        let encryption = resolver.encryption_parameters();
+        Self {
+            unique_id,
+            resolver,
+            input_source_control: None,
+            version: String::new(),
+            parsed: false,
+            check_mode: false,
+            trailer: ObjectHandle::uninitialized(),
+            last_xref_form: XrefForm::Table,
+            first_xref_item_offset: 0,
+            cache: ObjectCache::default(),
+            foreign_object_maps: BTreeMap::new(),
+            writer_object_order: None,
+            foreign_object_visiting: BTreeMap::new(),
+            acroform_cache: Rc::new(RefCell::new(None)),
+            trailer_handle_memo: None,
+            root_handle_memo: None,
+            compressed_member_parents: BTreeMap::new(),
+            sorted_object_offsets: Vec::new(),
+            legacy_resolution_state_synced: false,
+            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
+            dirty_object_refs: BTreeSet::new(),
+            handle_mutated_object_refs: BTreeSet::new(),
+            qpdf_dangling_refs: BTreeSet::new(),
+            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
+            ever_called_get_all_pages: false,
+            ever_pushed_inherited_attributes_to_pages: false,
+            page_list_cache: None,
+            encryption,
+            encryption_inspection: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Open a document with qpdf's default recovery policy.
+    ///
+    /// qpdf enables recovery by default. Use [`Pdf::open_with_options`] with
+    /// `repair: false` for the explicit strict/suppressed-recovery route.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`] (called with qpdf's
+    /// default recovery options): [`Error::Io`] / [`Error::Parse`] /
+    /// [`Error::Missing`] from loading the cross-reference and trailer, and
+    /// [`Error::Encrypted`] when the document is encrypted and cannot be
+    /// authenticated.
+    pub fn open(reader: R) -> Result<Self> {
+        Self::open_with_options(reader, PdfOpenOptions::default())
+    }
+
+    /// Open a document with qpdf-style xref/trailer recovery explicitly enabled.
+    ///
+    /// This is equivalent to [`Pdf::open`] because qpdf enables recovery by
+    /// default. Diagnostics from the recovery pass are stored on the handle and
+    /// exposed via [`Pdf::repair_diagnostics`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`] (called with `repair`
+    /// enabled); see that method for the full error set.
+    pub fn open_with_repair(reader: R) -> Result<Self> {
+        Self::open_with_options(
+            reader,
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+    }
+
+    /// Alias for [`Pdf::open_with_repair`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_repair`].
+    pub fn open_best_effort(reader: R) -> Result<Self> {
+        Self::open_with_repair(reader)
+    }
+
+    /// Open a document with explicit repair and password options.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] when loading the
+    ///   cross-reference table and trailer fails (e.g. an unreadable stream, a
+    ///   malformed xref, or a cross-reference stream missing its `/Size` or `/W`
+    ///   entry). With `options.repair` set, the qpdf-style recovery pass runs
+    ///   first and only its residual failures surface.
+    /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
+    ///   entry type or `/W` field-width layout.
+    /// - [`Error::Encrypted`] when the document carries an `/Encrypt` dictionary
+    ///   that cannot be authenticated or processed: a wrong password
+    ///   ([`EncryptedError::BadPassword`]), an unsupported filter or revision
+    ///   ([`EncryptedError::UnsupportedHandler`]), a structurally invalid
+    ///   `/Encrypt` dictionary ([`EncryptedError::Malformed`]). Weak
+    ///   encryption is readable; qpdf's `--allow-weak-crypto` is a write-only
+    ///   policy.
+    pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
+        Self::open_with_repair_mode(reader, options, false)
+    }
+
+    /// Open a document for qpdf's read-only encryption inspection path.
+    ///
+    /// Unlike [`Pdf::open_with_options`], this retains the parsed encryption
+    /// parameters and returns a document when password authentication fails
+    /// with [`EncryptedError::BadPassword`]. The returned document is only
+    /// suitable for encryption inspection; its authenticated decryption state
+    /// remains absent.
+    pub fn open_for_encryption_inspection(reader: R, options: PdfOpenOptions) -> Result<Self> {
+        Self::open_with_repair_mode(reader, options, true)
+    }
+
+    fn open_with_repair_mode(
+        reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+    ) -> Result<Self> {
+        Self::open_with_repair_mode_as(reader, options, allow_bad_password, None)
+    }
+
+    /// The open path with an optional pre-assigned document identity.
+    ///
+    /// `QPDF::processMemoryFile` installs a source on an already constructed
+    /// `QPDF`, so every handle minted while parsing must carry that object's
+    /// identity rather than a fresh one; `None` allocates a new identity for
+    /// the ordinary factory functions.
+    fn open_with_repair_mode_as(
+        mut reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+        unique_id: Option<u64>,
+    ) -> Result<Self> {
+        let warning_options = ResolverWarningOptions::new(
+            options
+                .logger
+                .clone()
+                .unwrap_or_else(crate::QPDFLogger::default_logger),
+            options.suppress_warnings,
+            options.description.clone(),
+        );
+        // Read the source through the same input boundary that will be owned
+        // by the document resolver.  The document itself is constructed before
+        // xref parsing below; only this byte snapshot is a scan aid for the
+        // existing xref/recovery code.
+        let source_bytes = match read_initial_source(&mut reader, &options.description) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some((_, diagnostics)) = error.open_failure() {
+                    // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
+                    warning_options.replay_warnings(diagnostics)?; // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
+                }
+                return Err(error);
+            }
+        };
+        let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
+        let resolver = ResolverHandle::new_shared(
+            reader,
+            0,
+            BTreeMap::new(),
+            options.repair,
+            false,
+            crate::Diagnostics::default(),
+            warning_options.clone(),
+            unique_id,
+        );
+        let loaded_state = match load_xref_state_from_bytes(
+            &source_bytes,
+            XrefLoadOptions {
+                allow_repair: options.repair,
+                ignore_xref_streams: options.ignore_xref_streams,
+                description: options.description.clone(),
+            },
+            Some(resolver.as_ref()),
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some((_, diagnostics)) = error.open_failure() {
+                    warning_options.replay_warnings(diagnostics)?;
+                }
+                return Err(error);
+            }
+        };
+        // The production xref loader was given this resolver as its canonical
+        // owner, so xref-stream handles and all metadata they resolve are
+        // already in the live cache. The owner-less loader still returns the
+        // temporary bootstrap handoff for its standalone API/tests.
+        let bootstrap_cache = loaded_state.bootstrap_cache;
+        let parsed_xref_streams = loaded_state.parsed_xref_streams;
+        let trailer_references = loaded_state.trailer_references;
+        let header_offset = loaded_state.header_offset;
+        let already_reconstructed = loaded_state.already_reconstructed;
+        let first_xref_item_offset = loaded_state.first_xref_item_offset;
+        let loaded = loaded_state.loaded;
+        let source_xref_entries = loaded.entries.clone();
+        let mut sorted_object_offsets: Vec<u64> = loaded
+            .entries
+            .values()
+            .filter_map(|offset| match offset {
+                crate::XrefEntry::Uncompressed { offset } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        sorted_object_offsets.sort_unstable();
+        sorted_object_offsets.dedup();
+        let cache = ObjectCache::from_offsets(&loaded.entries);
+        let initial_diagnostics = loaded.repair_diagnostics.clone();
+        resolver.set_header_offset(header_offset);
+        resolver.install_source_xref_entries(source_xref_entries);
+        resolver.set_reconstructed_xref(already_reconstructed);
+        resolver.install_repair_diagnostics(loaded.repair_diagnostics.clone());
+        // QPDF's parser registers indirect references while reading every
+        // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
+        // Canonical xref loading has already minted those handles in this
+        // resolver; retain this idempotent registration for owner-less state
+        // handoffs and trailer references collected during recovery.
+        for object_ref in trailer_references {
+            if object_ref.number != 0 && object_ref.generation != u16::MAX {
+                resolver.get_object_handle(object_ref);
+            }
+        }
+        // qpdf's readTrailer resets InputSource::last_offset to the xref read
+        // position before initializeEncryption runs (QPDF.cc:1313-1327).
+        resolver.set_last_offset(loaded.startxref);
+        resolver.replay_warnings(&initial_diagnostics)?;
+        let trailer = if loaded
+            .trailer
+            .owning_pdf_unique_id()
+            .is_some_and(|owner| owner == unique_id)
+        {
+            loaded.trailer
+        } else {
+            resolver.direct_object_handle(crate::reader::rebind_handle_value(
+                &resolver,
+                &loaded.trailer,
+            )?) // cov:ignore: owner-less standalone xref loading may still return a foreign trailer
+        };
+        // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
+        // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
+        // separate copy kept in sync.
+        let encryption = resolver.encryption_parameters();
+        let mut pdf = Self {
+            unique_id,
+            resolver,
+            input_source_control: None,
+            version: loaded.version,
+            parsed: true,
+            check_mode: false,
+            trailer,
+            last_xref_form: loaded.last_xref_form,
+            first_xref_item_offset,
+            cache,
+            foreign_object_maps: BTreeMap::new(),
+            writer_object_order: None,
+            foreign_object_visiting: BTreeMap::new(),
+            acroform_cache: Rc::new(RefCell::new(None)),
+            trailer_handle_memo: None,
+            root_handle_memo: None,
+            compressed_member_parents: BTreeMap::new(),
+            sorted_object_offsets,
+            legacy_resolution_state_synced: already_reconstructed,
+            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
+            dirty_object_refs: BTreeSet::new(),
+            handle_mutated_object_refs: BTreeSet::new(),
+            qpdf_dangling_refs: BTreeSet::new(),
+            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
+            ever_called_get_all_pages: false,
+            ever_pushed_inherited_attributes_to_pages: false,
+            page_list_cache: None,
+            encryption,
+            encryption_inspection: Rc::new(RefCell::new(None)),
+        };
+        pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
+        drop(bootstrap_cache);
+        if let Err(error) = pdf.initialize_encryption_inspection() {
+            // Same diagnostic-wrapping boundary as the authentication
+            // failure below: xref recovery may have already recorded repair
+            // warnings, and a suppressed inspection consumer (such as the
+            // JSON check route, which replays them via
+            // `Error::OpenFailure`/`report_open_failure`) must not lose them
+            // just because a malformed `/Encrypt` entry fails this
+            // password-independent parse before authentication even runs.
+            let diagnostics = pdf.repair_diagnostics();
+            return Err(Error::with_open_diagnostics(error, diagnostics));
+        }
+        if let Err(error) = pdf.authenticate_if_encrypted(&options) {
+            // qpdf reconstructs and records warnings before
+            // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
+            // authentication errors afterward (`libqpdf/QPDF_encryption.cc:929`).
+            // Preserve that warning stream alongside the terminal
+            // password/encryption error so file-backed helpers can emit it
+            // before the final diagnostic.
+            if allow_bad_password && matches!(error, Error::Encrypted(EncryptedError::BadPassword))
+            {
+                return Ok(pdf);
+            }
+            let diagnostics = pdf.repair_diagnostics();
+            return Err(Error::with_open_diagnostics(error, diagnostics));
+        }
+        Ok(pdf)
+    }
+}
+
+impl Pdf<Cursor<Arc<[u8]>>> {
+    /// Open a PDF document from a shared, reference-counted byte buffer.
+    ///
+    /// **This call copies nothing.** The document and the caller share one
+    /// allocation; clone the `Arc` to keep reading the same bytes elsewhere,
+    /// and it is freed once both are done with it. (Producing the `Arc<[u8]>`
+    /// in the first place may copy — `Vec<u8> -> Arc<[u8]>` reallocates so the
+    /// refcount can sit beside the data — but that happens once, in the
+    /// caller's own code, not per open.)
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
+    /// let kept = Arc::clone(&bytes);
+    /// let mut pdf = Pdf::open_mem(bytes)?;
+    /// // `kept` and the document are the same bytes, not two copies.
+    /// println!("version {} over {} shared bytes", pdf.version(), kept.len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Why `Arc<[u8]>` and not `&[u8]`
+    ///
+    /// This took `&[u8]` and returned `Pdf<Cursor<&'a [u8]>>`, borrowing
+    /// without copying. That type is no longer well-formed: `Pdf<R>` requires
+    /// `R: 'static` (see the bound on [`Pdf`] for why), so the input must be
+    /// owned rather than borrowed.
+    ///
+    /// Copying the slice internally would have kept the old signature, and it
+    /// is the wrong trade. qpdf's own in-memory entry point does not copy:
+    /// `QPDF::processMemoryFile` (`libqpdf/QPDF.cc:259-268`) wraps the
+    /// caller's pointer in a `BufferInputSource` over
+    /// `Buffer(unsigned char*, size_t)`, whose contract is "memory is owned by
+    /// the caller and will not be freed when the Buffer is destroyed"
+    /// (`include/qpdf/Buffer.hh:42-45`). Shared ownership is the safe-Rust
+    /// analogue of that contract — no copy on either side — and a caller who
+    /// holds only a slice writes `Arc::from(slice)` itself, so the copy is
+    /// visible at the call site rather than hidden in the library.
+    ///
+    /// `Arc` rather than `Rc` because the buffer, unlike the document, can then
+    /// be shared across threads that each open their own `Pdf`. The `Arc` buys
+    /// sharing of the *input*, not of the document — the two doctests below
+    /// pin both halves of that, so neither can go stale silently.
+    ///
+    /// One buffer, cloned across threads, each clone opening its own document:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// let workers: Vec<_> = (0..2)
+    ///     .map(|_| {
+    ///         let shared = Arc::clone(&bytes);
+    ///         std::thread::spawn(move || Pdf::open_mem(shared).is_ok())
+    ///     })
+    ///     .collect();
+    /// for worker in workers {
+    ///     worker.join().unwrap();
+    /// }
+    /// ```
+    ///
+    /// The document itself, by contrast, is not `Send`, and has not been since
+    /// long before the resolver existed: `handle_registry` holds
+    /// [`ObjectHandle`]s whose identity is `Rc<RefCell<..>>`, as that field's
+    /// own comment records. The resolver's `Rc` is a second reason, not the
+    /// reason — compiling the snippet below standalone reports both, and
+    /// `Rc<RefCell<DirectSlot>>` is the one that predates this work.
+    /// `compile_fail` passes on *any* error,
+    /// so this one is only meaningful next to the example above: that one
+    /// builds the same `Arc<[u8]>` and calls the same `open_mem`, and it runs.
+    /// The bound `require_send` adds is therefore the only thing left to
+    /// reject:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// fn require_send<T: Send>(_: T) {}
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// require_send(Pdf::open_mem(bytes));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
+    pub fn open_mem(bytes: Arc<[u8]>) -> crate::Result<Self> {
+        Self::open(Cursor::new(bytes))
+    }
+
+    /// Open a PDF document from a shared byte buffer with explicit open options.
+    ///
+    /// Like [`Pdf::open_mem`] but accepts a [`PdfOpenOptions`] struct for repair and
+    /// password configuration, mirroring [`Pdf::open_with_options`]. Shares
+    /// `bytes` without copying, on the same terms.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`]; see that method for the
+    /// full error set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use flpdf::{Pdf, PdfOpenOptions};
+    ///
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
+    /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
+    /// let mut pdf = Pdf::open_mem_with_options(bytes, opts)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_with_options(bytes: Arc<[u8]>, options: PdfOpenOptions) -> crate::Result<Self> {
+        Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+impl Pdf<Cursor<Vec<u8>>> {
+    /// Process an in-memory PDF through an already constructed document.
+    ///
+    /// This is qpdf's `QPDF::processMemoryFile` (`include/qpdf/QPDF.hh:91-97`,
+    /// `libqpdf/QPDF.cc:259-269`). The Rust document owns the replacement
+    /// byte vector, while the qpdf policy state that is observable before the
+    /// parse — recovery, warning suppression, logger, and source description
+    /// — is carried across to the normal opening path. A failed parse leaves
+    /// the existing document unchanged, just as qpdf does not install a new
+    /// parsed source until its process call succeeds.
+    pub fn process_memory_file(
+        &mut self,
+        description: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
+    ) -> crate::Result<()> {
+        if self.parsed {
+            return Err(crate::Error::Internal(
+                "QPDF::processMemoryFile must be called before a process method".to_owned(),
+            ));
+        }
+        let options = PdfOpenOptions {
+            repair: self.resolver.attempt_recovery(),
+            logger: Some(self.resolver.logger()),
+            suppress_warnings: self.resolver.suppress_warnings(),
+            description: description.as_ref().to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        // Parse with this document's identity so the handles minted during
+        // the open (trailer, root, cached objects) and any handle created
+        // afterwards agree on their owner.
+        *self = Self::open_with_repair_mode_as(
+            Cursor::new(bytes),
+            options,
+            false,
+            Some(self.unique_id),
+        )?;
+        Ok(())
+    }
+
+    /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
+    ///
+    /// The sole-ownership counterpart to [`Pdf::open_mem`]: the handle takes the
+    /// `Vec` outright rather than sharing an `Arc`. Neither copies; both are
+    /// `'static` and can be freely moved and stored in data structures.
+    ///
+    /// This is the preferred form for in-memory PDF handling in most contexts (e.g. WASM,
+    /// test helpers, fulgur's document pipeline).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let mut pdf = Pdf::open_mem_owned(bytes)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_owned(bytes: Vec<u8>) -> crate::Result<Self> {
+        Self::open(Cursor::new(bytes))
+    }
+
+    /// Open a PDF document from an owned byte vector with explicit open options.
+    ///
+    /// Like [`Pdf::open_mem_owned`] but accepts a [`PdfOpenOptions`] struct for repair
+    /// and password configuration, mirroring [`Pdf::open_with_options`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`]; see that method for the
+    /// full error set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::{Pdf, PdfOpenOptions};
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
+    /// let mut pdf = Pdf::open_mem_owned_with_options(bytes, opts)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_owned_with_options(
+        bytes: Vec<u8>,
+        options: PdfOpenOptions,
+    ) -> crate::Result<Self> {
+        Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+impl Pdf<Box<dyn crate::ReadSeek>> {
+    /// Open a path through qpdf's reopenable file-source boundary.
+    ///
+    /// The returned erased document is suitable for a mixed qpdf page job:
+    /// its source can be closed and reopened by
+    /// [`crate::job::QPDFJob::handle_page_specs`] without exposing a concrete
+    /// reader type to the caller. The source is initially kept open so the
+    /// opening parse can complete; the job selects the final policy before
+    /// resolving page specifications.
+    ///
+    /// This corresponds to `QPDF::processFile` plus
+    /// `ClosedFileInputSource::before`/`after`
+    /// (`libqpdf/QPDF.cc:244-249`, `libqpdf/ClosedFileInputSource.cc:18-35`).
+    pub fn open_file_with_options(
+        path: impl AsRef<Path>,
+        options: PdfOpenOptions,
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let source = ReopenableFile::new(path)
+            .map_err(|error| crate::Error::file_io("open", path.to_path_buf(), error))?;
+        let controller = source.controller();
+        let mut pdf = Self::open_with_options(Box::new(source), options)?;
+        pdf.input_source_control = Some(controller);
+        Ok(pdf)
+    }
+}
+
+// Mirrors qpdf's `EMPTY_PDF` (`libqpdf/QPDF.cc:34-51`) byte for byte: PDF
+// 1.3, a Catalog (object 1) pointing at an empty Pages tree (object 2), and
+// a classic xref table whose offsets match this exact literal.
+pub(crate) const EMPTY_PDF_BYTES: &[u8] = concat!(
+    "%PDF-1.3\n",
+    "1 0 obj\n",
+    "<< /Type /Catalog /Pages 2 0 R >>\n",
+    "endobj\n",
+    "2 0 obj\n",
+    "<< /Type /Pages /Kids [] /Count 0 >>\n",
+    "endobj\n",
+    "xref\n",
+    "0 3\n",
+    "0000000000 65535 f \n",
+    "0000000009 00000 n \n",
+    "0000000058 00000 n \n",
+    "trailer << /Size 3 /Root 1 0 R >>\n",
+    "startxref\n",
+    "110\n",
+    "%%EOF\n",
+)
+.as_bytes();
+
+/// Open qpdf's canonical empty document through the erased source boundary
+/// used by [`crate::job::JobDocument`].
+pub(crate) fn open_empty_with_options_erased(
+    options: PdfOpenOptions,
+) -> crate::Result<Pdf<Box<dyn crate::ReadSeek>>> {
+    Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
+        Box::new(Cursor::new(EMPTY_PDF_BYTES.to_vec())),
+        options,
+    )
+}
+
+impl Pdf<Cursor<Vec<u8>>> {
+    // qpdf's `QPDF::emptyPDF()` is a `void` method that initializes an already-
+    // constructed `QPDF` with the canonical empty bytes. `Pdf::uninitialized`
+    // preserves the separate default-constructed state, while `empty()` is
+    // the ready-to-use factory for qpdf's `emptyPDF()` result.
+    /// Open a canonical minimal PDF: a `Catalog` (object 1) pointing at an
+    /// empty `Pages` tree (object 2, zero pages), read through the normal
+    /// parser and object cache like any other document.
+    ///
+    /// Mirrors qpdf's `QPDF::emptyPDF()` (`libqpdf/QPDF.cc:34-51,290-293`):
+    /// the same fixed bytes, opened the same way [`Pdf::open_mem_owned`]
+    /// opens any in-memory PDF. Objects can be added and the trailer or
+    /// catalog mutated exactly as with any other opened document.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_mem_owned`]; the fixed bytes
+    /// are well-formed, so in practice this only surfaces allocator or
+    /// similar infrastructure failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flpdf::Pdf;
+    ///
+    /// let pdf = Pdf::empty()?;
+    /// assert_eq!(pdf.version(), "1.3");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn empty() -> crate::Result<Self> {
+        Self::open_mem_owned(EMPTY_PDF_BYTES.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pdf, EMPTY_PDF_BYTES};
+    use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
+    use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
+    use crate::{Error, ObjectRef, PdfOpenOptions, QPDFLogger};
+    use std::collections::BTreeMap;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    #[test]
+    fn classic_trailer_children_are_canonical_before_open_handoff() {
+        let unique_id = 0x12_34_56;
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(EMPTY_PDF_BYTES.to_vec()),
+            0,
+            BTreeMap::new(),
+            true,
+            false,
+            crate::Diagnostics::default(),
+            ResolverWarningOptions::new(QPDFLogger::default_logger(), false, Vec::new()),
+            unique_id,
+        );
+        let loaded = load_xref_state_from_bytes(
+            EMPTY_PDF_BYTES,
+            XrefLoadOptions::default(),
+            Some(resolver.as_ref()),
+        )
+        .expect("classic xref should load through the canonical owner");
+
+        let trailer_root = loaded
+            .loaded
+            .trailer
+            .try_get_key(b"/Root")
+            .expect("trailer /Root lookup");
+        let cached_root = resolver.get_object_handle(ObjectRef::new(1, 0));
+        assert!(
+            trailer_root.is_same_object_as(&cached_root),
+            "classic trailer indirect children must be the canonical cache slot"
+        );
+        assert_eq!(trailer_root.owning_pdf_unique_id(), Some(unique_id));
+    }
+
+    #[test]
+    fn initial_seek_failure_is_not_reported_as_a_read_failure() {
+        struct SeekFails;
+
+        // cov:ignore-start: the test reader's seek always fails before any read can occur
+        impl Read for SeekFails {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!("the bootstrap seek must fail before a read");
+            }
+        }
+        // cov:ignore-end
+
+        impl Seek for SeekFails {
+            fn seek(&mut self, _position: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::other("initial seek failed"))
+            }
+        }
+
+        let options = PdfOpenOptions {
+            description: b"input.pdf".to_vec(),
+            ..Default::default()
+        };
+        let error = Pdf::open_with_options(SeekFails, options)
+            .err()
+            .expect("the initial seek failure must abort opening");
+
+        assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
+    }
+
+    #[test]
+    fn uninitialized_memory_processing_honors_strict_recovery_policy() {
+        let mut pdf = Pdf::uninitialized();
+        pdf.set_attempt_recovery(false);
+        pdf.set_suppress_warnings(true);
+
+        let error = pdf
+            .process_memory_file(b"empty", Vec::new())
+            .expect_err("an empty strict input must fail at the qpdf parse boundary");
+
+        assert!(!pdf.resolver.attempt_recovery());
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(pdf.suppress_warnings());
+    }
+
+    #[test]
+    fn memory_processing_rejects_reprocessing_a_parsed_document() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let _trailer = pdf.trailer();
+
+        let error = pdf
+            .process_memory_file(b"replacement", Vec::new())
+            .expect_err("qpdf process methods are pre-parse operations");
+
+        assert!(
+            matches!(error, Error::Internal(message) if message == "QPDF::processMemoryFile must be called before a process method")
+        );
+    }
+
+    #[test]
+    fn memory_processing_installs_a_successful_source_and_preserves_document_identity() {
+        let mut pdf = Pdf::uninitialized();
+        let unique_id = pdf.unique_id;
+
+        pdf.process_memory_file(b"empty PDF", EMPTY_PDF_BYTES.to_vec())
+            .expect("qpdf memory processing should install a valid source");
+
+        assert!(pdf.parsed);
+        assert_eq!(pdf.unique_id, unique_id);
+        // Handles minted while parsing and handles created afterwards must
+        // share one owner: qpdf's processMemoryFile keeps working on the
+        // same QPDF object.
+        let root = pdf.root_handle().expect("root resolves");
+        let stream = pdf
+            .new_stream_with_data(std::rc::Rc::new(b"x".to_vec()))
+            .expect("new stream on the processed document");
+        root.replace_key(b"/X", stream)
+            .expect("a handle minted during the open accepts a later handle of the same document");
+    }
+}

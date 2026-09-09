@@ -8,7 +8,10 @@ use crate::{
     hidden_text::apply_hidden_text_policy,
     scrub::scrub_pdf,
 };
-use flpdf::{ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, StreamDataMode};
+use flpdf::{
+    ImageOptimizationOptions, ImageOptimizationStats, ObjectStreamMode, PageDocumentHelper, Pdf,
+    PdfWriter, QPDFLogger, StreamDataMode, optimize_images_with_stats,
+};
 use std::io::Cursor;
 
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
@@ -25,6 +28,29 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         canonicalize_font_program_streams(&mut pdf)?
     } else {
         Default::default()
+    };
+    let raster_transform = match &cfg.image_policy {
+        ImagePolicy::Preserve | ImagePolicy::Print { .. } => ImageOptimizationStats::default(),
+        ImagePolicy::Perceptual {
+            jpeg_quality,
+            min_savings_percent,
+            ..
+        } => {
+            let logger = QPDFLogger::create();
+            optimize_images_with_stats(
+                &mut pdf,
+                &logger,
+                "pdf-deshit",
+                false,
+                ImageOptimizationOptions {
+                    keep_inline_images: true,
+                    jpeg_quality: *jpeg_quality,
+                    min_savings_bytes: 1,
+                    min_savings_percent: *min_savings_percent,
+                    ..ImageOptimizationOptions::default()
+                },
+            )?
+        }
     };
     let image_dedup = if cfg.deduplicate_image_xobjects {
         canonicalize_image_xobjects(&mut pdf)?
@@ -53,9 +79,21 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let output = writer.get_buffer()?;
 
     let mut notes = Vec::new();
-    match cfg.image_policy {
-        ImagePolicy::Preserve => {}
-        _ => notes.push("Image policy is configured, but the first implementation currently performs structural/lossless PDF rewrites only; raster transcode is the next pass.".to_owned()),
+    if let ImagePolicy::Print { .. } = &cfg.image_policy {
+        notes.push(
+            "Print raster policy is not implemented yet; no resolution-aware downsampling was performed."
+                .to_owned(),
+        );
+    }
+    if raster_transform.images_optimized > 0
+        && let ImagePolicy::Perceptual { jpeg_quality, .. } = &cfg.image_policy
+    {
+        notes.push(format!(
+            "Transcoded {} eligible raster image(s) to JPEG at quality {} and reduced their encoded payload by {} bytes.",
+            raster_transform.images_optimized,
+            jpeg_quality,
+            raster_transform.saved_bytes()
+        ));
     }
     if before.incremental_update_count > 0 {
         notes.push(format!(
@@ -111,9 +149,137 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
         image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
         image_references_canonicalized: image_dedup.references_canonicalized,
+        raster_images_transcoded: raster_transform.images_optimized,
+        raster_references_reused: raster_transform.references_reused,
+        raster_original_encoded_bytes: raster_transform.original_encoded_bytes,
+        raster_optimized_encoded_bytes: raster_transform.optimized_encoded_bytes,
         flate_streams_selected_for_recompression: flate.streams_selected,
         flate_estimated_savings_bytes: flate.estimated_savings_bytes,
         notes,
     };
     Ok((output, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use flate2::{Compression, write::ZlibEncoder};
+    use flpdf::ObjectHandle;
+    use std::{io::Write, rc::Rc};
+
+    fn perceptual_image_fixture() -> Result<Vec<u8>> {
+        let width = 200_usize;
+        let height = 200_usize;
+        let mut state = 0x1234_5678_u32;
+        let mut pixels = Vec::with_capacity(width * height);
+        for _ in 0..width * height {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pixels.push((state >> 24) as u8);
+        }
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&pixels)?;
+        let compressed = encoder.finish()?;
+
+        let mut pdf = Pdf::empty()?;
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pdf.resolve(&pages)?;
+
+        let image = pdf.new_stream_with_data(Rc::new(compressed))?;
+        let image_dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        for (key, value) in [
+            (b"/Type".as_slice(), ObjectHandle::name(b"XObject".to_vec())),
+            (
+                b"/Subtype".as_slice(),
+                ObjectHandle::name(b"Image".to_vec()),
+            ),
+            (b"/Width".as_slice(), ObjectHandle::integer(width as i64)),
+            (b"/Height".as_slice(), ObjectHandle::integer(height as i64)),
+            (
+                b"/ColorSpace".as_slice(),
+                ObjectHandle::name(b"DeviceGray".to_vec()),
+            ),
+            (b"/BitsPerComponent".as_slice(), ObjectHandle::integer(8)),
+            (
+                b"/Filter".as_slice(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ] {
+            image_dict.replace_key(key, value)?;
+        }
+        pdf.mark_object_handle_dirty(&image_dict)?;
+
+        let mut page_handles = Vec::new();
+        for _ in 0..2 {
+            let content =
+                pdf.new_stream_with_data(Rc::new(b"q 200 0 0 200 0 0 cm /Im0 Do Q\n".to_vec()))?;
+            let resources = ObjectHandle::dictionary(vec![(
+                b"/XObject".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image.clone())]),
+            )]);
+            let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(width as i64),
+                        ObjectHandle::integer(height as i64),
+                    ]),
+                ),
+                (b"/Resources".to_vec(), resources),
+                (b"/Contents".to_vec(), content),
+            ]))?;
+            pdf.mark_object_handle_dirty(&page)?;
+            page_handles.push(page);
+        }
+        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(2))?;
+        pdf.mark_object_handle_dirty(&pages)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn perceptual_profile_transcodes_an_eligible_lossless_image() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+
+        let (_, lossless_report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(lossless_report.raster_images_transcoded, 0);
+
+        let (output, perceptual_report) = optimize_pdf(&input, &Config::perceptual())?;
+        assert_eq!(perceptual_report.raster_images_transcoded, 1);
+        assert_eq!(perceptual_report.raster_references_reused, 1);
+        assert!(
+            perceptual_report.raster_optimized_encoded_bytes
+                < perceptual_report.raster_original_encoded_bytes
+        );
+        assert!(
+            perceptual_report.raster_original_encoded_bytes
+                - perceptual_report.raster_optimized_encoded_bytes
+                >= perceptual_report.raster_original_encoded_bytes / 5
+        );
+
+        let analysis = analyze_pdf(&output)?;
+        assert!(
+            analysis
+                .filter_counts
+                .get("/DCTDecode")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        Ok(())
+    }
 }

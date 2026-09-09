@@ -19,6 +19,7 @@ The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fre
 - `pdf-deshit-cli`: native CLI
 - `pdf-deshit-wasm`: WASM bindings
 - `web/`: static no-framework site
+- `third_party/flpdf/`: minimal vendored `flpdf` 0.5.1 fork used by the core; provenance and local API extensions are documented in `third_party/flpdf/PATCHES.md`
 
 ## Status
 
@@ -27,6 +28,7 @@ Early but functional. The core currently provides:
 - whole-document fresh rewrites, garbage collection, object-stream generation, and optional page-content normalization;
 - exact duplicate `/Metadata`, embedded font-program, and Image XObject canonicalization before garbage collection;
 - high-level structural/risk profiling plus size-gated selective Flate recompression;
+- a real Perceptual raster path that converts eligible 8-bit DeviceGray/RGB/CMYK lossless Image XObjects to JPEG at the configured quality only when the encoded-size savings gate is met, while preserving pixel dimensions and reusing one transcoded object for shared source images;
 - metadata, JPEG metadata, active-content, attachment, form/signature, and incremental-history privacy cleanup;
 - conservative invisible-text analysis that distinguishes OCR overlays, accessibility text, hidden layers, outside-page text, likely fake-redaction leaks, and uncertain invisible content;
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
@@ -34,4 +36,4 @@ Early but functional. The core currently provides:
 
 Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates. The WASM crate enables `getrandom`'s browser JS backend because `flpdf` uses randomness for PDF encryption IV generation.
 
-Image transcoding, semantic stream/font/resource deduplication, inline-image externalization, corpus-driven structural normalization, and validation of the opt-in resource-pruning pass remain active optimization work.
+Print-profile resolution-aware downsampling/line-art preservation, semantic stream/resource deduplication, targeted inline-image handling, and deeper classification of the remaining structurally ambiguous duplicate streams remain active optimization work. The opt-in resource-pruning pass has been corpus-tested and intentionally remains default-off because it produced negligible size wins.

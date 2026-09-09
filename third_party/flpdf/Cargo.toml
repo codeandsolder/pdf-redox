@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "crates/flpdf",
+    "crates/flpdf-libjpeg-compat",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.5.1"
+authors = ["Mitsuru Hayasaka <10877+mitsuru@users.noreply.github.com>"]
+repository = "https://github.com/fulgur-rs/flpdf"
+homepage = "https://github.com/fulgur-rs/flpdf"
+rust-version = "1.89"
+
+[workspace.dependencies]
+thiserror = "2"
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+assert_cmd = "2"
+predicates = "3"
+regex = "1"
+tempfile = "3"
+aes = "0.9"
+cbc = { version = "0.2", features = ["block-padding"] }
+md-5 = "0.11"
+sha2 = "0.11"
+hex = "0.4"
+libc = "0.2"
+windows-sys = "0.61"
+serde_json = "1"
+yaml-rust2 = { version = "0.12", default-features = false }
+same-file = "1"
+# Cryptographically secure RNG for encryption write-side IV / random-bytes use
+# (flpdf-9hc.4.9 --encrypt). Pure-Rust frontend; OS APIs underneath
+# (Linux getrandom(2), macOS SecRandomCopyBytes, Windows BCryptGenRandom).
+# Already present as a transitive dep via tempfile/etc — direct declaration
+# is free build-closure-wise.
+getrandom = "0.4"
+# `ar_archive_writer` is a transitive build-dependency of `stacker` (via
+# `psm`), not used directly by this crate. Both 0.5.1 and 0.5.2 use a
+# let-chain (`if let ... && ...`), stabilized in rustc 1.88 — 0.5.2 declares
+# `rust-version = "1.88.0"`; 0.5.1 uses the same construct without declaring
+# a `rust-version` at all. This workspace's `rust-version` above was raised
+# to 1.89 to cover it. Exact-pinned so a future `cargo update` that raises
+# the requirement again fails loudly instead of silently breaking the MSRV
+# build.
+ar_archive_writer = "=0.5.3"
+# Transparently grows the call stack for the parser's bounded recursive
+# descent (MAX_PARSE_DEPTH levels) when the current stack segment is nearly
+# exhausted, so recursion to that depth cannot abort the process on a
+# caller-provided thread with a smaller-than-expected stack (e.g. the
+# default ~2 MiB a spawned thread gets, which some builds/paths measurably
+# do not have enough per-frame headroom to survive at the full depth).
+stacker = "0.1.24"
+libjpeg-turbo-rs = "=0.8.0"
+cc = "1"
+
+# CI-only profile for the "Release" job's `cargo test --workspace --profile
+# release-ci` run. It exists to catch release-mode-only behavior (no
+# debug_assertions, no overflow-checks) across flpdf's large test suite (105+
+# integration test binaries) without paying opt-level 3's expensive
+# inlining/vectorization passes on every PR. It inherits every other
+# `[profile.release]` setting (debug-assertions off, overflow-checks off) and
+# only lowers opt-level, so release-mode panic/overflow semantics are
+# unchanged; only codegen effort is reduced. This profile is CI-only — it
+# never affects `cargo build --release`/`cargo install`/`release-plz`
+# packaging, all of which use the untouched `[profile.release]` above.
+[profile.release-ci]
+inherits = "release"
+opt-level = 1

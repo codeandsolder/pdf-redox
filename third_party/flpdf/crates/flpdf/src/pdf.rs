@@ -1,0 +1,744 @@
+//! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
+
+use crate::acroform_document_helper::AcroFormCache;
+use crate::cache::ObjectCache;
+use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
+use crate::object_handle::DocumentResolver;
+use crate::pages::repair::PreparedPages;
+use crate::pdf_version::{leading_major_minor, PdfVersion};
+use crate::reader::resolver::{ResolverHandle, CLOSED_INPUT_SOURCE_NAME};
+use crate::reader::InputSourceControl;
+use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek};
+use std::rc::Rc;
+
+/// Provenance for a legacy object-stream member that has already been
+/// materialized.
+///
+/// `source_stream`/`source_index` preserve the live xref identity so
+/// resolution-time xref reconstruction can distinguish a still-valid
+/// compressed member from a stale mapping.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompressedMemberProvenance {
+    pub(crate) source_stream: u32,
+    pub(crate) source_index: u32,
+}
+
+/// Ordering key for objects that were imported into a fresh writer target.
+///
+/// qpdf keeps the primary input's objects in their original object-number
+/// space while `QPDF::copyForeignObject` allocates later-source objects in the
+/// destination's discovery order. A fresh flpdf merge necessarily gives both
+/// kinds of objects new local references, so the linearization planner carries
+/// this qpdf ordering separately from those references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WriterObjectOrderKey {
+    group: u8,
+    object_ref: ObjectRef,
+    original_object_ref: Option<ObjectRef>,
+}
+
+impl WriterObjectOrderKey {
+    pub(crate) const fn primary(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 0,
+            object_ref,
+            original_object_ref: Some(object_ref),
+        }
+    }
+
+    pub(crate) const fn foreign(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 1,
+            object_ref,
+            original_object_ref: None,
+        }
+    }
+
+    pub(crate) const fn foreign_with_original(
+        object_ref: ObjectRef,
+        original_object_ref: ObjectRef,
+    ) -> Self {
+        Self {
+            group: 1,
+            object_ref,
+            original_object_ref: Some(original_object_ref),
+        }
+    }
+
+    pub(crate) const fn fresh(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 2,
+            object_ref,
+            original_object_ref: None,
+        }
+    }
+}
+
+/// Lazily parsed PDF document handle.
+///
+/// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
+/// table and the trailer; individual objects are parsed on first access via
+/// [`Pdf::resolve`]. The same handle is what every higher-level helper
+/// ([`crate::pages`], [`crate::outline_object_helper`], [`crate::PdfWriter`])
+/// consumes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{ObjectRef, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// println!("version {}", pdf.version());
+/// let catalog = pdf.root_handle()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Why `R: 'static`
+///
+/// A document hands each [`ObjectHandle`] it vends a weak link back to its own
+/// resolver, so that dereferencing a nested reference will not require the
+/// `Pdf` in scope. [`ObjectHandle`] has no lifetime parameter — it is a plain
+/// `'static` type held in the document's registry and handed to callers — so
+/// the trait object that link points at is `dyn DocumentResolver + 'static`,
+/// and everything reachable from it, the input source included, must be
+/// `'static` too.
+///
+/// The practical consequence is that `R` cannot borrow: `Cursor<&[u8]>` is
+/// rejected, while `Cursor<Vec<u8>>`, `Cursor<Arc<[u8]>>`, and
+/// `BufReader<File>` are fine. For in-memory input use [`Pdf::open_mem`],
+/// which shares an `Arc<[u8]>` with the caller, or [`Pdf::open_mem_owned`],
+/// which takes a `Vec<u8>` outright. Neither copies.
+pub struct Pdf<R: Read + Seek + 'static> {
+    /// Stable per-document identity used by qpdf-style foreign object copiers.
+    pub(crate) unique_id: u64,
+    /// The canonical resolver and the state it owns — the input source, the
+    /// header offset, and the cross-reference table among them. See
+    /// [`crate::reader::resolver::ResolverCore`] for the full field list and its qpdf
+    /// correspondence.
+    ///
+    /// Held behind an `Rc` because every [`ObjectHandle`] this document vends
+    /// carries a `Weak` to it, so a nested reference can be dereferenced with
+    /// no `&mut Pdf` in scope. `Pdf` holds the only strong reference, so a
+    /// surviving handle can never keep a dropped document's input source
+    /// alive.
+    pub(crate) resolver: Rc<ResolverHandle<R>>,
+    /// Optional qpdf-style file-source lifetime controller. Generic readers
+    /// (memory buffers and caller-owned streams) leave this absent; the
+    /// file-open factory installs it for `QPDFJob::handle_page_specs`.
+    pub(crate) input_source_control: Option<InputSourceControl>,
+    pub(crate) version: String,
+    /// Whether a process method has installed a parsed input source.
+    ///
+    /// qpdf permits `processMemoryFile`/`processFile` only before a process
+    /// method has been called; after that point the public contract permits
+    /// only parameter setters (`include/qpdf/QPDF.hh:71-75`). Keep this
+    /// state explicit so Rust does not silently replace a live resolver while
+    /// previously issued handles still point at it.
+    pub(crate) parsed: bool,
+    /// Whether qpdf's enhanced `QPDF::getRoot` checks are enabled for a
+    /// document check (`QPDF::JobSetter::setCheckMode`,
+    /// `libqpdf/QPDFJob.cc:745-752`).
+    pub(crate) check_mode: bool,
+    pub(crate) trailer: ObjectHandle,
+    pub(crate) last_xref_form: XrefForm,
+    /// qpdf's xref-parser-owned `first_xref_item_offset` used by the
+    /// linearization `/T` check; zero preserves qpdf's initialized default
+    /// when no parsed xref section contains object 0.
+    pub(crate) first_xref_item_offset: u64,
+    pub(crate) cache: ObjectCache,
+    // The canonical indirect-object handle registry that used to live here is
+    // now `ResolverCore::object_cache`, reached through `self.resolver`. It
+    // had to move: `DocumentResolver::resolve_indirect` takes `&self` and
+    // must mint a canonical handle for every nested `N G R` it parses, and a
+    // registry it cannot reach would mean two maps, divergent identity, and
+    // reference cycles `Pdf::drop` could no longer break.
+    //
+    // `ObjectHandle`'s Rc<RefCell<..>> identity (see object_handle.rs) makes
+    // `Pdf<R>` lose the `Send`/`Sync` auto traits it previously had for any
+    // `R: Send`/`Sync`. This is an accepted, intentional consequence of that
+    // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
+    // thread-safe for concurrent access to one document.
+    /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
+    pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
+    /// qpdf's original-object order for objects copied while building a
+    /// multi-source page-selection target. `None` means this is an ordinary
+    /// parsed document, for which the live object reference is already the
+    /// source order. `Some` also distinguishes merge-created objects, which
+    /// retain their target allocation order as a fallback. The same key feeds
+    /// linearization and generated ObjStm planning.
+    pub(crate) writer_object_order: Option<BTreeMap<ObjectRef, WriterObjectOrderKey>>,
+    /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent
+    /// (`include/qpdf/QPDF.hh:891-897`). qpdf never rolls back
+    /// `ObjCopier::object_map`/`visiting` when `copyForeignObject` fails
+    /// partway (`libqpdf/QPDF.cc:2019-2093`): a `reserveObjects` traversal
+    /// failure leaves the ancestor chain's refs still in `visiting`, and the
+    /// *next* call for that same source checks this exact field before doing
+    /// any work, throwing rather than silently treating the earlier
+    /// failure's partial reservations as complete (`QPDF.cc:2066-2069`). Kept
+    /// separate from [`Self::foreign_object_maps`], rather than folded into
+    /// one bundled per-source struct, so map persistence and failure poisoning
+    /// remain independently tracked by the canonical `copy_foreign_object`
+    /// port.
+    pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
+    /// qpdf's per-source AcroForm helper cache (`QPDFJob::get_afdh_for_qpdf`,
+    /// `QPDFJob.cc:1847-1856`). It stores only canonical ObjectHandle
+    /// identities, so sequential helper facades can share it without a
+    /// self-referential borrow of this Pdf. Transient page-selection helpers
+    /// use their own cache instead.
+    pub(crate) acroform_cache: Rc<RefCell<Option<AcroFormCache>>>,
+    /// Optional replacement used by the JSON importer while it is building a
+    /// new document trailer. Ordinary parsed documents use `trailer` directly.
+    pub(crate) trailer_handle_memo: Option<ObjectHandle>,
+    /// Canonical `/Root` handle after the first root lookup.
+    pub(crate) root_handle_memo: Option<ObjectHandle>,
+    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
+    /// Every uncompressed object offset, sorted ascending and deduplicated. Used
+    /// to bound a single object read to the start of the next object in the file
+    /// (objects do not overlap in a well-formed PDF), so resolving one object
+    /// cannot read/parse the whole remaining file — which would make resolving
+    /// many objects quadratic, a CPU DoS on a crafted (e.g. repaired) document.
+    pub(crate) sorted_object_offsets: Vec<u64>,
+    /// Whether the legacy cache and object-boundary snapshot already reflect
+    /// the resolver's reconstructed xref. Open-time recovery initializes all
+    /// three from the same recovered table; resolution-time recovery flips
+    /// this lazily before the next legacy read.
+    pub(crate) legacy_resolution_state_synced: bool,
+    /// Remaining read-to-end fallbacks allowed when a bounded object window does
+    /// not contain a complete object (a corrupt offset pointing inside another
+    /// object, or a header-like line recorded inside stream data during repair).
+    /// Each fallback may scan to EOF, so the count is capped: a handful of bad
+    /// boundaries in an otherwise valid file still resolve, but a document full
+    /// of objects whose bodies run to EOF cannot revive the quadratic cost.
+    pub(crate) resolution_fallbacks_remaining: u32,
+    pub(crate) dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Dirty objects whose live ObjectHandle graph was changed directly, so
+    /// the legacy object cache may no longer agree with it. `set_object`
+    /// updates both representations and retains the stream zero-copy fast
+    /// path in the raw value cache.
+    pub(crate) handle_mutated_object_refs: BTreeSet<ObjectRef>,
+    /// Valid indirect references discovered while preparing qpdf JSON whose
+    /// exact object generation has no live xref/cache target.
+    pub(crate) qpdf_dangling_refs: BTreeSet<ObjectRef>,
+    /// Historical xref-stream object identities promoted into the canonical
+    /// resolver cache while following the source `/Prev` chain. The parsed
+    /// values themselves live on their [`ObjectHandle`]s; this set only keeps
+    /// the qpdf JSON preparation/mutation boundary aware of cache-only refs.
+    pub(crate) qpdf_parsed_xref_stream_refs: BTreeSet<ObjectRef>,
+    /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
+    pub(crate) ever_called_get_all_pages: bool,
+    /// Monotonic observation matching qpdf's
+    /// `everPushedInheritedAttributesToPages()`.
+    pub(crate) ever_pushed_inherited_attributes_to_pages: bool,
+    /// qpdf's `m->all_pages` cache (`QPDF_pages.cc:39-75`). The prepared
+    /// root and leaf identities stay together because page consumers need the
+    /// repaired root as well as the ordered page list. An empty qpdf page
+    /// vector is not cached by qpdf (it is its cache sentinel), so this is
+    /// populated only for a non-empty page list.
+    pub(crate) page_list_cache: Option<PreparedPages>,
+    pub(crate) encryption: Rc<RefCell<Option<EncryptionState>>>,
+    /// qpdf's parsed encryption parameters retained for read-only inspection,
+    /// including the partial state visible after a bad password.
+    pub(crate) encryption_inspection: Rc<RefCell<Option<EncryptionInspectionState>>>,
+}
+
+impl<R: Read + Seek> Drop for Pdf<R> {
+    // A resolved indirect handle's value can embed other indirect handles
+    // sharing `handle_registry`'s own canonical `Rc` identity (array/dict/
+    // stream-dict children). Two objects that reference each other (e.g. a
+    // `/Pages` node and a page's `/Parent`, common in real PDFs) therefore
+    // form a strong reference cycle once both are resolved, which plain
+    // `Rc` drop never collects on its own.
+    //
+    // Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache
+    // and disconnects every resolved object, replacing it with
+    // `QPDF_Destroyed()`, specifically to break cycles like this one
+    // (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Disconnecting every registry
+    // entry here — the sole owner of the canonical `Rc`s — before the
+    // registry itself drops ensures no lingering cycle keeps a document's
+    // object graph (and any reachable stream buffers) alive past `self`.
+    fn drop(&mut self) {
+        self.resolver.disconnect_all();
+    }
+}
+
+impl<R: Read + Seek> Pdf<R> {
+    /// Return the qpdf-equivalent source/discovery order used by writer
+    /// planners. Ordinary parsed documents use their source object references
+    /// directly; fresh merge targets use the provenance recorded by the
+    /// page-selection copier and place later-created objects after imported
+    /// objects.
+    pub(crate) fn writer_object_order_key(&self, object_ref: ObjectRef) -> WriterObjectOrderKey {
+        match &self.writer_object_order {
+            Some(order) => order
+                .get(&object_ref)
+                .copied()
+                .unwrap_or_else(|| WriterObjectOrderKey::fresh(object_ref)),
+            None => WriterObjectOrderKey::primary(object_ref),
+        }
+    }
+
+    pub(crate) fn set_writer_object_order(
+        &mut self,
+        order: BTreeMap<ObjectRef, WriterObjectOrderKey>,
+    ) {
+        self.writer_object_order = Some(order);
+    }
+
+    /// Return the source ObjGen used for a QDF `Original object ID` comment.
+    /// Fresh merge targets retain their copied source identity separately from
+    /// the destination reference used for writer ordering.
+    pub(crate) fn writer_original_object_ref(&self, object_ref: ObjectRef) -> ObjectRef {
+        self.writer_object_order
+            .as_ref()
+            .and_then(|order| order.get(&object_ref))
+            .and_then(|key| key.original_object_ref)
+            .unwrap_or(object_ref)
+    }
+
+    /// Close the current qpdf input source while retaining the document's
+    /// already-parsed object graph.
+    ///
+    /// This is qpdf's `QPDF::closeInputSource` (`include/qpdf/QPDF.hh:162-166`,
+    /// `libqpdf/QPDF.cc:278-281`). The resolver replaces its source pointer
+    /// with an invalid source; a foreign stream provider that captured the
+    /// previous pointer remains independent, matching qpdf's ownership rule.
+    ///
+    /// A file-backed document's reopen controller is a second, independent
+    /// owner of the underlying OS file handle (`Pdf::input_source_control`,
+    /// cloned from the reader's own `InputSourceControl`), so replacing only
+    /// the resolver's source would leave that handle open until the whole
+    /// `Pdf` is dropped. Also release it here, matching a C++ `shared_ptr`
+    /// reset losing its last owner when `m->file` is replaced.
+    pub fn close_input_source(&self) {
+        self.resolver.close_input_source();
+        self.set_input_source_stay_open(false);
+    }
+
+    /// Set qpdf's `ClosedFileInputSource::stayOpen` policy when this document
+    /// was opened through the file-source factory. Non-file readers have no
+    /// close/reopen controller and therefore remain unchanged.
+    pub fn set_input_source_stay_open(&self, value: bool) {
+        if let Some(control) = &self.input_source_control {
+            control.set_stay_open(value);
+        }
+    }
+
+    /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Return the raw qpdf input-source description retained for diagnostics.
+    ///
+    /// qpdf's page job uses each source QPDF's `getFilename()` value when it
+    /// formats verbose page-operation messages (`libqpdf/QPDFJob.cc:2271-2272,
+    /// 2400-2427`). Keep the caller-provided bytes rather than projecting the
+    /// description through UTF-8 so non-UTF-8 argv paths remain observable.
+    pub(crate) fn input_source_description(&self) -> Vec<u8> {
+        self.resolver.input_description()
+    }
+
+    /// Return the logical bytes of the input source, excluding any leading
+    /// material skipped by the PDF header parser.
+    ///
+    /// This is a crate-visible source seam for qpdf consumers that inspect
+    /// physical offsets against the same document input, notably
+    /// `QPDF::checkLinearization` (`libqpdf/QPDF_linearization.cc:84-245`).
+    pub(crate) fn source_bytes(&self) -> crate::Result<Vec<u8>> {
+        self.resolver.source_bytes()
+    }
+
+    /// Return the qpdf-logical offset from which the most recent source read
+    /// started (`InputSource::getLastOffset()`). This is used by linearization
+    /// damage warnings to reproduce qpdf's source-location context.
+    pub(crate) fn source_last_offset(&self) -> u64 {
+        self.resolver.last_offset()
+    }
+
+    /// Configure this document as a qpdf source whose lazy stream data must
+    /// be materialized when it is copied into another document. This is
+    /// qpdf's `QPDF::setImmediateCopyFrom` (`include/qpdf/QPDF.hh:242-257`):
+    /// the flag belongs to the source document, not the destination, and one
+    /// materialized buffer is then shared by every copied stream.
+    pub fn set_immediate_copy_from(&self, value: bool) {
+        self.resolver.set_immediate_copy_from(value);
+    }
+
+    /// Whether this document has been asked to enumerate its complete page tree.
+    ///
+    /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
+    /// `everCalledGetAllPages()` observation used by JSON v2 metadata.
+    pub fn ever_called_get_all_pages(&self) -> bool {
+        self.ever_called_get_all_pages
+    }
+
+    /// Whether inherited page attributes have been pushed to page leaves.
+    ///
+    /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
+    /// `everPushedInheritedAttributesToPages()` observation used by JSON v2
+    /// metadata.
+    pub fn ever_pushed_inherited_attributes_to_pages(&self) -> bool {
+        self.ever_pushed_inherited_attributes_to_pages
+    }
+
+    /// Rebuild qpdf's document-owned page-list cache after direct `/Pages`
+    /// tree manipulation.
+    ///
+    /// This is qpdf's `QPDF::updateAllPagesCache`
+    /// (`include/qpdf/QPDF.hh:695-704`). Page-specific mutation APIs update
+    /// the cache themselves, but callers that edit page-tree handles directly
+    /// must invoke this boundary before asking for the refreshed page list.
+    pub fn update_all_pages_cache(&mut self) -> Result<()> {
+        self.invalidate_page_list_cache();
+        let _ = crate::PageDocumentHelper::new(self).get_all_pages()?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_get_all_pages_called(&mut self) {
+        self.ever_called_get_all_pages = true;
+    }
+
+    pub(crate) fn cached_page_list(&self) -> Option<PreparedPages> {
+        self.page_list_cache.clone()
+    }
+
+    pub(crate) fn cache_page_list(&mut self, prepared: &PreparedPages) {
+        if !prepared.pages.is_empty() {
+            self.page_list_cache = Some(prepared.clone());
+        }
+    }
+
+    /// Invalidate qpdf's page-list cache after a page-tree mutation.
+    pub(crate) fn invalidate_page_list_cache(&mut self) {
+        self.page_list_cache = None;
+    }
+
+    /// Adobe extension level from the catalog's `/Extensions /ADBE
+    /// /ExtensionLevel`, resolving direct and indirect references at each
+    /// step. Returns `None` when any link in that chain is absent or is not
+    /// the expected type. Only the `/ADBE` developer prefix is honoured,
+    /// matching qpdf's `--check` version banner and the extension level qpdf
+    /// accumulates into its `max_input_version`.
+    ///
+    /// The trailer's `/Root` may itself be a direct Catalog dictionary;
+    /// qpdf's `QPDF::getRoot` accepts that shape via `getKey` rather than
+    /// requiring an indirect object (`libqpdf/QPDF.cc:2329-2367`).
+    /// # Errors
+    ///
+    /// Propagates failures resolving the Catalog or any indirect value in the
+    /// `/Extensions /ADBE /ExtensionLevel` chain, including logger delivery
+    /// failures raised while resolving a damaged object.
+    pub fn adobe_extension_level(&mut self) -> Result<Option<i64>> {
+        Ok(self
+            .extension_level_handle()?
+            .map(|level| level.try_as_integer())
+            .transpose()?
+            .flatten())
+    }
+
+    /// Walk qpdf's `/Root` -> `/Extensions` -> `/ADBE` -> `/ExtensionLevel`
+    /// chain and return the final handle, resolved.
+    ///
+    /// This is the shared body of `QPDF::getExtensionLevel`
+    /// (`libqpdf/QPDF.cc:2329-2345`); the callers differ only in what they do
+    /// with the value, so the walk itself lives here once.
+    fn extension_level_handle(&mut self) -> Result<Option<ObjectHandle>> {
+        let catalog = self.root_handle()?;
+        let extensions = catalog.try_get_key(b"/Extensions")?;
+        self.resolve(&extensions)?;
+        if extensions.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        let adbe = extensions.try_get_key(b"/ADBE")?;
+        self.resolve(&adbe)?;
+        if adbe.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        let level = adbe.try_get_key(b"/ExtensionLevel")?;
+        self.resolve(&level)?;
+        Ok(Some(level))
+    }
+
+    /// The Adobe extension level, clamped like qpdf's own integer read.
+    ///
+    /// Ports `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): the
+    /// `/Extensions /ADBE /ExtensionLevel` value read through
+    /// [`ObjectHandle::try_get_int_value_as_int`], which clamps to `i32` range
+    /// the way `QPDFObjectHandle::getIntValueAsInt` does
+    /// (`libqpdf/QPDFObjectHandle.cc:527-542`) -- unlike
+    /// [`Self::adobe_extension_level`], which keeps the full 64-bit value.
+    ///
+    /// A clamp is observable: it records the same warning qpdf emits,
+    /// `requested value of integer is too small; returning INT_MIN` or
+    /// `requested value of integer is too big; returning INT_MAX`, retrievable
+    /// through [`Self::repair_diagnostics`]. A non-integer `/ExtensionLevel`
+    /// yields `0` with no diagnostic, because qpdf checks `isInteger()` before
+    /// reading the value (`libqpdf/QPDF.cc:2337-2341`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the errors of the `/Root` walk, and — when the value is
+    /// clamped — any failure to deliver the accompanying warning to the
+    /// document's diagnostic sink.
+    pub fn get_extension_level(&mut self) -> Result<i32> {
+        let Some(level) = self.extension_level_handle()? else {
+            return Ok(0);
+        };
+        // qpdf guards with `isInteger()` and only then calls
+        // `getIntValueAsInt` (`libqpdf/QPDF.cc:2337-2341`), so a non-integer
+        // `/ExtensionLevel` yields 0 without any diagnostic. Going through
+        // `try_get_int_value_as_int` unguarded would emit the
+        // `returning 0` type warning qpdf never produces here.
+        if level.try_as_integer()?.is_none() {
+            return Ok(0);
+        }
+        // Clamping is qpdf's `getIntValueAsInt`, which warns
+        // "requested value of integer is too small/too big" on the way
+        // (`libqpdf/QPDFObjectHandle.cc:527-543`). Reproducing the clamp by
+        // hand would drop that warning.
+        level.try_get_int_value_as_int()
+    }
+
+    /// The header version paired with the Adobe extension level, as a
+    /// [`PdfVersion`].
+    ///
+    /// Ports `QPDF::getVersionAsPDFVersion` (`libqpdf/QPDF.cc:2305-2320`):
+    /// [`Self::version`]'s leading `M.m` digit-run prefix (defaulting to
+    /// `1.3` when the header does not start that way) paired with
+    /// [`Self::get_extension_level`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::get_extension_level`]'s errors.
+    pub fn get_version_as_pdf_version(&mut self) -> Result<PdfVersion> {
+        let extension_level = self.get_extension_level()?;
+        let (major, minor) = leading_major_minor(self.version());
+        Ok(PdfVersion::new(major, minor, i64::from(extension_level)))
+    }
+
+    /// The live trailer dictionary as an [`ObjectHandle`].
+    pub fn trailer(&mut self) -> ObjectHandle {
+        if let Some(handle) = &self.trailer_handle_memo {
+            return handle.clone();
+        }
+        let handle = self.trailer.clone();
+        self.trailer_handle_memo = Some(handle.clone());
+        handle
+    }
+
+    /// Return the live value for a trailer key, or a contextless null handle
+    /// when the key is absent.
+    pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
+        let trailer = self.trailer();
+        let mut name = Vec::with_capacity(key.len() + 1);
+        name.push(b'/');
+        name.extend_from_slice(key);
+        let handle = trailer
+            .try_get_key(&name)
+            .unwrap_or_else(|_| ObjectHandle::null());
+        if key == b"Root" && !handle.is_null() {
+            self.root_handle_memo = Some(handle.clone());
+        }
+        handle
+    }
+
+    /// `/Root` as listed in the trailer, when present.
+    pub fn root_ref(&self) -> Option<ObjectRef> {
+        self.trailer_handle_memo
+            .as_ref()
+            .unwrap_or(&self.trailer)
+            .try_get_key(b"/Root")
+            .ok()
+            .and_then(|handle| handle.object_ref())
+    }
+
+    /// Return the live catalog handle after applying qpdf's `QPDF::getRoot`
+    /// dictionary gate (`libqpdf/QPDF.cc:2329-2368`). The trailer value may
+    /// be an indirect reference, so resolve it through the canonical handle
+    /// graph before checking its type. A missing, dangling, or non-dictionary
+    /// `/Root` is a document-level error rather than a missing-key fallback.
+    ///
+    /// Reads `/Root` fresh from the live trailer on every call, matching
+    /// [`Self::root_ref`]'s identical reasoning: a caller may replace `/Root`
+    /// through the live handle returned by [`Self::trailer`], or install a
+    /// new trailer via `update_from_json()`, after an earlier call already
+    /// populated `root_handle_memo` — trusting that memo unconditionally
+    /// would keep returning the old catalog after such a replacement.
+    pub fn root_handle(&mut self) -> Result<ObjectHandle> {
+        let candidate = self
+            .trailer_handle_memo
+            .as_ref()
+            .unwrap_or(&self.trailer)
+            .try_get_key(b"/Root")?;
+        if !candidate.is_null() {
+            self.root_handle_memo = Some(candidate.clone());
+        }
+        self.resolve(&candidate)?;
+        let root = candidate;
+        if root.as_dictionary().is_none() {
+            let message = "unable to find /Root dictionary";
+            let filename = if self.resolver.input_source_closed() {
+                CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()
+            } else {
+                self.resolver.input_description()
+            };
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                filename,
+                b"",
+                0,
+                message,
+            )));
+        }
+        if self.check_mode
+            && !root
+                .try_get_key(b"/Type")?
+                .try_is_name_and_equals(b"Catalog")?
+        {
+            // qpdf's check mode warns and repairs an invalid Catalog type in
+            // `QPDF::getRoot` (`libqpdf/QPDF.cc:2354-2366`). The replacement
+            // is on the live handle so later inspection branches observe the
+            // same repaired Catalog.
+            self.resolver.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                self.resolver.input_description(),
+                b"",
+                0,
+                b"catalog /Type entry missing or invalid",
+            ))?;
+            root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))?;
+            self.mark_object_handle_dirty(&root)?;
+        }
+        Ok(root)
+    }
+
+    /// Enable or disable qpdf's enhanced root checks for a document check.
+    pub(crate) fn set_check_mode(&mut self, enabled: bool) {
+        self.check_mode = enabled;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pdf, WriterObjectOrderKey};
+    use crate::{ObjectRef, PdfOpenOptions};
+    use std::collections::BTreeMap;
+
+    fn open_recoverable(bytes: &[u8]) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
+        Pdf::open_mem_owned_with_options(bytes.to_vec(), options).expect("open fixture")
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_reads_header_prefix_and_extension_level() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version and extension level");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 7);
+        assert_eq!(version.extension_level(), 8);
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_defaults_extension_level_without_extensions() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+              2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version without an /Extensions chain");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 4);
+        assert_eq!(version.extension_level(), 0);
+    }
+
+    #[test]
+    fn get_extension_level_clamps_a_value_outside_i32_range() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        assert_eq!(
+            pdf.get_extension_level().expect("read extension level"),
+            i32::MAX
+        );
+        // qpdf clamps inside getIntValueAsInt, which warns on the way
+        // (`libqpdf/QPDFObjectHandle.cc:527-543`); a hand-written clamp would
+        // return the same number silently.
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.what_bytes())
+                    .contains("requested value of integer is too big; returning INT_MAX")
+            }),
+            "clamping must carry qpdf's warning"
+        );
+    }
+
+    #[test]
+    fn get_extension_level_is_silent_for_a_non_integer_level() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel /Foo >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        // qpdf guards with `isInteger()` before calling `getIntValueAsInt`
+        // (`libqpdf/QPDF.cc:2337-2341`), so a name here yields 0 and no
+        // diagnostic at all -- not the "returning 0" type warning an
+        // unguarded accessor would emit.
+        assert_eq!(pdf.get_extension_level().expect("read extension level"), 0);
+        assert!(
+            !pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.what_bytes()).contains("returning 0")
+            }),
+            "a non-integer extension level must not warn"
+        );
+    }
+
+    #[test]
+    fn writer_order_uses_source_mapped_and_fresh_keys() {
+        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+        let source_ref = ObjectRef::new(3, 0);
+        assert_eq!(
+            pdf.writer_object_order_key(source_ref),
+            WriterObjectOrderKey::primary(source_ref)
+        );
+
+        let mapped_ref = ObjectRef::new(7, 0);
+        let mut order = BTreeMap::new();
+        order.insert(mapped_ref, WriterObjectOrderKey::foreign(mapped_ref));
+        pdf.set_writer_object_order(order);
+        assert_eq!(
+            pdf.writer_object_order_key(mapped_ref),
+            WriterObjectOrderKey::foreign(mapped_ref)
+        );
+
+        let fresh_ref = ObjectRef::new(11, 0);
+        assert_eq!(
+            pdf.writer_object_order_key(fresh_ref),
+            WriterObjectOrderKey::fresh(fresh_ref)
+        );
+    }
+}
