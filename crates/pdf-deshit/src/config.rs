@@ -141,6 +141,9 @@ pub struct Config {
     /// Canonicalize exact duplicate embedded font-program streams referenced through the
     /// same `/FontFile`, `/FontFile2`, or `/FontFile3` key kind.
     pub deduplicate_font_programs: bool,
+    /// Canonicalize byte- and dictionary-identical Image XObjects referenced from
+    /// `/Resources /XObject` dictionaries.
+    pub deduplicate_image_xobjects: bool,
     /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
     pub flate_level: i32,
 }
@@ -158,6 +161,7 @@ impl Config {
             prune_resources: false,
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
+            deduplicate_image_xobjects: true,
             flate_level: 9,
         }
     }
@@ -241,6 +245,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_image_xobjects(mut self, value: bool) -> Self {
+        self.config.deduplicate_image_xobjects = value;
+        self
+    }
+
     pub fn flate_level(mut self, value: i32) -> Self {
         self.config.flate_level = value;
         self
@@ -292,6 +301,7 @@ mod tests {
             .prune_resources(true)
             .deduplicate_metadata_streams(false)
             .deduplicate_font_programs(true)
+            .deduplicate_image_xobjects(false)
             .flate_level(6)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
@@ -306,6 +316,7 @@ mod tests {
         assert!(config.prune_resources);
         assert!(!config.deduplicate_metadata_streams);
         assert!(config.deduplicate_font_programs);
+        assert!(!config.deduplicate_image_xobjects);
         assert_eq!(config.flate_level, 6);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);

@@ -95,6 +95,88 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     })
 }
 
+fn xobject_fingerprint(
+    object: &ObjectHandle,
+    subtype_name: &[u8],
+    domain: &[u8],
+) -> Result<Option<[u8; 32]>> {
+    let Some(dict) = object.as_stream_dict() else {
+        return Ok(None);
+    };
+    let subtype = dict.try_get_key(b"/Subtype")?;
+    if !subtype.try_is_name_and_equals(subtype_name)? {
+        return Ok(None);
+    }
+    stream_fingerprint(object, domain)
+}
+
+fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    subtype_name: &[u8],
+    domain: &[u8],
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for object in &objects {
+        let Some(object_ref) = object.object_ref() else {
+            continue;
+        };
+        let Ok(Some(fingerprint)) = xobject_fingerprint(object, subtype_name, domain) else {
+            continue;
+        };
+        if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            redirects.insert(object_ref, canonical_ref);
+            duplicate_raw_bytes += object.get_raw_stream_data()?.len();
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, object_ref);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for object in &objects {
+        let dict = if let Some(dict) = object.as_stream_dict() {
+            dict
+        } else if object.try_is_dictionary()? {
+            object.clone()
+        } else {
+            continue;
+        };
+        let xobjects = dict.try_get_key(b"/XObject")?;
+        if pdf.resolve(&xobjects).is_err() {
+            continue;
+        }
+        let Some(entries) = xobjects.as_dictionary() else {
+            continue;
+        };
+        for (name, target) in entries {
+            let Some(target_ref) = target.object_ref() else {
+                continue;
+            };
+            let Some(canonical_ref) = redirects.get(&target_ref).copied() else {
+                continue;
+            };
+            xobjects.replace_key(&name, pdf.get_object_handle(canonical_ref))?;
+            pdf.mark_object_handle_dirty(&xobjects)?;
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: redirects.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    canonicalize_xobject_subtype(pdf, b"Image", b"image-xobject")
+}
+
 const FONT_FILE_KEYS: [&[u8]; 3] = [b"/FontFile", b"/FontFile2", b"/FontFile3"];
 
 pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
@@ -226,6 +308,65 @@ mod tests {
         let first_ref = first_holder.try_get_key(b"/Metadata")?.object_ref();
         let second_ref = second_holder.try_get_key(b"/Metadata")?.object_ref();
         let different_ref = different_holder.try_get_key(b"/Metadata")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    fn image_stream(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+        width: i64,
+        height: i64,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        let dict = stream
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("new image stream has no dictionary".to_owned()))?;
+        for (key, value) in [
+            (b"/Type".as_slice(), ObjectHandle::name(b"XObject".to_vec())),
+            (
+                b"/Subtype".as_slice(),
+                ObjectHandle::name(b"Image".to_vec()),
+            ),
+            (b"/Width".as_slice(), ObjectHandle::integer(width)),
+            (b"/Height".as_slice(), ObjectHandle::integer(height)),
+            (
+                b"/ColorSpace".as_slice(),
+                ObjectHandle::name(b"DeviceGray".to_vec()),
+            ),
+            (b"/BitsPerComponent".as_slice(), ObjectHandle::integer(8)),
+        ] {
+            dict.replace_key(key, value)?;
+        }
+        pdf.mark_object_handle_dirty(&dict)?;
+        Ok(stream)
+    }
+
+    #[test]
+    fn canonicalizes_only_exact_image_xobjects_in_resource_dictionaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"01234567";
+        let first = image_stream(&mut pdf, payload, 4, 2)?;
+        let second = image_stream(&mut pdf, payload, 4, 2)?;
+        let different_dict = image_stream(&mut pdf, payload, 8, 1)?;
+        let xobjects = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Im1".to_vec(), first),
+            (b"/Im2".to_vec(), second),
+            (b"/Im3".to_vec(), different_dict),
+        ]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/XObject", xobjects.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_image_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = xobjects.try_get_key(b"/Im1")?.object_ref();
+        let second_ref = xobjects.try_get_key(b"/Im2")?.object_ref();
+        let different_ref = xobjects.try_get_key(b"/Im3")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
         Ok(())

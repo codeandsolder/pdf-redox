@@ -1,6 +1,9 @@
 use crate::{
     Config, FlatePolicy, ImagePolicy, OptimizationReport, Result, analyze_pdf,
-    dedup::{canonicalize_font_program_streams, canonicalize_metadata_streams},
+    dedup::{
+        canonicalize_font_program_streams, canonicalize_image_xobjects,
+        canonicalize_metadata_streams,
+    },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
     scrub::scrub_pdf,
@@ -20,6 +23,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     };
     let font_dedup = if cfg.deduplicate_font_programs {
         canonicalize_font_program_streams(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let image_dedup = if cfg.deduplicate_image_xobjects {
+        canonicalize_image_xobjects(&mut pdf)?
     } else {
         Default::default()
     };
@@ -67,6 +75,12 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
         ));
     }
+    if image_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate Image XObject reference(s) across {} duplicate image stream object(s).",
+            image_dedup.references_canonicalized, image_dedup.duplicate_streams_detected
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -94,6 +108,9 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
+        image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
+        image_references_canonicalized: image_dedup.references_canonicalized,
         flate_streams_selected_for_recompression: flate.streams_selected,
         flate_estimated_savings_bytes: flate.estimated_savings_bytes,
         notes,

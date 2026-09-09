@@ -60,6 +60,9 @@ struct Args {
     /// Preserve separate exact duplicate embedded font-program stream objects.
     #[arg(long)]
     no_font_program_dedup: bool,
+    /// Preserve separate exact duplicate Image XObjects instead of canonicalizing them.
+    #[arg(long)]
+    no_image_dedup: bool,
     /// Recursively analyze every PDF below INPUT and emit one aggregate JSON report.
     #[arg(long)]
     corpus: bool,
@@ -115,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.prune_resources = a.prune_resources;
     cfg.deduplicate_metadata_streams = !a.no_metadata_dedup;
     cfg.deduplicate_font_programs = !a.no_font_program_dedup;
+    cfg.deduplicate_image_xobjects = !a.no_image_dedup;
 
     let (output, report) = optimize_pdf(&input, &cfg)?;
     let out_path = a.output.unwrap_or_else(|| {
