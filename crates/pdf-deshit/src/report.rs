@@ -188,5 +188,7 @@ pub struct OptimizationReport {
     pub font_duplicate_streams_detected: usize,
     pub font_duplicate_raw_bytes: usize,
     pub font_references_canonicalized: usize,
+    pub flate_streams_selected_for_recompression: usize,
+    pub flate_estimated_savings_bytes: usize,
     pub notes: Vec<String>,
 }

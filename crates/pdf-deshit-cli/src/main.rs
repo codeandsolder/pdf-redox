@@ -1,7 +1,7 @@
 mod corpus;
 
 use clap::{Parser, ValueEnum};
-use pdf_deshit::{Config, OutputProfile, PrivacyLevel, analyze_pdf, optimize_pdf};
+use pdf_deshit::{Config, FlatePolicy, OutputProfile, PrivacyLevel, analyze_pdf, optimize_pdf};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -17,6 +17,13 @@ enum PrivacyArg {
     BestEffort,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FlatePolicyArg {
+    Preserve,
+    Selective,
+    RecompressAll,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "pdf-deshit",
@@ -30,6 +37,12 @@ struct Args {
     profile: ProfileArg,
     #[arg(long, value_enum, default_value = "none")]
     privacy: PrivacyArg,
+    /// Existing Flate stream policy. Selective is the optimize-only default.
+    #[arg(long, value_enum, default_value = "selective")]
+    flate_policy: FlatePolicyArg,
+    /// Normalize page-content token syntax. This can increase file size.
+    #[arg(long)]
+    normalize_content: bool,
     #[arg(long)]
     scrub_jpeg_metadata: bool,
     #[arg(long)]
@@ -83,6 +96,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ProfileArg::Perceptual => OutputProfile::Perceptual,
         ProfileArg::Print => OutputProfile::Print,
     };
+    cfg.flate_policy = match a.flate_policy {
+        FlatePolicyArg::Preserve => FlatePolicy::Preserve,
+        FlatePolicyArg::Selective => FlatePolicy::default(),
+        FlatePolicyArg::RecompressAll => FlatePolicy::RecompressAll,
+    };
+    cfg.normalize_content_streams = a.normalize_content;
     cfg.privacy.level = match a.privacy {
         PrivacyArg::None => PrivacyLevel::None,
         PrivacyArg::Metadata => PrivacyLevel::Metadata,

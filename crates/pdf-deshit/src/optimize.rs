@@ -1,6 +1,7 @@
 use crate::{
-    Config, ImagePolicy, OptimizationReport, Result, analyze_pdf,
+    Config, FlatePolicy, ImagePolicy, OptimizationReport, Result, analyze_pdf,
     dedup::{canonicalize_font_program_streams, canonicalize_metadata_streams},
+    flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
     scrub::scrub_pdf,
 };
@@ -25,12 +26,13 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     if cfg.prune_resources {
         PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
     }
+    let flate = apply_flate_policy(&mut pdf, cfg.flate_policy, cfg.flate_level)?;
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     writer.set_preserve_unreferenced_objects(false);
     writer.set_stream_data_mode(StreamDataMode::Compress);
-    writer.set_recompress_flate(cfg.recompress_flate);
+    writer.set_recompress_flate(matches!(cfg.flate_policy, FlatePolicy::RecompressAll));
     writer.set_compression_level(cfg.flate_level);
     writer.set_content_normalization(cfg.normalize_content_streams);
     writer.set_object_stream_mode(if cfg.generate_object_streams {
@@ -65,6 +67,12 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
         ));
     }
+    if flate.streams_selected > 0 {
+        notes.push(format!(
+            "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
+            flate.streams_selected, flate.estimated_savings_bytes
+        ));
+    }
 
     let saved_bytes = input.len() as isize - output.len() as isize;
     let saved_percent = if input.is_empty() {
@@ -86,6 +94,8 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        flate_streams_selected_for_recompression: flate.streams_selected,
+        flate_estimated_savings_bytes: flate.estimated_savings_bytes,
         notes,
     };
     Ok((output, report))

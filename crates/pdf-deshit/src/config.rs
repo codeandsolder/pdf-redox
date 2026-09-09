@@ -35,6 +35,29 @@ pub enum ImagePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "mode")]
+pub enum FlatePolicy {
+    /// Preserve unmodified lone-Flate streams byte-for-byte.
+    Preserve,
+    /// Recompress only lone-Flate streams that clear explicit size gates.
+    Selective {
+        min_savings_bytes: usize,
+        min_savings_percent: u8,
+    },
+    /// Ask the writer to recompress every eligible Flate stream.
+    RecompressAll,
+}
+
+impl Default for FlatePolicy {
+    fn default() -> Self {
+        Self::Selective {
+            min_savings_bytes: 1024,
+            min_savings_percent: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrivacyLevel {
     None,
@@ -107,8 +130,8 @@ pub struct Config {
     pub generate_object_streams: bool,
     /// Normalize lexical representation of page content streams.
     pub normalize_content_streams: bool,
-    /// Re-run DEFLATE on already-Flate streams. Important for malformed exporters.
-    pub recompress_flate: bool,
+    /// Policy for preserving or recompressing existing Flate streams.
+    pub flate_policy: FlatePolicy,
     /// Remove unused `/Font` and `/XObject` resource entries using flpdf's
     /// qpdf-compatible parse-gated pruning pass. Experimental until corpus validation.
     pub prune_resources: bool,
@@ -130,8 +153,8 @@ impl Config {
             privacy: PrivacyConfig::default(),
             hidden_text: HiddenTextPolicy::default(),
             generate_object_streams: true,
-            normalize_content_streams: true,
-            recompress_flate: true,
+            normalize_content_streams: false,
+            flate_policy: FlatePolicy::default(),
             prune_resources: false,
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
@@ -198,8 +221,8 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn recompress_flate(mut self, value: bool) -> Self {
-        self.config.recompress_flate = value;
+    pub fn flate_policy(mut self, value: FlatePolicy) -> Self {
+        self.config.flate_policy = value;
         self
     }
 
@@ -264,8 +287,8 @@ mod tests {
     fn builder_overrides_independent_policy_knobs() {
         let config = Config::builder(OutputProfile::OptimizeOnly)
             .generate_object_streams(false)
-            .normalize_content_streams(false)
-            .recompress_flate(false)
+            .normalize_content_streams(true)
+            .flate_policy(FlatePolicy::Preserve)
             .prune_resources(true)
             .deduplicate_metadata_streams(false)
             .deduplicate_font_programs(true)
@@ -278,8 +301,8 @@ mod tests {
             .build();
 
         assert!(!config.generate_object_streams);
-        assert!(!config.normalize_content_streams);
-        assert!(!config.recompress_flate);
+        assert!(config.normalize_content_streams);
+        assert_eq!(config.flate_policy, FlatePolicy::Preserve);
         assert!(config.prune_resources);
         assert!(!config.deduplicate_metadata_streams);
         assert!(config.deduplicate_font_programs);

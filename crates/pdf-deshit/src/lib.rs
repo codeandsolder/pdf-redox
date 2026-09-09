@@ -2,6 +2,7 @@ mod analyze;
 mod config;
 mod dedup;
 mod error;
+mod flate;
 mod hidden_text;
 mod jpeg;
 mod optimize;
@@ -10,8 +11,8 @@ mod scrub;
 
 pub use analyze::analyze_pdf;
 pub use config::{
-    Config, ConfigBuilder, HiddenTextPolicy, ImagePolicy, OutputProfile, PrivacyConfig,
-    PrivacyLevel,
+    Config, ConfigBuilder, FlatePolicy, HiddenTextPolicy, ImagePolicy, OutputProfile,
+    PrivacyConfig, PrivacyLevel,
 };
 pub use error::{Error, Result};
 pub use optimize::optimize_pdf;

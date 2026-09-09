@@ -24,9 +24,9 @@ The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fre
 
 Early but functional. The core currently provides:
 
-- whole-document fresh rewrites, garbage collection, object-stream generation, and content normalization;
+- whole-document fresh rewrites, garbage collection, object-stream generation, and optional page-content normalization;
 - exact duplicate `/Metadata` and embedded font-program stream canonicalization before garbage collection;
-- high-level structural/risk profiling and pathological-Flate recompression detection;
+- high-level structural/risk profiling plus size-gated selective Flate recompression;
 - metadata, JPEG metadata, active-content, attachment, form/signature, and incremental-history privacy cleanup;
 - conservative invisible-text analysis that distinguishes OCR overlays, accessibility text, hidden layers, outside-page text, likely fake-redaction leaks, and uncertain invisible content;
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
