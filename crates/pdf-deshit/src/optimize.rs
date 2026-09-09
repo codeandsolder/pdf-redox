@@ -1,7 +1,7 @@
 use crate::{
     Config, FlatePolicy, ImagePolicy, OptimizationReport, Result, analyze_pdf,
     dedup::{
-        canonicalize_font_program_streams, canonicalize_image_xobjects,
+        canonicalize_font_program_streams, canonicalize_icc_profiles, canonicalize_image_xobjects,
         canonicalize_metadata_streams,
     },
     flate::apply_flate_policy,
@@ -26,6 +26,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     };
     let font_dedup = if cfg.deduplicate_font_programs {
         canonicalize_font_program_streams(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let icc_dedup = if cfg.deduplicate_icc_profiles {
+        canonicalize_icc_profiles(&mut pdf)?
     } else {
         Default::default()
     };
@@ -119,6 +124,12 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             image_dedup.references_canonicalized, image_dedup.duplicate_streams_detected
         ));
     }
+    if icc_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate ICCBased profile reference(s) across {} duplicate ICC stream object(s).",
+            icc_dedup.references_canonicalized, icc_dedup.duplicate_streams_detected
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -149,6 +160,9 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
         image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
         image_references_canonicalized: image_dedup.references_canonicalized,
+        icc_duplicate_streams_detected: icc_dedup.duplicate_streams_detected,
+        icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
+        icc_references_canonicalized: icc_dedup.references_canonicalized,
         raster_images_transcoded: raster_transform.images_optimized,
         raster_references_reused: raster_transform.references_reused,
         raster_original_encoded_bytes: raster_transform.original_encoded_bytes,

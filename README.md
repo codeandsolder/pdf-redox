@@ -26,7 +26,7 @@ The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fre
 Early but functional. The core currently provides:
 
 - whole-document fresh rewrites, garbage collection, object-stream generation, and optional page-content normalization;
-- exact duplicate `/Metadata`, embedded font-program, and Image XObject canonicalization before garbage collection;
+- exact duplicate `/Metadata`, embedded font-program, Image XObject, and ICCBased profile canonicalization before garbage collection; metadata references are trusted even when a producer omits the stream's nominal `/Type /Metadata` entry;
 - high-level structural/risk profiling plus size-gated selective Flate recompression;
 - a real Perceptual raster path that converts eligible 8-bit DeviceGray/RGB/CMYK lossless Image XObjects to JPEG at the configured quality only when the encoded-size savings gate is met, while preserving pixel dimensions and reusing one transcoded object for shared source images;
 - metadata, JPEG metadata, active-content, attachment, form/signature, and incremental-history privacy cleanup;

@@ -5,7 +5,7 @@ use flpdf::{
     ParseControl, Pdf,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Seek, Write};
 
 fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
@@ -75,11 +75,155 @@ fn collect_page_content_refs<R: Read + Seek + 'static>(
     Ok(refs)
 }
 
+fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
+    match key {
+        b"/Metadata" => Some("metadata"),
+        b"/ToUnicode" => Some("to-unicode"),
+        b"/CIDToGIDMap" => Some("cid-to-gid"),
+        b"/ColorSpace" | b"/DestOutputProfile" => Some("color-space-support"),
+        b"/XFA" => Some("xfa"),
+        b"/Function" => Some("function"),
+        b"/Shading" => Some("shading"),
+        b"/Pattern" => Some("pattern"),
+        _ => None,
+    }
+}
+
+fn collect_incoming_roles(objects: &[ObjectHandle]) -> HashMap<ObjectRef, HashSet<&'static str>> {
+    let objects_by_ref: HashMap<ObjectRef, ObjectHandle> = objects
+        .iter()
+        .filter_map(|object| {
+            object
+                .object_ref()
+                .map(|object_ref| (object_ref, object.clone()))
+        })
+        .collect();
+    let mut roles: HashMap<ObjectRef, HashSet<&'static str>> = HashMap::new();
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+
+    for object in objects {
+        let dictionary = object.as_stream_dict().or_else(|| {
+            let is_dictionary = object.try_is_dictionary().ok()?;
+            if is_dictionary {
+                Some(object.clone())
+            } else {
+                object.as_stream_dict()
+            }
+        });
+        let Some(dictionary) = dictionary else {
+            continue;
+        };
+        if let Some(entries) = dictionary.as_dictionary() {
+            for (key, value) in entries {
+                if let Some(role) = incoming_role_for_key(&key) {
+                    queue.push_back((value, role));
+                }
+            }
+        }
+    }
+
+    while let Some((value, role)) = queue.pop_front() {
+        if let Some(object_ref) = value.object_ref() {
+            if !seen.insert((object_ref, role)) {
+                continue;
+            }
+            let Some(target) = objects_by_ref.get(&object_ref) else {
+                continue;
+            };
+            let is_array = target.try_is_array().ok().unwrap_or(false);
+            if target.as_stream_dict().is_some() {
+                roles.entry(object_ref).or_default().insert(role);
+                continue;
+            }
+            if is_array {
+                if let Some(items) = target.as_array() {
+                    for item in items {
+                        queue.push_back((item, role));
+                    }
+                }
+            } else if target.try_is_dictionary().ok().unwrap_or(false)
+                && let Some(entries) = target.as_dictionary()
+            {
+                for (key, child) in entries {
+                    queue.push_back((child, incoming_role_for_key(&key).unwrap_or(role)));
+                }
+            }
+            continue;
+        }
+        if let Some(items) = value.as_array() {
+            for item in items {
+                queue.push_back((item, role));
+            }
+        } else if let Some(entries) = value.as_dictionary() {
+            for (key, child) in entries {
+                queue.push_back((child, incoming_role_for_key(&key).unwrap_or(role)));
+            }
+        }
+    }
+
+    roles
+}
+
+fn collect_direct_icc_profile_refs(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    refs: &mut HashSet<ObjectRef>,
+) {
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+    let Ok(is_array) = value.try_is_array() else {
+        return;
+    };
+    if is_array {
+        let Some(items) = value.as_array() else {
+            return;
+        };
+        if items.len() >= 2 && matches!(items[0].try_is_name_and_equals(b"ICCBased"), Ok(true)) {
+            if let Some(profile_ref) = items[1].object_ref() {
+                refs.insert(profile_ref);
+            }
+            return;
+        }
+        for item in items {
+            collect_direct_icc_profile_refs(&item, false, refs);
+        }
+        return;
+    }
+    if let Some(dict) = value.as_stream_dict() {
+        if let Some(entries) = dict.as_dictionary() {
+            for (_, child) in entries {
+                collect_direct_icc_profile_refs(&child, false, refs);
+            }
+        }
+        return;
+    }
+    let Ok(is_dictionary) = value.try_is_dictionary() else {
+        return;
+    };
+    if is_dictionary && let Some(entries) = value.as_dictionary() {
+        for (_, child) in entries {
+            collect_direct_icc_profile_refs(&child, false, refs);
+        }
+    }
+}
+
+fn collect_icc_profile_refs(objects: &[ObjectHandle]) -> HashSet<ObjectRef> {
+    let mut refs = HashSet::new();
+    for object in objects {
+        collect_direct_icc_profile_refs(object, true, &mut refs);
+    }
+    refs
+}
+
 fn stream_role(
     object: &ObjectHandle,
     object_ref: ObjectRef,
     font_refs: &HashSet<ObjectRef>,
     page_content_refs: &HashSet<ObjectRef>,
+    icc_profile_refs: &HashSet<ObjectRef>,
+    incoming_roles: &HashMap<ObjectRef, HashSet<&'static str>>,
 ) -> Result<&'static str> {
     let Some(dict) = object.as_stream_dict() else {
         return Ok("other");
@@ -90,7 +234,6 @@ fn stream_role(
         (b"EmbeddedFile".as_slice(), "embedded-file"),
         (b"ObjStm".as_slice(), "object-stream"),
         (b"XRef".as_slice(), "xref-stream"),
-        (b"CMap".as_slice(), "cmap"),
     ] {
         if type_object.try_is_name_and_equals(name)? {
             return Ok(role);
@@ -108,6 +251,20 @@ fn stream_role(
     }
     if page_content_refs.contains(&object_ref) {
         return Ok("page-content");
+    }
+    if icc_profile_refs.contains(&object_ref) {
+        return Ok("icc-profile");
+    }
+    if let Some(roles) = incoming_roles.get(&object_ref) {
+        if roles.len() == 1 {
+            return Ok(roles.iter().next().copied().unwrap_or("other"));
+        }
+        if roles.len() > 1 {
+            return Ok("multi-reference");
+        }
+    }
+    if type_object.try_is_name_and_equals(b"CMap")? {
+        return Ok("cmap");
     }
     Ok("other")
 }
@@ -417,6 +574,8 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         }
     }
 
+    let incoming_roles = collect_incoming_roles(&objects);
+    let icc_profile_refs = collect_icc_profile_refs(&objects);
     let mut stream_roles = HashMap::new();
     for object in &objects {
         let Some(object_ref) = object.object_ref() else {
@@ -425,7 +584,14 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         if object.as_stream_dict().is_none() {
             continue;
         }
-        let role = stream_role(object, object_ref, &font_refs, &page_content_refs)?;
+        let role = stream_role(
+            object,
+            object_ref,
+            &font_refs,
+            &page_content_refs,
+            &icc_profile_refs,
+            &incoming_roles,
+        )?;
         stream_roles.insert(object_ref, role);
     }
     (

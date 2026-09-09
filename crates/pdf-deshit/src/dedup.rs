@@ -1,7 +1,7 @@
 use crate::Result;
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,37 +32,42 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
     Ok(Some(hasher.finalize().into()))
 }
 
-fn metadata_fingerprint(object: &ObjectHandle) -> Result<Option<[u8; 32]>> {
-    let Some(dict) = object.as_stream_dict() else {
-        return Ok(None);
-    };
-    let type_object = dict.try_get_key(b"/Type")?;
-    if !type_object.try_is_name_and_equals(b"Metadata")? {
-        return Ok(None);
-    }
-    stream_fingerprint(object, b"metadata")
-}
-
 pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
     let mut duplicate_raw_bytes = 0_usize;
 
+    // Treat the /Metadata reference as authoritative. Real producers exist
+    // that omit the stream's nominal /Type /Metadata entry entirely.
     for object in &objects {
-        let Some(object_ref) = object.object_ref() else {
+        let dict = if let Some(dict) = object.as_stream_dict() {
+            dict
+        } else if object.try_is_dictionary()? {
+            object.clone()
+        } else {
             continue;
         };
-        let Some(fingerprint) = metadata_fingerprint(object)? else {
+        let metadata = dict.try_get_key(b"/Metadata")?;
+        let Some(metadata_ref) = metadata.object_ref() else {
+            continue;
+        };
+        if pdf.resolve(&metadata).is_err() {
+            continue;
+        }
+        let Ok(Some(fingerprint)) = stream_fingerprint(&metadata, b"metadata") else {
             continue;
         };
         if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            redirects.insert(object_ref, canonical_ref);
-            duplicate_raw_bytes += object.get_raw_stream_data()?.len();
+            redirects.insert(metadata_ref, canonical_ref);
+            if duplicate_refs.insert(metadata_ref) {
+                duplicate_raw_bytes += metadata.get_raw_stream_data()?.len();
+            }
         } else {
-            canonical_by_fingerprint.insert(fingerprint, object_ref);
+            canonical_by_fingerprint.insert(fingerprint, metadata_ref);
         }
     }
 
@@ -89,7 +94,113 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     }
 
     Ok(TargetedDedupStats {
-        duplicate_streams_detected: redirects.len(),
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+fn collect_direct_icc_arrays(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    arrays: &mut Vec<ObjectHandle>,
+) {
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    let Ok(is_array) = value.try_is_array() else {
+        return;
+    };
+    if is_array {
+        let Some(items) = value.as_array() else {
+            return;
+        };
+        if items.len() >= 2 && matches!(items[0].try_is_name_and_equals(b"ICCBased"), Ok(true)) {
+            arrays.push(value.clone());
+            return;
+        }
+        for item in items {
+            collect_direct_icc_arrays(&item, false, arrays);
+        }
+        return;
+    }
+
+    if let Some(dict) = value.as_stream_dict() {
+        if let Some(entries) = dict.as_dictionary() {
+            for (_, child) in entries {
+                collect_direct_icc_arrays(&child, false, arrays);
+            }
+        }
+        return;
+    }
+
+    if matches!(value.try_is_dictionary(), Ok(true))
+        && let Some(entries) = value.as_dictionary()
+    {
+        for (_, child) in entries {
+            collect_direct_icc_arrays(&child, false, arrays);
+        }
+    }
+}
+
+fn icc_arrays(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+    let mut arrays = Vec::new();
+    for object in objects {
+        collect_direct_icc_arrays(object, true, &mut arrays);
+    }
+    arrays
+}
+
+pub(crate) fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let arrays = icc_arrays(&objects);
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for array in &arrays {
+        let profile = array.try_get_array_item(1)?;
+        let Some(profile_ref) = profile.object_ref() else {
+            continue;
+        };
+        if pdf.resolve(&profile).is_err() {
+            continue;
+        }
+        let Ok(Some(fingerprint)) = stream_fingerprint(&profile, b"icc-profile") else {
+            continue;
+        };
+        if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical_ref != profile_ref {
+                redirects.insert(profile_ref, canonical_ref);
+                if duplicate_refs.insert(profile_ref) {
+                    duplicate_raw_bytes += profile.get_raw_stream_data()?.len();
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, profile_ref);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for array in arrays {
+        let profile = array.try_get_array_item(1)?;
+        let Some(profile_ref) = profile.object_ref() else {
+            continue;
+        };
+        let Some(canonical_ref) = redirects.get(&profile_ref).copied() else {
+            continue;
+        };
+        array.set_array_item(1, pdf.get_object_handle(canonical_ref))?;
+        pdf.mark_object_handle_dirty(&array)?;
+        references_canonicalized += 1;
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
         duplicate_raw_bytes,
         references_canonicalized,
     })
@@ -268,6 +379,14 @@ mod tests {
         Ok(stream)
     }
 
+    fn untyped_metadata_stream(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+    ) -> Result<ObjectHandle> {
+        pdf.new_stream_with_data(Rc::new(data.to_vec()))
+            .map_err(Into::into)
+    }
+
     fn holder(
         pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
         metadata: ObjectHandle,
@@ -308,6 +427,88 @@ mod tests {
         let first_ref = first_holder.try_get_key(b"/Metadata")?.object_ref();
         let second_ref = second_holder.try_get_key(b"/Metadata")?.object_ref();
         let different_ref = different_holder.try_get_key(b"/Metadata")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_metadata_references_even_when_type_is_missing() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"<x:xmpmeta>producer forgot Type</x:xmpmeta>";
+        let first = untyped_metadata_stream(&mut pdf, payload)?;
+        let second = untyped_metadata_stream(&mut pdf, payload)?;
+        let first_holder = holder(&mut pdf, first)?;
+        let second_holder = holder(&mut pdf, second)?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestUntypedMetadataA", first_holder.clone())?;
+        root.replace_key(b"/TestUntypedMetadataB", second_holder.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_metadata_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_holder.try_get_key(b"/Metadata")?.object_ref(),
+            second_holder.try_get_key(b"/Metadata")?.object_ref()
+        );
+        Ok(())
+    }
+
+    fn icc_profile(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+        components: i64,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        let dict = stream
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("new ICC stream has no dictionary".to_owned()))?;
+        dict.replace_key(b"/N", ObjectHandle::integer(components))?;
+        dict.replace_key(
+            b"/Alternate",
+            ObjectHandle::name(if components == 4 {
+                b"DeviceCMYK".to_vec()
+            } else {
+                b"DeviceRGB".to_vec()
+            }),
+        )?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        Ok(stream)
+    }
+
+    fn icc_array(profile: ObjectHandle) -> ObjectHandle {
+        ObjectHandle::array(vec![ObjectHandle::name(b"ICCBased".to_vec()), profile])
+    }
+
+    #[test]
+    fn canonicalizes_only_exact_icc_profile_streams() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"identical ICC profile payload";
+        let first_profile = icc_profile(&mut pdf, payload, 4)?;
+        let second_profile = icc_profile(&mut pdf, payload, 4)?;
+        let different_profile = icc_profile(&mut pdf, payload, 3)?;
+        let first = icc_array(first_profile);
+        let second = pdf.make_indirect_object_handle(icc_array(second_profile))?;
+        let different = icc_array(different_profile);
+        let color_spaces = ObjectHandle::dictionary(vec![
+            (b"/CS1".to_vec(), first.clone()),
+            (b"/CS2".to_vec(), second.clone()),
+            (b"/CS3".to_vec(), different.clone()),
+        ]);
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestColorSpaces", color_spaces)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_icc_profiles(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = first.try_get_array_item(1)?.object_ref();
+        let second_ref = second.try_get_array_item(1)?.object_ref();
+        let different_ref = different.try_get_array_item(1)?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
         Ok(())

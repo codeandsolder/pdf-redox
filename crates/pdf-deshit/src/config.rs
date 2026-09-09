@@ -144,6 +144,9 @@ pub struct Config {
     /// Canonicalize byte- and dictionary-identical Image XObjects referenced from
     /// `/Resources /XObject` dictionaries.
     pub deduplicate_image_xobjects: bool,
+    /// Canonicalize byte- and dictionary-identical ICC profile streams referenced from
+    /// `/ICCBased` color-space arrays.
+    pub deduplicate_icc_profiles: bool,
     /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
     pub flate_level: i32,
 }
@@ -162,6 +165,7 @@ impl Config {
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
             deduplicate_image_xobjects: true,
+            deduplicate_icc_profiles: true,
             flate_level: 9,
         }
     }
@@ -250,6 +254,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
+        self.config.deduplicate_icc_profiles = value;
+        self
+    }
+
     pub fn flate_level(mut self, value: i32) -> Self {
         self.config.flate_level = value;
         self
@@ -302,6 +311,7 @@ mod tests {
             .deduplicate_metadata_streams(false)
             .deduplicate_font_programs(true)
             .deduplicate_image_xobjects(false)
+            .deduplicate_icc_profiles(false)
             .flate_level(6)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
@@ -317,6 +327,7 @@ mod tests {
         assert!(!config.deduplicate_metadata_streams);
         assert!(config.deduplicate_font_programs);
         assert!(!config.deduplicate_image_xobjects);
+        assert!(!config.deduplicate_icc_profiles);
         assert_eq!(config.flate_level, 6);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);
