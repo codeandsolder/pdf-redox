@@ -182,5 +182,8 @@ pub struct OptimizationReport {
     pub privacy_items_removed: BTreeMap<String, usize>,
     pub jpeg_metadata_bytes_removed: usize,
     pub hidden_text_items_removed: usize,
+    pub metadata_duplicate_streams_detected: usize,
+    pub metadata_duplicate_raw_bytes: usize,
+    pub metadata_references_canonicalized: usize,
     pub notes: Vec<String>,
 }

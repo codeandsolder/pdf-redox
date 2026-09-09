@@ -112,6 +112,9 @@ pub struct Config {
     /// Remove unused `/Font` and `/XObject` resource entries using flpdf's
     /// qpdf-compatible parse-gated pruning pass. Experimental until corpus validation.
     pub prune_resources: bool,
+    /// Canonicalize byte- and dictionary-identical `/Metadata` streams so a fresh rewrite
+    /// can garbage-collect duplicate XMP objects.
+    pub deduplicate_metadata_streams: bool,
     /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
     pub flate_level: i32,
 }
@@ -127,6 +130,7 @@ impl Config {
             normalize_content_streams: true,
             recompress_flate: true,
             prune_resources: false,
+            deduplicate_metadata_streams: true,
             flate_level: 9,
         }
     }
@@ -200,6 +204,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
+        self.config.deduplicate_metadata_streams = value;
+        self
+    }
+
     pub fn flate_level(mut self, value: i32) -> Self {
         self.config.flate_level = value;
         self
@@ -249,6 +258,7 @@ mod tests {
             .normalize_content_streams(false)
             .recompress_flate(false)
             .prune_resources(true)
+            .deduplicate_metadata_streams(false)
             .flate_level(6)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
@@ -261,6 +271,7 @@ mod tests {
         assert!(!config.normalize_content_streams);
         assert!(!config.recompress_flate);
         assert!(config.prune_resources);
+        assert!(!config.deduplicate_metadata_streams);
         assert_eq!(config.flate_level, 6);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);

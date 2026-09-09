@@ -25,6 +25,7 @@ The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fre
 Early but functional. The core currently provides:
 
 - whole-document fresh rewrites, garbage collection, object-stream generation, and content normalization;
+- exact duplicate `/Metadata` stream canonicalization before garbage collection;
 - high-level structural/risk profiling and pathological-Flate recompression detection;
 - metadata, JPEG metadata, active-content, attachment, form/signature, and incremental-history privacy cleanup;
 - conservative invisible-text analysis that distinguishes OCR overlays, accessibility text, hidden layers, outside-page text, likely fake-redaction leaks, and uncertain invisible content;
@@ -33,4 +34,4 @@ Early but functional. The core currently provides:
 
 Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates. The WASM crate enables `getrandom`'s browser JS backend because `flpdf` uses randomness for PDF encryption IV generation.
 
-Image transcoding, semantic stream/font/resource deduplication, inline-image externalization, resource pruning, and corpus-driven structural normalization remain active optimization work.
+Image transcoding, semantic stream/font/resource deduplication, inline-image externalization, corpus-driven structural normalization, and validation of the opt-in resource-pruning pass remain active optimization work.

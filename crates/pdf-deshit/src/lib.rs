@@ -1,5 +1,6 @@
 mod analyze;
 mod config;
+mod dedup;
 mod error;
 mod hidden_text;
 mod jpeg;

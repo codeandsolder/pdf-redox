@@ -41,6 +41,9 @@ struct Args {
     /// Experimentally remove unused Font/XObject resource entries.
     #[arg(long)]
     prune_resources: bool,
+    /// Preserve separate byte-identical metadata stream objects instead of canonicalizing them.
+    #[arg(long)]
+    no_metadata_dedup: bool,
     /// Recursively analyze every PDF below INPUT and emit one aggregate JSON report.
     #[arg(long)]
     corpus: bool,
@@ -88,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.privacy.remove_active_content = a.remove_active_content;
     cfg.privacy.remove_signatures = a.remove_signatures;
     cfg.prune_resources = a.prune_resources;
+    cfg.deduplicate_metadata_streams = !a.no_metadata_dedup;
 
     let (output, report) = optimize_pdf(&input, &cfg)?;
     let out_path = a.output.unwrap_or_else(|| {

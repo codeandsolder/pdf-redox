@@ -1,6 +1,6 @@
 use crate::{
     Config, ImagePolicy, OptimizationReport, Result, analyze_pdf,
-    hidden_text::apply_hidden_text_policy, scrub::scrub_pdf,
+    dedup::canonicalize_metadata_streams, hidden_text::apply_hidden_text_policy, scrub::scrub_pdf,
 };
 use flpdf::{ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, StreamDataMode};
 use std::io::Cursor;
@@ -10,6 +10,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
     let hidden_text = apply_hidden_text_policy(&mut pdf, &cfg.hidden_text)?;
     let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
+    let metadata_dedup = if cfg.deduplicate_metadata_streams {
+        canonicalize_metadata_streams(&mut pdf)?
+    } else {
+        Default::default()
+    };
     if cfg.prune_resources {
         PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
     }
@@ -41,6 +46,12 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             before.incremental_update_count
         ));
     }
+    if metadata_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate metadata reference(s) across {} duplicate stream object(s).",
+            metadata_dedup.references_canonicalized, metadata_dedup.duplicate_streams_detected
+        ));
+    }
 
     let saved_bytes = input.len() as isize - output.len() as isize;
     let saved_percent = if input.is_empty() {
@@ -56,6 +67,9 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         privacy_items_removed: scrub.removed,
         jpeg_metadata_bytes_removed: scrub.jpeg_metadata_bytes_removed,
         hidden_text_items_removed: hidden_text.removed,
+        metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
+        metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
+        metadata_references_canonicalized: metadata_dedup.references_canonicalized,
         notes,
     };
     Ok((output, report))
