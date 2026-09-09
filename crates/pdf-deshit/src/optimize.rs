@@ -2,7 +2,7 @@ use crate::{
     Config, ImagePolicy, OptimizationReport, Result, analyze_pdf,
     hidden_text::apply_hidden_text_policy, scrub::scrub_pdf,
 };
-use flpdf::{ObjectStreamMode, Pdf, PdfWriter, StreamDataMode};
+use flpdf::{ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, StreamDataMode};
 use std::io::Cursor;
 
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
@@ -10,6 +10,9 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
     let hidden_text = apply_hidden_text_policy(&mut pdf, &cfg.hidden_text)?;
     let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
+    if cfg.prune_resources {
+        PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
+    }
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;

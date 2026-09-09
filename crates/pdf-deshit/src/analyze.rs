@@ -149,6 +149,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
     }
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+    let mut metadata_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
@@ -280,8 +281,10 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         }
         let type_obj = dict.try_get_key(b"/Type")?;
         if type_obj.try_is_name_and_equals(b"Metadata")? {
+            let raw = object.get_raw_stream_data()?;
             out.metadata_stream_count += 1;
-            out.metadata_stream_bytes += object.get_raw_stream_data()?.len();
+            out.metadata_stream_bytes += raw.len();
+            record_payload(&mut metadata_payloads, raw.as_ref());
             push_risk(
                 &mut risks,
                 RiskKind::XmpMetadata,
@@ -315,6 +318,10 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         }
     }
 
+    (
+        out.duplicate_metadata_payload_groups,
+        out.duplicate_metadata_payload_wasted_bytes,
+    ) = duplicate_payload_stats(metadata_payloads);
     (
         out.duplicate_stream_payload_groups,
         out.duplicate_stream_payload_wasted_bytes,

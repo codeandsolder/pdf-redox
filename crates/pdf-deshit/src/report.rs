@@ -144,6 +144,8 @@ pub struct PdfAnalysis {
     pub font_program_bytes: usize,
     pub metadata_stream_count: usize,
     pub metadata_stream_bytes: usize,
+    pub duplicate_metadata_payload_groups: usize,
+    pub duplicate_metadata_payload_wasted_bytes: usize,
     pub duplicate_stream_payload_groups: usize,
     pub duplicate_stream_payload_wasted_bytes: usize,
     pub duplicate_image_payload_groups: usize,

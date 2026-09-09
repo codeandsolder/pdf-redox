@@ -109,6 +109,9 @@ pub struct Config {
     pub normalize_content_streams: bool,
     /// Re-run DEFLATE on already-Flate streams. Important for malformed exporters.
     pub recompress_flate: bool,
+    /// Remove unused `/Font` and `/XObject` resource entries using flpdf's
+    /// qpdf-compatible parse-gated pruning pass. Experimental until corpus validation.
+    pub prune_resources: bool,
     /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
     pub flate_level: i32,
 }
@@ -123,6 +126,7 @@ impl Config {
             generate_object_streams: true,
             normalize_content_streams: true,
             recompress_flate: true,
+            prune_resources: false,
             flate_level: 9,
         }
     }
@@ -152,8 +156,113 @@ impl Config {
     }
 }
 
+/// Fluent construction for [`Config`] when callers need to override several
+/// independent policy knobs without mutating public fields piecemeal.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "config builders do nothing unless build() is called"]
+pub struct ConfigBuilder {
+    config: Config,
+}
+
+impl ConfigBuilder {
+    pub fn image_policy(mut self, value: ImagePolicy) -> Self {
+        self.config.image_policy = value;
+        self
+    }
+
+    pub fn privacy(mut self, value: PrivacyConfig) -> Self {
+        self.config.privacy = value;
+        self
+    }
+
+    pub fn hidden_text(mut self, value: HiddenTextPolicy) -> Self {
+        self.config.hidden_text = value;
+        self
+    }
+
+    pub fn generate_object_streams(mut self, value: bool) -> Self {
+        self.config.generate_object_streams = value;
+        self
+    }
+
+    pub fn normalize_content_streams(mut self, value: bool) -> Self {
+        self.config.normalize_content_streams = value;
+        self
+    }
+
+    pub fn recompress_flate(mut self, value: bool) -> Self {
+        self.config.recompress_flate = value;
+        self
+    }
+
+    pub fn prune_resources(mut self, value: bool) -> Self {
+        self.config.prune_resources = value;
+        self
+    }
+
+    pub fn flate_level(mut self, value: i32) -> Self {
+        self.config.flate_level = value;
+        self
+    }
+
+    pub fn build(self) -> Config {
+        self.config
+    }
+}
+
+impl Config {
+    /// Start from the canonical preset for `profile` and override only the
+    /// settings the caller cares about.
+    pub fn builder(profile: OutputProfile) -> ConfigBuilder {
+        let config = match profile {
+            OutputProfile::OptimizeOnly => Self::optimize_only(),
+            OutputProfile::Perceptual => Self::perceptual(),
+            OutputProfile::Print => Self::print(),
+        };
+        ConfigBuilder { config }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self::optimize_only()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_starts_from_requested_profile() {
+        let perceptual = Config::builder(OutputProfile::Perceptual).build();
+        assert_eq!(perceptual, Config::perceptual());
+
+        let print = Config::builder(OutputProfile::Print).build();
+        assert_eq!(print, Config::print());
+    }
+
+    #[test]
+    fn builder_overrides_independent_policy_knobs() {
+        let config = Config::builder(OutputProfile::OptimizeOnly)
+            .generate_object_streams(false)
+            .normalize_content_streams(false)
+            .recompress_flate(false)
+            .prune_resources(true)
+            .flate_level(6)
+            .privacy(PrivacyConfig {
+                level: PrivacyLevel::Metadata,
+                strip_jpeg_metadata: true,
+                ..PrivacyConfig::default()
+            })
+            .build();
+
+        assert!(!config.generate_object_streams);
+        assert!(!config.normalize_content_streams);
+        assert!(!config.recompress_flate);
+        assert!(config.prune_resources);
+        assert_eq!(config.flate_level, 6);
+        assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
+        assert!(config.privacy.strip_jpeg_metadata);
     }
 }

@@ -19,6 +19,7 @@ pub(crate) struct CorpusFileSummary {
     image_bytes: usize,
     font_program_bytes: usize,
     metadata_stream_bytes: usize,
+    duplicate_metadata_wasted_bytes: usize,
     duplicate_stream_wasted_bytes: usize,
     duplicate_image_wasted_bytes: usize,
     duplicate_form_wasted_bytes: usize,
@@ -46,6 +47,7 @@ impl CorpusFileSummary {
             image_bytes: analysis.image_raw_bytes,
             font_program_bytes: analysis.font_program_bytes,
             metadata_stream_bytes: analysis.metadata_stream_bytes,
+            duplicate_metadata_wasted_bytes: analysis.duplicate_metadata_payload_wasted_bytes,
             duplicate_stream_wasted_bytes: analysis.duplicate_stream_payload_wasted_bytes,
             duplicate_image_wasted_bytes: analysis.duplicate_image_payload_wasted_bytes,
             duplicate_form_wasted_bytes: analysis.duplicate_form_payload_wasted_bytes,
@@ -77,6 +79,7 @@ struct ProducerStats {
     input_bytes: u64,
     flate_recompress_potential_saving_bytes: u64,
     non_image_flate_recompress_potential_saving_bytes: u64,
+    duplicate_metadata_wasted_bytes: u64,
     duplicate_stream_wasted_bytes: u64,
     duplicate_image_wasted_bytes: u64,
     duplicate_form_wasted_bytes: u64,
@@ -102,6 +105,9 @@ struct CorpusTotals {
     font_program_bytes: u64,
     metadata_streams: u64,
     metadata_stream_bytes: u64,
+    duplicate_metadata_payload_groups: u64,
+    duplicate_metadata_payload_wasted_bytes: u64,
+    documents_with_duplicate_metadata: u64,
     duplicate_stream_payload_groups: u64,
     duplicate_stream_payload_wasted_bytes: u64,
     duplicate_image_payload_groups: u64,
@@ -153,6 +159,7 @@ pub(crate) struct CorpusReport {
     largest_files: Vec<CorpusFileSummary>,
     top_flate_recompress_savings: Vec<CorpusFileSummary>,
     top_non_image_flate_recompress_savings: Vec<CorpusFileSummary>,
+    top_duplicate_metadata_waste: Vec<CorpusFileSummary>,
     top_duplicate_stream_waste: Vec<CorpusFileSummary>,
     top_duplicate_image_waste: Vec<CorpusFileSummary>,
     top_duplicate_form_waste: Vec<CorpusFileSummary>,
@@ -241,6 +248,8 @@ pub(crate) fn analyze_corpus(
     let top_non_image_flate_recompress_savings = top_nonzero_by(&summaries, top, |row| {
         row.non_image_flate_recompress_potential_saving_bytes
     });
+    let top_duplicate_metadata_waste =
+        top_nonzero_by(&summaries, top, |row| row.duplicate_metadata_wasted_bytes);
     let top_duplicate_stream_waste =
         top_nonzero_by(&summaries, top, |row| row.duplicate_stream_wasted_bytes);
     let top_duplicate_image_waste =
@@ -278,6 +287,7 @@ pub(crate) fn analyze_corpus(
         largest_files,
         top_flate_recompress_savings,
         top_non_image_flate_recompress_savings,
+        top_duplicate_metadata_waste,
         top_duplicate_stream_waste,
         top_duplicate_image_waste,
         top_duplicate_form_waste,
@@ -342,6 +352,11 @@ fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
     totals.font_program_bytes += analysis.font_program_bytes as u64;
     totals.metadata_streams += analysis.metadata_stream_count as u64;
     totals.metadata_stream_bytes += analysis.metadata_stream_bytes as u64;
+    totals.duplicate_metadata_payload_groups += analysis.duplicate_metadata_payload_groups as u64;
+    totals.duplicate_metadata_payload_wasted_bytes +=
+        analysis.duplicate_metadata_payload_wasted_bytes as u64;
+    totals.documents_with_duplicate_metadata +=
+        u64::from(analysis.duplicate_metadata_payload_groups > 0);
     totals.duplicate_stream_payload_groups += analysis.duplicate_stream_payload_groups as u64;
     totals.duplicate_stream_payload_wasted_bytes +=
         analysis.duplicate_stream_payload_wasted_bytes as u64;
@@ -403,6 +418,8 @@ fn accumulate_producer_context(
         analysis.flate_recompress_potential_saving_bytes as u64;
     stats.non_image_flate_recompress_potential_saving_bytes +=
         analysis.non_image_flate_recompress_potential_saving_bytes as u64;
+    stats.duplicate_metadata_wasted_bytes +=
+        analysis.duplicate_metadata_payload_wasted_bytes as u64;
     stats.duplicate_stream_wasted_bytes += analysis.duplicate_stream_payload_wasted_bytes as u64;
     stats.duplicate_image_wasted_bytes += analysis.duplicate_image_payload_wasted_bytes as u64;
     stats.duplicate_form_wasted_bytes += analysis.duplicate_form_payload_wasted_bytes as u64;

@@ -9,7 +9,8 @@ mod scrub;
 
 pub use analyze::analyze_pdf;
 pub use config::{
-    Config, HiddenTextPolicy, ImagePolicy, OutputProfile, PrivacyConfig, PrivacyLevel,
+    Config, ConfigBuilder, HiddenTextPolicy, ImagePolicy, OutputProfile, PrivacyConfig,
+    PrivacyLevel,
 };
 pub use error::{Error, Result};
 pub use optimize::optimize_pdf;
