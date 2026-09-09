@@ -148,6 +148,10 @@ pub struct PdfAnalysis {
     pub duplicate_metadata_payload_wasted_bytes: usize,
     pub duplicate_stream_payload_groups: usize,
     pub duplicate_stream_payload_wasted_bytes: usize,
+    /// Exact duplicate raw-stream groups attributed to structurally proven roles.
+    pub duplicate_stream_role_groups: BTreeMap<String, usize>,
+    /// Wasted encoded bytes from exact duplicate raw-stream groups by role.
+    pub duplicate_stream_role_wasted_bytes: BTreeMap<String, usize>,
     pub duplicate_image_payload_groups: usize,
     pub duplicate_image_payload_wasted_bytes: usize,
     pub duplicate_form_payload_groups: usize,

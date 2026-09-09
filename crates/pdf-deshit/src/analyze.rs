@@ -1,7 +1,8 @@
 use crate::{PdfAnalysis, Result, RiskFinding, RiskKind, hidden_text::analyze_hidden_text};
 use flate2::{Compression, write::ZlibEncoder};
 use flpdf::{
-    DecodeLevel, ObjectHandle, ObjectHandleParserCallbacks, PageObjectHelper, ParseControl, Pdf,
+    DecodeLevel, ObjectHandle, ObjectHandleParserCallbacks, ObjectRef, PageObjectHelper,
+    ParseControl, Pdf,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -44,10 +45,11 @@ fn document_info_text<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Op
     Ok((!text.is_empty()).then_some(text))
 }
 
-fn record_payload(map: &mut HashMap<[u8; 32], (usize, usize)>, bytes: &[u8]) {
+fn record_payload(map: &mut HashMap<[u8; 32], (usize, usize)>, bytes: &[u8]) -> [u8; 32] {
     let hash: [u8; 32] = Sha256::digest(bytes).into();
     let entry = map.entry(hash).or_insert((0, bytes.len()));
     entry.0 += 1;
+    hash
 }
 
 fn duplicate_payload_stats(map: HashMap<[u8; 32], (usize, usize)>) -> (usize, usize) {
@@ -56,6 +58,88 @@ fn duplicate_payload_stats(map: HashMap<[u8; 32], (usize, usize)>) -> (usize, us
         .fold((0, 0), |(groups, wasted), (count, bytes)| {
             (groups + 1, wasted + (count - 1) * bytes)
         })
+}
+
+fn collect_page_content_refs<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<HashSet<ObjectRef>> {
+    let mut refs = HashSet::new();
+    for page_ref in flpdf::pages::page_refs(pdf)? {
+        let mut helper = PageObjectHelper::new(page_ref, pdf);
+        for stream in helper.get_page_contents()? {
+            if let Some(object_ref) = stream.object_ref() {
+                refs.insert(object_ref);
+            }
+        }
+    }
+    Ok(refs)
+}
+
+fn stream_role(
+    object: &ObjectHandle,
+    object_ref: ObjectRef,
+    font_refs: &HashSet<ObjectRef>,
+    page_content_refs: &HashSet<ObjectRef>,
+) -> Result<&'static str> {
+    let Some(dict) = object.as_stream_dict() else {
+        return Ok("other");
+    };
+    let type_object = dict.try_get_key(b"/Type")?;
+    for (name, role) in [
+        (b"Metadata".as_slice(), "metadata"),
+        (b"EmbeddedFile".as_slice(), "embedded-file"),
+        (b"ObjStm".as_slice(), "object-stream"),
+        (b"XRef".as_slice(), "xref-stream"),
+        (b"CMap".as_slice(), "cmap"),
+    ] {
+        if type_object.try_is_name_and_equals(name)? {
+            return Ok(role);
+        }
+    }
+    let subtype = dict.try_get_key(b"/Subtype")?;
+    if subtype.try_is_name_and_equals(b"Image")? {
+        return Ok("image");
+    }
+    if subtype.try_is_name_and_equals(b"Form")? {
+        return Ok("form");
+    }
+    if font_refs.contains(&object_ref) {
+        return Ok("font-program");
+    }
+    if page_content_refs.contains(&object_ref) {
+        return Ok("page-content");
+    }
+    Ok("other")
+}
+
+fn duplicate_payload_role_stats(
+    payloads: &HashMap<[u8; 32], (usize, usize)>,
+    members: &HashMap<[u8; 32], Vec<ObjectRef>>,
+    roles: &HashMap<ObjectRef, &'static str>,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut groups = BTreeMap::new();
+    let mut wasted = BTreeMap::new();
+    for (hash, (count, bytes)) in payloads {
+        if *count <= 1 {
+            continue;
+        }
+        let role_set: HashSet<&'static str> = members
+            .get(hash)
+            .into_iter()
+            .flatten()
+            .filter_map(|object_ref| roles.get(object_ref).copied())
+            .collect();
+        let role = if role_set.len() == 1 {
+            role_set.into_iter().next().unwrap_or("other")
+        } else if role_set.is_empty() {
+            "other"
+        } else {
+            "mixed"
+        };
+        *groups.entry(role.to_owned()).or_default() += 1;
+        *wasted.entry(role.to_owned()).or_default() += (count - 1) * bytes;
+    }
+    (groups, wasted)
 }
 
 #[derive(Debug, Default)]
@@ -147,8 +231,17 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             .warnings
             .push(format!("Creator metadata analysis skipped: {error}")),
     }
+    let page_content_refs = match collect_page_content_refs(&mut pdf) {
+        Ok(refs) => refs,
+        Err(error) => {
+            out.warnings
+                .push(format!("page-content role analysis skipped: {error}"));
+            HashSet::new()
+        }
+    };
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+    let mut stream_payload_members: HashMap<[u8; 32], Vec<ObjectRef>> = HashMap::new();
     let mut metadata_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
@@ -160,7 +253,13 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             out.stream_count += 1;
             let raw = object.get_raw_stream_data()?;
             out.stream_raw_bytes += raw.len();
-            record_payload(&mut stream_payloads, raw.as_ref());
+            let hash = record_payload(&mut stream_payloads, raw.as_ref());
+            if let Some(object_ref) = object.object_ref() {
+                stream_payload_members
+                    .entry(hash)
+                    .or_default()
+                    .push(object_ref);
+            }
             d
         } else if object.try_is_dictionary()? {
             object.clone()
@@ -317,6 +416,22 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             }
         }
     }
+
+    let mut stream_roles = HashMap::new();
+    for object in &objects {
+        let Some(object_ref) = object.object_ref() else {
+            continue;
+        };
+        if object.as_stream_dict().is_none() {
+            continue;
+        }
+        let role = stream_role(object, object_ref, &font_refs, &page_content_refs)?;
+        stream_roles.insert(object_ref, role);
+    }
+    (
+        out.duplicate_stream_role_groups,
+        out.duplicate_stream_role_wasted_bytes,
+    ) = duplicate_payload_role_stats(&stream_payloads, &stream_payload_members, &stream_roles);
 
     (
         out.duplicate_metadata_payload_groups,

@@ -149,6 +149,8 @@ pub(crate) struct CorpusReport {
     creator_counts: BTreeMap<String, u64>,
     producer_stats: BTreeMap<String, ProducerStats>,
     filter_counts: BTreeMap<String, u64>,
+    duplicate_stream_role_groups: BTreeMap<String, u64>,
+    duplicate_stream_role_wasted_bytes: BTreeMap<String, u64>,
     risk_counts: BTreeMap<RiskKind, u64>,
     documents_with_risk: BTreeMap<RiskKind, u64>,
     hidden_text_categories: BTreeMap<HiddenTextCategory, u64>,
@@ -190,6 +192,8 @@ pub(crate) fn analyze_corpus(
     let mut creator_counts = BTreeMap::new();
     let mut producer_stats = BTreeMap::new();
     let mut filter_counts = BTreeMap::new();
+    let mut duplicate_stream_role_groups = BTreeMap::new();
+    let mut duplicate_stream_role_wasted_bytes = BTreeMap::new();
     let mut risk_counts = BTreeMap::new();
     let mut documents_with_risk = BTreeMap::new();
     let mut hidden_text_categories = BTreeMap::new();
@@ -225,6 +229,11 @@ pub(crate) fn analyze_corpus(
             &mut producer_counts,
             &mut creator_counts,
             &mut producer_stats,
+        );
+        accumulate_stream_role_counts(
+            &analysis,
+            &mut duplicate_stream_role_groups,
+            &mut duplicate_stream_role_wasted_bytes,
         );
         accumulate_counts(
             &analysis,
@@ -277,6 +286,8 @@ pub(crate) fn analyze_corpus(
         creator_counts,
         producer_stats,
         filter_counts,
+        duplicate_stream_role_groups,
+        duplicate_stream_role_wasted_bytes,
         risk_counts,
         documents_with_risk,
         hidden_text_categories,
@@ -428,6 +439,19 @@ fn accumulate_producer_context(
     stats.duplicate_inline_image_wasted_bytes +=
         analysis.duplicate_inline_image_payload_wasted_bytes as u64;
     stats.hidden_text_findings += analysis.hidden_text.len() as u64;
+}
+
+fn accumulate_stream_role_counts(
+    analysis: &PdfAnalysis,
+    groups: &mut BTreeMap<String, u64>,
+    wasted_bytes: &mut BTreeMap<String, u64>,
+) {
+    for (role, count) in &analysis.duplicate_stream_role_groups {
+        *groups.entry(role.clone()).or_default() += *count as u64;
+    }
+    for (role, bytes) in &analysis.duplicate_stream_role_wasted_bytes {
+        *wasted_bytes.entry(role.clone()).or_default() += *bytes as u64;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
