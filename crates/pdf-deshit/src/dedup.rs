@@ -5,10 +5,31 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct MetadataDedupStats {
+pub(crate) struct TargetedDedupStats {
     pub duplicate_streams_detected: usize,
     pub duplicate_raw_bytes: usize,
     pub references_canonicalized: usize,
+}
+
+fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
+    let Some(dict) = object.as_stream_dict() else {
+        return Ok(None);
+    };
+
+    // Require byte-identical encoded payload and an identical resolved stream
+    // dictionary. This deliberately refuses broader decoded-content
+    // equivalence: differing filters, decode parameters, or stream attributes
+    // stay as separate objects.
+    let raw = object.get_raw_stream_data()?;
+    let dictionary = dict.unparse_resolved();
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    hasher.update((raw.len() as u64).to_le_bytes());
+    hasher.update(raw.as_ref());
+    hasher.update((dictionary.len() as u64).to_le_bytes());
+    hasher.update(dictionary);
+    Ok(Some(hasher.finalize().into()))
 }
 
 fn metadata_fingerprint(object: &ObjectHandle) -> Result<Option<[u8; 32]>> {
@@ -19,24 +40,12 @@ fn metadata_fingerprint(object: &ObjectHandle) -> Result<Option<[u8; 32]>> {
     if !type_object.try_is_name_and_equals(b"Metadata")? {
         return Ok(None);
     }
-
-    // Require byte-identical encoded payload and an identical resolved stream
-    // dictionary. This deliberately refuses broader "same decoded XML"
-    // equivalence: differing filters, decode parameters, or metadata stream
-    // attributes stay as separate objects.
-    let raw = object.get_raw_stream_data()?;
-    let dictionary = dict.unparse_resolved();
-    let mut hasher = Sha256::new();
-    hasher.update((raw.len() as u64).to_le_bytes());
-    hasher.update(raw.as_ref());
-    hasher.update((dictionary.len() as u64).to_le_bytes());
-    hasher.update(dictionary);
-    Ok(Some(hasher.finalize().into()))
+    stream_fingerprint(object, b"metadata")
 }
 
 pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
-) -> Result<MetadataDedupStats> {
+) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -79,8 +88,79 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
         references_canonicalized += 1;
     }
 
-    Ok(MetadataDedupStats {
+    Ok(TargetedDedupStats {
         duplicate_streams_detected: redirects.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+const FONT_FILE_KEYS: [&[u8]; 3] = [b"/FontFile", b"/FontFile2", b"/FontFile3"];
+
+pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<(Vec<u8>, ObjectRef), ObjectRef> = HashMap::new();
+    let mut duplicate_refs = std::collections::HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for object in &objects {
+        let dict = if let Some(dict) = object.as_stream_dict() {
+            dict
+        } else if object.try_is_dictionary()? {
+            object.clone()
+        } else {
+            continue;
+        };
+        for key in FONT_FILE_KEYS {
+            let font_program = dict.try_get_key(key)?;
+            let Some(font_ref) = font_program.object_ref() else {
+                continue;
+            };
+            if pdf.resolve(&font_program).is_err() {
+                continue;
+            }
+            let Ok(Some(fingerprint)) = stream_fingerprint(&font_program, key) else {
+                continue;
+            };
+            if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                redirects.insert((key.to_vec(), font_ref), canonical_ref);
+                if duplicate_refs.insert(font_ref) {
+                    duplicate_raw_bytes += font_program.get_raw_stream_data()?.len();
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, font_ref);
+            }
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for object in &objects {
+        let dict = if let Some(dict) = object.as_stream_dict() {
+            dict
+        } else if object.try_is_dictionary()? {
+            object.clone()
+        } else {
+            continue;
+        };
+        for key in FONT_FILE_KEYS {
+            let font_program = dict.try_get_key(key)?;
+            let Some(font_ref) = font_program.object_ref() else {
+                continue;
+            };
+            let Some(canonical_ref) = redirects.get(&(key.to_vec(), font_ref)).copied() else {
+                continue;
+            };
+            dict.replace_key(key, pdf.get_object_handle(canonical_ref))?;
+            pdf.mark_object_handle_dirty(&dict)?;
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
         duplicate_raw_bytes,
         references_canonicalized,
     })
@@ -148,6 +228,71 @@ mod tests {
         let different_ref = different_holder.try_get_key(b"/Metadata")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    fn font_program(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, data: &[u8]) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        let dict = stream
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("new font stream has no dictionary".to_owned()))?;
+        dict.replace_key(b"/Length1", ObjectHandle::integer(data.len() as i64))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        Ok(stream)
+    }
+
+    fn font_descriptor(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        key: &[u8],
+        font_program: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        Ok(
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                key.to_vec(),
+                font_program,
+            )]))?,
+        )
+    }
+
+    #[test]
+    fn canonicalizes_font_programs_only_with_same_fontfile_kind_and_dictionary() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let first = font_program(&mut pdf, b"same-font-program")?;
+        let second = font_program(&mut pdf, b"same-font-program")?;
+        let different_key = font_program(&mut pdf, b"same-font-program")?;
+        let different_dict = font_program(&mut pdf, b"same-font-program")?;
+        let different_dict_handle = different_dict
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
+        different_dict_handle.replace_key(b"/Custom", ObjectHandle::integer(1))?;
+        pdf.mark_object_handle_dirty(&different_dict_handle)?;
+
+        let first_descriptor = font_descriptor(&mut pdf, b"/FontFile2", first)?;
+        let second_descriptor = font_descriptor(&mut pdf, b"/FontFile2", second)?;
+        let different_key_descriptor = font_descriptor(&mut pdf, b"/FontFile3", different_key)?;
+        let different_dict_descriptor = font_descriptor(&mut pdf, b"/FontFile2", different_dict)?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFontA", first_descriptor.clone())?;
+        root.replace_key(b"/TestFontB", second_descriptor.clone())?;
+        root.replace_key(b"/TestFontC", different_key_descriptor.clone())?;
+        root.replace_key(b"/TestFontD", different_dict_descriptor.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_font_program_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+
+        let first_ref = first_descriptor.try_get_key(b"/FontFile2")?.object_ref();
+        let second_ref = second_descriptor.try_get_key(b"/FontFile2")?.object_ref();
+        let different_key_ref = different_key_descriptor
+            .try_get_key(b"/FontFile3")?
+            .object_ref();
+        let different_dict_ref = different_dict_descriptor
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_key_ref);
+        assert_ne!(first_ref, different_dict_ref);
         Ok(())
     }
 }

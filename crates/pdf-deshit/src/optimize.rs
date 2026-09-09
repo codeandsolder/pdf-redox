@@ -1,6 +1,8 @@
 use crate::{
     Config, ImagePolicy, OptimizationReport, Result, analyze_pdf,
-    dedup::canonicalize_metadata_streams, hidden_text::apply_hidden_text_policy, scrub::scrub_pdf,
+    dedup::{canonicalize_font_program_streams, canonicalize_metadata_streams},
+    hidden_text::apply_hidden_text_policy,
+    scrub::scrub_pdf,
 };
 use flpdf::{ObjectStreamMode, PageDocumentHelper, Pdf, PdfWriter, StreamDataMode};
 use std::io::Cursor;
@@ -12,6 +14,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
     let metadata_dedup = if cfg.deduplicate_metadata_streams {
         canonicalize_metadata_streams(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let font_dedup = if cfg.deduplicate_font_programs {
+        canonicalize_font_program_streams(&mut pdf)?
     } else {
         Default::default()
     };
@@ -52,6 +59,12 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             metadata_dedup.references_canonicalized, metadata_dedup.duplicate_streams_detected
         ));
     }
+    if font_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate embedded-font reference(s) across {} duplicate font-program stream object(s).",
+            font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
+        ));
+    }
 
     let saved_bytes = input.len() as isize - output.len() as isize;
     let saved_percent = if input.is_empty() {
@@ -70,6 +83,9 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,
+        font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
+        font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
+        font_references_canonicalized: font_dedup.references_canonicalized,
         notes,
     };
     Ok((output, report))
