@@ -11,8 +11,8 @@ use crate::{
 };
 use flpdf::{
     ImageOptimizationOptions, ImageOptimizationStats, ObjectStreamMode, PageDocumentHelper, Pdf,
-    PdfWriter, QPDFLogger, StreamDataMode, optimize_images_with_resize_targets,
-    optimize_images_with_stats,
+    PdfWriter, QPDFLogger, StreamDataMode, externalize_duplicate_inline_images,
+    optimize_images_with_resize_targets, optimize_images_with_stats,
 };
 use std::io::Cursor;
 
@@ -36,9 +36,23 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     } else {
         Default::default()
     };
-    // Canonicalize exact source images before any raster transform. This makes
-    // byte-identical source XObjects share one geometry identity and avoids
-    // decoding/resampling/re-encoding duplicates independently.
+    let inline_image_dedup = if cfg.deduplicate_inline_images
+        && before.duplicate_inline_image_payload_wasted_bytes
+            >= cfg.inline_image_min_duplicate_payload_bytes
+    {
+        externalize_duplicate_inline_images(
+            &mut pdf,
+            0,
+            cfg.inline_image_min_duplicate_payload_bytes,
+        )?
+    } else {
+        Default::default()
+    };
+    // Canonicalize exact source images after duplicate inline-image
+    // externalization and before any raster transform. This lets newly
+    // externalized images share existing byte-identical Image XObjects and
+    // gives lossy transforms one canonical source identity, avoiding
+    // duplicate decode/resample/re-encode work.
     let image_dedup = if cfg.deduplicate_image_xobjects {
         canonicalize_image_xobjects(&mut pdf)?
     } else {
@@ -158,6 +172,15 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             raster_transform.saved_bytes()
         ));
     }
+    if inline_image_dedup.occurrences_externalized > 0 {
+        notes.push(format!(
+            "Externalized {} repeated inline-image occurrence(s) from {} exact semantic fingerprint(s) into {} shared Image XObject(s), representing {} duplicated encoded payload bytes.",
+            inline_image_dedup.occurrences_externalized,
+            inline_image_dedup.fingerprints_selected,
+            inline_image_dedup.xobjects_created,
+            inline_image_dedup.duplicate_payload_bytes
+        ));
+    }
     if before.incremental_update_count > 0 {
         notes.push(format!(
             "Fresh rewrite discarded {} incremental revision(s) from the source byte history.",
@@ -215,6 +238,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        inline_image_fingerprints_selected: inline_image_dedup.fingerprints_selected,
+        inline_image_occurrences_externalized: inline_image_dedup.occurrences_externalized,
+        inline_image_xobjects_created: inline_image_dedup.xobjects_created,
+        inline_image_xobject_references_reused: inline_image_dedup.xobject_references_reused,
+        inline_image_duplicate_payload_bytes: inline_image_dedup.duplicate_payload_bytes,
         image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
         image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
         image_references_canonicalized: image_dedup.references_canonicalized,
@@ -331,6 +359,76 @@ mod tests {
         writer.set_object_stream_mode(ObjectStreamMode::Preserve);
         writer.write()?;
         Ok(writer.get_buffer()?)
+    }
+
+    fn repeated_inline_image_fixture() -> Result<Vec<u8>> {
+        let mut pdf = Pdf::empty()?;
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pdf.resolve(&pages)?;
+
+        let payload = vec![b'A'; 600];
+        let make_content = |copies: usize| {
+            let mut bytes = Vec::new();
+            for _ in 0..copies {
+                bytes.extend_from_slice(b"q BI /W 600 /H 1 /BPC 8 /CS /G ID ");
+                bytes.extend_from_slice(&payload);
+                bytes.extend_from_slice(b" EI Q\n");
+            }
+            bytes
+        };
+
+        let mut page_handles = Vec::new();
+        for copies in [2, 1] {
+            let content = pdf.new_stream_with_data(Rc::new(make_content(copies)))?;
+            let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+                (
+                    b"/MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(600),
+                        ObjectHandle::integer(100),
+                    ]),
+                ),
+                (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                (b"/Contents".to_vec(), content),
+            ]))?;
+            pdf.mark_object_handle_dirty(&page)?;
+            page_handles.push(page);
+        }
+        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(2))?;
+        pdf.mark_object_handle_dirty(&pages)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn optimize_only_externalizes_and_reuses_large_duplicate_inline_images() -> Result<()> {
+        let input = repeated_inline_image_fixture()?;
+        let before = analyze_pdf(&input)?;
+        assert_eq!(before.inline_image_count, 3);
+        assert!(before.duplicate_inline_image_payload_wasted_bytes >= 1024);
+
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(report.inline_image_fingerprints_selected, 1);
+        assert_eq!(report.inline_image_occurrences_externalized, 3);
+        assert_eq!(report.inline_image_xobjects_created, 1);
+        assert!(report.inline_image_duplicate_payload_bytes >= 1024);
+
+        let after = analyze_pdf(&output)?;
+        assert_eq!(after.inline_image_count, 0);
+        assert_eq!(after.image_count, 1);
+        assert_eq!(after.duplicate_image_payload_wasted_bytes, 0);
+        Ok(())
     }
 
     #[test]

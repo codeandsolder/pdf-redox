@@ -215,7 +215,9 @@ pub use page_label_document_helper::{
     merge_adjacent_ranges, merge_adjacent_ranges_with_prefix_presence, LabelRange, LabelStyle,
     PageLabelDocumentHelper,
 };
-pub use page_object_helper::{PageBox, PageObjectHelper};
+pub use page_object_helper::{
+    externalize_duplicate_inline_images, DuplicateInlineImageStats, PageBox, PageObjectHelper,
+};
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use pdf::Pdf;

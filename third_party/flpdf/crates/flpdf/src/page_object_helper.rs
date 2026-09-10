@@ -113,8 +113,9 @@ use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
 use crate::writer::DecodeLevel;
 use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -167,10 +168,35 @@ struct ObjectRecordingCallbacks {
     objects: Vec<ObjectHandle>,
 }
 
+type InlineImageFingerprint = [u8; 32];
+
+/// Statistics from exact duplicate-inline-image externalization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DuplicateInlineImageStats {
+    /// Exact semantic inline-image fingerprints selected for externalization.
+    pub fingerprints_selected: usize,
+    /// Inline-image occurrences replaced by `Do` references.
+    pub occurrences_externalized: usize,
+    /// New indirect Image XObjects allocated.
+    pub xobjects_created: usize,
+    /// Resource entries that reused an XObject created for an earlier scope.
+    pub xobject_references_reused: usize,
+    /// Duplicate encoded payload bytes represented by selected fingerprints.
+    /// This intentionally excludes duplicated inline-image header bytes.
+    pub duplicate_payload_bytes: usize,
+}
+
 struct ExternalizedInlineImage {
     name: Vec<u8>,
     dictionary: ObjectHandle,
     data: Vec<u8>,
+    fingerprint: Option<InlineImageFingerprint>,
+}
+
+enum InlineImageExternalizeMode {
+    All,
+    Count,
+    Selected(Rc<HashSet<InlineImageFingerprint>>),
 }
 
 struct InlineImageExternalizer {
@@ -183,6 +209,10 @@ struct InlineImageExternalizer {
     in_inline_image: bool,
     images: Vec<ExternalizedInlineImage>,
     unresolved_color_spaces: Vec<Vec<u8>>,
+    mode: InlineImageExternalizeMode,
+    fingerprint_counts: HashMap<InlineImageFingerprint, (usize, usize)>,
+    local_names: HashMap<InlineImageFingerprint, Vec<u8>>,
+    externalized_occurrences: usize,
 }
 
 impl InlineImageExternalizer {
@@ -190,6 +220,43 @@ impl InlineImageExternalizer {
         min_size: usize,
         color_spaces: Option<ObjectHandle>,
         resource_names: std::collections::BTreeSet<Vec<u8>>,
+    ) -> Self {
+        Self::with_mode(
+            min_size,
+            color_spaces,
+            resource_names,
+            InlineImageExternalizeMode::All,
+        )
+    }
+
+    fn new_counter(min_size: usize, color_spaces: Option<ObjectHandle>) -> Self {
+        Self::with_mode(
+            min_size,
+            color_spaces,
+            BTreeSet::new(),
+            InlineImageExternalizeMode::Count,
+        )
+    }
+
+    fn new_selected(
+        min_size: usize,
+        color_spaces: Option<ObjectHandle>,
+        resource_names: BTreeSet<Vec<u8>>,
+        selected: Rc<HashSet<InlineImageFingerprint>>,
+    ) -> Self {
+        Self::with_mode(
+            min_size,
+            color_spaces,
+            resource_names,
+            InlineImageExternalizeMode::Selected(selected),
+        )
+    }
+
+    fn with_mode(
+        min_size: usize,
+        color_spaces: Option<ObjectHandle>,
+        resource_names: BTreeSet<Vec<u8>>,
+        mode: InlineImageExternalizeMode,
     ) -> Self {
         Self {
             min_size,
@@ -201,6 +268,10 @@ impl InlineImageExternalizer {
             in_inline_image: false,
             images: Vec::new(),
             unresolved_color_spaces: Vec::new(),
+            mode,
+            fingerprint_counts: HashMap::new(),
+            local_names: HashMap::new(),
+            externalized_occurrences: 0,
         }
     }
 
@@ -318,6 +389,44 @@ impl InlineImageExternalizer {
             .unwrap_or(value)
     }
 
+    fn semantic_fingerprint(
+        dictionary: &ObjectHandle,
+        data: &[u8],
+    ) -> std::result::Result<InlineImageFingerprint, PipelineError> {
+        let serialized = dictionary
+            .try_unparse_resolved()
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update((serialized.len() as u64).to_le_bytes());
+        hasher.update(&serialized);
+        hasher.update((data.len() as u64).to_le_bytes());
+        hasher.update(data);
+        Ok(hasher.finalize().into())
+    }
+
+    fn fingerprint_if_resolved(
+        &mut self,
+        dictionary: &ObjectHandle,
+        data: &[u8],
+        unresolved_before: usize,
+    ) -> std::result::Result<Option<InlineImageFingerprint>, PipelineError> {
+        if self.unresolved_color_spaces.len() != unresolved_before {
+            return Ok(None);
+        }
+        Self::semantic_fingerprint(dictionary, data).map(Some)
+    }
+
+    fn preserve_inline_image(
+        &mut self,
+        token: &Token,
+        output: &mut crate::TokenFilterOutput<'_>,
+    ) -> crate::PipelineResult<()> {
+        output.write(&self.bi_bytes)?;
+        output.write_token(token)?;
+        self.in_inline_image = false;
+        Ok(())
+    }
+
     fn next_name(&mut self) -> Vec<u8> {
         loop {
             let mut name = b"/IIm".to_vec();
@@ -338,23 +447,68 @@ impl TokenFilter for InlineImageExternalizer {
     ) -> crate::PipelineResult<()> {
         if self.in_inline_image {
             if token.token_type == TokenType::InlineImage {
-                if token.value.len() >= self.min_size {
-                    let dict_bytes = self.dict_bytes.clone();
-                    let dictionary =
-                        self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
+                if token.value.len() < self.min_size {
+                    self.preserve_inline_image(token, output)?;
+                    return Ok(());
+                }
+
+                let dict_bytes = self.dict_bytes.clone();
+                let unresolved_before = self.unresolved_color_spaces.len();
+                let dictionary =
+                    self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
+                let fingerprint = match self.mode {
+                    InlineImageExternalizeMode::All => None,
+                    InlineImageExternalizeMode::Count | InlineImageExternalizeMode::Selected(_) => {
+                        self.fingerprint_if_resolved(&dictionary, &token.value, unresolved_before)?
+                    }
+                };
+                if let Some(fingerprint) = fingerprint {
+                    let entry = self
+                        .fingerprint_counts
+                        .entry(fingerprint)
+                        .or_insert((0, token.value.len()));
+                    entry.0 += 1;
+                }
+
+                let selected = match &self.mode {
+                    InlineImageExternalizeMode::All => true,
+                    InlineImageExternalizeMode::Count => false,
+                    InlineImageExternalizeMode::Selected(selected) => {
+                        fingerprint.is_some_and(|fingerprint| selected.contains(&fingerprint))
+                    }
+                };
+                if !selected {
+                    self.preserve_inline_image(token, output)?;
+                    return Ok(());
+                }
+
+                let name = if let Some(fingerprint) = fingerprint {
+                    if let Some(name) = self.local_names.get(&fingerprint) {
+                        name.clone()
+                    } else {
+                        let name = self.next_name();
+                        self.local_names.insert(fingerprint, name.clone());
+                        self.images.push(ExternalizedInlineImage {
+                            name: name.clone(),
+                            dictionary,
+                            data: token.value.clone(),
+                            fingerprint: Some(fingerprint),
+                        });
+                        name
+                    }
+                } else {
                     let name = self.next_name();
                     self.images.push(ExternalizedInlineImage {
                         name: name.clone(),
                         dictionary,
                         data: token.value.clone(),
+                        fingerprint: None,
                     });
-                    output.write(&name)?;
-                    output.write(b" Do\n")?;
-                } else {
-                    output.write(&self.bi_bytes)?;
-                    output.write_token(token)?;
-                    self.in_inline_image = false;
-                }
+                    name
+                };
+                self.externalized_occurrences += 1;
+                output.write(&name)?;
+                output.write(b" Do\n")?;
                 return Ok(());
             }
             if token.is_word_value(b"ID") {
@@ -2005,6 +2159,281 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     pdf.mark_object_handle_dirty(&target)
 }
 
+struct InlineImageTargetSummary {
+    object: ObjectHandle,
+    description: String,
+    fingerprint_counts: HashMap<InlineImageFingerprint, (usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InlineImageFingerprintAggregate {
+    occurrences: usize,
+    payload_bytes: usize,
+    scopes: usize,
+}
+
+fn collect_inline_image_targets<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<Vec<(ObjectHandle, String)>> {
+    let page_refs = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+    let mut targets = Vec::new();
+    let mut seen_forms = HashSet::new();
+    for page_ref in page_refs {
+        let page = pdf.get_object_handle(page_ref);
+        targets.push((page, format!("page {page_ref}")));
+
+        let mut forms = Vec::new();
+        PageObjectHelper::new(page_ref, pdf).for_each_form_xobject(true, |form, _, _| {
+            if seen_forms.insert(form.identity_key()) {
+                forms.push(form);
+            }
+            Ok(())
+        })?;
+        for form in forms {
+            let description = object_handle_description(&form);
+            targets.push((form, description));
+        }
+    }
+    Ok(targets)
+}
+
+fn count_inline_image_fingerprints_for_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: ObjectHandle,
+    description: &str,
+    min_size: usize,
+) -> Result<Option<InlineImageTargetSummary>> {
+    let (target, _) = resolve_attribute_target(pdf, object, description)?;
+    let resources =
+        get_attribute_for_target(pdf, target.clone(), b"/Resources", false, description)?;
+    // Only count occurrences in scopes that can safely receive an /XObject
+    // binding. Otherwise an unmodifiable occurrence could make a lone mutable
+    // occurrence cross the duplicate threshold and turn a no-op into overhead.
+    if resources.as_dictionary().is_none() {
+        return Ok(None);
+    }
+    let color_spaces = resolve_resource_dictionary(pdf, &resources, b"/ColorSpace")?;
+    let mut filter = InlineImageExternalizer::new_counter(min_size, color_spaces);
+    let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
+    if let Err(error) = helper.filter_contents(&mut filter, None) {
+        target.warn_if_possible(&format!(
+            "Unable to inspect content stream for duplicate inline images: {error}"
+        ))?;
+        return Ok(None);
+    }
+    Ok(Some(InlineImageTargetSummary {
+        object: target,
+        description: description.to_owned(),
+        fingerprint_counts: filter.fingerprint_counts,
+    }))
+}
+
+fn create_externalized_inline_image<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    image: &ExternalizedInlineImage,
+) -> Result<ObjectHandle> {
+    let stream = pdf.new_stream_with_data(Rc::new(image.data.clone()))?;
+    let stream_dict = stream.as_stream_dict().ok_or_else(|| {
+        Error::Internal("new duplicate-inline image stream has no dictionary".to_owned())
+    })?;
+    if let Some(entries) = image.dictionary.as_dictionary() {
+        for (key, value) in entries {
+            stream_dict.replace_key(&key, value)?;
+        }
+    }
+    pdf.mark_object_handle_dirty(&stream)?;
+    Ok(stream)
+}
+
+fn externalize_selected_inline_images_for_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    summary: InlineImageTargetSummary,
+    min_size: usize,
+    selected: Rc<HashSet<InlineImageFingerprint>>,
+    xobjects_by_fingerprint: &mut HashMap<InlineImageFingerprint, ObjectHandle>,
+    stats: &mut DuplicateInlineImageStats,
+) -> Result<()> {
+    if !summary
+        .fingerprint_counts
+        .keys()
+        .any(|fingerprint| selected.contains(fingerprint))
+    {
+        return Ok(());
+    }
+
+    let (target, is_form) = resolve_attribute_target(pdf, summary.object, &summary.description)?;
+    // Inspect against the current effective scope without changing it. In
+    // particular, a resource-less Form may borrow names from its caller;
+    // manufacturing a local /Resources dictionary here would shadow those
+    // names. Such a scope is therefore left untouched by this optimization.
+    let read_resources = get_attribute_for_target(
+        pdf,
+        target.clone(),
+        b"/Resources",
+        false,
+        &summary.description,
+    )?;
+    if read_resources.as_dictionary().is_none() {
+        return Ok(());
+    }
+    let resource_names = collect_resource_names(pdf, &read_resources)?;
+    let color_spaces = resolve_resource_dictionary(pdf, &read_resources, b"/ColorSpace")?;
+    let mut filter =
+        InlineImageExternalizer::new_selected(min_size, color_spaces, resource_names, selected);
+    let mut rewritten = Vec::new();
+    {
+        let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
+        let mut sink = PlString::new("duplicate-inline image content", None, &mut rewritten);
+        if let Err(error) = helper.filter_contents(&mut filter, Some(&mut sink)) {
+            target.warn_if_possible(&format!(
+                "Unable to filter content stream for duplicate inline images: {error}"
+            ))?;
+            return Ok(());
+        }
+    }
+    if filter.externalized_occurrences == 0 {
+        return Ok(());
+    }
+
+    // Copy-on-write only after filtering has succeeded and at least one
+    // replacement is known to be useful. This keeps failed/no-op inspection
+    // from perturbing page resource structure.
+    let resources = get_attribute_for_target(
+        pdf,
+        target.clone(),
+        b"/Resources",
+        true,
+        &summary.description,
+    )?;
+    if resources.as_dictionary().is_none() {
+        return Ok(());
+    }
+    let existing_xobjects = resources.get_key(b"/XObject");
+    pdf.resolve(&existing_xobjects)?;
+    let empty_xobjects = ObjectHandle::dictionary(Vec::new());
+    let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
+    resources.merge_resources(&seed, None)?;
+    pdf.mark_object_handle_dirty(&resources)?;
+
+    let xobjects = resources.get_key(b"/XObject");
+    pdf.resolve(&xobjects)?;
+    if xobjects.as_dictionary().is_none() {
+        return Ok(());
+    }
+    for image in &filter.images {
+        let fingerprint = image.fingerprint.ok_or_else(|| {
+            Error::Internal("selected duplicate-inline image has no fingerprint".to_owned())
+        })?;
+        let stream = if let Some(existing) = xobjects_by_fingerprint.get(&fingerprint) {
+            stats.xobject_references_reused += 1;
+            existing.clone()
+        } else {
+            let stream = create_externalized_inline_image(pdf, image)?;
+            xobjects_by_fingerprint.insert(fingerprint, stream.clone());
+            stats.xobjects_created += 1;
+            stream
+        };
+        xobjects.replace_key(&image.name, stream)?;
+    }
+    pdf.mark_object_handle_dirty(&xobjects)?;
+
+    if is_form {
+        target.replace_stream_data(
+            Rc::new(rewritten),
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        );
+    } else {
+        let contents = pdf.new_stream_with_data(Rc::new(rewritten))?;
+        target.replace_key(b"/Contents", contents)?;
+    }
+    pdf.mark_object_handle_dirty(&target)?;
+    stats.occurrences_externalized += filter.externalized_occurrences;
+    Ok(())
+}
+
+/// Externalize only exact repeated inline images, reusing one indirect Image
+/// XObject for every selected semantic fingerprint across page/Form scopes.
+///
+/// A fingerprint includes the expanded/converted Image XObject dictionary and
+/// the encoded inline payload. Inline images whose color-space name cannot be
+/// resolved are deliberately excluded. A fingerprint must occur in at least
+/// two mutable page/Form content scopes and its duplicated payload bytes
+/// `(occurrences - 1) * payload_len` must meet `min_duplicate_payload_bytes`;
+/// duplicated inline header bytes are ignored by the gate. Requiring cross-
+/// scope repetition targets redundancy that content-stream compression cannot
+/// already exploit locally.
+pub fn externalize_duplicate_inline_images<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    min_size: usize,
+    min_duplicate_payload_bytes: usize,
+) -> Result<DuplicateInlineImageStats> {
+    let targets = collect_inline_image_targets(pdf)?;
+    let mut summaries = Vec::new();
+    let mut counts: HashMap<InlineImageFingerprint, InlineImageFingerprintAggregate> =
+        HashMap::new();
+
+    for (object, description) in targets {
+        let Some(summary) =
+            count_inline_image_fingerprints_for_target(pdf, object, &description, min_size)?
+        else {
+            continue;
+        };
+        for (&fingerprint, &(count, bytes)) in &summary.fingerprint_counts {
+            let entry = counts.entry(fingerprint).or_default();
+            entry.occurrences += count;
+            entry.payload_bytes = bytes;
+            entry.scopes += 1;
+        }
+        summaries.push(summary);
+    }
+
+    let selected: HashSet<_> = counts
+        .iter()
+        .filter_map(|(fingerprint, aggregate)| {
+            let wasted = aggregate
+                .occurrences
+                .saturating_sub(1)
+                .saturating_mul(aggregate.payload_bytes);
+            (aggregate.occurrences >= 2
+                && aggregate.scopes >= 2
+                && wasted >= min_duplicate_payload_bytes)
+                .then_some(*fingerprint)
+        })
+        .collect();
+    let mut stats = DuplicateInlineImageStats {
+        fingerprints_selected: selected.len(),
+        duplicate_payload_bytes: selected
+            .iter()
+            .filter_map(|fingerprint| counts.get(fingerprint))
+            .map(|aggregate| {
+                aggregate
+                    .occurrences
+                    .saturating_sub(1)
+                    .saturating_mul(aggregate.payload_bytes)
+            })
+            .sum(),
+        ..DuplicateInlineImageStats::default()
+    };
+    if selected.is_empty() {
+        return Ok(stats);
+    }
+
+    let selected = Rc::new(selected);
+    let mut xobjects_by_fingerprint = HashMap::new();
+    for summary in summaries {
+        externalize_selected_inline_images_for_target(
+            pdf,
+            summary,
+            min_size,
+            selected.clone(),
+            &mut xobjects_by_fingerprint,
+            &mut stats,
+        )?;
+    }
+    Ok(stats)
+}
+
 fn object_handle_description(object: &ObjectHandle) -> String {
     object
         .object_ref()
@@ -2758,6 +3187,204 @@ mod tests {
                 .expect("orphan association should resolve"),
             Some(annotation_ref),
             "the rebuilt qpdf orphan scan must self-associate the copied Widget"
+        );
+    }
+
+    fn pdf_with_inline_image_pages(contents: &[&str]) -> Vec<u8> {
+        let kids = (0..contents.len())
+            .map(|index| format!("{} 0 R", 3 + index as u32 * 2))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (
+                2,
+                format!(
+                    "<< /Type /Pages /Kids [{kids}] /Count {} >>",
+                    contents.len()
+                ),
+            ),
+        ];
+        for (index, content) in contents.iter().enumerate() {
+            let page_num = 3 + index as u32 * 2;
+            let content_num = page_num + 1;
+            objects.push((
+                page_num,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents {content_num} 0 R >>"
+                ),
+            ));
+            objects.push((
+                content_num,
+                format!(
+                    "<< /Length {} >>\nstream\n{}\nendstream",
+                    content.len(),
+                    content
+                ),
+            ));
+        }
+        pdf_from_objects(1, &objects)
+    }
+
+    #[test]
+    fn blanket_inline_externalization_retains_qpdf_per_occurrence_behavior() {
+        let inline = "BI /W 2 /H 1 /BPC 8 /CS /RGB ID abcdef EI";
+        let page = format!("q {inline} Q q {inline} Q");
+        let bytes = pdf_with_inline_image_pages(&[&page]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("inline-image PDF should parse");
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+
+        PageObjectHelper::new(page_ref, &mut pdf)
+            .externalize_inline_images(0, true)
+            .expect("blanket qpdf-compatible externalization should succeed");
+
+        let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+        assert_eq!(
+            helper.get_images().expect("externalized images").len(),
+            2,
+            "the original API must keep one XObject per occurrence"
+        );
+        let objects = helper
+            .content_stream_objects()
+            .expect("rewritten contents should parse");
+        assert!(objects
+            .iter()
+            .all(|object| object.as_inline_image().is_none()));
+    }
+
+    #[test]
+    fn duplicate_inline_externalization_reuses_one_xobject_across_occurrences_and_pages() {
+        let inline = "BI /W 2 /H 1 /BPC 8 /CS /RGB ID abcdef EI";
+        let page_one = format!("q {inline} Q q {inline} Q");
+        let page_two = format!("q {inline} Q");
+        let bytes = pdf_with_inline_image_pages(&[&page_one, &page_two]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("inline-image PDF should parse");
+
+        let stats = externalize_duplicate_inline_images(&mut pdf, 0, 1)
+            .expect("duplicate inline images should externalize");
+        assert_eq!(stats.fingerprints_selected, 1);
+        assert_eq!(stats.occurrences_externalized, 3);
+        assert_eq!(stats.xobjects_created, 1);
+        assert_eq!(stats.xobject_references_reused, 1);
+        assert_eq!(stats.duplicate_payload_bytes, 14);
+
+        let pages = crate::pages::page_refs(&mut pdf).expect("page refs");
+        assert_eq!(pages.len(), 2);
+        let mut shared_ref = None;
+        for page_ref in pages {
+            let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+            let images = helper.get_images().expect("externalized images");
+            assert_eq!(images.len(), 1, "each page needs one local resource name");
+            let image_ref = images
+                .values()
+                .next()
+                .and_then(ObjectHandle::object_ref)
+                .expect("externalized image must be indirect");
+            if let Some(expected) = shared_ref {
+                assert_eq!(image_ref, expected, "pages must reuse one image object");
+            } else {
+                shared_ref = Some(image_ref);
+            }
+            let objects = helper
+                .content_stream_objects()
+                .expect("rewritten contents should parse");
+            assert!(objects
+                .iter()
+                .all(|object| object.as_inline_image().is_none()));
+        }
+    }
+
+    #[test]
+    fn duplicate_inline_selection_requires_cross_scope_repetition() {
+        let inline = "BI /W 2 /H 1 /BPC 8 /CS /RGB ID abcdef EI";
+        let page = format!("q {inline} Q q {inline} Q");
+        let bytes = pdf_with_inline_image_pages(&[&page]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("inline-image PDF should parse");
+
+        let stats = externalize_duplicate_inline_images(&mut pdf, 0, 1)
+            .expect("same-scope repetition should remain inline");
+        assert_eq!(stats, DuplicateInlineImageStats::default());
+
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let objects = PageObjectHelper::new(page_ref, &mut pdf)
+            .content_stream_objects()
+            .expect("original contents should remain parseable");
+        assert_eq!(
+            objects
+                .iter()
+                .filter(|object| object.as_inline_image().is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_inline_selection_ignores_scopes_without_mutable_resources() {
+        let inline = "BI /W 2 /H 1 /BPC 8 /CS /RGB ID abcdef EI";
+        let content = format!("q {inline} Q");
+        let objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_owned()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>".to_owned(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+            ),
+            (
+                5,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R >>".to_owned(),
+            ),
+            (
+                6,
+                format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+            ),
+        ];
+        let mut pdf = Pdf::open(Cursor::new(pdf_from_objects(1, &objects)))
+            .expect("inline-image PDF should parse");
+
+        let stats = externalize_duplicate_inline_images(&mut pdf, 0, 1)
+            .expect("an unmodifiable scope must not manufacture a duplicate");
+        assert_eq!(stats, DuplicateInlineImageStats::default());
+
+        for page_ref in crate::pages::page_refs(&mut pdf).expect("page refs") {
+            let objects = PageObjectHelper::new(page_ref, &mut pdf)
+                .content_stream_objects()
+                .expect("original contents should remain parseable");
+            assert_eq!(
+                objects
+                    .iter()
+                    .filter(|object| object.as_inline_image().is_some())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_inline_fingerprint_includes_converted_dictionary_semantics() {
+        let rgb = "BI /W 2 /H 1 /BPC 8 /CS /RGB ID abcdef EI";
+        let gray = "BI /W 6 /H 1 /BPC 8 /CS /G ID abcdef EI";
+        let page = format!("q {rgb} Q q {gray} Q");
+        let bytes = pdf_with_inline_image_pages(&[&page]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("inline-image PDF should parse");
+
+        let stats = externalize_duplicate_inline_images(&mut pdf, 0, 1)
+            .expect("non-duplicate inline images should be a no-op");
+        assert_eq!(stats, DuplicateInlineImageStats::default());
+
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let objects = PageObjectHelper::new(page_ref, &mut pdf)
+            .content_stream_objects()
+            .expect("original contents should still parse");
+        assert_eq!(
+            objects
+                .iter()
+                .filter(|object| object.as_inline_image().is_some())
+                .count(),
+            2
         );
     }
 

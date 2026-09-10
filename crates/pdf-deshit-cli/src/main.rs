@@ -57,6 +57,12 @@ struct Args {
     /// Preserve separate byte-identical metadata stream objects instead of canonicalizing them.
     #[arg(long)]
     no_metadata_dedup: bool,
+    /// Preserve repeated inline-image syntax instead of externalizing exact duplicates.
+    #[arg(long)]
+    no_inline_image_dedup: bool,
+    /// Minimum duplicated encoded payload bytes for one cross-scope inline-image fingerprint.
+    #[arg(long, default_value_t = 1024)]
+    inline_image_dedup_min_waste: usize,
     /// Preserve separate exact duplicate embedded font-program stream objects.
     #[arg(long)]
     no_font_program_dedup: bool,
@@ -121,6 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.prune_resources = a.prune_resources;
     cfg.deduplicate_metadata_streams = !a.no_metadata_dedup;
     cfg.deduplicate_font_programs = !a.no_font_program_dedup;
+    cfg.deduplicate_inline_images = !a.no_inline_image_dedup;
+    cfg.inline_image_min_duplicate_payload_bytes = a.inline_image_dedup_min_waste;
     cfg.deduplicate_image_xobjects = !a.no_image_dedup;
     cfg.deduplicate_icc_profiles = !a.no_icc_dedup;
 

@@ -40,6 +40,17 @@ few opt-in controls needed by pdf-deshit:
   dimension-changing transforms when parsing required recovery.
 - `ImageOptimizationStats` additionally reports resize count and source/output
   pixel totals for callers using the targeted resize path.
+- `externalize_duplicate_inline_images()` adds a two-pass exact-repeat mode
+  separate from qpdf's existing blanket inline-image externalizer. It
+  fingerprints the expanded/converted Image XObject dictionary plus encoded
+  inline payload, excludes unresolved color-space semantics and scopes without
+  a mutable resource dictionary, and rewrites only fingerprints present in at
+  least two mutable content scopes whose duplicated payload clears a
+  caller-provided threshold. One local resource name is reused per fingerprint
+  per content scope, and one indirect Image XObject is reused globally across
+  page/Form scopes. Counting is read-only and resource copy-on-write is
+  deferred until a successful selected rewrite. The original
+  `PageObjectHelper::externalize_inline_images()` behavior is unchanged.
 
 The original `PlDct::new_compressor()` still takes the quality-75 path.
 Custom-quality callers use `new_compressor_with_quality()`.
@@ -47,11 +58,14 @@ Custom-quality callers use `new_compressor_with_quality()`.
 ## Validation
 
 The fork retains upstream unit tests embedded in `src/`. Local regression
-coverage additionally verifies that configured JPEG quality changes output and
-that the savings gate rejects an otherwise-smaller conversion. pdf-deshit's
-own tests construct a two-page PDF sharing one lossless image and verify one
-transcode plus one cached-reference reuse through a complete write/reopen
-round trip.
+coverage additionally verifies that configured JPEG quality changes output,
+that the savings gate rejects an otherwise-smaller conversion, that repeated
+inline images reuse one indirect XObject across pages while differing image
+semantics stay separate, same-scope-only repetition stays inline, and
+non-mutable resource scopes cannot create a false duplicate-selection signal.
+pdf-deshit's own tests construct a two-page PDF sharing one lossless image and
+verify one transcode plus one cached-reference reuse through a complete
+write/reopen round trip.
 
 When updating upstream, rebase these small extensions first rather than
 copying newer source over this directory blindly.
