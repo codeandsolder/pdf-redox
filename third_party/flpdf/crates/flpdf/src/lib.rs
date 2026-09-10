@@ -192,8 +192,9 @@ pub use job::{
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{
-    optimize_images, optimize_images_with_stats, should_remove_unreferenced_resources,
-    ImageOptimizationOptions, ImageOptimizationStats, RemoveUnreferencedResources,
+    optimize_images, optimize_images_with_resize_targets, optimize_images_with_stats,
+    should_remove_unreferenced_resources, ImageOptimizationOptions, ImageOptimizationStats,
+    ImageResizeTarget, RemoveUnreferencedResources,
 };
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{

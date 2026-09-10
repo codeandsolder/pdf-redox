@@ -11,10 +11,14 @@
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::count::Count;
 use crate::pipeline::dct::PlDct;
-use crate::pipeline::{Discard, Pipeline};
+use crate::pipeline::{Discard, Pipeline, PlString};
 use crate::writer::DecodeLevel;
 use crate::{
-    ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, QPDFLogger, Result, StreamDataProvider,
+    Error, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, QPDFLogger, Result,
+    StreamDataProvider,
+};
+use fast_image_resize::{
+    images::Image as ResizeImage, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
 };
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -65,9 +69,29 @@ impl Default for ImageOptimizationOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImageOptimizationStats {
     pub images_optimized: usize,
+    pub images_resized: usize,
     pub original_encoded_bytes: u64,
     pub optimized_encoded_bytes: u64,
+    pub original_pixels: u64,
+    pub optimized_pixels: u64,
     pub references_reused: usize,
+}
+
+/// Requested pixel dimensions for an already-placed image XObject.
+///
+/// The targeted resize API never upscales: dimensions larger than the source
+/// are clamped back to the source dimensions before evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageResizeTarget {
+    pub width: u32,
+    pub height: u32,
+}
+
+struct ResizedImage {
+    encoded: Vec<u8>,
+    width: u32,
+    height: u32,
+    original_encoded_bytes: u64,
 }
 
 impl ImageOptimizationStats {
@@ -209,6 +233,214 @@ pub fn optimize_images_with_stats<R: Read + Seek + 'static>(
         for (xobjects, key, new_image) in replacements {
             xobjects.replace_key(&key, new_image.clone())?;
             pdf.mark_object_handle_dirty(&new_image)?;
+            pdf.mark_object_handle_dirty(&xobjects)?;
+        }
+    }
+    Ok(stats)
+}
+
+fn is_conservative_dct_resize_source(dictionary: &ObjectHandle) -> Result<bool> {
+    if !dictionary.try_get_key(b"/SMask")?.is_null()
+        || !dictionary.try_get_key(b"/Mask")?.is_null()
+        || !dictionary.try_get_key(b"/Decode")?.is_null()
+        || !dictionary.try_get_key(b"/DecodeParms")?.is_null()
+        || dictionary
+            .try_get_key(b"/BitsPerComponent")?
+            .try_get_int_value()
+            .ok()
+            != Some(8)
+    {
+        return Ok(false);
+    }
+
+    let filter = dictionary.try_get_key(b"/Filter")?;
+    if !filter.try_is_name_and_equals(b"DCTDecode")? && !filter.try_is_name_and_equals(b"DCT")? {
+        return Ok(false);
+    }
+
+    let color_space = dictionary.try_get_key(b"/ColorSpace")?;
+    color_space.try_dereference()?;
+    Ok(color_space.try_is_name_and_equals(b"DeviceGray")?
+        || color_space.try_is_name_and_equals(b"DeviceRGB")?)
+}
+
+fn isolate_page_xobjects<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<ObjectHandle> {
+    let resources = PageObjectHelper::new(page_ref, pdf).get_resources(true)?;
+    if resources.is_null() {
+        return Err(Error::Internal(
+            "targeted image replacement page has no resources".to_owned(),
+        ));
+    }
+    let xobjects = resources.try_get_key(b"/XObject")?;
+    pdf.resolve(&xobjects)?;
+    if xobjects.as_dictionary().is_none() {
+        return Err(Error::Internal(
+            "targeted image replacement page has no XObject dictionary".to_owned(),
+        ));
+    }
+
+    let isolated = xobjects.shallow_copy()?;
+    resources.replace_key(b"/XObject", isolated.clone())?;
+    pdf.mark_object_handle_dirty(&resources)?;
+    Ok(isolated)
+}
+
+/// Resize selected image XObjects to caller-supplied pixel dimensions and
+/// re-encode accepted results as JPEG. Images not present in `targets` are
+/// untouched. The target map is keyed by `(page, source image)` identity, so
+/// only page bindings explicitly selected by a placement-aware caller are
+/// mutated. Page resource dictionaries are copy-on-write isolated before
+/// replacement, and a shared source image with the same target dimensions is
+/// transformed once and reused across selected page bindings.
+///
+/// This is intentionally separate from qpdf-compatible [`optimize_images`]:
+/// existing callers retain qpdf's no-resize behavior, while placement-aware
+/// consumers can opt into dimension changes explicitly.
+pub fn optimize_images_with_resize_targets<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    verbose: bool,
+    options: ImageOptimizationOptions,
+    targets: &HashMap<(ObjectRef, ObjectRef), ImageResizeTarget>,
+) -> Result<ImageOptimizationStats> {
+    let mut stats = ImageOptimizationStats::default();
+    let mut optimized_by_source: HashMap<(ObjectRef, ImageResizeTarget), ObjectHandle> =
+        HashMap::new();
+    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+
+    for (page_index, page_ref) in page_refs.into_iter().enumerate() {
+        let page_number = page_index + 1;
+        let mut replacements = Vec::new();
+        {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.for_each_image(false, |image, _xobjects, key| {
+                let Some(source_ref) = image.object_ref() else {
+                    return Ok(());
+                };
+                let Some(target) = targets.get(&(page_ref, source_ref)).copied() else {
+                    return Ok(());
+                };
+                let description = format!(
+                    "image {} on page {page_number}",
+                    String::from_utf8_lossy(&key)
+                );
+
+                if let Some(cached) = optimized_by_source.get(&(source_ref, target)) {
+                    replacements.push((key, cached.clone()));
+                    stats.references_reused += 1;
+                    return Ok(());
+                }
+
+                let Some(dictionary) = image.as_stream_dict() else {
+                    return Ok(());
+                };
+                let conservative_source = match is_conservative_dct_resize_source(&dictionary) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log_verbose(
+                            logger,
+                            message_prefix,
+                            verbose,
+                            &description,
+                            format!("not resizing because image metadata is malformed: {error}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
+                if !conservative_source {
+                    log_verbose(
+                        logger,
+                        message_prefix,
+                        verbose,
+                        &description,
+                        "not resizing because the JPEG uses unsupported color, mask, decode, or filter semantics"
+                            .to_owned(),
+                    )?;
+                    return Ok(());
+                }
+
+                let optimizer = match ImageOptimizer::prepare(image.clone(), options) {
+                    Ok(PrepareResult::Ready(optimizer)) => optimizer,
+                    Ok(PrepareResult::Skip(reason)) => {
+                        log_skip(logger, message_prefix, verbose, &description, reason)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        log_verbose(
+                            logger,
+                            message_prefix,
+                            verbose,
+                            &description,
+                            format!("not resizing because image metadata is malformed: {error}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
+
+                let resized = match optimizer.resize_and_encode(target) {
+                    Ok(Some(resized)) => resized,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        log_verbose(
+                            logger,
+                            message_prefix,
+                            verbose,
+                            &description,
+                            format!(
+                                "not resizing because image decoding/resampling failed: {error}"
+                            ),
+                        )?;
+                        return Ok(());
+                    }
+                };
+                let original_length = resized.original_encoded_bytes;
+                let compressed_length = resized.encoded.len() as u64;
+                let savings = original_length.saturating_sub(compressed_length);
+                let clears_byte_gate = savings >= options.min_savings_bytes;
+                let clears_percent_gate = u128::from(savings) * 100
+                    >= u128::from(original_length) * u128::from(options.min_savings_percent);
+                if compressed_length >= original_length || !clears_byte_gate || !clears_percent_gate
+                {
+                    return Ok(());
+                }
+
+                let new_image = image.copy_stream()?;
+                let new_dictionary = new_image.as_stream_dict().ok_or_else(|| {
+                    Error::Internal("copied image has no stream dictionary".to_owned())
+                })?;
+                new_dictionary
+                    .replace_key(b"/Width", ObjectHandle::integer(i64::from(resized.width)))?;
+                new_dictionary
+                    .replace_key(b"/Height", ObjectHandle::integer(i64::from(resized.height)))?;
+                new_image.replace_stream_data(
+                    Rc::new(resized.encoded),
+                    Some(ObjectHandle::name(b"DCTDecode".to_vec())),
+                    Some(ObjectHandle::null()),
+                );
+
+                stats.images_optimized += 1;
+                stats.images_resized += 1;
+                stats.original_encoded_bytes += original_length;
+                stats.optimized_encoded_bytes += compressed_length;
+                stats.original_pixels += u64::from(optimizer.width) * u64::from(optimizer.height);
+                stats.optimized_pixels += u64::from(resized.width) * u64::from(resized.height);
+
+                optimized_by_source.insert((source_ref, target), new_image.clone());
+                replacements.push((key, new_image));
+                Ok(())
+            })?;
+        }
+
+        if !replacements.is_empty() {
+            let xobjects = isolate_page_xobjects(pdf, page_ref)?;
+            for (key, new_image) in replacements {
+                xobjects.replace_key(&key, new_image.clone())?;
+                pdf.mark_object_handle_dirty(&new_image)?;
+            }
             pdf.mark_object_handle_dirty(&xobjects)?;
         }
     }
@@ -403,24 +635,82 @@ impl ImageOptimizer {
     }
 
     fn encoder<'a>(&self, next: &'a mut dyn Pipeline) -> PlDct<'a> {
+        self.encoder_for_dimensions(next, self.width, self.height)
+    }
+
+    fn encoder_for_dimensions<'a>(
+        &self,
+        next: &'a mut dyn Pipeline,
+        width: u32,
+        height: u32,
+    ) -> PlDct<'a> {
         if self.jpeg_quality == 75 {
             PlDct::new_compressor(
                 "jpg",
                 next,
-                self.width as usize,
-                self.height as usize,
+                width as usize,
+                height as usize,
                 self.pixel_format,
             )
         } else {
             PlDct::new_compressor_with_quality(
                 "jpg",
                 next,
-                self.width as usize,
-                self.height as usize,
+                width as usize,
+                height as usize,
                 self.pixel_format,
                 self.jpeg_quality,
             )
         }
+    }
+
+    fn resize_pixel_type(&self) -> Option<PixelType> {
+        match self.pixel_format {
+            libjpeg_turbo_rs::PixelFormat::Grayscale => Some(PixelType::U8),
+            libjpeg_turbo_rs::PixelFormat::Rgb => Some(PixelType::U8x3),
+            libjpeg_turbo_rs::PixelFormat::Cmyk => Some(PixelType::U8x4),
+            _ => None,
+        }
+    }
+
+    fn resize_and_encode(&self, target: ImageResizeTarget) -> Result<Option<ResizedImage>> {
+        let target_width = target.width.max(1).min(self.width);
+        let target_height = target.height.max(1).min(self.height);
+        if target_width == self.width && target_height == self.height {
+            return Ok(None);
+        }
+
+        let raw = self.image.get_raw_stream_data()?;
+        let original_encoded_bytes = raw.len() as u64;
+        let decoded = crate::filters::decode_stream_data(&self.dictionary, raw.as_ref())?;
+        let pixel_type = self.resize_pixel_type().ok_or_else(|| {
+            Error::Unsupported("unsupported pixel format for image resizing".to_owned())
+        })?;
+        let source = ResizeImage::from_vec_u8(self.width, self.height, decoded, pixel_type)
+            .map_err(|error| {
+                Error::Unsupported(format!("invalid decoded image buffer: {error}"))
+            })?;
+        let mut destination = ResizeImage::new(target_width, target_height, pixel_type);
+        let mut resizer = Resizer::new();
+        let resize_options =
+            ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+        resizer
+            .resize(&source, &mut destination, &resize_options)
+            .map_err(|error| Error::Unsupported(format!("unable to resize image: {error}")))?;
+
+        let mut encoded = Vec::new();
+        {
+            let mut sink = PlString::new("resized jpeg", None, &mut encoded);
+            let mut encoder = self.encoder_for_dimensions(&mut sink, target_width, target_height);
+            encoder.write(destination.buffer())?;
+            encoder.finish()?;
+        }
+        Ok(Some(ResizedImage {
+            encoded,
+            width: target_width,
+            height: target_height,
+            original_encoded_bytes,
+        }))
     }
 }
 
@@ -598,6 +888,172 @@ mod tests {
             .provide_stream_data_by_id(0, 0, &mut sink)
             .expect("provider emits the same deterministic JPEG");
         assert!(output.starts_with(&[0xff, 0xd8]));
+    }
+
+    #[test]
+    fn targeted_resize_isolates_page_xobjects_from_other_resource_owners() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+        let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists"))
+            .expect("fixture opens");
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+
+        let shared_xobjects = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Im".to_vec(),
+                ObjectHandle::integer(7),
+            )]))
+            .expect("shared XObject dictionary");
+        let shared_resources = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/XObject".to_vec(),
+                shared_xobjects.clone(),
+            )]))
+            .expect("shared Resources dictionary");
+
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("page resolves");
+        page.replace_key(b"/Resources", shared_resources.clone())
+            .expect("page resources");
+        pdf.mark_object_handle_dirty(&page).expect("dirty page");
+
+        let other_owner = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                shared_resources,
+            )]))
+            .expect("other resource owner");
+
+        let isolated = isolate_page_xobjects(&mut pdf, page_ref).expect("isolate page XObjects");
+        isolated
+            .replace_key(b"/Im", ObjectHandle::integer(8))
+            .expect("mutate page-local XObject dictionary");
+
+        pdf.resolve(&other_owner).expect("other owner resolves");
+        let other_resources = other_owner
+            .try_get_key(b"/Resources")
+            .expect("other resources");
+        pdf.resolve(&other_resources)
+            .expect("other resources resolve");
+        let other_xobjects = other_resources
+            .try_get_key(b"/XObject")
+            .expect("other XObjects");
+        pdf.resolve(&other_xobjects)
+            .expect("other XObjects resolve");
+
+        assert_eq!(
+            isolated.try_get_key(b"/Im").expect("page Im").as_integer(),
+            Some(8)
+        );
+        assert_eq!(
+            other_xobjects
+                .try_get_key(b"/Im")
+                .expect("other Im")
+                .as_integer(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn targeted_resize_rejects_ambiguous_pdf_image_semantics() {
+        let image = direct_image(200, 100, vec![0; 20_000]);
+        let dictionary = image.as_stream_dict().expect("image dictionary");
+        dictionary
+            .replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))
+            .expect("install DCT filter");
+        assert!(is_conservative_dct_resize_source(&dictionary).unwrap());
+
+        dictionary
+            .replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceCMYK".to_vec()))
+            .expect("install CMYK color space");
+        assert!(!is_conservative_dct_resize_source(&dictionary).unwrap());
+
+        dictionary
+            .replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceRGB".to_vec()))
+            .expect("restore RGB color space");
+        dictionary
+            .replace_key(
+                b"/Decode",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(0),
+                ]),
+            )
+            .expect("install decode array");
+        assert!(!is_conservative_dct_resize_source(&dictionary).unwrap());
+
+        dictionary
+            .replace_key(b"/Decode", ObjectHandle::null())
+            .expect("clear decode array");
+        dictionary
+            .replace_key(b"/Mask", ObjectHandle::array(Vec::new()))
+            .expect("install mask");
+        assert!(!is_conservative_dct_resize_source(&dictionary).unwrap());
+    }
+
+    #[test]
+    fn resize_path_decodes_existing_dct_and_reencodes_target_dimensions() {
+        let source_pixels: Vec<u8> = (0..200 * 100)
+            .map(|index| ((index * 37 + index / 11) & 0xff) as u8)
+            .collect();
+        let source_optimizer = prepared_gray_optimizer(200, 100, source_pixels);
+        let mut jpeg = Vec::new();
+        {
+            let mut sink = PlString::new("jpeg sink", None, &mut jpeg);
+            source_optimizer
+                .provide_stream_data_by_id(0, 0, &mut sink)
+                .expect("encode source JPEG");
+        }
+
+        let image = direct_image(200, 100, jpeg);
+        let dictionary = image.as_stream_dict().expect("image dictionary");
+        dictionary
+            .replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))
+            .expect("install DCT filter");
+        let optimizer = match ImageOptimizer::prepare(
+            image,
+            ImageOptimizationOptions {
+                min_width: 0,
+                min_height: 0,
+                min_area: 0,
+                jpeg_quality: 85,
+                ..ImageOptimizationOptions::default()
+            },
+        )
+        .expect("prepare DCT resize source")
+        {
+            PrepareResult::Ready(optimizer) => optimizer,
+            PrepareResult::Skip(_) => panic!("DCT resize source should be eligible"),
+        };
+
+        let resized = optimizer
+            .resize_and_encode(ImageResizeTarget {
+                width: 100,
+                height: 50,
+            })
+            .expect("resize DCT source")
+            .expect("target is smaller than source");
+        assert_eq!((resized.width, resized.height), (100, 50));
+        assert!(resized.encoded.starts_with(&[0xff, 0xd8]));
+
+        let resized_image = direct_image(100, 50, resized.encoded);
+        let resized_dict = resized_image.as_stream_dict().expect("resized dictionary");
+        resized_dict
+            .replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))
+            .expect("install resized DCT filter");
+        let decoded = crate::filters::decode_stream_data(
+            &resized_dict,
+            resized_image
+                .get_raw_stream_data()
+                .expect("read resized JPEG")
+                .as_ref(),
+        )
+        .expect("decode resized JPEG");
+        assert_eq!(decoded.len(), 100 * 50);
     }
 
     #[test]

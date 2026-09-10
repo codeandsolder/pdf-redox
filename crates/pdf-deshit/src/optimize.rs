@@ -6,11 +6,13 @@ use crate::{
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
+    print::{PrintPlan, plan_print_downsampling},
     scrub::scrub_pdf,
 };
 use flpdf::{
     ImageOptimizationOptions, ImageOptimizationStats, ObjectStreamMode, PageDocumentHelper, Pdf,
-    PdfWriter, QPDFLogger, StreamDataMode, optimize_images_with_stats,
+    PdfWriter, QPDFLogger, StreamDataMode, optimize_images_with_resize_targets,
+    optimize_images_with_stats,
 };
 use std::io::Cursor;
 
@@ -34,8 +36,53 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     } else {
         Default::default()
     };
+    // Canonicalize exact source images before any raster transform. This makes
+    // byte-identical source XObjects share one geometry identity and avoids
+    // decoding/resampling/re-encoding duplicates independently.
+    let image_dedup = if cfg.deduplicate_image_xobjects {
+        canonicalize_image_xobjects(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let (print_plan, print_plan_error) = match &cfg.image_policy {
+        ImagePolicy::Print { target_ppi, .. } => {
+            match plan_print_downsampling(&mut pdf, u32::from(*target_ppi)) {
+                Ok(plan) => (plan, None),
+                Err(error) => (PrintPlan::default(), Some(error.to_string())),
+            }
+        }
+        _ => (PrintPlan::default(), None),
+    };
     let raster_transform = match &cfg.image_policy {
-        ImagePolicy::Preserve | ImagePolicy::Print { .. } => ImageOptimizationStats::default(),
+        ImagePolicy::Preserve => ImageOptimizationStats::default(),
+        ImagePolicy::Print {
+            jpeg_quality,
+            min_savings_percent,
+            ..
+        } => {
+            if print_plan.resize_targets.is_empty() {
+                ImageOptimizationStats::default()
+            } else {
+                let logger = QPDFLogger::create();
+                optimize_images_with_resize_targets(
+                    &mut pdf,
+                    &logger,
+                    "pdf-deshit",
+                    false,
+                    ImageOptimizationOptions {
+                        min_width: 0,
+                        min_height: 0,
+                        min_area: 0,
+                        keep_inline_images: true,
+                        jpeg_quality: *jpeg_quality,
+                        min_savings_bytes: 1,
+                        min_savings_percent: *min_savings_percent,
+                        ..ImageOptimizationOptions::default()
+                    },
+                    &print_plan.resize_targets,
+                )?
+            }
+        }
         ImagePolicy::Perceptual {
             jpeg_quality,
             min_savings_percent,
@@ -56,11 +103,6 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
                 },
             )?
         }
-    };
-    let image_dedup = if cfg.deduplicate_image_xobjects {
-        canonicalize_image_xobjects(&mut pdf)?
-    } else {
-        Default::default()
     };
     if cfg.prune_resources {
         PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
@@ -84,11 +126,27 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let output = writer.get_buffer()?;
 
     let mut notes = Vec::new();
-    if let ImagePolicy::Print { .. } = &cfg.image_policy {
-        notes.push(
-            "Print raster policy is not implemented yet; no resolution-aware downsampling was performed."
-                .to_owned(),
-        );
+    if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
+        if let Some(error) = &print_plan_error {
+            notes.push(format!(
+                "Print placement analysis failed ({error}); resolution-aware raster resizing was disabled for this document."
+            ));
+        } else if print_plan.stats.geometry_complete {
+            notes.push(format!(
+                "Print placement analysis found {} raster image object(s) across {} use(s); {} exceed the {} PPI target, {} are conservative existing-JPEG resize candidates, and {} were resized.",
+                print_plan.stats.images_placed,
+                print_plan.stats.image_uses,
+                print_plan.stats.downsample_candidates,
+                target_ppi,
+                print_plan.stats.existing_jpeg_resize_candidates,
+                raster_transform.images_resized
+            ));
+        } else {
+            notes.push(format!(
+                "Print placement analysis was incomplete after finding {} raster image object(s) across {} use(s); resolution-aware raster resizing was disabled for this document.",
+                print_plan.stats.images_placed, print_plan.stats.image_uses
+            ));
+        }
     }
     if raster_transform.images_optimized > 0
         && let ImagePolicy::Perceptual { jpeg_quality, .. } = &cfg.image_policy
@@ -164,9 +222,19 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
         icc_references_canonicalized: icc_dedup.references_canonicalized,
         raster_images_transcoded: raster_transform.images_optimized,
+        raster_images_resized: raster_transform.images_resized,
         raster_references_reused: raster_transform.references_reused,
         raster_original_encoded_bytes: raster_transform.original_encoded_bytes,
         raster_optimized_encoded_bytes: raster_transform.optimized_encoded_bytes,
+        raster_original_pixels: raster_transform.original_pixels,
+        raster_optimized_pixels: raster_transform.optimized_pixels,
+        print_images_placed: print_plan.stats.images_placed,
+        print_image_uses: print_plan.stats.image_uses,
+        print_geometry_complete: print_plan.stats.geometry_complete,
+        print_downsample_candidates: print_plan.stats.downsample_candidates,
+        print_existing_jpeg_resize_candidates: print_plan.stats.existing_jpeg_resize_candidates,
+        print_source_pixels: print_plan.stats.source_pixels,
+        print_target_pixels: print_plan.stats.target_pixels,
         flate_streams_selected_for_recompression: flate.streams_selected,
         flate_estimated_savings_bytes: flate.estimated_savings_bytes,
         notes,
@@ -230,7 +298,7 @@ mod tests {
         let mut page_handles = Vec::new();
         for _ in 0..2 {
             let content =
-                pdf.new_stream_with_data(Rc::new(b"q 200 0 0 200 0 0 cm /Im0 Do Q\n".to_vec()))?;
+                pdf.new_stream_with_data(Rc::new(b"q 24 0 0 24 0 0 cm /Im0 Do Q\n".to_vec()))?;
             let resources = ObjectHandle::dictionary(vec![(
                 b"/XObject".to_vec(),
                 ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image.clone())]),
@@ -284,6 +352,35 @@ mod tests {
                 - perceptual_report.raster_optimized_encoded_bytes
                 >= perceptual_report.raster_original_encoded_bytes / 5
         );
+
+        let analysis = analyze_pdf(&output)?;
+        assert!(
+            analysis
+                .filter_counts
+                .get("/DCTDecode")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn print_profile_downsamples_an_oversampled_existing_jpeg_once() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let (jpeg_input, _) = optimize_pdf(&input, &Config::perceptual())?;
+
+        let (output, report) = optimize_pdf(&jpeg_input, &Config::print())?;
+        assert_eq!(report.print_images_placed, 1);
+        assert_eq!(report.print_image_uses, 2);
+        assert!(report.print_geometry_complete);
+        assert_eq!(report.print_downsample_candidates, 1);
+        assert_eq!(report.print_existing_jpeg_resize_candidates, 1);
+        assert_eq!(report.raster_images_resized, 1);
+        assert_eq!(report.raster_references_reused, 1);
+        assert_eq!(report.raster_original_pixels, 200 * 200);
+        assert_eq!(report.raster_optimized_pixels, 150 * 150);
+        assert!(report.raster_optimized_encoded_bytes < report.raster_original_encoded_bytes);
 
         let analysis = analyze_pdf(&output)?;
         assert!(

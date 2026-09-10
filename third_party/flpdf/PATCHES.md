@@ -25,6 +25,21 @@ few opt-in controls needed by pdf-deshit:
   Image XObject is reused across resource dictionaries. Distinct source
   objects are never merged merely because their bytes match; pdf-deshit's
   separate exact-image canonicalizer handles that case.
+- `optimize_images_with_resize_targets()` accepts explicit `(page, source
+  image) -> pixel target` entries and uses `fast_image_resize` with Lanczos3
+  before JPEG encoding. This path is intentionally separate from
+  qpdf-compatible image optimization. It mutates only direct page Image
+  XObject bindings selected by the caller, copy-on-write isolates the page's
+  effective `/Resources` and `/XObject` dictionaries only after a resize has
+  cleared the final encoded-size gate, and reuses one resized object for
+  matching shared-source/target pairs. It currently accepts only conservative
+  8-bit DeviceGray/DeviceRGB DCT sources with a single DCT filter and no
+  `/Mask`, `/SMask`, `/Decode`, or `/DecodeParms`.
+- `Pdf::num_warnings()` is public in the local fork so a placement-aware caller
+  can snapshot qpdf-style repair diagnostics around content parsing and veto
+  dimension-changing transforms when parsing required recovery.
+- `ImageOptimizationStats` additionally reports resize count and source/output
+  pixel totals for callers using the targeted resize path.
 
 The original `PlDct::new_compressor()` still takes the quality-75 path.
 Custom-quality callers use `new_compressor_with_quality()`.

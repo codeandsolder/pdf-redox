@@ -6,6 +6,7 @@ mod flate;
 mod hidden_text;
 mod jpeg;
 mod optimize;
+mod print;
 mod report;
 mod scrub;
 
