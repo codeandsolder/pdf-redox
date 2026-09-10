@@ -194,7 +194,7 @@ pub use job::{
 pub use job::{
     optimize_images, optimize_images_with_resize_targets, optimize_images_with_stats,
     should_remove_unreferenced_resources, ImageOptimizationOptions, ImageOptimizationStats,
-    ImageResizeTarget, RemoveUnreferencedResources,
+    ImageResizeEncoding, ImageResizeTarget, RemoveUnreferencedResources,
 };
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{

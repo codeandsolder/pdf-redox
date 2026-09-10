@@ -1,5 +1,7 @@
 //! qpdf correspondence: QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter.
-use std::borrow::Cow;
+use std::{borrow::Cow, io::Write};
+
+use flate2::{write::ZlibEncoder, Compression};
 
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::{PipelineError, PipelineResult};
@@ -287,6 +289,30 @@ fn replay_strict_decode_event(
 ///   `/ASCIIHexDecode`, and `LZWDecode`.
 pub fn encode_stream_data(stream_dict: &ObjectHandle, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_from_handle(stream_dict, stream_data)
+}
+
+/// Encode `stream_data` through the declared filter chain while using an
+/// explicit local zlib compression level for every `/FlateDecode` stage.
+///
+/// Unlike [`encode_stream_data`], this function does not read or mutate
+/// qpdf/flpdf's process-global Flate compression setting. A level of `-1`
+/// selects zlib's default; `0..=9` select the corresponding zlib level.
+/// Other filter stages retain the same encoding behavior as
+/// [`encode_stream_data`].
+///
+/// # Errors
+///
+/// Returns the same filter/predictor errors as [`encode_stream_data`] and
+/// rejects Flate levels outside `-1` and `0..=9`.
+pub fn encode_stream_data_with_flate_level(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+    flate_level: i32,
+) -> Result<Vec<u8>> {
+    let filter = stream_dict.try_get_key(b"/Filter")?;
+    let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
+    let specs = decode_filter_specs_from_handle(&filter, &decode_params, None)?;
+    encode_stream_data_from_specs_with_flate_level(specs, stream_data, flate_level)
 }
 
 /// Encode `stream_data` using `/Filter` and `/DecodeParms` read from an
@@ -802,6 +828,37 @@ fn encode_stream_data_from_specs(specs: Vec<FilterSpec>, stream_data: &[u8]) -> 
     Ok(encoded)
 }
 
+fn encode_stream_data_from_specs_with_flate_level(
+    specs: Vec<FilterSpec>,
+    stream_data: &[u8],
+    flate_level: i32,
+) -> Result<Vec<u8>> {
+    let compression = match flate_level {
+        -1 => Compression::default(),
+        0..=9 => Compression::new(flate_level as u32),
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "flate compression level must be -1 or 0..=9, got {flate_level}"
+            )));
+        }
+    };
+
+    let mut encoded = stream_data.to_vec();
+    for spec in specs.into_iter().rev() {
+        let after_predictor =
+            apply_encode_params(spec.normalized_name(), &spec.decode_params, &encoded)?;
+        encoded = if spec.normalized_name() == b"FlateDecode" {
+            let mut encoder = ZlibEncoder::new(Vec::new(), compression);
+            encoder.write_all(&after_predictor)?;
+            encoder.finish()?
+        } else {
+            apply_single_filter_encode(spec.normalized_name(), &after_predictor)
+                .map_err(Error::Unsupported)?
+        };
+    }
+    Ok(encoded)
+}
+
 /// Apply the predictor selected by `/DecodeParms`, if any, and validate the
 /// target filter's DecodeParms contract before encoding.
 fn apply_encode_params(
@@ -864,4 +921,39 @@ fn apply_single_filter_encode(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>"),
     ))
+}
+
+#[cfg(test)]
+mod explicit_level_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_flate_level_round_trips_and_changes_compression_strength() {
+        let dictionary = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let mut source = Vec::with_capacity(256 * 1024);
+        for block in 0..4096_u32 {
+            let tag = block % 31;
+            for offset in 0..64_u32 {
+                source.push(((tag * 17 + offset * 3) & 0xff) as u8);
+            }
+        }
+
+        let level_one =
+            encode_stream_data_with_flate_level(&dictionary, &source, 1).expect("level 1 encoding");
+        let level_nine =
+            encode_stream_data_with_flate_level(&dictionary, &source, 9).expect("level 9 encoding");
+        assert!(level_nine.len() <= level_one.len());
+        assert_eq!(
+            decode_stream_data(&dictionary, &level_one).expect("decode level 1"),
+            source
+        );
+        assert_eq!(
+            decode_stream_data(&dictionary, &level_nine).expect("decode level 9"),
+            source
+        );
+        assert!(encode_stream_data_with_flate_level(&dictionary, &source, 10).is_err());
+    }
 }

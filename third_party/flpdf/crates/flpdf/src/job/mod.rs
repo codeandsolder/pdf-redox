@@ -51,7 +51,7 @@ pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
 pub use image_optimization::{
     optimize_images, optimize_images_with_resize_targets, optimize_images_with_stats,
-    ImageOptimizationOptions, ImageOptimizationStats, ImageResizeTarget,
+    ImageOptimizationOptions, ImageOptimizationStats, ImageResizeEncoding, ImageResizeTarget,
 };
 pub use json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 pub(crate) use json_sections::checksum_to_hex;

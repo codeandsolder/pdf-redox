@@ -45,6 +45,10 @@ pub struct ImageOptimizationOptions {
     /// JPEG quality used when converting eligible lossless images to DCT.
     /// qpdf-compatible default: 75.
     pub jpeg_quality: u8,
+    /// Explicit zlib level used by targeted Flate resize output. `-1` selects
+    /// zlib's default; `0..=9` select a concrete level. The qpdf-compatible
+    /// non-targeted image optimizer does not use this field.
+    pub flate_level: i32,
     /// Require at least this many encoded bytes of savings before replacement.
     pub min_savings_bytes: u64,
     /// Require at least this percentage of encoded savings before replacement.
@@ -60,6 +64,7 @@ impl Default for ImageOptimizationOptions {
             inline_min_bytes: DEFAULT_II_MIN_BYTES,
             keep_inline_images: false,
             jpeg_quality: 75,
+            flate_level: -1,
             min_savings_bytes: 1,
             min_savings_percent: 0,
         }
@@ -70,6 +75,8 @@ impl Default for ImageOptimizationOptions {
 pub struct ImageOptimizationStats {
     pub images_optimized: usize,
     pub images_resized: usize,
+    pub jpeg_images_resized: usize,
+    pub flate_images_resized: usize,
     pub original_encoded_bytes: u64,
     pub optimized_encoded_bytes: u64,
     pub original_pixels: u64,
@@ -82,9 +89,37 @@ pub struct ImageOptimizationStats {
 /// The targeted resize API never upscales: dimensions larger than the source
 /// are clamped back to the source dimensions before evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageResizeEncoding {
+    /// Re-encode resized pixels as JPEG using `ImageOptimizationOptions::jpeg_quality`.
+    Jpeg,
+    /// Re-encode the resampled pixels with Flate compression. The encoding is
+    /// lossless, while the spatial resize itself still discards resolution.
+    Flate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageResizeTarget {
     pub width: u32,
     pub height: u32,
+    pub encoding: ImageResizeEncoding,
+}
+
+impl ImageResizeTarget {
+    pub const fn jpeg(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            encoding: ImageResizeEncoding::Jpeg,
+        }
+    }
+
+    pub const fn flate(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            encoding: ImageResizeEncoding::Flate,
+        }
+    }
 }
 
 struct ResizedImage {
@@ -92,6 +127,8 @@ struct ResizedImage {
     width: u32,
     height: u32,
     original_encoded_bytes: u64,
+    encoding: ImageResizeEncoding,
+    decode_params: ObjectHandle,
 }
 
 impl ImageOptimizationStats {
@@ -264,6 +301,30 @@ fn is_conservative_dct_resize_source(dictionary: &ObjectHandle) -> Result<bool> 
         || color_space.try_is_name_and_equals(b"DeviceRGB")?)
 }
 
+fn is_conservative_flate_resize_source(dictionary: &ObjectHandle) -> Result<bool> {
+    if !dictionary.try_get_key(b"/SMask")?.is_null()
+        || !dictionary.try_get_key(b"/Mask")?.is_null()
+        || !dictionary.try_get_key(b"/Decode")?.is_null()
+        || dictionary
+            .try_get_key(b"/BitsPerComponent")?
+            .try_get_int_value()
+            .ok()
+            != Some(8)
+    {
+        return Ok(false);
+    }
+
+    let filter = dictionary.try_get_key(b"/Filter")?;
+    if !filter.try_is_name_and_equals(b"FlateDecode")? && !filter.try_is_name_and_equals(b"Fl")? {
+        return Ok(false);
+    }
+
+    let color_space = dictionary.try_get_key(b"/ColorSpace")?;
+    color_space.try_dereference()?;
+    Ok(color_space.try_is_name_and_equals(b"DeviceGray")?
+        || color_space.try_is_name_and_equals(b"DeviceRGB")?)
+}
+
 fn isolate_page_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -338,7 +399,13 @@ pub fn optimize_images_with_resize_targets<R: Read + Seek + 'static>(
                 let Some(dictionary) = image.as_stream_dict() else {
                     return Ok(());
                 };
-                let conservative_source = match is_conservative_dct_resize_source(&dictionary) {
+                let conservative_source = match target.encoding {
+                    ImageResizeEncoding::Jpeg => is_conservative_dct_resize_source(&dictionary),
+                    ImageResizeEncoding::Flate => {
+                        is_conservative_flate_resize_source(&dictionary)
+                    }
+                };
+                let conservative_source = match conservative_source {
                     Ok(value) => value,
                     Err(error) => {
                         log_verbose(
@@ -357,7 +424,7 @@ pub fn optimize_images_with_resize_targets<R: Read + Seek + 'static>(
                         message_prefix,
                         verbose,
                         &description,
-                        "not resizing because the JPEG uses unsupported color, mask, decode, or filter semantics"
+                        "not resizing because the source uses unsupported color, mask, decode, or filter semantics"
                             .to_owned(),
                     )?;
                     return Ok(());
@@ -416,14 +483,26 @@ pub fn optimize_images_with_resize_targets<R: Read + Seek + 'static>(
                     .replace_key(b"/Width", ObjectHandle::integer(i64::from(resized.width)))?;
                 new_dictionary
                     .replace_key(b"/Height", ObjectHandle::integer(i64::from(resized.height)))?;
+                let output_filter = match resized.encoding {
+                    ImageResizeEncoding::Jpeg => b"DCTDecode".as_slice(),
+                    ImageResizeEncoding::Flate => b"FlateDecode".as_slice(),
+                };
                 new_image.replace_stream_data(
                     Rc::new(resized.encoded),
-                    Some(ObjectHandle::name(b"DCTDecode".to_vec())),
-                    Some(ObjectHandle::null()),
+                    Some(ObjectHandle::name(output_filter.to_vec())),
+                    Some(resized.decode_params),
                 );
+                // These are already the final encoded bytes whose size was
+                // evaluated above. Keep the writer from decoding/recompressing
+                // them again under document-wide stream policies.
+                new_image.set_filter_on_write(false)?;
 
                 stats.images_optimized += 1;
                 stats.images_resized += 1;
+                match resized.encoding {
+                    ImageResizeEncoding::Jpeg => stats.jpeg_images_resized += 1,
+                    ImageResizeEncoding::Flate => stats.flate_images_resized += 1,
+                }
                 stats.original_encoded_bytes += original_length;
                 stats.optimized_encoded_bytes += compressed_length;
                 stats.original_pixels += u64::from(optimizer.width) * u64::from(optimizer.height);
@@ -526,6 +605,7 @@ struct ImageOptimizer {
     height: u32,
     pixel_format: libjpeg_turbo_rs::PixelFormat,
     jpeg_quality: u8,
+    flate_level: i32,
     min_savings_bytes: u64,
     min_savings_percent: u8,
 }
@@ -589,6 +669,7 @@ impl ImageOptimizer {
             height,
             pixel_format,
             jpeg_quality: options.jpeg_quality,
+            flate_level: options.flate_level,
             min_savings_bytes: options.min_savings_bytes,
             min_savings_percent: options.min_savings_percent,
         }))
@@ -698,18 +779,59 @@ impl ImageOptimizer {
             .resize(&source, &mut destination, &resize_options)
             .map_err(|error| Error::Unsupported(format!("unable to resize image: {error}")))?;
 
-        let mut encoded = Vec::new();
-        {
-            let mut sink = PlString::new("resized jpeg", None, &mut encoded);
-            let mut encoder = self.encoder_for_dimensions(&mut sink, target_width, target_height);
-            encoder.write(destination.buffer())?;
-            encoder.finish()?;
-        }
+        let (encoded, decode_params) = match target.encoding {
+            ImageResizeEncoding::Jpeg => {
+                let mut encoded = Vec::new();
+                {
+                    let mut sink = PlString::new("resized jpeg", None, &mut encoded);
+                    let mut encoder =
+                        self.encoder_for_dimensions(&mut sink, target_width, target_height);
+                    encoder.write(destination.buffer())?;
+                    encoder.finish()?;
+                }
+                (encoded, ObjectHandle::null())
+            }
+            ImageResizeEncoding::Flate => {
+                let colors = match self.pixel_format {
+                    libjpeg_turbo_rs::PixelFormat::Grayscale => 1,
+                    libjpeg_turbo_rs::PixelFormat::Rgb => 3,
+                    _ => {
+                        return Err(Error::Unsupported(
+                            "Flate resize output supports only Gray/RGB pixels".to_owned(),
+                        ));
+                    }
+                };
+                let decode_params = ObjectHandle::dictionary(vec![
+                    (b"/Predictor".to_vec(), ObjectHandle::integer(12)),
+                    (b"/Colors".to_vec(), ObjectHandle::integer(colors)),
+                    (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                    (
+                        b"/Columns".to_vec(),
+                        ObjectHandle::integer(i64::from(target_width)),
+                    ),
+                ]);
+                let output_dictionary = ObjectHandle::dictionary(vec![
+                    (
+                        b"/Filter".to_vec(),
+                        ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ),
+                    (b"/DecodeParms".to_vec(), decode_params.clone()),
+                ]);
+                let encoded = crate::filters::encode_stream_data_with_flate_level(
+                    &output_dictionary,
+                    destination.buffer(),
+                    self.flate_level,
+                )?;
+                (encoded, decode_params)
+            }
+        };
         Ok(Some(ResizedImage {
             encoded,
             width: target_width,
             height: target_height,
             original_encoded_bytes,
+            encoding: target.encoding,
+            decode_params,
         }))
     }
 }
@@ -787,6 +909,7 @@ mod tests {
             height: height as u32,
             pixel_format: libjpeg_turbo_rs::PixelFormat::Grayscale,
             jpeg_quality: 75,
+            flate_level: -1,
             min_savings_bytes: 1,
             min_savings_percent: 0,
         }
@@ -1031,10 +1154,7 @@ mod tests {
         };
 
         let resized = optimizer
-            .resize_and_encode(ImageResizeTarget {
-                width: 100,
-                height: 50,
-            })
+            .resize_and_encode(ImageResizeTarget::jpeg(100, 50))
             .expect("resize DCT source")
             .expect("target is smaller than source");
         assert_eq!((resized.width, resized.height), (100, 50));
@@ -1053,6 +1173,84 @@ mod tests {
                 .as_ref(),
         )
         .expect("decode resized JPEG");
+        assert_eq!(decoded.len(), 100 * 50);
+    }
+
+    #[test]
+    fn resize_path_decodes_predictor_flate_and_keeps_flate_encoding() {
+        let width = 200usize;
+        let height = 100usize;
+        let pixels: Vec<u8> = (0..width * height)
+            .map(|index| ((index * 17 + index / 13) & 0xff) as u8)
+            .collect();
+        let dictionary = image_dictionary(
+            ObjectHandle::integer(width as i64),
+            ObjectHandle::integer(height as i64),
+        );
+        dictionary
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("install Flate filter");
+        dictionary
+            .replace_key(
+                b"/DecodeParms",
+                ObjectHandle::dictionary(vec![
+                    (b"/Predictor".to_vec(), ObjectHandle::integer(12)),
+                    (b"/Colors".to_vec(), ObjectHandle::integer(1)),
+                    (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                    (b"/Columns".to_vec(), ObjectHandle::integer(width as i64)),
+                ]),
+            )
+            .expect("install predictor params");
+        let encoded = crate::filters::encode_stream_data(&dictionary, &pixels)
+            .expect("encode predictor-bearing source");
+        dictionary
+            .replace_key(b"/Length", ObjectHandle::integer(encoded.len() as i64))
+            .expect("install source length");
+        let image = ObjectHandle::stream(dictionary.clone(), Rc::new(encoded));
+        let optimizer = match ImageOptimizer::prepare(
+            image,
+            ImageOptimizationOptions {
+                min_width: 0,
+                min_height: 0,
+                min_area: 0,
+                min_savings_bytes: 0,
+                min_savings_percent: 0,
+                ..ImageOptimizationOptions::default()
+            },
+        )
+        .expect("prepare lossless resize source")
+        {
+            PrepareResult::Ready(optimizer) => optimizer,
+            PrepareResult::Skip(_) => panic!("Flate resize source should be eligible"),
+        };
+
+        let resized = optimizer
+            .resize_and_encode(ImageResizeTarget::flate(100, 50))
+            .expect("resize Flate source")
+            .expect("target is smaller than source");
+        assert_eq!((resized.width, resized.height), (100, 50));
+        assert_eq!(resized.encoding, ImageResizeEncoding::Flate);
+
+        let resized_dictionary = image_dictionary(
+            ObjectHandle::integer(resized.width.into()),
+            ObjectHandle::integer(resized.height.into()),
+        );
+        resized_dictionary
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("install resized Flate filter");
+        resized_dictionary
+            .replace_key(b"/DecodeParms", resized.decode_params.clone())
+            .expect("install resized predictor params");
+        assert_eq!(
+            resized
+                .decode_params
+                .try_get_key(b"/Columns")
+                .expect("columns")
+                .as_integer(),
+            Some(100)
+        );
+        let decoded = crate::filters::decode_stream_data(&resized_dictionary, &resized.encoded)
+            .expect("decode resized lossless image");
         assert_eq!(decoded.len(), 100 * 50);
     }
 

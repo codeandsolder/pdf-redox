@@ -428,6 +428,7 @@ pub(crate) struct PrintPlacementStats {
     pub image_uses: usize,
     pub downsample_candidates: usize,
     pub existing_jpeg_resize_candidates: usize,
+    pub flate_resize_candidates: usize,
     pub source_pixels: u64,
     pub target_pixels: u64,
     pub geometry_complete: bool,
@@ -443,6 +444,13 @@ fn is_single_dct_filter(dict: &ObjectHandle) -> bool {
     dict.try_get_key(b"/Filter").is_ok_and(|filter| {
         matches!(filter.try_is_name_and_equals(b"DCTDecode"), Ok(true))
             || matches!(filter.try_is_name_and_equals(b"DCT"), Ok(true))
+    })
+}
+
+fn is_single_flate_filter(dict: &ObjectHandle) -> bool {
+    dict.try_get_key(b"/Filter").is_ok_and(|filter| {
+        matches!(filter.try_is_name_and_equals(b"FlateDecode"), Ok(true))
+            || matches!(filter.try_is_name_and_equals(b"Fl"), Ok(true))
     })
 }
 
@@ -473,6 +481,41 @@ fn is_resize_safe_existing_jpeg<R: Read + Seek + 'static>(
             .try_get_key(b"/BitsPerComponent")
             .is_ok_and(|value| value.as_integer() == Some(8))
         || !is_single_dct_filter(&dict)
+    {
+        return false;
+    }
+
+    let Ok(color_space) = dict.try_get_key(b"/ColorSpace") else {
+        return false;
+    };
+    if pdf.resolve(&color_space).is_err() {
+        return false;
+    }
+    matches!(color_space.try_is_name_and_equals(b"DeviceGray"), Ok(true))
+        || matches!(color_space.try_is_name_and_equals(b"DeviceRGB"), Ok(true))
+}
+
+fn is_resize_safe_flate<R: Read + Seek + 'static>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> bool {
+    let image = pdf.get_object_handle(object_ref);
+    if pdf.resolve(&image).is_err() {
+        return false;
+    }
+    let Some(dict) = image.as_stream_dict() else {
+        return false;
+    };
+    if !dict
+        .try_get_key(b"/SMask")
+        .is_ok_and(|value| value.is_null())
+        || !dict
+            .try_get_key(b"/Mask")
+            .is_ok_and(|value| value.is_null())
+        || !dict
+            .try_get_key(b"/Decode")
+            .is_ok_and(|value| value.is_null())
+        || !dict
+            .try_get_key(b"/BitsPerComponent")
+            .is_ok_and(|value| value.as_integer() == Some(8))
+        || !is_single_flate_filter(&dict)
     {
         return false;
     }
@@ -518,23 +561,33 @@ pub(crate) fn plan_print_downsampling<R: Read + Seek + 'static>(
 
         let clears_pixel_reduction_gate = target_pixels.saturating_mul(100)
             <= source_pixels.saturating_mul(100 - MIN_DOWNSAMPLE_PIXEL_REDUCTION_PERCENT);
-        if is_downsample
-            && clears_pixel_reduction_gate
-            && geometry_complete
-            && is_resize_safe_existing_jpeg(pdf, object_ref)
-        {
-            let binding_pages = page_image_bindings
-                .iter()
-                .filter_map(|(page_ref, image_ref)| (*image_ref == object_ref).then_some(*page_ref))
-                .collect::<Vec<_>>();
-            if !binding_pages.is_empty() {
-                plan.stats.existing_jpeg_resize_candidates += 1;
-                let target = ImageResizeTarget {
-                    width: target_width,
-                    height: target_height,
-                };
-                for page_ref in binding_pages {
-                    plan.resize_targets.insert((page_ref, object_ref), target);
+        if is_downsample && clears_pixel_reduction_gate && geometry_complete {
+            let target = if is_resize_safe_existing_jpeg(pdf, object_ref) {
+                Some(ImageResizeTarget::jpeg(target_width, target_height))
+            } else if is_resize_safe_flate(pdf, object_ref) {
+                Some(ImageResizeTarget::flate(target_width, target_height))
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                let binding_pages = page_image_bindings
+                    .iter()
+                    .filter_map(|(page_ref, image_ref)| {
+                        (*image_ref == object_ref).then_some(*page_ref)
+                    })
+                    .collect::<Vec<_>>();
+                if !binding_pages.is_empty() {
+                    match target.encoding {
+                        flpdf::ImageResizeEncoding::Jpeg => {
+                            plan.stats.existing_jpeg_resize_candidates += 1;
+                        }
+                        flpdf::ImageResizeEncoding::Flate => {
+                            plan.stats.flate_resize_candidates += 1;
+                        }
+                    }
+                    for page_ref in binding_pages {
+                        plan.resize_targets.insert((page_ref, object_ref), target);
+                    }
                 }
             }
         }

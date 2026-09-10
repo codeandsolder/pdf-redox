@@ -1,5 +1,5 @@
-use crate::{Error, FlatePolicy, Result};
-use flpdf::{DecodeLevel, ObjectHandle, Pdf, filters::encode_stream_data, pipeline::PlFlate};
+use crate::{FlatePolicy, Result};
+use flpdf::{DecodeLevel, ObjectHandle, Pdf, filters::encode_stream_data_with_flate_level};
 use std::{
     io::{Read, Seek},
     rc::Rc,
@@ -9,18 +9,6 @@ use std::{
 pub(crate) struct FlateOptimizationStats {
     pub streams_selected: usize,
     pub estimated_savings_bytes: usize,
-}
-
-fn configure_compression_level(level: i32) -> Result<()> {
-    if !(0..=9).contains(&level) {
-        return Err(Error::Invalid(format!(
-            "flate compression level must be in 0..=9, got {level}"
-        )));
-    }
-    PlFlate::set_compression_level(level).map_err(|error| {
-        Error::Invalid(format!("unable to set flate compression level: {error}"))
-    })?;
-    Ok(())
 }
 
 fn is_safe_lone_flate(dict: &ObjectHandle) -> Result<bool> {
@@ -53,7 +41,6 @@ pub(crate) fn apply_flate_policy<R: Read + Seek + 'static>(
     else {
         return Ok(FlateOptimizationStats::default());
     };
-    configure_compression_level(level)?;
     let mut stats = FlateOptimizationStats::default();
 
     for object in pdf.get_all_objects()? {
@@ -67,7 +54,8 @@ pub(crate) fn apply_flate_policy<R: Read + Seek + 'static>(
         let Ok(decoded) = object.get_stream_data(DecodeLevel::Generalized) else {
             continue;
         };
-        let Ok(repacked) = encode_stream_data(&dict, decoded.as_ref()) else {
+        let Ok(repacked) = encode_stream_data_with_flate_level(&dict, decoded.as_ref(), level)
+        else {
             continue;
         };
         let saving = raw.len().saturating_sub(repacked.len());
@@ -97,15 +85,13 @@ pub(crate) fn apply_flate_policy<R: Read + Seek + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use flate2::{Compression, write::ZlibEncoder};
     use flpdf::{ObjectHandle, ObjectStreamMode, PdfWriter, StreamDataMode};
     use std::{
         io::{Cursor, Write},
         rc::Rc,
-        sync::Mutex,
     };
-
-    static FLATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn compressed(data: &[u8], level: Compression) -> Result<Vec<u8>> {
         let mut encoder = ZlibEncoder::new(Vec::new(), level);
@@ -135,9 +121,6 @@ mod tests {
 
     #[test]
     fn selective_policy_recompresses_only_a_measured_win() -> Result<()> {
-        let _guard = FLATE_TEST_LOCK
-            .lock()
-            .map_err(|_| Error::Invalid("flate test lock poisoned".to_owned()))?;
         let source = vec![b'A'; 32 * 1024];
         let original = compressed(&source, Compression::fast())?;
         let mut pdf = Pdf::empty()?;
@@ -179,9 +162,6 @@ mod tests {
     #[test]
     fn selective_policy_recompresses_predictor_streams_without_changing_decoded_bytes() -> Result<()>
     {
-        let _guard = FLATE_TEST_LOCK
-            .lock()
-            .map_err(|_| Error::Invalid("flate test lock poisoned".to_owned()))?;
         let columns = 256_i64;
         let mut source = Vec::with_capacity(columns as usize * 128);
         for row in 0..128_u8 {
@@ -202,8 +182,7 @@ mod tests {
             ),
             (b"/DecodeParms".to_vec(), parms.clone()),
         ]);
-        configure_compression_level(1)?;
-        let original = encode_stream_data(&encoding_dict, &source)?;
+        let original = encode_stream_data_with_flate_level(&encoding_dict, &source, 1)?;
 
         let mut pdf = Pdf::empty()?;
         let _stream = linked_flate_stream(&mut pdf, original.clone(), Some(parms))?;

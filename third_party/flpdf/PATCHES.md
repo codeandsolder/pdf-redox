@@ -26,15 +26,24 @@ few opt-in controls needed by pdf-deshit:
   objects are never merged merely because their bytes match; pdf-deshit's
   separate exact-image canonicalizer handles that case.
 - `optimize_images_with_resize_targets()` accepts explicit `(page, source
-  image) -> pixel target` entries and uses `fast_image_resize` with Lanczos3
-  before JPEG encoding. This path is intentionally separate from
-  qpdf-compatible image optimization. It mutates only direct page Image
-  XObject bindings selected by the caller, copy-on-write isolates the page's
-  effective `/Resources` and `/XObject` dictionaries only after a resize has
-  cleared the final encoded-size gate, and reuses one resized object for
-  matching shared-source/target pairs. It currently accepts only conservative
+  image) -> pixel target` entries and uses `fast_image_resize` with Lanczos3.
+  Each target selects either JPEG output or Flate output. This path is
+  intentionally separate from qpdf-compatible image optimization. It mutates
+  only direct page Image XObject bindings selected by the caller, copy-on-write
+  isolates the page's effective `/Resources` and `/XObject` dictionaries only
+  after a resize has cleared the final encoded-size gate, pins accepted encoded
+  output with `filter_on_write=false`, and reuses one resized object for
+  matching shared-source/target pairs. JPEG targets accept only conservative
   8-bit DeviceGray/DeviceRGB DCT sources with a single DCT filter and no
-  `/Mask`, `/SMask`, `/Decode`, or `/DecodeParms`.
+  `/Mask`, `/SMask`, `/Decode`, or `/DecodeParms`. Flate targets accept only
+  conservative 8-bit DeviceGray/DeviceRGB lone-Flate sources with no mask or
+  custom `/Decode`; source predictors are decoded normally and output is
+  re-encoded as Flate with a fresh PNG predictor matching the resized width.
+- `filters::encode_stream_data_with_flate_level()` is an additive encoder entry
+  point that applies the same filter/predictor semantics as
+  `encode_stream_data()` while taking an explicit local zlib level (`-1` or
+  `0..=9`). It does not read or mutate flpdf/qpdf's process-global Flate level;
+  the original qpdf-compatible encoder remains unchanged.
 - `Pdf::num_warnings()` is public in the local fork so a placement-aware caller
   can snapshot qpdf-style repair diagnostics around content parsing and veto
   dimension-changing transforms when parsing required recovery.

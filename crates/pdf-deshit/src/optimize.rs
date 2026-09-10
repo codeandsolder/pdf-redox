@@ -89,6 +89,7 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
                         min_area: 0,
                         keep_inline_images: true,
                         jpeg_quality: *jpeg_quality,
+                        flate_level: cfg.flate_level,
                         min_savings_bytes: 1,
                         min_savings_percent: *min_savings_percent,
                         ..ImageOptimizationOptions::default()
@@ -147,13 +148,16 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
             ));
         } else if print_plan.stats.geometry_complete {
             notes.push(format!(
-                "Print placement analysis found {} raster image object(s) across {} use(s); {} exceed the {} PPI target, {} are conservative existing-JPEG resize candidates, and {} were resized.",
+                "Print placement analysis found {} raster image object(s) across {} use(s); {} exceed the {} PPI target, {} are conservative existing-JPEG candidates, {} are conservative Flate-encoded resize candidates, and {} were resized ({} JPEG, {} Flate-encoded).",
                 print_plan.stats.images_placed,
                 print_plan.stats.image_uses,
                 print_plan.stats.downsample_candidates,
                 target_ppi,
                 print_plan.stats.existing_jpeg_resize_candidates,
-                raster_transform.images_resized
+                print_plan.stats.flate_resize_candidates,
+                raster_transform.images_resized,
+                raster_transform.jpeg_images_resized,
+                raster_transform.flate_images_resized
             ));
         } else {
             notes.push(format!(
@@ -251,6 +255,8 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         icc_references_canonicalized: icc_dedup.references_canonicalized,
         raster_images_transcoded: raster_transform.images_optimized,
         raster_images_resized: raster_transform.images_resized,
+        raster_jpeg_images_resized: raster_transform.jpeg_images_resized,
+        raster_flate_images_resized: raster_transform.flate_images_resized,
         raster_references_reused: raster_transform.references_reused,
         raster_original_encoded_bytes: raster_transform.original_encoded_bytes,
         raster_optimized_encoded_bytes: raster_transform.optimized_encoded_bytes,
@@ -261,6 +267,7 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         print_geometry_complete: print_plan.stats.geometry_complete,
         print_downsample_candidates: print_plan.stats.downsample_candidates,
         print_existing_jpeg_resize_candidates: print_plan.stats.existing_jpeg_resize_candidates,
+        print_flate_resize_candidates: print_plan.stats.flate_resize_candidates,
         print_source_pixels: print_plan.stats.source_pixels,
         print_target_pixels: print_plan.stats.target_pixels,
         flate_streams_selected_for_recompression: flate.streams_selected,
@@ -460,6 +467,83 @@ mod tests {
                 .unwrap_or(0)
                 >= 1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn print_profile_downsamples_a_simple_flate_image_and_keeps_flate_encoding() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let (output, report) = optimize_pdf(&input, &Config::print())?;
+
+        assert_eq!(report.print_images_placed, 1);
+        assert_eq!(report.print_image_uses, 2);
+        assert!(report.print_geometry_complete);
+        assert_eq!(report.print_downsample_candidates, 1);
+        assert_eq!(report.print_existing_jpeg_resize_candidates, 0);
+        assert_eq!(report.print_flate_resize_candidates, 1);
+        assert_eq!(report.raster_images_resized, 1);
+        assert_eq!(report.raster_jpeg_images_resized, 0);
+        assert_eq!(report.raster_flate_images_resized, 1);
+        assert_eq!(report.raster_references_reused, 1);
+        assert_eq!(report.raster_original_pixels, 200 * 200);
+        assert_eq!(report.raster_optimized_pixels, 150 * 150);
+        assert!(report.raster_optimized_encoded_bytes < report.raster_original_encoded_bytes);
+
+        let analysis = analyze_pdf(&output)?;
+        assert!(
+            analysis
+                .filter_counts
+                .get("/FlateDecode")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            analysis
+                .filter_counts
+                .get("/DCTDecode")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+
+        let mut rewritten = Pdf::open_mem_owned(output)?;
+        let page_ref = flpdf::pages::page_refs(&mut rewritten)?[0];
+        let mut images = Vec::new();
+        flpdf::PageObjectHelper::new(page_ref, &mut rewritten).for_each_image(
+            false,
+            |image, _, _| {
+                images.push(image);
+                Ok(())
+            },
+        )?;
+        assert_eq!(images.len(), 1);
+        let image = images.pop().ok_or_else(|| {
+            Error::Invalid("rewritten Print fixture has no page image".to_owned())
+        })?;
+        let dictionary = image.as_stream_dict().ok_or_else(|| {
+            Error::Invalid("rewritten Print image has no stream dictionary".to_owned())
+        })?;
+        assert_eq!(dictionary.try_get_key(b"/Width")?.as_integer(), Some(150));
+        assert_eq!(dictionary.try_get_key(b"/Height")?.as_integer(), Some(150));
+        assert!(
+            dictionary
+                .try_get_key(b"/Filter")?
+                .try_is_name_and_equals(b"FlateDecode")?
+        );
+        let decode_params = dictionary.try_get_key(b"/DecodeParms")?;
+        assert_eq!(
+            decode_params.try_get_key(b"/Predictor")?.as_integer(),
+            Some(12)
+        );
+        assert_eq!(
+            decode_params.try_get_key(b"/Columns")?.as_integer(),
+            Some(150)
+        );
+        let raw = image.get_raw_stream_data()?;
+        assert_eq!(raw.len() as u64, report.raster_optimized_encoded_bytes);
+        let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;
+        assert_eq!(decoded.len(), 150 * 150);
         Ok(())
     }
 
