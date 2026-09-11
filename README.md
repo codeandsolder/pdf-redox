@@ -34,7 +34,7 @@ Early but functional. The core currently provides:
 - metadata, JPEG metadata, active-content, attachment, form/signature, and incremental-history privacy cleanup;
 - conservative invisible-text analysis that distinguishes OCR overlays, accessibility text, hidden layers, outside-page text, likely fake-redaction leaks, and uncertain invisible content;
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
-- a client-side WASM review UI that analyzes first and asks the user what invisible text to remove before rewriting.
+- a client-side WASM review UI that analyzes first and asks the user what invisible text to remove before rewriting; the WASM layer keeps that exact-byte analysis in memory and reuses it for the subsequent rewrite after a SHA-256 identity check, avoiding a second full structural scan.
 
 Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates. The WASM crate enables `getrandom`'s browser JS backend because `flpdf` uses randomness for PDF encryption IV generation.
 

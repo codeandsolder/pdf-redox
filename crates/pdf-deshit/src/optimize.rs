@@ -1,5 +1,6 @@
 use crate::{
-    Config, FlatePolicy, ImagePolicy, OptimizationReport, Result, analyze_pdf,
+    Config, FlatePolicy, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
+    analyze::{analyze_pdf, input_sha256},
     dedup::{
         canonicalize_font_program_streams, canonicalize_icc_profiles, canonicalize_image_xobjects,
         canonicalize_metadata_streams,
@@ -18,6 +19,38 @@ use std::io::Cursor;
 
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
     let before = analyze_pdf(input)?;
+    optimize_pdf_with_before(input, cfg, before)
+}
+
+/// Optimize `input`, reusing a previously computed analysis when it belongs
+/// to these exact bytes. A missing/legacy digest or any byte-length/digest
+/// mismatch falls back to a fresh analysis.
+///
+/// The supplied analysis is treated as trusted cached application state once
+/// its input identity matches. Callers that accept analysis objects from an
+/// untrusted boundary should keep their own trusted cached copy rather than
+/// round-tripping mutable user data into this function.
+pub fn optimize_pdf_with_analysis(
+    input: &[u8],
+    cfg: &Config,
+    analysis: &PdfAnalysis,
+) -> Result<(Vec<u8>, OptimizationReport)> {
+    let matches = analysis.input_bytes == input.len()
+        && !analysis.input_sha256.is_empty()
+        && analysis.input_sha256 == input_sha256(input);
+    let before = if matches {
+        analysis.clone()
+    } else {
+        analyze_pdf(input)?
+    };
+    optimize_pdf_with_before(input, cfg, before)
+}
+
+fn optimize_pdf_with_before(
+    input: &[u8],
+    cfg: &Config,
+    before: PdfAnalysis,
+) -> Result<(Vec<u8>, OptimizationReport)> {
     let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
     let hidden_text = apply_hidden_text_policy(&mut pdf, &cfg.hidden_text)?;
     let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
@@ -416,6 +449,61 @@ mod tests {
         writer.set_object_stream_mode(ObjectStreamMode::Preserve);
         writer.write()?;
         Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn matching_cached_analysis_is_reused() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let mut analysis = analyze_pdf(&input)?;
+        analysis.warnings.push("cached-analysis-marker".to_owned());
+
+        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
+        assert!(
+            report
+                .before
+                .warnings
+                .iter()
+                .any(|warning| warning == "cached-analysis-marker")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_cached_analysis_falls_back_to_fresh_analysis() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let mut analysis = analyze_pdf(&input)?;
+        analysis.input_sha256 = "00".repeat(32);
+        analysis.warnings.push("stale-analysis-marker".to_owned());
+
+        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
+        assert_eq!(report.before.input_sha256, input_sha256(&input));
+        assert!(
+            !report
+                .before
+                .warnings
+                .iter()
+                .any(|warning| warning == "stale-analysis-marker")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_cached_analysis_without_digest_falls_back_to_fresh_analysis() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let mut analysis = analyze_pdf(&input)?;
+        analysis.input_sha256.clear();
+        analysis.warnings.push("legacy-analysis-marker".to_owned());
+
+        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
+        assert_eq!(report.before.input_sha256, input_sha256(&input));
+        assert!(
+            !report
+                .before
+                .warnings
+                .iter()
+                .any(|warning| warning == "legacy-analysis-marker")
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,6 +1,14 @@
-use pdf_deshit::{Config, HiddenTextPolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
+use pdf_deshit::{
+    Config, HiddenTextPolicy, PdfAnalysis, PrivacyLevel, analyze_pdf, optimize_pdf,
+    optimize_pdf_with_analysis,
+};
 use serde::Serialize;
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
+
+thread_local! {
+    static LAST_ANALYSIS: RefCell<Option<PdfAnalysis>> = const { RefCell::new(None) };
+}
 
 #[derive(Serialize)]
 struct WasmResult {
@@ -16,7 +24,10 @@ pub fn start() {
 #[wasm_bindgen]
 pub fn analyze(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let report = analyze_pdf(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))
+    let value =
+        serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    LAST_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(report));
+    Ok(value)
 }
 
 fn config(profile: &str, privacy: &str) -> Config {
@@ -37,7 +48,15 @@ fn config(profile: &str, privacy: &str) -> Config {
 }
 
 fn run(bytes: &[u8], cfg: &Config) -> Result<JsValue, JsValue> {
-    let (pdf, report) = optimize_pdf(bytes, cfg).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let optimized = LAST_ANALYSIS.with(|slot| {
+        let cached = slot.borrow();
+        match cached.as_ref() {
+            Some(analysis) => optimize_pdf_with_analysis(bytes, cfg, analysis),
+            None => optimize_pdf(bytes, cfg),
+        }
+    });
+    let (pdf, report) = optimized.map_err(|e| JsValue::from_str(&e.to_string()))?;
+    LAST_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(report.before.clone()));
     serde_wasm_bindgen::to_value(&WasmResult { pdf, report })
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }

@@ -8,6 +8,17 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Seek, Write};
 
+pub(crate) fn input_sha256(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(input);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
 fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;
@@ -372,6 +383,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
 
     let mut out = PdfAnalysis {
         input_bytes: input.len(),
+        input_sha256: input_sha256(input),
         page_count,
         object_count: objects.len(),
         ..PdfAnalysis::default()

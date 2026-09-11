@@ -129,6 +129,9 @@ pub struct HiddenTextFinding {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PdfAnalysis {
     pub input_bytes: usize,
+    /// SHA-256 of the exact input bytes, as lowercase hexadecimal.
+    #[serde(default)]
+    pub input_sha256: String,
     /// UTF-8 view of `/Info /Producer`, when present.
     pub producer: Option<String>,
     /// UTF-8 view of `/Info /Creator`, when present.

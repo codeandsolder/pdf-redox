@@ -16,7 +16,7 @@ pub use config::{
     PrivacyConfig, PrivacyLevel,
 };
 pub use error::{Error, Result};
-pub use optimize::optimize_pdf;
+pub use optimize::{optimize_pdf, optimize_pdf_with_analysis};
 pub use report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism,
     OptimizationReport, PageRect, PdfAnalysis, RiskFinding, RiskKind,
