@@ -27,9 +27,11 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
     // falsely distinguish exact duplicates. The encoded payload itself is
     // already hashed below, so omit `/Length` while retaining every other
     // stream-dictionary entry exactly as represented.
+    let Some(entries) = dict.as_dictionary() else {
+        return Ok(None);
+    };
     let dictionary = ObjectHandle::dictionary(
-        dict.as_dictionary()
-            .unwrap_or_default()
+        entries
             .into_iter()
             .filter(|(key, _)| key.as_slice() != b"/Length")
             .collect(),
