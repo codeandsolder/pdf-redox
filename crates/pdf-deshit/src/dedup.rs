@@ -21,7 +21,20 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
     // equivalence: differing filters, decode parameters, or stream attributes
     // stay as separate objects.
     let raw = object.get_raw_stream_data()?;
-    let dictionary = dict.unparse_resolved();
+    // `/Length` is derived bookkeeping, not stream semantics. Producers often
+    // store it in a distinct indirect integer object for every otherwise
+    // identical stream, which makes object-number-sensitive serialization
+    // falsely distinguish exact duplicates. The encoded payload itself is
+    // already hashed below, so omit `/Length` while retaining every other
+    // stream-dictionary entry exactly as represented.
+    let dictionary = ObjectHandle::dictionary(
+        dict.as_dictionary()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(key, _)| key.as_slice() != b"/Length")
+            .collect(),
+    )
+    .unparse_resolved();
     let mut hasher = Sha256::new();
     hasher.update((domain.len() as u64).to_le_bytes());
     hasher.update(domain);
@@ -429,6 +442,45 @@ mod tests {
         let different_ref = different_holder.try_get_key(b"/Metadata")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_streams_when_only_length_reference_identity_differs() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"<x:xmpmeta>same payload, separate indirect lengths</x:xmpmeta>";
+        let first = metadata_stream(&mut pdf, payload)?;
+        let second = metadata_stream(&mut pdf, payload)?;
+        let first_length =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+        let second_length =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+        let first_dict = first
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("first metadata stream has no dictionary".to_owned()))?;
+        let second_dict = second
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("second metadata stream has no dictionary".to_owned()))?;
+        first_dict.replace_key(b"/Length", first_length)?;
+        second_dict.replace_key(b"/Length", second_length)?;
+        pdf.mark_object_handle_dirty(&first_dict)?;
+        pdf.mark_object_handle_dirty(&second_dict)?;
+
+        let first_holder = holder(&mut pdf, first)?;
+        let second_holder = holder(&mut pdf, second)?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestIndirectLengthMetadataA", first_holder.clone())?;
+        root.replace_key(b"/TestIndirectLengthMetadataB", second_holder.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_metadata_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_holder.try_get_key(b"/Metadata")?.object_ref(),
+            second_holder.try_get_key(b"/Metadata")?.object_ref()
+        );
         Ok(())
     }
 
