@@ -39,10 +39,7 @@ fn stream_fingerprint_ignoring(
         entries
             .into_iter()
             .filter(|(key, _)| {
-                key.as_slice() != b"/Length"
-                    && !ignored_dictionary_keys
-                        .iter()
-                        .any(|ignored| key.as_slice() == *ignored)
+                key.as_slice() != b"/Length" && !ignored_dictionary_keys.contains(&key.as_slice())
             })
             .collect(),
     )
@@ -422,6 +419,7 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     subtype_name: &[u8],
     domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
     let holders = xobject_holders(&objects);
@@ -431,7 +429,7 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
         &objects,
         subtype_name,
         domain,
-        &[],
+        ignored_dictionary_keys,
         &mut duplicate_refs,
         &mut duplicate_raw_bytes,
     )?;
@@ -444,7 +442,7 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
     })
 }
 
-fn image_name_is_ignorable(version: &str) -> bool {
+fn xobject_name_is_ignorable(version: &str) -> bool {
     let Some((major, minor)) = version.split_once('.') else {
         return false;
     };
@@ -461,7 +459,7 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     // Be deliberately conservative: only a parseable header version greater
     // than 1.0 enables omitting it from identity. A catalog /Version upgrade
     // on a 1.0 header may therefore miss a dedup opportunity, never broaden it.
-    let ignored_dictionary_keys: &[&[u8]] = if image_name_is_ignorable(pdf.version()) {
+    let ignored_dictionary_keys: &[&[u8]] = if xobject_name_is_ignorable(pdf.version()) {
         &[b"/Name"]
     } else {
         &[]
@@ -534,7 +532,14 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
 pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
-    canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject")
+    // Form /Name has the same PDF 1.0-only requirement and obsolescent status
+    // as Image /Name. Keep every rendering-relevant Form key exact.
+    let ignored: &[&[u8]] = if xobject_name_is_ignorable(pdf.version()) {
+        &[b"/Name"]
+    } else {
+        &[]
+    };
+    canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject", ignored)
 }
 
 fn collect_direct_appearance_dictionaries(
@@ -1480,12 +1485,12 @@ mod tests {
     }
 
     #[test]
-    fn image_name_is_ignored_only_after_pdf_1_0() {
-        assert!(!image_name_is_ignorable("1.0"));
-        assert!(image_name_is_ignorable("1.1"));
-        assert!(image_name_is_ignorable("1.7"));
-        assert!(image_name_is_ignorable("2.0"));
-        assert!(!image_name_is_ignorable("garbage"));
+    fn xobject_name_is_ignored_only_after_pdf_1_0() {
+        assert!(!xobject_name_is_ignorable("1.0"));
+        assert!(xobject_name_is_ignorable("1.1"));
+        assert!(xobject_name_is_ignorable("1.7"));
+        assert!(xobject_name_is_ignorable("2.0"));
+        assert!(!xobject_name_is_ignorable("garbage"));
     }
 
     #[test]
@@ -1617,6 +1622,17 @@ mod tests {
         let first = form_stream(&mut pdf, payload, 10)?;
         let second = form_stream(&mut pdf, payload, 10)?;
         let different_dict = form_stream(&mut pdf, payload, 20)?;
+        for (form, name) in [
+            (&first, b"FmA".as_slice()),
+            (&second, b"FmB".as_slice()),
+            (&different_dict, b"FmC".as_slice()),
+        ] {
+            let dict = form
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("form stream has no dictionary".to_owned()))?;
+            dict.replace_key(b"/Name", ObjectHandle::name(name.to_vec()))?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
         let xobjects = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
             (b"/Fm1".to_vec(), first),
             (b"/Fm2".to_vec(), second),
