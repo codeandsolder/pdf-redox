@@ -66,6 +66,9 @@ struct Args {
     /// Preserve separate exact duplicate embedded font-program stream objects.
     #[arg(long)]
     no_font_program_dedup: bool,
+    /// Preserve separate exact duplicate ToUnicode CMap stream objects.
+    #[arg(long)]
+    no_to_unicode_dedup: bool,
     /// Preserve separate exact duplicate Image XObjects instead of canonicalizing them.
     #[arg(long)]
     no_image_dedup: bool,
@@ -127,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.prune_resources = a.prune_resources;
     cfg.deduplicate_metadata_streams = !a.no_metadata_dedup;
     cfg.deduplicate_font_programs = !a.no_font_program_dedup;
+    cfg.deduplicate_to_unicode_cmaps = !a.no_to_unicode_dedup;
     cfg.deduplicate_inline_images = !a.no_inline_image_dedup;
     cfg.inline_image_min_duplicate_payload_bytes = a.inline_image_dedup_min_waste;
     cfg.deduplicate_image_xobjects = !a.no_image_dedup;

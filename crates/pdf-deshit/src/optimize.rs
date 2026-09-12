@@ -3,7 +3,7 @@ use crate::{
     analyze::{analyze_pdf, input_sha256},
     dedup::{
         canonicalize_font_program_streams, canonicalize_icc_profiles, canonicalize_image_xobjects,
-        canonicalize_metadata_streams,
+        canonicalize_metadata_streams, canonicalize_to_unicode_cmaps,
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
@@ -61,6 +61,11 @@ fn optimize_pdf_with_before(
     };
     let font_dedup = if cfg.deduplicate_font_programs {
         canonicalize_font_program_streams(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let to_unicode_dedup = if cfg.deduplicate_to_unicode_cmaps {
+        canonicalize_to_unicode_cmaps(&mut pdf)?
     } else {
         Default::default()
     };
@@ -236,6 +241,12 @@ fn optimize_pdf_with_before(
             font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
         ));
     }
+    if to_unicode_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate ToUnicode reference(s) across {} duplicate CMap stream object(s).",
+            to_unicode_dedup.references_canonicalized, to_unicode_dedup.duplicate_streams_detected
+        ));
+    }
     if image_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate Image XObject reference(s) across {} duplicate image stream object(s).",
@@ -275,6 +286,9 @@ fn optimize_pdf_with_before(
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        to_unicode_duplicate_streams_detected: to_unicode_dedup.duplicate_streams_detected,
+        to_unicode_duplicate_raw_bytes: to_unicode_dedup.duplicate_raw_bytes,
+        to_unicode_references_canonicalized: to_unicode_dedup.references_canonicalized,
         inline_image_fingerprints_selected: inline_image_dedup.fingerprints_selected,
         inline_image_occurrences_externalized: inline_image_dedup.occurrences_externalized,
         inline_image_xobjects_created: inline_image_dedup.xobjects_created,

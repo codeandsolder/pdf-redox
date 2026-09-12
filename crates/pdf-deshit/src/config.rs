@@ -141,6 +141,9 @@ pub struct Config {
     /// Canonicalize exact duplicate embedded font-program streams referenced through the
     /// same `/FontFile`, `/FontFile2`, or `/FontFile3` key kind.
     pub deduplicate_font_programs: bool,
+    /// Canonicalize byte- and dictionary-identical character maps referenced through
+    /// font `/ToUnicode` entries.
+    pub deduplicate_to_unicode_cmaps: bool,
     /// Externalize and share only exact inline images repeated across multiple mutable
     /// content scopes whose duplicated encoded payload clears the configured size gate.
     pub deduplicate_inline_images: bool,
@@ -170,6 +173,7 @@ impl Config {
             prune_resources: false,
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
+            deduplicate_to_unicode_cmaps: true,
             deduplicate_inline_images: true,
             inline_image_min_duplicate_payload_bytes: 1024,
             deduplicate_image_xobjects: true,
@@ -257,6 +261,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_to_unicode_cmaps(mut self, value: bool) -> Self {
+        self.config.deduplicate_to_unicode_cmaps = value;
+        self
+    }
+
     pub fn deduplicate_inline_images(mut self, value: bool) -> Self {
         self.config.deduplicate_inline_images = value;
         self
@@ -328,6 +337,7 @@ mod tests {
             .prune_resources(true)
             .deduplicate_metadata_streams(false)
             .deduplicate_font_programs(true)
+            .deduplicate_to_unicode_cmaps(false)
             .deduplicate_inline_images(false)
             .inline_image_min_duplicate_payload_bytes(4096)
             .deduplicate_image_xobjects(false)
@@ -346,6 +356,7 @@ mod tests {
         assert!(config.prune_resources);
         assert!(!config.deduplicate_metadata_streams);
         assert!(config.deduplicate_font_programs);
+        assert!(!config.deduplicate_to_unicode_cmaps);
         assert!(!config.deduplicate_inline_images);
         assert_eq!(config.inline_image_min_duplicate_payload_bytes, 4096);
         assert!(!config.deduplicate_image_xobjects);

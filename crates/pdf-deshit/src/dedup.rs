@@ -402,6 +402,116 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     canonicalize_xobject_subtype(pdf, b"Image", b"image-xobject")
 }
 
+fn collect_direct_to_unicode_holders(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    holders: &mut Vec<ObjectHandle>,
+) {
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    if let Some(dict) = value.as_stream_dict() {
+        if matches!(dict.try_get_key(b"/ToUnicode"), Ok(cmap) if !cmap.is_null()) {
+            holders.push(dict.clone());
+        }
+        if let Some(entries) = dict.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/ToUnicode" {
+                    collect_direct_to_unicode_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if matches!(value.try_is_dictionary(), Ok(true)) {
+        if matches!(value.try_get_key(b"/ToUnicode"), Ok(cmap) if !cmap.is_null()) {
+            holders.push(value.clone());
+        }
+        if let Some(entries) = value.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/ToUnicode" {
+                    collect_direct_to_unicode_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_direct_to_unicode_holders(&item, false, holders);
+        }
+    }
+}
+
+fn to_unicode_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+    let mut holders = Vec::new();
+    for object in objects {
+        collect_direct_to_unicode_holders(object, true, &mut holders);
+    }
+    holders
+}
+
+pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let holders = to_unicode_holders(&objects);
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for dict in &holders {
+        let Ok(cmap) = dict.try_get_key(b"/ToUnicode") else {
+            continue;
+        };
+        let Some(cmap_ref) = cmap.object_ref() else {
+            continue;
+        };
+        if pdf.resolve(&cmap).is_err() {
+            continue;
+        }
+        let Ok(Some(fingerprint)) = stream_fingerprint(&cmap, b"to-unicode") else {
+            continue;
+        };
+        if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical_ref != cmap_ref {
+                redirects.insert(cmap_ref, canonical_ref);
+                if duplicate_refs.insert(cmap_ref) {
+                    duplicate_raw_bytes += cmap.get_raw_stream_data()?.len();
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, cmap_ref);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for dict in holders {
+        let Ok(cmap) = dict.try_get_key(b"/ToUnicode") else {
+            continue;
+        };
+        let Some(cmap_ref) = cmap.object_ref() else {
+            continue;
+        };
+        let Some(canonical_ref) = redirects.get(&cmap_ref).copied() else {
+            continue;
+        };
+        dict.replace_key(b"/ToUnicode", pdf.get_object_handle(canonical_ref))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        references_canonicalized += 1;
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 const FONT_FILE_KEYS: [&[u8]; 3] = [b"/FontFile", b"/FontFile2", b"/FontFile3"];
 
 pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
@@ -810,6 +920,96 @@ mod tests {
         assert_eq!(
             image_ref(&first_holder, b"/Im1")?,
             image_ref(&second_holder, b"/Im2")?
+        );
+        Ok(())
+    }
+
+    fn to_unicode_stream(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+        extra_key: Option<(&[u8], ObjectHandle)>,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        if let Some((key, value)) = extra_key {
+            let dict = stream.as_stream_dict().ok_or_else(|| {
+                Error::Invalid("new ToUnicode stream has no dictionary".to_owned())
+            })?;
+            dict.replace_key(key, value)?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        Ok(stream)
+    }
+
+    #[test]
+    fn canonicalizes_only_exact_to_unicode_cmaps() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"/CIDInit /ProcSet findresource begin end";
+        let first = to_unicode_stream(&mut pdf, payload, None)?;
+        let second = to_unicode_stream(&mut pdf, payload, None)?;
+        let different_dict = to_unicode_stream(
+            &mut pdf,
+            payload,
+            Some((b"/UseCMap", ObjectHandle::name(b"Identity-H".to_vec()))),
+        )?;
+
+        let holder =
+            |cmap: ObjectHandle| ObjectHandle::dictionary(vec![(b"/ToUnicode".to_vec(), cmap)]);
+        let first_holder = pdf.make_indirect_object_handle(holder(first))?;
+        let second_holder = pdf.make_indirect_object_handle(holder(second))?;
+        let different_holder = pdf.make_indirect_object_handle(holder(different_dict))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestToUnicodeA", first_holder.clone())?;
+        root.replace_key(b"/TestToUnicodeB", second_holder.clone())?;
+        root.replace_key(b"/TestToUnicodeDifferent", different_holder.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_to_unicode_cmaps(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let cmap_ref = |holder: &ObjectHandle| -> Result<Option<ObjectRef>> {
+            Ok(holder.try_get_key(b"/ToUnicode")?.object_ref())
+        };
+        let canonical = cmap_ref(&first_holder)?;
+        assert_eq!(canonical, cmap_ref(&second_holder)?);
+        assert_ne!(canonical, cmap_ref(&different_holder)?);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_to_unicode_nested_in_direct_font_dictionary() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"exact direct font cmap";
+        let first = to_unicode_stream(&mut pdf, payload, None)?;
+        let second = to_unicode_stream(&mut pdf, payload, None)?;
+        let fonts = ObjectHandle::dictionary(vec![
+            (
+                b"/F1".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/ToUnicode".to_vec(), first)]),
+            ),
+            (
+                b"/F2".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/ToUnicode".to_vec(), second)]),
+            ),
+        ]);
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFonts", fonts.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_to_unicode_cmaps(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            fonts
+                .try_get_key(b"/F1")?
+                .try_get_key(b"/ToUnicode")?
+                .object_ref(),
+            fonts
+                .try_get_key(b"/F2")?
+                .try_get_key(b"/ToUnicode")?
+                .object_ref()
         );
         Ok(())
     }
