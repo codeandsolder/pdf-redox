@@ -159,6 +159,9 @@ pub struct Config {
     /// Canonicalize byte- and dictionary-identical Form appearance streams referenced from
     /// annotation `/AP` dictionaries.
     pub deduplicate_appearance_streams: bool,
+    /// Canonicalize byte- and dictionary-identical page content streams referenced from
+    /// page `/Contents` entries.
+    pub deduplicate_page_contents: bool,
     /// Canonicalize byte- and dictionary-identical Type3 glyph streams referenced from
     /// `/CharProcs` dictionaries.
     pub deduplicate_type3_charprocs: bool,
@@ -188,6 +191,7 @@ impl Config {
             deduplicate_image_xobjects: true,
             deduplicate_form_xobjects: true,
             deduplicate_appearance_streams: true,
+            deduplicate_page_contents: true,
             deduplicate_type3_charprocs: true,
             deduplicate_icc_profiles: true,
             flate_level: 9,
@@ -303,6 +307,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_page_contents(mut self, value: bool) -> Self {
+        self.config.deduplicate_page_contents = value;
+        self
+    }
+
     pub fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
         self.config.deduplicate_type3_charprocs = value;
         self
@@ -370,6 +379,7 @@ mod tests {
             .deduplicate_image_xobjects(false)
             .deduplicate_form_xobjects(false)
             .deduplicate_appearance_streams(false)
+            .deduplicate_page_contents(false)
             .deduplicate_type3_charprocs(false)
             .deduplicate_icc_profiles(false)
             .flate_level(6)
@@ -392,6 +402,7 @@ mod tests {
         assert!(!config.deduplicate_image_xobjects);
         assert!(!config.deduplicate_form_xobjects);
         assert!(!config.deduplicate_appearance_streams);
+        assert!(!config.deduplicate_page_contents);
         assert!(!config.deduplicate_type3_charprocs);
         assert!(!config.deduplicate_icc_profiles);
         assert_eq!(config.flate_level, 6);

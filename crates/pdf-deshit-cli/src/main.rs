@@ -78,6 +78,9 @@ struct Args {
     /// Preserve separate exact duplicate annotation appearance streams instead of canonicalizing them.
     #[arg(long)]
     no_appearance_dedup: bool,
+    /// Preserve separate exact duplicate page content streams instead of canonicalizing them.
+    #[arg(long)]
+    no_page_content_dedup: bool,
     /// Preserve separate exact duplicate Type3 CharProc streams instead of canonicalizing them.
     #[arg(long)]
     no_type3_charproc_dedup: bool,
@@ -145,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.deduplicate_image_xobjects = !a.no_image_dedup;
     cfg.deduplicate_form_xobjects = !a.no_form_dedup;
     cfg.deduplicate_appearance_streams = !a.no_appearance_dedup;
+    cfg.deduplicate_page_contents = !a.no_page_content_dedup;
     cfg.deduplicate_type3_charprocs = !a.no_type3_charproc_dedup;
     cfg.deduplicate_icc_profiles = !a.no_icc_dedup;
 

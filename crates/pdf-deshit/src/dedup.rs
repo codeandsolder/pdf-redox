@@ -543,6 +543,93 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     })
 }
 
+pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    #[derive(Clone)]
+    struct ContentSlot {
+        holder: ObjectHandle,
+        index: Option<usize>,
+        stream_ref: ObjectRef,
+    }
+
+    let page_refs = flpdf::pages::page_refs(pdf)?;
+    let mut slots = Vec::new();
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for page_ref in page_refs {
+        let page = pdf.get_object_handle(page_ref);
+        if pdf.resolve(&page).is_err() {
+            continue;
+        }
+        let Ok(contents) = page.try_get_key(b"/Contents") else {
+            continue;
+        };
+        if contents.is_null() || pdf.resolve(&contents).is_err() {
+            continue;
+        }
+
+        let mut candidates: Vec<(ObjectHandle, Option<usize>, ObjectHandle)> = Vec::new();
+        if contents.as_stream_dict().is_some() {
+            candidates.push((page.clone(), None, contents));
+        } else if let Some(items) = contents.as_array() {
+            for (index, item) in items.into_iter().enumerate() {
+                if pdf.resolve(&item).is_ok() && item.as_stream_dict().is_some() {
+                    candidates.push((contents.clone(), Some(index), item));
+                }
+            }
+        }
+
+        for (holder, index, stream) in candidates {
+            let Some(stream_ref) = stream.object_ref() else {
+                continue;
+            };
+            let Ok(Some(fingerprint)) = stream_fingerprint(&stream, b"page-content") else {
+                continue;
+            };
+            slots.push(ContentSlot {
+                holder,
+                index,
+                stream_ref,
+            });
+            if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical_ref != stream_ref {
+                    redirects.insert(stream_ref, canonical_ref);
+                    if duplicate_refs.insert(stream_ref) {
+                        duplicate_raw_bytes += stream.get_raw_stream_data()?.len();
+                    }
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, stream_ref);
+            }
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for slot in slots {
+        let Some(canonical_ref) = redirects.get(&slot.stream_ref).copied() else {
+            continue;
+        };
+        let canonical = pdf.get_object_handle(canonical_ref);
+        if let Some(index) = slot.index {
+            slot.holder.set_array_item(index, canonical)?;
+        } else {
+            slot.holder.replace_key(b"/Contents", canonical)?;
+        }
+        pdf.mark_object_handle_dirty(&slot.holder)?;
+        references_canonicalized += 1;
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 fn collect_direct_type3_charprocs(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -1347,6 +1434,108 @@ mod tests {
             first_ap.try_get_key(b"/N")?.object_ref(),
             second_ap.try_get_key(b"/N")?.object_ref()
         );
+        Ok(())
+    }
+
+    fn add_page_with_contents(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        contents: ObjectHandle,
+        resource_marker: i64,
+    ) -> Result<ObjectHandle> {
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pdf.resolve(&pages)?;
+        let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Parent".to_vec(), pages.clone()),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Marker".to_vec(),
+                    ObjectHandle::integer(resource_marker),
+                )]),
+            ),
+            (b"/Contents".to_vec(), contents),
+        ]))?;
+        let kids = pages.try_get_key(b"/Kids")?;
+        let mut page_handles = if kids.try_is_array()? {
+            kids.try_get_array_as_vector()?
+        } else {
+            Vec::new()
+        };
+        page_handles.push(page.clone());
+        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles.clone()))?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(page_handles.len() as i64))?;
+        pdf.mark_object_handle_dirty(&pages)?;
+        Ok(page)
+    }
+
+    #[test]
+    fn canonicalizes_exact_direct_page_content_streams_across_resource_contexts() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q /Im0 Do Q";
+        let first = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let second = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let different_dict = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let different_dict_handle = different_dict
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("content stream has no dictionary".to_owned()))?;
+        different_dict_handle.replace_key(b"/Custom", ObjectHandle::integer(1))?;
+        pdf.mark_object_handle_dirty(&different_dict_handle)?;
+
+        let first_page = add_page_with_contents(&mut pdf, first, 1)?;
+        let second_page = add_page_with_contents(&mut pdf, second, 2)?;
+        let different_page = add_page_with_contents(&mut pdf, different_dict, 3)?;
+
+        let stats = canonicalize_page_contents(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_page.try_get_key(b"/Contents")?.object_ref(),
+            second_page.try_get_key(b"/Contents")?.object_ref()
+        );
+        assert_ne!(
+            first_page.try_get_key(b"/Contents")?.object_ref(),
+            different_page.try_get_key(b"/Contents")?.object_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_page_content_streams_inside_arrays_without_reordering() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 1 0 0 1 0 0 cm Q";
+        let first = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let second = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let unique = pdf.new_stream_with_data(Rc::new(b"BT ET".to_vec()))?;
+        let first_array = ObjectHandle::array(vec![first, unique.clone()]);
+        let second_array = ObjectHandle::array(vec![second]);
+        let first_page = add_page_with_contents(&mut pdf, first_array.clone(), 1)?;
+        let second_page = add_page_with_contents(&mut pdf, second_array.clone(), 2)?;
+
+        let stats = canonicalize_page_contents(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_contents = first_page.try_get_key(b"/Contents")?;
+        let second_contents = second_page.try_get_key(b"/Contents")?;
+        let first_items = first_contents.try_get_array_as_vector()?;
+        let second_items = second_contents.try_get_array_as_vector()?;
+        assert_eq!(first_items.len(), 2);
+        assert_eq!(second_items.len(), 1);
+        assert_eq!(first_items[0].object_ref(), second_items[0].object_ref());
+        assert_eq!(first_items[1].object_ref(), unique.object_ref());
         Ok(())
     }
 

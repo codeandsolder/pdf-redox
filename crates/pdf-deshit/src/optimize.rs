@@ -4,7 +4,8 @@ use crate::{
     dedup::{
         canonicalize_appearance_streams, canonicalize_font_program_streams,
         canonicalize_form_xobjects, canonicalize_icc_profiles, canonicalize_image_xobjects,
-        canonicalize_metadata_streams, canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
+        canonicalize_metadata_streams, canonicalize_page_contents, canonicalize_to_unicode_cmaps,
+        canonicalize_type3_charprocs,
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
@@ -177,6 +178,15 @@ fn optimize_pdf_with_before(
         PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
     }
     let flate = apply_flate_policy(&mut pdf, cfg.flate_policy, cfg.flate_level)?;
+    // Content streams must be canonicalized after every transform that can
+    // mutate them (hidden-text removal, inline-image externalization, and
+    // Flate recompression). Sharing them earlier would couple later writes
+    // across pages that originally had independent stream objects.
+    let page_content_dedup = if cfg.deduplicate_page_contents {
+        canonicalize_page_contents(&mut pdf)?
+    } else {
+        Default::default()
+    };
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
@@ -282,6 +292,13 @@ fn optimize_pdf_with_before(
             appearance_dedup.duplicate_streams_detected
         ));
     }
+    if page_content_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate page-content reference(s) across {} duplicate content stream object(s).",
+            page_content_dedup.references_canonicalized,
+            page_content_dedup.duplicate_streams_detected
+        ));
+    }
     if type3_charproc_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate Type3 CharProc reference(s) across {} duplicate glyph stream object(s).",
@@ -339,6 +356,9 @@ fn optimize_pdf_with_before(
         appearance_duplicate_streams_detected: appearance_dedup.duplicate_streams_detected,
         appearance_duplicate_raw_bytes: appearance_dedup.duplicate_raw_bytes,
         appearance_references_canonicalized: appearance_dedup.references_canonicalized,
+        page_content_duplicate_streams_detected: page_content_dedup.duplicate_streams_detected,
+        page_content_duplicate_raw_bytes: page_content_dedup.duplicate_raw_bytes,
+        page_content_references_canonicalized: page_content_dedup.references_canonicalized,
         type3_charproc_duplicate_streams_detected: type3_charproc_dedup.duplicate_streams_detected,
         type3_charproc_duplicate_raw_bytes: type3_charproc_dedup.duplicate_raw_bytes,
         type3_charproc_references_canonicalized: type3_charproc_dedup.references_canonicalized,
