@@ -11,7 +11,11 @@ pub(crate) struct TargetedDedupStats {
     pub references_canonicalized: usize,
 }
 
-fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
+fn stream_fingerprint_ignoring(
+    object: &ObjectHandle,
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+) -> Result<Option<[u8; 32]>> {
     let Some(dict) = object.as_stream_dict() else {
         return Ok(None);
     };
@@ -26,14 +30,20 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
     // identical stream, which makes object-number-sensitive serialization
     // falsely distinguish exact duplicates. The encoded payload itself is
     // already hashed below, so omit `/Length` while retaining every other
-    // stream-dictionary entry exactly as represented.
+    // stream-dictionary entry exactly unless a caller supplies an additional
+    // specification-backed non-semantic key to ignore.
     let Some(entries) = dict.as_dictionary() else {
         return Ok(None);
     };
     let dictionary = ObjectHandle::dictionary(
         entries
             .into_iter()
-            .filter(|(key, _)| key.as_slice() != b"/Length")
+            .filter(|(key, _)| {
+                key.as_slice() != b"/Length"
+                    && !ignored_dictionary_keys
+                        .iter()
+                        .any(|ignored| key.as_slice() == *ignored)
+            })
             .collect(),
     )
     .unparse_resolved();
@@ -45,6 +55,10 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
     hasher.update((dictionary.len() as u64).to_le_bytes());
     hasher.update(dictionary);
     Ok(Some(hasher.finalize().into()))
+}
+
+fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
+    stream_fingerprint_ignoring(object, domain, &[])
 }
 
 pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
@@ -273,6 +287,7 @@ fn xobject_fingerprint(
     object: &ObjectHandle,
     subtype_name: &[u8],
     domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
 ) -> Result<Option<[u8; 32]>> {
     let Some(dict) = object.as_stream_dict() else {
         return Ok(None);
@@ -281,7 +296,7 @@ fn xobject_fingerprint(
     if !subtype.try_is_name_and_equals(subtype_name)? {
         return Ok(None);
     }
-    stream_fingerprint(object, domain)
+    stream_fingerprint_ignoring(object, domain, ignored_dictionary_keys)
 }
 
 fn collect_direct_xobject_holders(
@@ -343,6 +358,7 @@ fn exact_xobject_redirects(
     objects: &[ObjectHandle],
     subtype_name: &[u8],
     domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
     duplicate_refs: &mut HashSet<ObjectRef>,
     duplicate_raw_bytes: &mut usize,
 ) -> Result<HashMap<ObjectRef, ObjectRef>> {
@@ -353,7 +369,9 @@ fn exact_xobject_redirects(
         let Some(object_ref) = object.object_ref() else {
             continue;
         };
-        let Ok(Some(fingerprint)) = xobject_fingerprint(object, subtype_name, domain) else {
+        let Ok(Some(fingerprint)) =
+            xobject_fingerprint(object, subtype_name, domain, ignored_dictionary_keys)
+        else {
             continue;
         };
         if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
@@ -413,6 +431,7 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
         &objects,
         subtype_name,
         domain,
+        &[],
         &mut duplicate_refs,
         &mut duplicate_raw_bytes,
     )?;
@@ -425,9 +444,28 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
     })
 }
 
+fn image_name_is_ignorable(version: &str) -> bool {
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+        return false;
+    };
+    major > 1 || (major == 1 && minor > 0)
+}
+
 pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
+    // Image /Name is required only in PDF 1.0 and obsolescent afterwards.
+    // Be deliberately conservative: only a parseable header version greater
+    // than 1.0 enables omitting it from identity. A catalog /Version upgrade
+    // on a 1.0 header may therefore miss a dedup opportunity, never broaden it.
+    let ignored_dictionary_keys: &[&[u8]] = if image_name_is_ignorable(pdf.version()) {
+        &[b"/Name"]
+    } else {
+        &[]
+    };
     let objects = pdf.get_all_objects()?;
     let holders = xobject_holders(&objects);
     let mut duplicate_refs = HashSet::new();
@@ -443,6 +481,7 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
         &objects,
         b"Image",
         b"image-xobject",
+        ignored_dictionary_keys,
         &mut duplicate_refs,
         &mut duplicate_raw_bytes,
     )?;
@@ -479,6 +518,7 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
         &objects,
         b"Image",
         b"image-xobject",
+        ignored_dictionary_keys,
         &mut duplicate_refs,
         &mut duplicate_raw_bytes,
     )?;
@@ -590,7 +630,7 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
                 continue;
             }
             let Ok(Some(fingerprint)) =
-                xobject_fingerprint(&appearance, b"Form", b"appearance-stream")
+                xobject_fingerprint(&appearance, b"Form", b"appearance-stream", &[])
             else {
                 continue;
             };
@@ -1434,6 +1474,70 @@ mod tests {
         let first_ref = xobjects.try_get_key(b"/Im1")?.object_ref();
         let second_ref = xobjects.try_get_key(b"/Im2")?.object_ref();
         let different_ref = xobjects.try_get_key(b"/Im3")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn image_name_is_ignored_only_after_pdf_1_0() {
+        assert!(!image_name_is_ignorable("1.0"));
+        assert!(image_name_is_ignorable("1.1"));
+        assert!(image_name_is_ignorable("1.7"));
+        assert!(image_name_is_ignorable("2.0"));
+        assert!(!image_name_is_ignorable("garbage"));
+    }
+
+    #[test]
+    fn canonicalizes_post_1_0_images_that_differ_only_by_obsolescent_name() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        assert_eq!(pdf.version(), "1.3");
+        let payload = b"same-image-payload";
+        let first = image_stream(&mut pdf, payload, 4, 2)?;
+        let second = image_stream(&mut pdf, payload, 4, 2)?;
+        let different_intent = image_stream(&mut pdf, payload, 4, 2)?;
+
+        for (image, name) in [
+            (&first, b"ImA".as_slice()),
+            (&second, b"ImB".as_slice()),
+            (&different_intent, b"ImC".as_slice()),
+        ] {
+            let dict = image
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("image has no dictionary".to_owned()))?;
+            dict.replace_key(b"/Name", ObjectHandle::name(name.to_vec()))?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        let different_dict = different_intent
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("image has no dictionary".to_owned()))?;
+        different_dict.replace_key(
+            b"/Intent",
+            ObjectHandle::name(b"RelativeColorimetric".to_vec()),
+        )?;
+        pdf.mark_object_handle_dirty(&different_dict)?;
+
+        let xobjects = ObjectHandle::dictionary(vec![
+            (b"/ImA".to_vec(), first),
+            (b"/ImB".to_vec(), second),
+            (b"/ImC".to_vec(), different_intent),
+        ]);
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestImageHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_image_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = xobjects.try_get_key(b"/ImA")?.object_ref();
+        let second_ref = xobjects.try_get_key(b"/ImB")?.object_ref();
+        let different_ref = xobjects.try_get_key(b"/ImC")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
         Ok(())
