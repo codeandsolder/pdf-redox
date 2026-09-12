@@ -51,6 +51,7 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
+    let holders = metadata_holders(&objects);
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut duplicate_refs = HashSet::new();
@@ -58,15 +59,10 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
 
     // Treat the /Metadata reference as authoritative. Real producers exist
     // that omit the stream's nominal /Type /Metadata entry entirely.
-    for object in &objects {
-        let dict = if let Some(dict) = object.as_stream_dict() {
-            dict
-        } else if object.try_is_dictionary()? {
-            object.clone()
-        } else {
+    for dict in &holders {
+        let Ok(metadata) = dict.try_get_key(b"/Metadata") else {
             continue;
         };
-        let metadata = dict.try_get_key(b"/Metadata")?;
         let Some(metadata_ref) = metadata.object_ref() else {
             continue;
         };
@@ -77,9 +73,11 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
             continue;
         };
         if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            redirects.insert(metadata_ref, canonical_ref);
-            if duplicate_refs.insert(metadata_ref) {
-                duplicate_raw_bytes += metadata.get_raw_stream_data()?.len();
+            if canonical_ref != metadata_ref {
+                redirects.insert(metadata_ref, canonical_ref);
+                if duplicate_refs.insert(metadata_ref) {
+                    duplicate_raw_bytes += metadata.get_raw_stream_data()?.len();
+                }
             }
         } else {
             canonical_by_fingerprint.insert(fingerprint, metadata_ref);
@@ -87,15 +85,10 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     }
 
     let mut references_canonicalized = 0_usize;
-    for object in &objects {
-        let dict = if let Some(dict) = object.as_stream_dict() {
-            dict
-        } else if object.try_is_dictionary()? {
-            object.clone()
-        } else {
+    for dict in holders {
+        let Ok(metadata) = dict.try_get_key(b"/Metadata") else {
             continue;
         };
-        let metadata = dict.try_get_key(b"/Metadata")?;
         let Some(metadata_ref) = metadata.object_ref() else {
             continue;
         };
@@ -113,6 +106,61 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
         duplicate_raw_bytes,
         references_canonicalized,
     })
+}
+
+fn collect_direct_metadata_holders(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    holders: &mut Vec<ObjectHandle>,
+) {
+    // Every indirect object is visited separately from `get_all_objects`.
+    // Recurse only through direct descendants here so cycles in the object
+    // graph cannot turn metadata discovery into an unbounded traversal.
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    if let Some(dict) = value.as_stream_dict() {
+        if matches!(dict.try_get_key(b"/Metadata"), Ok(metadata) if !metadata.is_null()) {
+            holders.push(dict.clone());
+        }
+        if let Some(entries) = dict.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/Metadata" {
+                    collect_direct_metadata_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if matches!(value.try_is_dictionary(), Ok(true)) {
+        if matches!(value.try_get_key(b"/Metadata"), Ok(metadata) if !metadata.is_null()) {
+            holders.push(value.clone());
+        }
+        if let Some(entries) = value.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/Metadata" {
+                    collect_direct_metadata_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_direct_metadata_holders(&item, false, holders);
+        }
+    }
+}
+
+fn metadata_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+    let mut holders = Vec::new();
+    for object in objects {
+        collect_direct_metadata_holders(object, true, &mut holders);
+    }
+    holders
 }
 
 fn collect_direct_icc_arrays(
@@ -482,6 +530,52 @@ mod tests {
         assert_eq!(
             first_holder.try_get_key(b"/Metadata")?.object_ref(),
             second_holder.try_get_key(b"/Metadata")?.object_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_metadata_nested_in_direct_resource_dictionaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"<x:xmpmeta>nested page property metadata</x:xmpmeta>";
+        let first = metadata_stream(&mut pdf, payload)?;
+        let second = metadata_stream(&mut pdf, payload)?;
+
+        let nested_holder = |metadata: ObjectHandle| {
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Properties".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"/MC0".to_vec(),
+                        ObjectHandle::dictionary(vec![(b"/Metadata".to_vec(), metadata)]),
+                    )]),
+                )]),
+            )])
+        };
+        let first_holder = pdf.make_indirect_object_handle(nested_holder(first))?;
+        let second_holder = pdf.make_indirect_object_handle(nested_holder(second))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestNestedMetadataA", first_holder.clone())?;
+        root.replace_key(b"/TestNestedMetadataB", second_holder.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_metadata_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let nested_metadata_ref = |holder: &ObjectHandle| -> Result<Option<ObjectRef>> {
+            Ok(holder
+                .try_get_key(b"/Resources")?
+                .try_get_key(b"/Properties")?
+                .try_get_key(b"/MC0")?
+                .try_get_key(b"/Metadata")?
+                .object_ref())
+        };
+        assert_eq!(
+            nested_metadata_ref(&first_holder)?,
+            nested_metadata_ref(&second_holder)?
         );
         Ok(())
     }
