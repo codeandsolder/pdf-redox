@@ -415,33 +415,6 @@ fn rewrite_xobject_resource_references<R: Read + Seek + 'static>(
     Ok(references_canonicalized)
 }
 
-fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    subtype_name: &[u8],
-    domain: &[u8],
-    ignored_dictionary_keys: &[&[u8]],
-) -> Result<TargetedDedupStats> {
-    let objects = pdf.get_all_objects()?;
-    let holders = xobject_holders(&objects);
-    let mut duplicate_refs = HashSet::new();
-    let mut duplicate_raw_bytes = 0_usize;
-    let redirects = exact_xobject_redirects(
-        &objects,
-        subtype_name,
-        domain,
-        ignored_dictionary_keys,
-        &mut duplicate_refs,
-        &mut duplicate_raw_bytes,
-    )?;
-    let references_canonicalized = rewrite_xobject_resource_references(pdf, holders, &redirects)?;
-
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
-}
-
 fn xobject_name_is_ignorable(version: &str) -> bool {
     let Some((major, minor)) = version.split_once('.') else {
         return false;
@@ -529,9 +502,166 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     })
 }
 
+fn dictionary_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
+    if !object.try_is_dictionary()? {
+        return Ok(None);
+    }
+    let dictionary = object.unparse_resolved();
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    hasher.update((dictionary.len() as u64).to_le_bytes());
+    hasher.update(dictionary);
+    Ok(Some(hasher.finalize().into()))
+}
+
+fn exact_form_font_redirects<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    objects: &[ObjectHandle],
+) -> Result<HashMap<ObjectRef, ObjectRef>> {
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects = HashMap::new();
+    let mut seen_font_refs = HashSet::new();
+
+    for object in objects {
+        let Some(dict) = object.as_stream_dict() else {
+            continue;
+        };
+        let Ok(subtype) = dict.try_get_key(b"/Subtype") else {
+            continue;
+        };
+        if !matches!(subtype.try_is_name_and_equals(b"Form"), Ok(true)) {
+            continue;
+        }
+        let Ok(resources) = dict.try_get_key(b"/Resources") else {
+            continue;
+        };
+        if resources.object_ref().is_some() {
+            continue;
+        }
+        let Ok(fonts) = resources.try_get_key(b"/Font") else {
+            continue;
+        };
+        if fonts.object_ref().is_some() {
+            continue;
+        }
+        let Some(entries) = fonts.as_dictionary() else {
+            continue;
+        };
+        for (_, font) in entries {
+            let Some(font_ref) = font.object_ref() else {
+                continue;
+            };
+            if !seen_font_refs.insert(font_ref) {
+                continue;
+            }
+            if pdf.resolve(&font).is_err() {
+                continue;
+            }
+            let Ok(Some(fingerprint)) =
+                dictionary_fingerprint(&font, b"form-font-resource-dictionary")
+            else {
+                continue;
+            };
+            if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical_ref != font_ref {
+                    redirects.insert(font_ref, canonical_ref);
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, font_ref);
+            }
+        }
+    }
+
+    Ok(redirects)
+}
+
+fn normalized_form_resources<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    resources: &ObjectHandle,
+    font_redirects: &HashMap<ObjectRef, ObjectRef>,
+) -> Result<ObjectHandle> {
+    // Keep indirect resource containers exact. The targeted producer pattern
+    // uses a direct /Resources dictionary with a direct /Font dictionary; we
+    // normalize only those font entry references and nothing else in the graph.
+    if resources.object_ref().is_some() {
+        return Ok(resources.clone());
+    }
+    let Some(entries) = resources.as_dictionary() else {
+        return Ok(resources.clone());
+    };
+
+    let mut normalized = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if key.as_slice() != b"/Font" || value.object_ref().is_some() {
+            normalized.push((key, value));
+            continue;
+        }
+        let Some(fonts) = value.as_dictionary() else {
+            normalized.push((key, value));
+            continue;
+        };
+        let mut normalized_fonts = Vec::with_capacity(fonts.len());
+        for (name, font) in fonts {
+            let normalized_font = font
+                .object_ref()
+                .and_then(|font_ref| font_redirects.get(&font_ref).copied())
+                .map(|canonical_ref| pdf.get_object_handle(canonical_ref))
+                .unwrap_or(font);
+            normalized_fonts.push((name, normalized_font));
+        }
+        normalized.push((key, ObjectHandle::dictionary(normalized_fonts)));
+    }
+    Ok(ObjectHandle::dictionary(normalized))
+}
+
+fn form_fingerprint<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    object: &ObjectHandle,
+    ignored_dictionary_keys: &[&[u8]],
+    font_redirects: &HashMap<ObjectRef, ObjectRef>,
+) -> Result<Option<[u8; 32]>> {
+    let Some(dict) = object.as_stream_dict() else {
+        return Ok(None);
+    };
+    let subtype = dict.try_get_key(b"/Subtype")?;
+    if !subtype.try_is_name_and_equals(b"Form")? {
+        return Ok(None);
+    }
+    let raw = object.get_raw_stream_data()?;
+    let Some(entries) = dict.as_dictionary() else {
+        return Ok(None);
+    };
+    let mut normalized = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if key.as_slice() == b"/Length" || ignored_dictionary_keys.contains(&key.as_slice()) {
+            continue;
+        }
+        if key.as_slice() == b"/Resources" {
+            normalized.push((key, normalized_form_resources(pdf, &value, font_redirects)?));
+        } else {
+            normalized.push((key, value));
+        }
+    }
+    let dictionary = ObjectHandle::dictionary(normalized).unparse_resolved();
+    let domain = b"form-xobject";
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    hasher.update((raw.len() as u64).to_le_bytes());
+    hasher.update(raw.as_ref());
+    hasher.update((dictionary.len() as u64).to_le_bytes());
+    hasher.update(dictionary);
+    Ok(Some(hasher.finalize().into()))
+}
+
 pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let holders = xobject_holders(&objects);
+    let font_redirects = exact_form_font_redirects(pdf, &objects)?;
+
     // Form /Name has the same PDF 1.0-only requirement and obsolescent status
     // as Image /Name. Keep every rendering-relevant Form key exact.
     let ignored: &[&[u8]] = if xobject_name_is_ignorable(pdf.version()) {
@@ -539,7 +669,40 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     } else {
         &[]
     };
-    canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject", ignored)
+
+    // Font redirects are virtual: they affect only the Form fingerprint. The
+    // actual /Resources dictionaries remain untouched unless the parent Form
+    // itself is replaced by an exact canonical Form, avoiding size changes in
+    // files where font identity noise does not unlock a parent deduplication.
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    for object in &objects {
+        let Some(object_ref) = object.object_ref() else {
+            continue;
+        };
+        let Ok(Some(fingerprint)) = form_fingerprint(pdf, object, ignored, &font_redirects) else {
+            continue;
+        };
+        if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical_ref != object_ref {
+                redirects.insert(object_ref, canonical_ref);
+                if duplicate_refs.insert(object_ref) {
+                    duplicate_raw_bytes += object.get_raw_stream_data()?.len();
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, object_ref);
+        }
+    }
+    let references_canonicalized = rewrite_xobject_resource_references(pdf, holders, &redirects)?;
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
 }
 
 fn collect_direct_appearance_dictionaries(
@@ -1657,6 +1820,141 @@ mod tests {
         let different_ref = xobjects.try_get_key(b"/Fm3")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_form_font_resources_before_parent_forms() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"BT /F1 10 Tf (same) Tj ET";
+        let make_font = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]| {
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
+                (b"/BaseFont".to_vec(), ObjectHandle::name(base.to_vec())),
+            ]))
+        };
+        let first_font = make_font(&mut pdf, b"Helvetica")?;
+        let second_font = make_font(&mut pdf, b"Helvetica")?;
+        let different_font = make_font(&mut pdf, b"Courier")?;
+        let first = form_stream(&mut pdf, payload, 10)?;
+        let second = form_stream(&mut pdf, payload, 10)?;
+        let different = form_stream(&mut pdf, payload, 10)?;
+
+        let attach_font = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+                           form: &ObjectHandle,
+                           font: ObjectHandle|
+         -> Result<ObjectHandle> {
+            let fonts = ObjectHandle::dictionary(vec![(b"/F1".to_vec(), font)]);
+            let dict = form
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("form stream has no dictionary".to_owned()))?;
+            dict.replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(b"/Font".to_vec(), fonts.clone())]),
+            )?;
+            pdf.mark_object_handle_dirty(&dict)?;
+            Ok(fonts)
+        };
+        let first_fonts = attach_font(&mut pdf, &first, first_font)?;
+        let second_fonts = attach_font(&mut pdf, &second, second_font)?;
+        let different_fonts = attach_font(&mut pdf, &different, different_font)?;
+
+        let xobjects = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Fm1".to_vec(), first),
+            (b"/Fm2".to_vec(), second),
+            (b"/Fm3".to_vec(), different),
+        ]))?;
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFormFontHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_form_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        // Font-resource identity is normalized only for the Form fingerprint;
+        // the source resource dictionaries themselves remain untouched.
+        assert_ne!(
+            first_fonts.try_get_key(b"/F1")?.object_ref(),
+            second_fonts.try_get_key(b"/F1")?.object_ref()
+        );
+        assert_ne!(
+            first_fonts.try_get_key(b"/F1")?.object_ref(),
+            different_fonts.try_get_key(b"/F1")?.object_ref()
+        );
+        assert_eq!(
+            xobjects.try_get_key(b"/Fm1")?.object_ref(),
+            xobjects.try_get_key(b"/Fm2")?.object_ref()
+        );
+        assert_ne!(
+            xobjects.try_get_key(b"/Fm1")?.object_ref(),
+            xobjects.try_get_key(b"/Fm3")?.object_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_rewrite_exact_form_fonts_without_parent_form_match() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let make_font = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>| {
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
+                (
+                    b"/BaseFont".to_vec(),
+                    ObjectHandle::name(b"Helvetica".to_vec()),
+                ),
+            ]))
+        };
+        let first_font = make_font(&mut pdf)?;
+        let second_font = make_font(&mut pdf)?;
+        let first = form_stream(&mut pdf, b"BT /F1 10 Tf (one) Tj ET", 10)?;
+        let second = form_stream(&mut pdf, b"BT /F1 10 Tf (two) Tj ET", 10)?;
+
+        let attach_font = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+                           form: &ObjectHandle,
+                           font: ObjectHandle|
+         -> Result<ObjectHandle> {
+            let fonts = ObjectHandle::dictionary(vec![(b"/F1".to_vec(), font)]);
+            let dict = form
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("form stream has no dictionary".to_owned()))?;
+            dict.replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(b"/Font".to_vec(), fonts.clone())]),
+            )?;
+            pdf.mark_object_handle_dirty(&dict)?;
+            Ok(fonts)
+        };
+        let first_fonts = attach_font(&mut pdf, &first, first_font)?;
+        let second_fonts = attach_font(&mut pdf, &second, second_font)?;
+        let xobjects = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Fm1".to_vec(), first),
+            (b"/Fm2".to_vec(), second),
+        ]))?;
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestUnmatchedFormFontHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_form_xobjects(&mut pdf)?;
+        assert_eq!(stats, TargetedDedupStats::default());
+        assert_ne!(
+            first_fonts.try_get_key(b"/F1")?.object_ref(),
+            second_fonts.try_get_key(b"/F1")?.object_ref()
+        );
+        assert_ne!(
+            xobjects.try_get_key(b"/Fm1")?.object_ref(),
+            xobjects.try_get_key(b"/Fm2")?.object_ref()
+        );
         Ok(())
     }
 
