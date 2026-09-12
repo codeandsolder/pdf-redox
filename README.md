@@ -26,7 +26,7 @@ The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fre
 Early but functional. The core currently provides:
 
 - whole-document fresh rewrites, garbage collection, object-stream generation, and optional page-content normalization;
-- exact duplicate `/Metadata`, embedded font-program, `/ToUnicode` CMap, Image/Form XObject, and ICCBased profile canonicalization before garbage collection; metadata references are trusted even when a producer omits the stream's nominal `/Type /Metadata` entry;
+- exact duplicate `/Metadata`, embedded font-program, `/ToUnicode` CMap, Type3 `/CharProcs`, Image/Form XObject, and ICCBased profile canonicalization before garbage collection; metadata references are trusted even when a producer omits the stream's nominal `/Type /Metadata` entry;
 - duplicate-aware inline-image externalization that fingerprints the expanded Image XObject dictionary plus exact encoded payload, rewrites only fingerprints repeated across multiple mutable page/Form content scopes whose duplicated payload clears a 1 KiB gate, keeps singleton/marginal or same-stream repeats inline, and shares one indirect Image XObject across scopes; the extra two-pass scan is skipped entirely when pre-analysis sees less than 1 KiB of duplicate inline payload;
 - high-level structural/risk profiling plus size-gated selective Flate recompression;
 - a real Perceptual raster path that converts eligible 8-bit DeviceGray/RGB/CMYK lossless Image XObjects to JPEG at the configured quality only when the encoded-size savings gate is met, while preserving pixel dimensions and reusing one transcoded object for shared source images;

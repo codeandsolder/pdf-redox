@@ -4,6 +4,7 @@ use crate::{
     dedup::{
         canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_to_unicode_cmaps,
+        canonicalize_type3_charprocs,
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
@@ -98,6 +99,11 @@ fn optimize_pdf_with_before(
     };
     let form_dedup = if cfg.deduplicate_form_xobjects {
         canonicalize_form_xobjects(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let type3_charproc_dedup = if cfg.deduplicate_type3_charprocs {
+        canonicalize_type3_charprocs(&mut pdf)?
     } else {
         Default::default()
     };
@@ -264,6 +270,13 @@ fn optimize_pdf_with_before(
             form_dedup.references_canonicalized, form_dedup.duplicate_streams_detected
         ));
     }
+    if type3_charproc_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate Type3 CharProc reference(s) across {} duplicate glyph stream object(s).",
+            type3_charproc_dedup.references_canonicalized,
+            type3_charproc_dedup.duplicate_streams_detected
+        ));
+    }
     if icc_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate ICCBased profile reference(s) across {} duplicate ICC stream object(s).",
@@ -311,6 +324,9 @@ fn optimize_pdf_with_before(
         form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
         form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
         form_references_canonicalized: form_dedup.references_canonicalized,
+        type3_charproc_duplicate_streams_detected: type3_charproc_dedup.duplicate_streams_detected,
+        type3_charproc_duplicate_raw_bytes: type3_charproc_dedup.duplicate_raw_bytes,
+        type3_charproc_references_canonicalized: type3_charproc_dedup.references_canonicalized,
         icc_duplicate_streams_detected: icc_dedup.duplicate_streams_detected,
         icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
         icc_references_canonicalized: icc_dedup.references_canonicalized,

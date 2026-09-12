@@ -75,6 +75,9 @@ struct Args {
     /// Preserve separate exact duplicate Form XObjects instead of canonicalizing them.
     #[arg(long)]
     no_form_dedup: bool,
+    /// Preserve separate exact duplicate Type3 CharProc streams instead of canonicalizing them.
+    #[arg(long)]
+    no_type3_charproc_dedup: bool,
     /// Preserve separate exact duplicate ICC profile streams instead of canonicalizing them.
     #[arg(long)]
     no_icc_dedup: bool,
@@ -138,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.inline_image_min_duplicate_payload_bytes = a.inline_image_dedup_min_waste;
     cfg.deduplicate_image_xobjects = !a.no_image_dedup;
     cfg.deduplicate_form_xobjects = !a.no_form_dedup;
+    cfg.deduplicate_type3_charprocs = !a.no_type3_charproc_dedup;
     cfg.deduplicate_icc_profiles = !a.no_icc_dedup;
 
     let (output, report) = optimize_pdf(&input, &cfg)?;

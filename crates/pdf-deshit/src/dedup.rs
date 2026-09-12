@@ -408,6 +408,119 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject")
 }
 
+fn collect_direct_type3_charprocs(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    charprocs: &mut Vec<ObjectHandle>,
+) {
+    // Every indirect object is visited independently by `get_all_objects`.
+    // Recurse only through direct descendants so nested direct font
+    // dictionaries are found without following cycles in the object graph.
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    let dictionary = if let Some(dict) = value.as_stream_dict() {
+        dict
+    } else if matches!(value.try_is_dictionary(), Ok(true)) {
+        value.clone()
+    } else {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                collect_direct_type3_charprocs(&item, false, charprocs);
+            }
+        }
+        return;
+    };
+
+    if matches!(dictionary.try_get_key(b"/Subtype"), Ok(subtype) if matches!(subtype.try_is_name_and_equals(b"Type3"), Ok(true)))
+        && matches!(dictionary.try_get_key(b"/CharProcs"), Ok(value) if !value.is_null())
+        && let Ok(value) = dictionary.try_get_key(b"/CharProcs")
+    {
+        charprocs.push(value);
+    }
+
+    if let Some(entries) = dictionary.as_dictionary() {
+        for (key, child) in entries {
+            if key.as_slice() != b"/CharProcs" {
+                collect_direct_type3_charprocs(&child, false, charprocs);
+            }
+        }
+    }
+}
+
+pub(crate) fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let mut charprocs = Vec::new();
+    for object in &objects {
+        collect_direct_type3_charprocs(object, true, &mut charprocs);
+    }
+
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for dictionary in &charprocs {
+        if pdf.resolve(dictionary).is_err() {
+            continue;
+        }
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        for (_, glyph) in entries {
+            let Some(glyph_ref) = glyph.object_ref() else {
+                continue;
+            };
+            if pdf.resolve(&glyph).is_err() {
+                continue;
+            }
+            let Ok(Some(fingerprint)) = stream_fingerprint(&glyph, b"type3-charproc") else {
+                continue;
+            };
+            if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical_ref != glyph_ref {
+                    redirects.insert(glyph_ref, canonical_ref);
+                    if duplicate_refs.insert(glyph_ref) {
+                        duplicate_raw_bytes += glyph.get_raw_stream_data()?.len();
+                    }
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, glyph_ref);
+            }
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for dictionary in charprocs {
+        if pdf.resolve(&dictionary).is_err() {
+            continue;
+        }
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        for (name, glyph) in entries {
+            let Some(glyph_ref) = glyph.object_ref() else {
+                continue;
+            };
+            let Some(canonical_ref) = redirects.get(&glyph_ref).copied() else {
+                continue;
+            };
+            dictionary.replace_key(&name, pdf.get_object_handle(canonical_ref))?;
+            pdf.mark_object_handle_dirty(&dictionary)?;
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 fn collect_direct_to_unicode_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -984,6 +1097,98 @@ mod tests {
         let first_ref = xobjects.try_get_key(b"/Fm1")?.object_ref();
         let second_ref = xobjects.try_get_key(b"/Fm2")?.object_ref();
         let different_ref = xobjects.try_get_key(b"/Fm3")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    fn type3_charproc_stream(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+        extra_key: Option<(&[u8], ObjectHandle)>,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        if let Some((key, value)) = extra_key {
+            let dict = stream.as_stream_dict().ok_or_else(|| {
+                Error::Invalid("new CharProc stream has no dictionary".to_owned())
+            })?;
+            dict.replace_key(key, value)?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        Ok(stream)
+    }
+
+    #[test]
+    fn canonicalizes_exact_type3_charprocs_across_font_resource_contexts() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"500 0 0 0 500 700 d1 0 0 500 700 re f";
+        let first = type3_charproc_stream(&mut pdf, payload, None)?;
+        let second = type3_charproc_stream(&mut pdf, payload, None)?;
+        let different_dict = type3_charproc_stream(
+            &mut pdf,
+            payload,
+            Some((b"/PrivateMarker", ObjectHandle::integer(1))),
+        )?;
+
+        let first_font = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type3".to_vec())),
+            (
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Context".to_vec(),
+                    ObjectHandle::name(b"First".to_vec()),
+                )]),
+            ),
+            (
+                b"/CharProcs".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"/A".to_vec(), first),
+                    (b"/Different".to_vec(), different_dict),
+                ]),
+            ),
+        ]);
+        let second_font = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type3".to_vec())),
+            (
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Context".to_vec(),
+                    ObjectHandle::name(b"Second".to_vec()),
+                )]),
+            ),
+            (
+                b"/CharProcs".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/B".to_vec(), second)]),
+            ),
+        ]);
+        let fonts = ObjectHandle::dictionary(vec![
+            (b"/F1".to_vec(), first_font),
+            (b"/F2".to_vec(), second_font),
+        ]);
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestType3Fonts", fonts.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_type3_charprocs(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = fonts
+            .try_get_key(b"/F1")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/A")?
+            .object_ref();
+        let second_ref = fonts
+            .try_get_key(b"/F2")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/B")?
+            .object_ref();
+        let different_ref = fonts
+            .try_get_key(b"/F1")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/Different")?
+            .object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
         Ok(())
