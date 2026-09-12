@@ -553,15 +553,46 @@ pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
         stream_ref: ObjectRef,
     }
 
+    // Keep canonical page-tree discovery as the primary source so damaged
+    // live pages that omit `/Type /Page` retain the behavior of the original
+    // pass. Then add detached `/Type /Page` dictionaries that remain
+    // reachable through outlines, article threads, private structures, etc.
+    // Their content streams have the same invocation semantics: resources
+    // stay on the invoking page dictionary, not on the shared stream object.
     let page_refs = flpdf::pages::page_refs(pdf)?;
+    let mut pages = Vec::new();
+    let mut seen_pages = HashSet::new();
+    for page_ref in page_refs {
+        seen_pages.insert(page_ref);
+        pages.push(pdf.get_object_handle(page_ref));
+    }
+    for object in pdf.get_all_objects()? {
+        let Some(object_ref) = object.object_ref() else {
+            continue;
+        };
+        if seen_pages.contains(&object_ref) {
+            continue;
+        }
+        if !object.try_is_dictionary()? {
+            continue;
+        }
+        let Ok(object_type) = object.try_get_key(b"/Type") else {
+            continue;
+        };
+        if object_type.as_name() != Some(b"Page".to_vec()) {
+            continue;
+        }
+        seen_pages.insert(object_ref);
+        pages.push(object);
+    }
+
     let mut slots = Vec::new();
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut duplicate_refs = HashSet::new();
     let mut duplicate_raw_bytes = 0_usize;
 
-    for page_ref in page_refs {
-        let page = pdf.get_object_handle(page_ref);
+    for page in pages {
         if pdf.resolve(&page).is_err() {
             continue;
         }
@@ -1536,6 +1567,50 @@ mod tests {
         assert_eq!(second_items.len(), 1);
         assert_eq!(first_items[0].object_ref(), second_items[0].object_ref());
         assert_eq!(first_items[1].object_ref(), unique.object_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_page_content_streams_on_detached_page_dictionaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 0 0 20 20 re f Q";
+        let live_stream = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let detached_stream = pdf.new_stream_with_data(Rc::new(payload.to_vec()))?;
+        let live_page = add_page_with_contents(&mut pdf, live_stream, 1)?;
+
+        let detached_page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Marker".to_vec(), ObjectHandle::integer(2))]),
+            ),
+            (b"/Contents".to_vec(), detached_stream),
+        ]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/DetachedTestPage", detached_page.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_page_contents(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            live_page.try_get_key(b"/Contents")?.object_ref(),
+            detached_page.try_get_key(b"/Contents")?.object_ref()
+        );
+        assert_ne!(
+            live_page.try_get_key(b"/Resources")?.unparse_resolved(),
+            detached_page.try_get_key(b"/Resources")?.unparse_resolved()
+        );
         Ok(())
     }
 
