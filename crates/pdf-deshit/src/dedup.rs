@@ -339,18 +339,17 @@ fn xobject_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     holders
 }
 
-fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
+fn exact_xobject_redirects(
+    objects: &[ObjectHandle],
     subtype_name: &[u8],
     domain: &[u8],
-) -> Result<TargetedDedupStats> {
-    let objects = pdf.get_all_objects()?;
-    let holders = xobject_holders(&objects);
+    duplicate_refs: &mut HashSet<ObjectRef>,
+    duplicate_raw_bytes: &mut usize,
+) -> Result<HashMap<ObjectRef, ObjectRef>> {
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
-    let mut duplicate_raw_bytes = 0_usize;
 
-    for object in &objects {
+    for object in objects {
         let Some(object_ref) = object.object_ref() else {
             continue;
         };
@@ -359,12 +358,22 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
         };
         if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
             redirects.insert(object_ref, canonical_ref);
-            duplicate_raw_bytes += object.get_raw_stream_data()?.len();
+            if duplicate_refs.insert(object_ref) {
+                *duplicate_raw_bytes += object.get_raw_stream_data()?.len();
+            }
         } else {
             canonical_by_fingerprint.insert(fingerprint, object_ref);
         }
     }
 
+    Ok(redirects)
+}
+
+fn rewrite_xobject_resource_references<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    holders: Vec<ObjectHandle>,
+    redirects: &HashMap<ObjectRef, ObjectRef>,
+) -> Result<usize> {
     let mut references_canonicalized = 0_usize;
     for dict in holders {
         let Ok(xobjects) = dict.try_get_key(b"/XObject") else {
@@ -388,9 +397,29 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
             references_canonicalized += 1;
         }
     }
+    Ok(references_canonicalized)
+}
+
+fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    subtype_name: &[u8],
+    domain: &[u8],
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let holders = xobject_holders(&objects);
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    let redirects = exact_xobject_redirects(
+        &objects,
+        subtype_name,
+        domain,
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    let references_canonicalized = rewrite_xobject_resource_references(pdf, holders, &redirects)?;
 
     Ok(TargetedDedupStats {
-        duplicate_streams_detected: redirects.len(),
+        duplicate_streams_detected: duplicate_refs.len(),
         duplicate_raw_bytes,
         references_canonicalized,
     })
@@ -399,7 +428,67 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
 pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
-    canonicalize_xobject_subtype(pdf, b"Image", b"image-xobject")
+    let objects = pdf.get_all_objects()?;
+    let holders = xobject_holders(&objects);
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    let mut references_canonicalized = 0_usize;
+
+    // First share exact Image XObjects when they are used as explicit or
+    // soft masks. Parent image identity includes the /Mask or /SMask object
+    // reference, so canonicalizing these dependency edges can make otherwise
+    // byte- and dictionary-identical parent images exactly equal without
+    // relaxing any image semantics.
+    let mask_redirects = exact_xobject_redirects(
+        &objects,
+        b"Image",
+        b"image-xobject",
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    for image in &objects {
+        let Some(dict) = image.as_stream_dict() else {
+            continue;
+        };
+        let Ok(subtype) = dict.try_get_key(b"/Subtype") else {
+            continue;
+        };
+        if !matches!(subtype.try_is_name_and_equals(b"Image"), Ok(true)) {
+            continue;
+        }
+        for key in [b"/Mask".as_slice(), b"/SMask".as_slice()] {
+            let Ok(mask) = dict.try_get_key(key) else {
+                continue;
+            };
+            let Some(mask_ref) = mask.object_ref() else {
+                continue;
+            };
+            let Some(canonical_ref) = mask_redirects.get(&mask_ref).copied() else {
+                continue;
+            };
+            dict.replace_key(key, pdf.get_object_handle(canonical_ref))?;
+            pdf.mark_object_handle_dirty(&dict)?;
+            references_canonicalized += 1;
+        }
+    }
+
+    // Re-fingerprint after mask canonicalization so parent images whose only
+    // distinction was duplicate mask-object identity can now be shared via
+    // their ordinary resource-dictionary bindings.
+    let redirects = exact_xobject_redirects(
+        &objects,
+        b"Image",
+        b"image-xobject",
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    references_canonicalized += rewrite_xobject_resource_references(pdf, holders, &redirects)?;
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
 }
 
 pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
@@ -1281,6 +1370,66 @@ mod tests {
         assert_eq!(stats.duplicate_streams_detected, 1);
         assert_eq!(stats.references_canonicalized, 1);
         assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = xobjects.try_get_key(b"/Im1")?.object_ref();
+        let second_ref = xobjects.try_get_key(b"/Im2")?.object_ref();
+        let different_ref = xobjects.try_get_key(b"/Im3")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_image_masks_before_parent_images() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let mask_payload = b"exact-soft-mask";
+        let parent_payload = b"exact-parent-image";
+        let first_mask = image_stream(&mut pdf, mask_payload, 4, 2)?;
+        let second_mask = image_stream(&mut pdf, mask_payload, 4, 2)?;
+        let first_parent = image_stream(&mut pdf, parent_payload, 4, 2)?;
+        let second_parent = image_stream(&mut pdf, parent_payload, 4, 2)?;
+        let different_parent = image_stream(&mut pdf, parent_payload, 4, 2)?;
+
+        for (parent, mask) in [
+            (&first_parent, first_mask.clone()),
+            (&second_parent, second_mask),
+            (&different_parent, first_mask.clone()),
+        ] {
+            let dict = parent
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("parent image has no dictionary".to_owned()))?;
+            dict.replace_key(b"/SMask", mask)?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        let different_dict = different_parent
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("parent image has no dictionary".to_owned()))?;
+        different_dict.replace_key(
+            b"/Intent",
+            ObjectHandle::name(b"RelativeColorimetric".to_vec()),
+        )?;
+        pdf.mark_object_handle_dirty(&different_dict)?;
+
+        let xobjects = ObjectHandle::dictionary(vec![
+            (b"/Im1".to_vec(), first_parent.clone()),
+            (b"/Im2".to_vec(), second_parent.clone()),
+            (b"/Im3".to_vec(), different_parent),
+        ]);
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestImageHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_image_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 2);
+        assert_eq!(stats.references_canonicalized, 2);
+        assert_eq!(
+            stats.duplicate_raw_bytes,
+            mask_payload.len() + parent_payload.len()
+        );
 
         let first_ref = xobjects.try_get_key(b"/Im1")?.object_ref();
         let second_ref = xobjects.try_get_key(b"/Im2")?.object_ref();
