@@ -284,12 +284,68 @@ fn xobject_fingerprint(
     stream_fingerprint(object, domain)
 }
 
+fn collect_direct_xobject_holders(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    holders: &mut Vec<ObjectHandle>,
+) {
+    // Every indirect object is visited separately from `get_all_objects`.
+    // Recurse only through direct descendants so page/Form resource
+    // dictionaries are discovered without following cycles in the object graph.
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    if let Some(dict) = value.as_stream_dict() {
+        if matches!(dict.try_get_key(b"/XObject"), Ok(xobjects) if !xobjects.is_null()) {
+            holders.push(dict.clone());
+        }
+        if let Some(entries) = dict.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/XObject" {
+                    collect_direct_xobject_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if matches!(value.try_is_dictionary(), Ok(true)) {
+        if matches!(value.try_get_key(b"/XObject"), Ok(xobjects) if !xobjects.is_null()) {
+            holders.push(value.clone());
+        }
+        if let Some(entries) = value.as_dictionary() {
+            for (key, child) in entries {
+                if key.as_slice() != b"/XObject" {
+                    collect_direct_xobject_holders(&child, false, holders);
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_direct_xobject_holders(&item, false, holders);
+        }
+    }
+}
+
+fn xobject_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
+    let mut holders = Vec::new();
+    for object in objects {
+        collect_direct_xobject_holders(object, true, &mut holders);
+    }
+    holders
+}
+
 fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     subtype_name: &[u8],
     domain: &[u8],
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
+    let holders = xobject_holders(&objects);
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut duplicate_raw_bytes = 0_usize;
@@ -310,15 +366,10 @@ fn canonicalize_xobject_subtype<R: Read + Seek + 'static>(
     }
 
     let mut references_canonicalized = 0_usize;
-    for object in &objects {
-        let dict = if let Some(dict) = object.as_stream_dict() {
-            dict
-        } else if object.try_is_dictionary()? {
-            object.clone()
-        } else {
+    for dict in holders {
+        let Ok(xobjects) = dict.try_get_key(b"/XObject") else {
             continue;
         };
-        let xobjects = dict.try_get_key(b"/XObject")?;
         if pdf.resolve(&xobjects).is_err() {
             continue;
         }
@@ -718,6 +769,48 @@ mod tests {
         let different_ref = xobjects.try_get_key(b"/Im3")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_image_xobjects_nested_in_resources() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"nested-resource-image";
+        let first = image_stream(&mut pdf, payload, 4, 2)?;
+        let second = image_stream(&mut pdf, payload, 4, 2)?;
+
+        let nested_holder = |name: &[u8], image: ObjectHandle| {
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/XObject".to_vec(),
+                    ObjectHandle::dictionary(vec![(name.to_vec(), image)]),
+                )]),
+            )])
+        };
+        let first_holder = pdf.make_indirect_object_handle(nested_holder(b"/Im1", first))?;
+        let second_holder = pdf.make_indirect_object_handle(nested_holder(b"/Im2", second))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestNestedImageA", first_holder.clone())?;
+        root.replace_key(b"/TestNestedImageB", second_holder.clone())?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_image_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let image_ref = |holder: &ObjectHandle, name: &[u8]| -> Result<Option<ObjectRef>> {
+            Ok(holder
+                .try_get_key(b"/Resources")?
+                .try_get_key(b"/XObject")?
+                .try_get_key(name)?
+                .object_ref())
+        };
+        assert_eq!(
+            image_ref(&first_holder, b"/Im1")?,
+            image_ref(&second_holder, b"/Im2")?
+        );
         Ok(())
     }
 
