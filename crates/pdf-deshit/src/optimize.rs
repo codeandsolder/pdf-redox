@@ -2,9 +2,9 @@ use crate::{
     Config, FlatePolicy, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{analyze_pdf, input_sha256},
     dedup::{
-        canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
-        canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_to_unicode_cmaps,
-        canonicalize_type3_charprocs,
+        canonicalize_appearance_streams, canonicalize_font_program_streams,
+        canonicalize_form_xobjects, canonicalize_icc_profiles, canonicalize_image_xobjects,
+        canonicalize_metadata_streams, canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
@@ -99,6 +99,11 @@ fn optimize_pdf_with_before(
     };
     let form_dedup = if cfg.deduplicate_form_xobjects {
         canonicalize_form_xobjects(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let appearance_dedup = if cfg.deduplicate_appearance_streams {
+        canonicalize_appearance_streams(&mut pdf)?
     } else {
         Default::default()
     };
@@ -270,6 +275,13 @@ fn optimize_pdf_with_before(
             form_dedup.references_canonicalized, form_dedup.duplicate_streams_detected
         ));
     }
+    if appearance_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate annotation appearance reference(s) across {} duplicate Form stream object(s).",
+            appearance_dedup.references_canonicalized,
+            appearance_dedup.duplicate_streams_detected
+        ));
+    }
     if type3_charproc_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate Type3 CharProc reference(s) across {} duplicate glyph stream object(s).",
@@ -324,6 +336,9 @@ fn optimize_pdf_with_before(
         form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
         form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
         form_references_canonicalized: form_dedup.references_canonicalized,
+        appearance_duplicate_streams_detected: appearance_dedup.duplicate_streams_detected,
+        appearance_duplicate_raw_bytes: appearance_dedup.duplicate_raw_bytes,
+        appearance_references_canonicalized: appearance_dedup.references_canonicalized,
         type3_charproc_duplicate_streams_detected: type3_charproc_dedup.duplicate_streams_detected,
         type3_charproc_duplicate_raw_bytes: type3_charproc_dedup.duplicate_raw_bytes,
         type3_charproc_references_canonicalized: type3_charproc_dedup.references_canonicalized,

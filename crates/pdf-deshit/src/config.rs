@@ -156,6 +156,9 @@ pub struct Config {
     /// Canonicalize byte- and dictionary-identical Form XObjects referenced from
     /// `/Resources /XObject` dictionaries.
     pub deduplicate_form_xobjects: bool,
+    /// Canonicalize byte- and dictionary-identical Form appearance streams referenced from
+    /// annotation `/AP` dictionaries.
+    pub deduplicate_appearance_streams: bool,
     /// Canonicalize byte- and dictionary-identical Type3 glyph streams referenced from
     /// `/CharProcs` dictionaries.
     pub deduplicate_type3_charprocs: bool,
@@ -184,6 +187,7 @@ impl Config {
             inline_image_min_duplicate_payload_bytes: 1024,
             deduplicate_image_xobjects: true,
             deduplicate_form_xobjects: true,
+            deduplicate_appearance_streams: true,
             deduplicate_type3_charprocs: true,
             deduplicate_icc_profiles: true,
             flate_level: 9,
@@ -294,6 +298,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_appearance_streams(mut self, value: bool) -> Self {
+        self.config.deduplicate_appearance_streams = value;
+        self
+    }
+
     pub fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
         self.config.deduplicate_type3_charprocs = value;
         self
@@ -360,6 +369,7 @@ mod tests {
             .inline_image_min_duplicate_payload_bytes(4096)
             .deduplicate_image_xobjects(false)
             .deduplicate_form_xobjects(false)
+            .deduplicate_appearance_streams(false)
             .deduplicate_type3_charprocs(false)
             .deduplicate_icc_profiles(false)
             .flate_level(6)
@@ -381,6 +391,7 @@ mod tests {
         assert_eq!(config.inline_image_min_duplicate_payload_bytes, 4096);
         assert!(!config.deduplicate_image_xobjects);
         assert!(!config.deduplicate_form_xobjects);
+        assert!(!config.deduplicate_appearance_streams);
         assert!(!config.deduplicate_type3_charprocs);
         assert!(!config.deduplicate_icc_profiles);
         assert_eq!(config.flate_level, 6);

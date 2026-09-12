@@ -408,6 +408,141 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject")
 }
 
+fn collect_direct_appearance_dictionaries(
+    value: &ObjectHandle,
+    include_indirect_root: bool,
+    appearances: &mut Vec<ObjectHandle>,
+) {
+    if !include_indirect_root && value.object_ref().is_some() {
+        return;
+    }
+
+    let dictionary = if let Some(dict) = value.as_stream_dict() {
+        dict
+    } else if matches!(value.try_is_dictionary(), Ok(true)) {
+        value.clone()
+    } else {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                collect_direct_appearance_dictionaries(&item, false, appearances);
+            }
+        }
+        return;
+    };
+
+    if matches!(dictionary.try_get_key(b"/AP"), Ok(ap) if !ap.is_null())
+        && let Ok(ap) = dictionary.try_get_key(b"/AP")
+    {
+        appearances.push(ap);
+    }
+
+    if let Some(entries) = dictionary.as_dictionary() {
+        for (key, child) in entries {
+            if key.as_slice() != b"/AP" {
+                collect_direct_appearance_dictionaries(&child, false, appearances);
+            }
+        }
+    }
+}
+
+fn appearance_holders<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    objects: &[ObjectHandle],
+) -> Vec<ObjectHandle> {
+    let mut appearances = Vec::new();
+    for object in objects {
+        collect_direct_appearance_dictionaries(object, true, &mut appearances);
+    }
+
+    let mut holders = Vec::new();
+    for appearance in appearances {
+        if pdf.resolve(&appearance).is_err() {
+            continue;
+        }
+        let Some(entries) = appearance.as_dictionary() else {
+            continue;
+        };
+        holders.push(appearance.clone());
+        for (key, state_or_stream) in entries {
+            if !matches!(key.as_slice(), b"/N" | b"/R" | b"/D") {
+                continue;
+            }
+            if pdf.resolve(&state_or_stream).is_err() || state_or_stream.as_stream_dict().is_some()
+            {
+                continue;
+            }
+            if state_or_stream.as_dictionary().is_some() {
+                holders.push(state_or_stream);
+            }
+        }
+    }
+    holders
+}
+
+pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    let objects = pdf.get_all_objects()?;
+    let holders = appearance_holders(pdf, &objects);
+    let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
+    let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for dictionary in &holders {
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        for (_, appearance) in entries {
+            let Some(appearance_ref) = appearance.object_ref() else {
+                continue;
+            };
+            if pdf.resolve(&appearance).is_err() {
+                continue;
+            }
+            let Ok(Some(fingerprint)) =
+                xobject_fingerprint(&appearance, b"Form", b"appearance-stream")
+            else {
+                continue;
+            };
+            if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical_ref != appearance_ref {
+                    redirects.insert(appearance_ref, canonical_ref);
+                    if duplicate_refs.insert(appearance_ref) {
+                        duplicate_raw_bytes += appearance.get_raw_stream_data()?.len();
+                    }
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, appearance_ref);
+            }
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for dictionary in holders {
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        for (name, appearance) in entries {
+            let Some(appearance_ref) = appearance.object_ref() else {
+                continue;
+            };
+            let Some(canonical_ref) = redirects.get(&appearance_ref).copied() else {
+                continue;
+            };
+            dictionary.replace_key(&name, pdf.get_object_handle(canonical_ref))?;
+            pdf.mark_object_handle_dirty(&dictionary)?;
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 fn collect_direct_type3_charprocs(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -1099,6 +1234,83 @@ mod tests {
         let different_ref = xobjects.try_get_key(b"/Fm3")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_form_appearance_streams_in_state_dictionaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 0 0 10 10 re f Q";
+        let first = form_stream(&mut pdf, payload, 10)?;
+        let second = form_stream(&mut pdf, payload, 10)?;
+        let different_dict = form_stream(&mut pdf, payload, 20)?;
+
+        let first_states = ObjectHandle::dictionary(vec![
+            (b"/Yes".to_vec(), first),
+            (b"/Different".to_vec(), different_dict),
+        ]);
+        let second_states = ObjectHandle::dictionary(vec![(b"/Yes".to_vec(), second)]);
+        let first_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), first_states.clone())]);
+        let second_ap = ObjectHandle::dictionary(vec![(b"/D".to_vec(), second_states.clone())]);
+        let first_annot = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (b"/AP".to_vec(), first_ap),
+        ]))?;
+        let second_annot = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (b"/AP".to_vec(), second_ap),
+        ]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(
+            b"/TestAppearanceAnnotations",
+            ObjectHandle::array(vec![first_annot, second_annot]),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_appearance_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = first_states.try_get_key(b"/Yes")?.object_ref();
+        let second_ref = second_states.try_get_key(b"/Yes")?.object_ref();
+        let different_ref = first_states.try_get_key(b"/Different")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_exact_direct_form_appearance_streams() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 0 0 5 5 re f Q";
+        let first = form_stream(&mut pdf, payload, 5)?;
+        let second = form_stream(&mut pdf, payload, 5)?;
+        let first_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), first)]);
+        let second_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), second)]);
+        let first_annot = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/AP".to_vec(),
+            first_ap.clone(),
+        )]))?;
+        let second_annot = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/AP".to_vec(),
+            second_ap.clone(),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(
+            b"/TestDirectAppearanceAnnotations",
+            ObjectHandle::array(vec![first_annot, second_annot]),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_appearance_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_ap.try_get_key(b"/N")?.object_ref(),
+            second_ap.try_get_key(b"/N")?.object_ref()
+        );
         Ok(())
     }
 
