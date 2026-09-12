@@ -402,6 +402,12 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     canonicalize_xobject_subtype(pdf, b"Image", b"image-xobject")
 }
 
+pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Result<TargetedDedupStats> {
+    canonicalize_xobject_subtype(pdf, b"Form", b"form-xobject")
+}
+
 fn collect_direct_to_unicode_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -921,6 +927,65 @@ mod tests {
             image_ref(&first_holder, b"/Im1")?,
             image_ref(&second_holder, b"/Im2")?
         );
+        Ok(())
+    }
+
+    fn form_stream(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        data: &[u8],
+        width: i64,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream_with_data(Rc::new(data.to_vec()))?;
+        let dict = stream
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("new form stream has no dictionary".to_owned()))?;
+        dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        dict.replace_key(
+            b"/BBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(width),
+                ObjectHandle::integer(10),
+            ]),
+        )?;
+        dict.replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        Ok(stream)
+    }
+
+    #[test]
+    fn canonicalizes_only_exact_form_xobjects_in_resource_dictionaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 0 0 10 10 re f Q";
+        let first = form_stream(&mut pdf, payload, 10)?;
+        let second = form_stream(&mut pdf, payload, 10)?;
+        let different_dict = form_stream(&mut pdf, payload, 20)?;
+        let xobjects = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Fm1".to_vec(), first),
+            (b"/Fm2".to_vec(), second),
+            (b"/Fm3".to_vec(), different_dict),
+        ]))?;
+        let resources = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]);
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            resources,
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFormHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_form_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+
+        let first_ref = xobjects.try_get_key(b"/Fm1")?.object_ref();
+        let second_ref = xobjects.try_get_key(b"/Fm2")?.object_ref();
+        let different_ref = xobjects.try_get_key(b"/Fm3")?.object_ref();
+        assert_eq!(first_ref, second_ref);
+        assert_ne!(first_ref, different_ref);
         Ok(())
     }
 

@@ -2,8 +2,8 @@ use crate::{
     Config, FlatePolicy, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{analyze_pdf, input_sha256},
     dedup::{
-        canonicalize_font_program_streams, canonicalize_icc_profiles, canonicalize_image_xobjects,
-        canonicalize_metadata_streams, canonicalize_to_unicode_cmaps,
+        canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
+        canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_to_unicode_cmaps,
     },
     flate::apply_flate_policy,
     hidden_text::apply_hidden_text_policy,
@@ -93,6 +93,11 @@ fn optimize_pdf_with_before(
     // duplicate decode/resample/re-encode work.
     let image_dedup = if cfg.deduplicate_image_xobjects {
         canonicalize_image_xobjects(&mut pdf)?
+    } else {
+        Default::default()
+    };
+    let form_dedup = if cfg.deduplicate_form_xobjects {
+        canonicalize_form_xobjects(&mut pdf)?
     } else {
         Default::default()
     };
@@ -253,6 +258,12 @@ fn optimize_pdf_with_before(
             image_dedup.references_canonicalized, image_dedup.duplicate_streams_detected
         ));
     }
+    if form_dedup.references_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} duplicate Form XObject reference(s) across {} duplicate form stream object(s).",
+            form_dedup.references_canonicalized, form_dedup.duplicate_streams_detected
+        ));
+    }
     if icc_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate ICCBased profile reference(s) across {} duplicate ICC stream object(s).",
@@ -297,6 +308,9 @@ fn optimize_pdf_with_before(
         image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
         image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
         image_references_canonicalized: image_dedup.references_canonicalized,
+        form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
+        form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
+        form_references_canonicalized: form_dedup.references_canonicalized,
         icc_duplicate_streams_detected: icc_dedup.duplicate_streams_detected,
         icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
         icc_references_canonicalized: icc_dedup.references_canonicalized,

@@ -153,6 +153,9 @@ pub struct Config {
     /// Canonicalize byte- and dictionary-identical Image XObjects referenced from
     /// `/Resources /XObject` dictionaries.
     pub deduplicate_image_xobjects: bool,
+    /// Canonicalize byte- and dictionary-identical Form XObjects referenced from
+    /// `/Resources /XObject` dictionaries.
+    pub deduplicate_form_xobjects: bool,
     /// Canonicalize byte- and dictionary-identical ICC profile streams referenced from
     /// `/ICCBased` color-space arrays.
     pub deduplicate_icc_profiles: bool,
@@ -177,6 +180,7 @@ impl Config {
             deduplicate_inline_images: true,
             inline_image_min_duplicate_payload_bytes: 1024,
             deduplicate_image_xobjects: true,
+            deduplicate_form_xobjects: true,
             deduplicate_icc_profiles: true,
             flate_level: 9,
         }
@@ -281,6 +285,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn deduplicate_form_xobjects(mut self, value: bool) -> Self {
+        self.config.deduplicate_form_xobjects = value;
+        self
+    }
+
     pub fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
         self.config.deduplicate_icc_profiles = value;
         self
@@ -341,6 +350,7 @@ mod tests {
             .deduplicate_inline_images(false)
             .inline_image_min_duplicate_payload_bytes(4096)
             .deduplicate_image_xobjects(false)
+            .deduplicate_form_xobjects(false)
             .deduplicate_icc_profiles(false)
             .flate_level(6)
             .privacy(PrivacyConfig {
@@ -360,6 +370,7 @@ mod tests {
         assert!(!config.deduplicate_inline_images);
         assert_eq!(config.inline_image_min_duplicate_payload_bytes, 4096);
         assert!(!config.deduplicate_image_xobjects);
+        assert!(!config.deduplicate_form_xobjects);
         assert!(!config.deduplicate_icc_profiles);
         assert_eq!(config.flate_level, 6);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
