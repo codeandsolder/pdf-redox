@@ -768,6 +768,42 @@ pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
 
 const FONT_FILE_KEYS: [&[u8]; 3] = [b"/FontFile", b"/FontFile2", b"/FontFile3"];
 
+fn font_program_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
+    let Some(dict) = object.as_stream_dict() else {
+        return Ok(None);
+    };
+    let raw = object.get_raw_stream_data()?;
+    let Some(entries) = dict.as_dictionary() else {
+        return Ok(None);
+    };
+    let dictionary = ObjectHandle::dictionary(
+        entries
+            .into_iter()
+            .filter(|(key, _)| key.as_slice() != b"/Length")
+            .map(|(key, value)| {
+                let value = if matches!(key.as_slice(), b"/Length1" | b"/Length2" | b"/Length3") {
+                    value
+                        .as_integer()
+                        .map(ObjectHandle::integer)
+                        .unwrap_or(value)
+                } else {
+                    value
+                };
+                (key, value)
+            })
+            .collect(),
+    )
+    .unparse_resolved();
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    hasher.update((raw.len() as u64).to_le_bytes());
+    hasher.update(raw.as_ref());
+    hasher.update((dictionary.len() as u64).to_le_bytes());
+    hasher.update(dictionary);
+    Ok(Some(hasher.finalize().into()))
+}
+
 pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -793,7 +829,7 @@ pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
             if pdf.resolve(&font_program).is_err() {
                 continue;
             }
-            let Ok(Some(fingerprint)) = stream_fingerprint(&font_program, key) else {
+            let Ok(Some(fingerprint)) = font_program_fingerprint(&font_program, key) else {
                 continue;
             };
             if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
@@ -1558,6 +1594,60 @@ mod tests {
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_key_ref);
         assert_ne!(first_ref, different_dict_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_font_programs_with_equivalent_indirect_length_values() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"same-font-program";
+        let first = font_program(&mut pdf, payload)?;
+        let second = font_program(&mut pdf, payload)?;
+        let different_length = font_program(&mut pdf, payload)?;
+
+        for stream in [&first, &second] {
+            let length =
+                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+            let dict = stream
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
+            dict.replace_key(b"/Length1", length)?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        let different_length_ref =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64 + 1))?;
+        let different_length_dict = different_length
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
+        different_length_dict.replace_key(b"/Length1", different_length_ref)?;
+        pdf.mark_object_handle_dirty(&different_length_dict)?;
+
+        let first_descriptor = font_descriptor(&mut pdf, b"/FontFile2", first)?;
+        let second_descriptor = font_descriptor(&mut pdf, b"/FontFile2", second)?;
+        let different_descriptor = font_descriptor(&mut pdf, b"/FontFile2", different_length)?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestIndirectLengthA", first_descriptor.clone())?;
+        root.replace_key(b"/TestIndirectLengthB", second_descriptor.clone())?;
+        root.replace_key(
+            b"/TestIndirectLengthDifferent",
+            different_descriptor.clone(),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_font_program_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_descriptor.try_get_key(b"/FontFile2")?.object_ref(),
+            second_descriptor.try_get_key(b"/FontFile2")?.object_ref()
+        );
+        assert_ne!(
+            first_descriptor.try_get_key(b"/FontFile2")?.object_ref(),
+            different_descriptor
+                .try_get_key(b"/FontFile2")?
+                .object_ref()
+        );
         Ok(())
     }
 }
