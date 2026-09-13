@@ -999,6 +999,7 @@ fn normalized_form_resources<R: Read + Seek + 'static>(
                     form_redirects,
                 )
             }
+            b"/ProcSet" => redirected_handle(pdf, value, exact_redirects),
             _ => value,
         };
         normalized.push((key, value));
@@ -2688,6 +2689,74 @@ mod tests {
         );
         // The exact OCG graph is virtual; the property objects themselves are untouched.
         assert_ne!(first_ocg.object_ref(), second_ocg.object_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_forms_across_exact_procset_resources() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"q 0 0 10 10 re f Q";
+        let first = form_stream(&mut pdf, payload, 10)?;
+        let second = form_stream(&mut pdf, payload, 10)?;
+        let different = form_stream(&mut pdf, payload, 10)?;
+
+        let make_procset = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, names: &[&[u8]]| {
+            pdf.make_indirect_object_handle(ObjectHandle::array(
+                names
+                    .iter()
+                    .map(|name| ObjectHandle::name(name.to_vec()))
+                    .collect(),
+            ))
+        };
+        let first_procset = make_procset(&mut pdf, &[b"PDF"])?;
+        let second_procset = make_procset(&mut pdf, &[b"PDF"])?;
+        let different_procset = make_procset(&mut pdf, &[b"PDF", b"Text"])?;
+
+        let attach_procset = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+                              form: &ObjectHandle,
+                              procset: ObjectHandle|
+         -> Result<()> {
+            let dict = form
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("form stream has no dictionary".to_owned()))?;
+            dict.replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(b"/ProcSet".to_vec(), procset)]),
+            )?;
+            pdf.mark_object_handle_dirty(&dict)?;
+            Ok(())
+        };
+        attach_procset(&mut pdf, &first, first_procset.clone())?;
+        attach_procset(&mut pdf, &second, second_procset.clone())?;
+        attach_procset(&mut pdf, &different, different_procset)?;
+
+        let xobjects = ObjectHandle::dictionary(vec![
+            (b"/Fm1".to_vec(), first),
+            (b"/Fm2".to_vec(), second),
+            (b"/Fm3".to_vec(), different),
+        ]);
+        let holder = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Resources".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects.clone())]),
+        )]))?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestProcSetFormHolder", holder)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_form_xobjects(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(
+            xobjects.try_get_key(b"/Fm1")?.object_ref(),
+            xobjects.try_get_key(b"/Fm2")?.object_ref()
+        );
+        assert_ne!(
+            xobjects.try_get_key(b"/Fm1")?.object_ref(),
+            xobjects.try_get_key(b"/Fm3")?.object_ref()
+        );
+        // ProcSet equivalence is virtual; the duplicate arrays remain distinct.
+        assert_ne!(first_procset.object_ref(), second_procset.object_ref());
         Ok(())
     }
 
