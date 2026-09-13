@@ -1033,6 +1033,26 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
     let holders = appearance_holders(pdf, &objects);
+    if holders.is_empty() {
+        return Ok(TargetedDedupStats::default());
+    }
+
+    // Appearance streams are Forms too, but they live under /AP rather than
+    // /Resources /XObject. Reuse the same exact virtual dependency graph as
+    // Form dedup while retaining appearance's stricter dictionary semantics:
+    // unlike general Form XObjects, /Name is not ignored here.
+    let exact_redirects = exact_non_stream_resource_redirects(pdf, &objects)?;
+    let font_redirects = exact_form_font_redirects(pdf, &objects, &exact_redirects)?;
+    let image_redirects = virtual_form_image_redirects(pdf, &objects, &exact_redirects)?;
+    let dependency_redirects = fixed_point_form_redirects(
+        pdf,
+        &objects,
+        &[],
+        &exact_redirects,
+        &font_redirects,
+        &image_redirects,
+    )?;
+
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut duplicate_refs = HashSet::new();
@@ -1049,9 +1069,15 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
             if pdf.resolve(&appearance).is_err() {
                 continue;
             }
-            let Ok(Some(fingerprint)) =
-                xobject_fingerprint(&appearance, b"Form", b"appearance-stream", &[])
-            else {
+            let Ok(Some(fingerprint)) = form_fingerprint(
+                pdf,
+                &appearance,
+                &[],
+                &exact_redirects,
+                &font_redirects,
+                &image_redirects,
+                &dependency_redirects,
+            ) else {
                 continue;
             };
             if let Some(canonical_ref) = canonical_by_fingerprint.get(&fingerprint).copied() {
@@ -2432,6 +2458,100 @@ mod tests {
         let different_ref = first_states.try_get_key(b"/Different")?.object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_graph_equivalent_form_appearance_streams() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let descriptor = |ascent: i64| {
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Type".to_vec(),
+                    ObjectHandle::name(b"FontDescriptor".to_vec()),
+                ),
+                (b"/FontName".to_vec(), ObjectHandle::name(b"Arial".to_vec())),
+                (b"/Ascent".to_vec(), ObjectHandle::integer(ascent)),
+            ])
+        };
+        let first_descriptor = pdf.make_indirect_object_handle(descriptor(905))?;
+        let second_descriptor = pdf.make_indirect_object_handle(descriptor(905))?;
+        let different_descriptor = pdf.make_indirect_object_handle(descriptor(906))?;
+        let make_font = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+                         descriptor: ObjectHandle|
+         -> Result<ObjectHandle> {
+            Ok(
+                pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                    (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+                    (
+                        b"/Subtype".to_vec(),
+                        ObjectHandle::name(b"TrueType".to_vec()),
+                    ),
+                    (b"/BaseFont".to_vec(), ObjectHandle::name(b"Arial".to_vec())),
+                    (b"/FontDescriptor".to_vec(), descriptor),
+                ]))?,
+            )
+        };
+        let first_font = make_font(&mut pdf, first_descriptor)?;
+        let second_font = make_font(&mut pdf, second_descriptor)?;
+        let different_font = make_font(&mut pdf, different_descriptor)?;
+        let payload = b"BT /F1 12 Tf (same) Tj ET";
+        let first = form_stream(&mut pdf, payload, 10)?;
+        let second = form_stream(&mut pdf, payload, 10)?;
+        let different = form_stream(&mut pdf, payload, 10)?;
+        for (form, font) in [
+            (&first, first_font),
+            (&second, second_font),
+            (&different, different_font),
+        ] {
+            let dict = form
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("appearance stream has no dictionary".to_owned()))?;
+            dict.replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(
+                    b"/Font".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/F1".to_vec(), font)]),
+                )]),
+            )?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        let first_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), first)]);
+        let second_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), second)]);
+        let different_ap = ObjectHandle::dictionary(vec![(b"/N".to_vec(), different)]);
+        let annotations = vec![
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/AP".to_vec(),
+                first_ap.clone(),
+            )]))?,
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/AP".to_vec(),
+                second_ap.clone(),
+            )]))?,
+            pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/AP".to_vec(),
+                different_ap.clone(),
+            )]))?,
+        ];
+        let root = pdf.root_handle()?;
+        root.replace_key(
+            b"/TestGraphAppearanceAnnotations",
+            ObjectHandle::array(annotations),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let stats = canonicalize_appearance_streams(&mut pdf)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        assert_eq!(stats.duplicate_raw_bytes, payload.len());
+        assert_eq!(
+            first_ap.try_get_key(b"/N")?.object_ref(),
+            second_ap.try_get_key(b"/N")?.object_ref()
+        );
+        assert_ne!(
+            first_ap.try_get_key(b"/N")?.object_ref(),
+            different_ap.try_get_key(b"/N")?.object_ref()
+        );
         Ok(())
     }
 
