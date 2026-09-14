@@ -609,6 +609,81 @@ mod tests {
         Ok(writer.get_buffer()?)
     }
 
+    fn empty_then_drawing_fixture() -> Result<Vec<u8>> {
+        let mut pdf = Pdf::empty()?;
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pdf.resolve(&pages)?;
+
+        let empty = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+        let drawing = pdf.new_stream_with_data(Rc::new(b"0 0 m 10 10 l S\n".to_vec()))?;
+        let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Parent".to_vec(), pages.clone()),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(100),
+                ]),
+            ),
+            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            (
+                b"/Contents".to_vec(),
+                ObjectHandle::array(vec![empty, drawing]),
+            ),
+        ]))?;
+        pdf.mark_object_handle_dirty(&page)?;
+        pages.replace_key(b"/Kids", ObjectHandle::array(vec![page]))?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(1))?;
+        pdf.mark_object_handle_dirty(&pages)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn optimize_only_keeps_content_after_an_empty_page_stream() -> Result<()> {
+        let input = empty_then_drawing_fixture()?;
+        let (output, _) = optimize_pdf(&input, &Config::optimize_only())?;
+        let mut pdf = Pdf::open_mem_owned(output)?;
+        let page_ref = flpdf::pages::page_refs(&mut pdf)?[0];
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page)?;
+        let contents = page.try_get_key(b"/Contents")?;
+        pdf.resolve(&contents)?;
+        let streams = contents.as_array().ok_or_else(|| {
+            Error::Invalid("rewritten fixture /Contents is not an array".to_owned())
+        })?;
+
+        let mut saw_empty = false;
+        let mut saw_drawing = false;
+        for stream in streams {
+            pdf.resolve(&stream)?;
+            let dictionary = stream.as_stream_dict().ok_or_else(|| {
+                Error::Invalid("rewritten fixture content item is not a stream".to_owned())
+            })?;
+            let raw = stream.get_raw_stream_data()?;
+            let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;
+            if decoded.is_empty() {
+                saw_empty = true;
+                assert!(dictionary.try_get_key(b"/Filter")?.is_null());
+            }
+            if decoded == b"0 0 m 10 10 l S\n" {
+                saw_drawing = true;
+            }
+        }
+        assert!(saw_empty);
+        assert!(saw_drawing);
+        Ok(())
+    }
+
     #[test]
     fn matching_cached_analysis_is_reused() -> Result<()> {
         let input = perceptual_image_fixture()?;

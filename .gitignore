@@ -1,4 +1,5 @@
 /target/
+/third_party/flpdf/target/
 /.cargo/
 /.rustup/
 /vendor/

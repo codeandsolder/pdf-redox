@@ -1539,11 +1539,6 @@ fn canonical_stream_output_with_rewrite_policy(
     // receive content-token normalization, mirroring the same guard
     // `reencode_stream_for_compress` already applies in `writer.rs`.
     let normalize_content = normalize_content && !is_metadata_stream;
-    let policy = if is_metadata_stream {
-        Some(CompressStreams::No)
-    } else {
-        crate::writer::effective_stream_policy(options)
-    };
     let source_for_pipe = handle.clone();
 
     // QPDFWriter::willFilterStream starts with `isDataModified()` before it
@@ -1556,7 +1551,10 @@ fn canonical_stream_output_with_rewrite_policy(
         apply_full_rewrite_metadata_policy,
         normalize_content,
     )?; // cov:ignore: canonical stream policy validation is exercised by the body tests; llvm-cov attributes this continuation to the defensive error path
-    let (data, filtering_attempted, normalized_content) =
+    let add_flate_filter_requested = filter_plan.as_ref().is_some_and(|(encode_flags, _, _)| {
+        encode_flags & crate::object_handle::STREAM_ENCODE_COMPRESS != 0
+    });
+    let (data, filtering_attempted, _normalized_content) =
         if let Some((encode_flags, decode_level, normalized_content)) = filter_plan {
             let mut attempt = 1_u8;
             let (data, filtering_attempted) = loop {
@@ -1615,7 +1613,7 @@ fn canonical_stream_output_with_rewrite_policy(
     }
     let dictionary_options = StreamDictionaryOptions::new(
         filtering_attempted,
-        filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content,
+        filtering_attempted && add_flate_filter_requested,
     );
     Ok((dict, data, dictionary_options))
 }
@@ -1701,6 +1699,15 @@ fn canonical_stream_filter_plan(
     } else {
         options.decode_level
     };
+    // QPDFWriter deliberately disables compression for an empty stream to
+    // improve reader compatibility. Pl_Flate does not initialize zlib until
+    // its first non-empty write, so labelling a zero-byte result as
+    // /FlateDecode would create an invalid stream. Keep the stream on the
+    // filtered path so source /Filter and /DecodeParms are removed, but do
+    // not request a replacement Flate filter.
+    if stream_dict.try_get_key(b"/Length")?.try_as_integer()? == Some(0) {
+        return Ok(Some((0, decode_level, false)));
+    }
     let preserve_lone_flate = matches!(policy, Some(CompressStreams::Yes))
         && source_has_lone_flate
         && !handle.is_data_modified()
@@ -1862,6 +1869,28 @@ mod final_handle_tests {
             Some(data.len() as i64)
         );
         assert!(policy.add_flate_filter);
+    }
+
+    #[test]
+    fn rewrite_does_not_label_an_empty_stream_as_flate_compressed() {
+        let pdf = crate::Pdf::empty().unwrap();
+        let stream = pdf.new_stream_with_data(Rc::new(Vec::new())).unwrap();
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Length", ObjectHandle::integer(0))
+            .unwrap();
+        let (dictionary, data, policy) =
+            canonical_stream_output_for_rewrite(&stream, &WriterOptions::default(), false)
+                .expect("canonical empty-stream rewrite output");
+
+        assert!(data.is_empty());
+        assert_eq!(
+            dictionary.try_get_key(b"/Length").unwrap().as_integer(),
+            Some(0)
+        );
+        assert!(policy.remove_filter_parameters);
+        assert!(!policy.add_flate_filter);
     }
 }
 
