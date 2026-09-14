@@ -41,3 +41,7 @@ Early but functional. The core currently provides:
 Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates. The WASM crate enables `getrandom`'s browser JS backend because `flpdf` uses randomness for PDF encryption IV generation.
 
 Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB subset remains active optimization work. A corpus-wide scan found that almost all other oversampled non-JPEG images are bilevel, Indexed, masked, or otherwise semantically unsuitable for the current path, and found no safe Form-local-only Print candidates, so broad raster classification and Form-branch cloning are intentionally deferred. The opt-in resource-pruning pass has been corpus-tested and remains default-off because it produced negligible size wins.
+
+## Development handoff
+
+For the current Hayro/COW migration state, validated checkpoints, known upstream gap, and exact restart sequence, see [`docs/THREAD_HANDOFF.md`](docs/THREAD_HANDOFF.md). The preserved minimal Hayro trailer-access patch is in [`docs/hayro-trailer-access.patch`](docs/hayro-trailer-access.patch).
