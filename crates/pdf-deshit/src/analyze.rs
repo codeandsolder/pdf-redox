@@ -604,6 +604,10 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             &icc_profile_refs,
             &incoming_roles,
         )?;
+        *out.stream_role_counts.entry(role.to_owned()).or_default() += 1;
+        *out.stream_role_raw_bytes
+            .entry(role.to_owned())
+            .or_default() += object.get_raw_stream_data()?.len();
         stream_roles.insert(object_ref, role);
     }
     (

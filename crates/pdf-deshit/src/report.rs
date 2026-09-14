@@ -140,6 +140,10 @@ pub struct PdfAnalysis {
     pub object_count: usize,
     pub stream_count: usize,
     pub stream_raw_bytes: usize,
+    #[serde(default)]
+    pub stream_role_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub stream_role_raw_bytes: BTreeMap<String, usize>,
     pub image_count: usize,
     pub image_raw_bytes: usize,
     pub form_xobject_count: usize,
@@ -195,6 +199,14 @@ pub struct OptimizationReport {
     pub font_duplicate_streams_detected: usize,
     pub font_duplicate_raw_bytes: usize,
     pub font_references_canonicalized: usize,
+    #[serde(default)]
+    pub font_programs_rendering_optimized: usize,
+    #[serde(default)]
+    pub font_rendering_original_encoded_bytes: usize,
+    #[serde(default)]
+    pub font_rendering_optimized_encoded_bytes: usize,
+    #[serde(default)]
+    pub font_rendering_decoded_table_bytes_removed: usize,
     pub to_unicode_duplicate_streams_detected: usize,
     pub to_unicode_duplicate_raw_bytes: usize,
     pub to_unicode_references_canonicalized: usize,
@@ -240,5 +252,25 @@ pub struct OptimizationReport {
     pub print_target_pixels: u64,
     pub flate_streams_selected_for_recompression: usize,
     pub flate_estimated_savings_bytes: usize,
+    #[serde(default)]
+    pub preservation_pages: usize,
+    #[serde(default)]
+    pub preservation_annotation_entries_seen: usize,
+    #[serde(default)]
+    pub preservation_annotation_entries_flattened: usize,
+    #[serde(default)]
+    pub preservation_annotation_entries_dropped_unflattened: usize,
+    #[serde(default)]
+    pub preservation_link_visual_shells_retained: usize,
+    #[serde(default)]
+    pub preservation_annotation_subtypes_seen: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub preservation_unflattened_annotation_subtypes: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub preservation_dropped_page_keys: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub preservation_dropped_page_tree_keys: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub preservation_dropped_catalog_keys: BTreeMap<String, usize>,
     pub notes: Vec<String>,
 }

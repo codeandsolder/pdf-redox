@@ -1,8 +1,11 @@
 mod corpus;
 
 use clap::{Parser, ValueEnum};
-use pdf_deshit::{Config, FlatePolicy, OutputProfile, PrivacyLevel, analyze_pdf, optimize_pdf};
-use std::path::PathBuf;
+use pdf_deshit::{AnnotationPolicy, Config, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProfileArg {
@@ -24,6 +27,13 @@ enum FlatePolicyArg {
     RecompressAll,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AnnotationPolicyArg {
+    Preserve,
+    AppearanceOnly,
+    Discard,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "pdf-deshit",
@@ -35,6 +45,42 @@ struct Args {
     output: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "optimize")]
     profile: ProfileArg,
+    /// Drop Link annotation navigation/actions.
+    #[arg(long)]
+    drop_links: bool,
+    /// Drop interactive form state and Widget annotations.
+    #[arg(long)]
+    drop_forms: bool,
+    /// Drop outlines, named destinations, page labels, threads, and open actions.
+    #[arg(long)]
+    drop_navigation: bool,
+    /// Drop optional-content/layer configuration.
+    #[arg(long)]
+    drop_optional_content: bool,
+    /// Drop tagged-PDF/accessibility structure.
+    #[arg(long)]
+    drop_structure: bool,
+    /// Drop color-management output intents.
+    #[arg(long)]
+    drop_output_intents: bool,
+    /// Drop viewer layout/mode/preferences.
+    #[arg(long)]
+    drop_viewer_preferences: bool,
+    /// Drop Catalog/page metadata-like auxiliary objects before privacy scrubbing.
+    #[arg(long)]
+    drop_document_metadata: bool,
+    /// Drop unrecognized Catalog/page entries and objects reachable only through them.
+    #[arg(long)]
+    drop_unknown_objects: bool,
+    /// Drop embedded-font tables useful for later editing/reflow but unused by PDF page rendering.
+    #[arg(long)]
+    drop_font_editing_support: bool,
+    /// Override handling of non-Link/non-Widget annotations.
+    #[arg(long, value_enum)]
+    annotations: Option<AnnotationPolicyArg>,
+    /// Override the effective-PPI target used by the print image policy.
+    #[arg(long)]
+    max_image_ppi: Option<u16>,
     #[arg(long, value_enum, default_value = "none")]
     privacy: PrivacyArg,
     /// Existing Flate stream policy. Selective is the optimize-only default.
@@ -118,11 +164,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ProfileArg::Perceptual => Config::perceptual(),
         ProfileArg::Print => Config::print(),
     };
-    cfg.profile = match a.profile {
-        ProfileArg::Optimize => OutputProfile::OptimizeOnly,
-        ProfileArg::Perceptual => OutputProfile::Perceptual,
-        ProfileArg::Print => OutputProfile::Print,
-    };
+    if a.drop_links {
+        cfg.preservation.links = false;
+    }
+    if a.drop_forms {
+        cfg.preservation.forms = false;
+    }
+    if a.drop_navigation {
+        cfg.preservation.navigation = false;
+    }
+    if a.drop_optional_content {
+        cfg.preservation.optional_content = false;
+    }
+    if a.drop_structure {
+        cfg.preservation.structure = false;
+    }
+    if a.drop_output_intents {
+        cfg.preservation.output_intents = false;
+    }
+    if a.drop_viewer_preferences {
+        cfg.preservation.viewer_preferences = false;
+    }
+    if a.drop_document_metadata {
+        cfg.preservation.metadata = false;
+    }
+    if a.drop_unknown_objects {
+        cfg.preservation.unknown_objects = false;
+    }
+    if a.drop_font_editing_support {
+        cfg.preservation.font_editing_support = false;
+    }
+    if let Some(policy) = a.annotations {
+        cfg.preservation.annotations = match policy {
+            AnnotationPolicyArg::Preserve => AnnotationPolicy::Preserve,
+            AnnotationPolicyArg::AppearanceOnly => AnnotationPolicy::AppearanceOnly,
+            AnnotationPolicyArg::Discard => AnnotationPolicy::Discard,
+        };
+    }
+    if let Some(max_image_ppi) = a.max_image_ppi {
+        cfg.max_image_ppi = Some(max_image_ppi);
+    }
     cfg.flate_policy = match a.flate_policy {
         FlatePolicyArg::Preserve => FlatePolicy::Preserve,
         FlatePolicyArg::Selective => FlatePolicy::default(),
@@ -161,15 +242,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("output");
         a.input.with_file_name(format!("{stem}.deshit.pdf"))
     });
-    std::fs::write(&out_path, output)?;
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    let output_to_stdout = out_path.as_os_str() == "-";
+    if output_to_stdout {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        lock.write_all(&output)?;
+        lock.flush()?;
+        if a.json {
+            eprintln!("{}", serde_json::to_string(&report)?);
+        } else {
+            eprintln!(
+                "{} -> {} bytes ({:+.2}%)",
+                report.before.input_bytes, report.after_bytes, -report.saved_percent
+            );
+        }
     } else {
-        eprintln!(
-            "{} -> {} bytes ({:+.2}%)",
-            report.before.input_bytes, report.after_bytes, -report.saved_percent
-        );
-        eprintln!("wrote {}", out_path.display());
+        std::fs::write(&out_path, output)?;
+        if a.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            eprintln!(
+                "{} -> {} bytes ({:+.2}%)",
+                report.before.input_bytes, report.after_bytes, -report.saved_percent
+            );
+            eprintln!("wrote {}", out_path.display());
+        }
     }
     Ok(())
 }

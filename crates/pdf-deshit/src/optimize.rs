@@ -8,7 +8,9 @@ use crate::{
         canonicalize_type3_charprocs,
     },
     flate::apply_flate_policy,
+    font::strip_font_editing_tables,
     hidden_text::apply_hidden_text_policy,
+    preservation::{PreservationStats, apply_preservation_policy},
     print::{PrintPlan, plan_print_downsampling},
     scrub::scrub_pdf,
 };
@@ -19,7 +21,20 @@ use flpdf::{
 };
 use std::io::Cursor;
 
+fn validate_config(cfg: &Config) -> Result<()> {
+    if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
+        let effective_target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
+        if effective_target_ppi == 0 {
+            return Err(crate::Error::Invalid(
+                "print image PPI target must be greater than zero".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
+    validate_config(cfg)?;
     let before = analyze_pdf(input)?;
     optimize_pdf_with_before(input, cfg, before)
 }
@@ -37,6 +52,7 @@ pub fn optimize_pdf_with_analysis(
     cfg: &Config,
     analysis: &PdfAnalysis,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
+    validate_config(cfg)?;
     let matches = analysis.input_bytes == input.len()
         && !analysis.input_sha256.is_empty()
         && analysis.input_sha256 == input_sha256(input);
@@ -54,8 +70,21 @@ fn optimize_pdf_with_before(
     before: PdfAnalysis,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
+    let preservation = if cfg.preservation == crate::PreservationConfig::functional() {
+        PreservationStats::default()
+    } else {
+        apply_preservation_policy(&mut pdf, &cfg.preservation)?
+    };
     let hidden_text = apply_hidden_text_policy(&mut pdf, &cfg.hidden_text)?;
     let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
+    // Strip rendering-irrelevant embedded-font editing/layout tables before
+    // font-program dedup. Different producer subsets can become identical once
+    // non-rendering font state is removed, increasing the later dedup win.
+    let font_rendering = if cfg.preservation.font_editing_support {
+        Default::default()
+    } else {
+        strip_font_editing_tables(&mut pdf, cfg.flate_level)?
+    };
     let metadata_dedup = if cfg.deduplicate_metadata_streams {
         canonicalize_metadata_streams(&mut pdf)?
     } else {
@@ -115,7 +144,8 @@ fn optimize_pdf_with_before(
     };
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
-            match plan_print_downsampling(&mut pdf, u32::from(*target_ppi)) {
+            let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
+            match plan_print_downsampling(&mut pdf, u32::from(target_ppi)) {
                 Ok(plan) => (plan, None),
                 Err(error) => (PrintPlan::default(), Some(error.to_string())),
             }
@@ -205,7 +235,32 @@ fn optimize_pdf_with_before(
     let output = writer.get_buffer()?;
 
     let mut notes = Vec::new();
+    if cfg.preservation != crate::PreservationConfig::functional() {
+        notes.push(format!(
+            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}.",
+            preservation.pages,
+            preservation.annotation_entries_flattened,
+            preservation.annotation_entries_seen,
+            preservation.link_visual_shells_retained,
+            preservation.annotation_entries_dropped_unflattened,
+            preservation.annotation_subtypes_seen,
+            preservation.unflattened_annotation_subtypes,
+            preservation.dropped_page_keys,
+            preservation.dropped_page_tree_keys,
+            preservation.dropped_catalog_keys
+        ));
+        if preservation
+            .dropped_catalog_keys
+            .contains_key("/OCProperties")
+        {
+            notes.push(
+                "Optional-content configuration (/OCProperties) was discarded by preservation policy; content whose default visibility depends on OCG state may render differently."
+                    .to_owned(),
+            );
+        }
+    }
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
+        let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
         if let Some(error) = &print_plan_error {
             notes.push(format!(
                 "Print placement analysis failed ({error}); resolution-aware raster resizing was disabled for this document."
@@ -312,6 +367,15 @@ fn optimize_pdf_with_before(
             icc_dedup.references_canonicalized, icc_dedup.duplicate_streams_detected
         ));
     }
+    if font_rendering.programs_optimized > 0 {
+        notes.push(format!(
+            "Removed PDF-rendering-unused embedded-font editing/layout tables from {} font program(s): {} -> {} encoded bytes ({} decoded table bytes removed).",
+            font_rendering.programs_optimized,
+            font_rendering.original_encoded_bytes,
+            font_rendering.optimized_encoded_bytes,
+            font_rendering.decoded_table_bytes_removed
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -339,6 +403,10 @@ fn optimize_pdf_with_before(
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        font_programs_rendering_optimized: font_rendering.programs_optimized,
+        font_rendering_original_encoded_bytes: font_rendering.original_encoded_bytes,
+        font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
+        font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
         to_unicode_duplicate_streams_detected: to_unicode_dedup.duplicate_streams_detected,
         to_unicode_duplicate_raw_bytes: to_unicode_dedup.duplicate_raw_bytes,
         to_unicode_references_canonicalized: to_unicode_dedup.references_canonicalized,
@@ -384,6 +452,17 @@ fn optimize_pdf_with_before(
         print_target_pixels: print_plan.stats.target_pixels,
         flate_streams_selected_for_recompression: flate.streams_selected,
         flate_estimated_savings_bytes: flate.estimated_savings_bytes,
+        preservation_pages: preservation.pages,
+        preservation_annotation_entries_seen: preservation.annotation_entries_seen,
+        preservation_annotation_entries_flattened: preservation.annotation_entries_flattened,
+        preservation_annotation_entries_dropped_unflattened: preservation
+            .annotation_entries_dropped_unflattened,
+        preservation_link_visual_shells_retained: preservation.link_visual_shells_retained,
+        preservation_annotation_subtypes_seen: preservation.annotation_subtypes_seen,
+        preservation_unflattened_annotation_subtypes: preservation.unflattened_annotation_subtypes,
+        preservation_dropped_page_keys: preservation.dropped_page_keys,
+        preservation_dropped_page_tree_keys: preservation.dropped_page_tree_keys,
+        preservation_dropped_catalog_keys: preservation.dropped_catalog_keys,
         notes,
     };
     Ok((output, report))
@@ -711,6 +790,33 @@ mod tests {
         assert_eq!(raw.len() as u64, report.raster_optimized_encoded_bytes);
         let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;
         assert_eq!(decoded.len(), 150 * 150);
+        Ok(())
+    }
+
+    #[test]
+    fn print_profile_rejects_zero_max_image_ppi() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let mut config = Config::print();
+        config.max_image_ppi = Some(0);
+        let error = match optimize_pdf(&input, &config) {
+            Ok(_) => return Err(Error::Invalid("zero PPI was not rejected".to_owned())),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Invalid(message) if message.contains("greater than zero")));
+        Ok(())
+    }
+
+    #[test]
+    fn print_profile_honors_max_image_ppi_override() -> Result<()> {
+        let input = perceptual_image_fixture()?;
+        let mut config = Config::print();
+        config.max_image_ppi = Some(300);
+        let (_output, report) = optimize_pdf(&input, &config)?;
+
+        assert_eq!(report.print_downsample_candidates, 1);
+        assert_eq!(report.raster_images_resized, 1);
+        assert_eq!(report.raster_original_pixels, 200 * 200);
+        assert_eq!(report.raster_optimized_pixels, 100 * 100);
         Ok(())
     }
 

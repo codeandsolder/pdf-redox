@@ -16,6 +16,97 @@ pub enum OutputProfile {
     Print,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnnotationPolicy {
+    /// Preserve annotation dictionaries and their interactive semantics.
+    Preserve,
+    /// Burn usable visible appearances into page content, retain only inert
+    /// visual shells where viewers synthesize visible ink, and discard the
+    /// remaining annotation semantics.
+    AppearanceOnly,
+    /// Remove annotations rather than preserving or flattening them.
+    Discard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreservationConfig {
+    /// Preserve Link annotation navigation/actions. Independent of whether
+    /// other annotations are preserved, flattened, or discarded.
+    pub links: bool,
+    /// Preserve interactive form state and Widget annotations.
+    pub forms: bool,
+    /// Preserve outlines, names/destinations, page labels, article threads,
+    /// and document open actions.
+    pub navigation: bool,
+    /// Preserve optional-content configuration so default layer visibility is
+    /// interpreted correctly.
+    pub optional_content: bool,
+    /// Preserve tagged-PDF/accessibility structure and language metadata.
+    pub structure: bool,
+    /// Preserve color-management output intents.
+    pub output_intents: bool,
+    /// Preserve viewer layout/mode/preferences.
+    pub viewer_preferences: bool,
+    /// Preserve Catalog/page metadata-like auxiliary entries such as XMP,
+    /// PieceInfo, LastModified, and thumbnails. Privacy scrubbing is still a
+    /// separate policy and may remove these afterward.
+    pub metadata: bool,
+    /// Preserve embedded-font tables used for later text editing/reflow but not
+    /// for rendering already-positioned PDF text. Visible-surface mode can drop
+    /// OpenType layout tables and sfnt vertical metrics that PDF consumers do
+    /// not use for page rendering.
+    pub font_editing_support: bool,
+    /// Handling for annotations not protected by `links` or `forms`.
+    pub annotations: AnnotationPolicy,
+    /// Keep unrecognized Catalog/page entries and everything reachable only
+    /// from them. Turning this off is the main "known semantics only" switch.
+    pub unknown_objects: bool,
+}
+
+impl PreservationConfig {
+    pub fn functional() -> Self {
+        Self {
+            links: true,
+            forms: true,
+            navigation: true,
+            optional_content: true,
+            structure: true,
+            output_intents: true,
+            viewer_preferences: true,
+            metadata: true,
+            font_editing_support: true,
+            annotations: AnnotationPolicy::Preserve,
+            unknown_objects: true,
+        }
+    }
+
+    pub fn visible_surface() -> Self {
+        Self {
+            links: false,
+            forms: false,
+            navigation: false,
+            // OCG state and output intents can change what "visible" means;
+            // preserve them until we explicitly flatten those semantics.
+            optional_content: true,
+            structure: false,
+            output_intents: true,
+            viewer_preferences: false,
+            metadata: false,
+            font_editing_support: false,
+            annotations: AnnotationPolicy::AppearanceOnly,
+            unknown_objects: false,
+        }
+    }
+}
+
+impl Default for PreservationConfig {
+    fn default() -> Self {
+        Self::functional()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "mode")]
 #[derive(Default)]
@@ -122,7 +213,12 @@ impl HiddenTextPolicy {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    pub profile: OutputProfile,
+    #[serde(default)]
+    pub preservation: PreservationConfig,
+    /// Optional override for the effective-PPI limit used by print raster
+    /// downsampling. `None` uses the profile's image-policy default.
+    #[serde(default)]
+    pub max_image_ppi: Option<u16>,
     pub image_policy: ImagePolicy,
     pub privacy: PrivacyConfig,
     pub hidden_text: HiddenTextPolicy,
@@ -175,7 +271,8 @@ pub struct Config {
 impl Config {
     pub fn optimize_only() -> Self {
         Self {
-            profile: OutputProfile::OptimizeOnly,
+            preservation: PreservationConfig::functional(),
+            max_image_ppi: None,
             image_policy: ImagePolicy::Preserve,
             privacy: PrivacyConfig::default(),
             hidden_text: HiddenTextPolicy::default(),
@@ -198,9 +295,15 @@ impl Config {
         }
     }
 
+    pub fn visible_surface() -> Self {
+        Self {
+            preservation: PreservationConfig::visible_surface(),
+            ..Self::optimize_only()
+        }
+    }
+
     pub fn perceptual() -> Self {
         Self {
-            profile: OutputProfile::Perceptual,
             image_policy: ImagePolicy::Perceptual {
                 jpeg_quality: 85,
                 min_savings_percent: 20,
@@ -212,7 +315,7 @@ impl Config {
 
     pub fn print() -> Self {
         Self {
-            profile: OutputProfile::Print,
+            max_image_ppi: Some(450),
             image_policy: ImagePolicy::Print {
                 jpeg_quality: 85,
                 target_ppi: 450,
@@ -232,6 +335,71 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    pub fn preservation(mut self, value: PreservationConfig) -> Self {
+        self.config.preservation = value;
+        self
+    }
+
+    pub fn preserve_links(mut self, value: bool) -> Self {
+        self.config.preservation.links = value;
+        self
+    }
+
+    pub fn preserve_forms(mut self, value: bool) -> Self {
+        self.config.preservation.forms = value;
+        self
+    }
+
+    pub fn preserve_navigation(mut self, value: bool) -> Self {
+        self.config.preservation.navigation = value;
+        self
+    }
+
+    pub fn preserve_optional_content(mut self, value: bool) -> Self {
+        self.config.preservation.optional_content = value;
+        self
+    }
+
+    pub fn preserve_structure(mut self, value: bool) -> Self {
+        self.config.preservation.structure = value;
+        self
+    }
+
+    pub fn preserve_output_intents(mut self, value: bool) -> Self {
+        self.config.preservation.output_intents = value;
+        self
+    }
+
+    pub fn preserve_viewer_preferences(mut self, value: bool) -> Self {
+        self.config.preservation.viewer_preferences = value;
+        self
+    }
+
+    pub fn preserve_metadata(mut self, value: bool) -> Self {
+        self.config.preservation.metadata = value;
+        self
+    }
+
+    pub fn preserve_font_editing_support(mut self, value: bool) -> Self {
+        self.config.preservation.font_editing_support = value;
+        self
+    }
+
+    pub fn annotation_policy(mut self, value: AnnotationPolicy) -> Self {
+        self.config.preservation.annotations = value;
+        self
+    }
+
+    pub fn preserve_unknown_objects(mut self, value: bool) -> Self {
+        self.config.preservation.unknown_objects = value;
+        self
+    }
+
+    pub fn max_image_ppi(mut self, value: Option<u16>) -> Self {
+        self.config.max_image_ppi = value;
+        self
+    }
+
     pub fn image_policy(mut self, value: ImagePolicy) -> Self {
         self.config.image_policy = value;
         self
@@ -367,6 +535,18 @@ mod tests {
     #[test]
     fn builder_overrides_independent_policy_knobs() {
         let config = Config::builder(OutputProfile::OptimizeOnly)
+            .preserve_links(false)
+            .preserve_forms(false)
+            .preserve_navigation(false)
+            .preserve_optional_content(false)
+            .preserve_structure(false)
+            .preserve_output_intents(false)
+            .preserve_viewer_preferences(false)
+            .preserve_metadata(false)
+            .preserve_font_editing_support(false)
+            .annotation_policy(AnnotationPolicy::AppearanceOnly)
+            .preserve_unknown_objects(false)
+            .max_image_ppi(Some(300))
             .generate_object_streams(false)
             .normalize_content_streams(true)
             .flate_policy(FlatePolicy::Preserve)
@@ -390,6 +570,21 @@ mod tests {
             })
             .build();
 
+        assert!(!config.preservation.links);
+        assert!(!config.preservation.forms);
+        assert!(!config.preservation.navigation);
+        assert!(!config.preservation.optional_content);
+        assert!(!config.preservation.structure);
+        assert!(!config.preservation.output_intents);
+        assert!(!config.preservation.viewer_preferences);
+        assert!(!config.preservation.metadata);
+        assert!(!config.preservation.font_editing_support);
+        assert_eq!(
+            config.preservation.annotations,
+            AnnotationPolicy::AppearanceOnly
+        );
+        assert!(!config.preservation.unknown_objects);
+        assert_eq!(config.max_image_ppi, Some(300));
         assert!(!config.generate_object_streams);
         assert!(config.normalize_content_streams);
         assert_eq!(config.flate_policy, FlatePolicy::Preserve);
