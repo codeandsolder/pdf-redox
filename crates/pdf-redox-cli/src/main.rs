@@ -1,7 +1,9 @@
 mod corpus;
 
 use clap::{Parser, ValueEnum};
-use pdf_redox::{AnnotationPolicy, Config, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
+use pdf_redox::{
+    AnnotationPolicy, Config, EditDocument, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf,
+};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -141,6 +143,9 @@ struct Args {
     corpus_top: usize,
     #[arg(long)]
     analyze_only: bool,
+    /// Migration-only fresh rewrite through the Hayro/COW backend.
+    #[arg(long, hide = true)]
+    hayro_rewrite_experimental: bool,
     #[arg(long)]
     json: bool,
 }
@@ -157,6 +162,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if a.analyze_only {
         let r = analyze_pdf(&input)?;
         println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    if a.hayro_rewrite_experimental {
+        let input_bytes = input.len();
+        let document = EditDocument::from_bytes(input)?;
+        let page_count = document.source().page_count();
+        let source_objects = document.source().object_count();
+        let output = document.write_compact_experimental()?;
+        let output_bytes = output.len();
+        let out_path = a.output.unwrap_or_else(|| {
+            let stem = a
+                .input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            a.input.with_file_name(format!("{stem}.redox.pdf"))
+        });
+        if out_path.as_os_str() == "-" {
+            let stdout = io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(&output)?;
+            lock.flush()?;
+        } else {
+            std::fs::write(&out_path, output)?;
+        }
+        if a.json {
+            let summary = serde_json::json!({
+                "input_bytes": input_bytes,
+                "output_bytes": output_bytes,
+                "page_count": page_count,
+                "source_objects": source_objects,
+            });
+            if out_path.as_os_str() == "-" {
+                eprintln!("{}", serde_json::to_string(&summary)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+        }
         return Ok(());
     }
     let mut cfg = match a.profile {
@@ -240,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
-        a.input.with_file_name(format!("{stem}.deshit.pdf"))
+        a.input.with_file_name(format!("{stem}.redox.pdf"))
     });
     let output_to_stdout = out_path.as_os_str() == "-";
     if output_to_stdout {

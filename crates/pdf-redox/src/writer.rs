@@ -1,12 +1,14 @@
 //! Compact generic writer for the Hayro/COW migration.
 //!
-//! This is intentionally not wired into the production optimizer yet. Hayro
-//! does not currently expose all trailer roots we need to preserve (`/Info`,
-//! `/ID`, and arbitrary trailer entries). The writer is exercised independently
-//! so the COS serialization and output planning can mature without weakening
-//! preservation guarantees in the existing path.
+//! This is intentionally not wired into the production optimizer yet. The body
+//! graph is fully Hayro/COW-backed; trailer-only semantic state is currently
+//! recovered through a temporary flpdf view over the same shared source buffer
+//! until Hayro exposes its already-parsed final trailer dictionary publicly.
+//! The writer is exercised independently before optimizer passes migrate onto it.
 
-use crate::{EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result};
+use crate::{
+    EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+};
 use hayro_syntax::{
     PdfVersion,
     object::{Dict, MaybeRef, Object, Stream},
@@ -26,15 +28,19 @@ struct OutputPlan {
 }
 
 impl OutputPlan {
-    fn new(document: &EditDocument) -> Result<Self> {
-        let reachable = document.reachable_objects()?;
+    fn new(document: &EditDocument, trailer: &OwnedDictionary) -> Result<Self> {
+        let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
+        let mut roots = vec![catalog_handle];
+        for value in trailer.values() {
+            roots.extend(value.references());
+        }
+        let reachable = document.reachable_from(roots)?;
         if reachable.len() > i32::MAX as usize {
             return Err(Error::TooManyOutputObjects {
                 count: reachable.len(),
             });
         }
 
-        let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
         let mut order = Vec::with_capacity(reachable.len());
         order.push(catalog_handle);
         order.extend(
@@ -65,7 +71,8 @@ impl OutputPlan {
 }
 
 pub(crate) fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
-    let plan = OutputPlan::new(document)?;
+    let trailer = document.source().preserved_trailer()?;
+    let plan = OutputPlan::new(document, &trailer)?;
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
     output.extend_from_slice(version_bytes(document.source().version()));
@@ -96,6 +103,12 @@ pub(crate) fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
     write!(&mut output, "{}", plan.order.len() + 1)?;
     output.extend_from_slice(b" /Root ");
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
+    for (name, value) in &trailer {
+        output.push(b' ');
+        write_pdf_name(&mut output, name);
+        output.push(b' ');
+        write_owned_object(&mut output, value, document, &plan)?;
+    }
     output.extend_from_slice(b" >>\nstartxref\n");
     writeln!(&mut output, "{xref_offset}")?;
     output.extend_from_slice(b"%%EOF\n");
@@ -532,6 +545,125 @@ mod tests {
     }
 
     #[test]
+    fn compact_writer_preserves_trailer_state_and_its_references() {
+        let document = match EditDocument::from_bytes(sample_pdf_with_trailer_state()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let output = match write_pdf(&document) {
+            Ok(output) => output,
+            Err(error) => panic!("rewrite should succeed: {error}"),
+        };
+        let rewritten = match SourcePdf::from_bytes(output) {
+            Ok(source) => source,
+            Err(error) => panic!("rewritten PDF should parse: {error}"),
+        };
+
+        assert_eq!(rewritten.object_count(), 6);
+        let trailer = match rewritten.preserved_trailer() {
+            Ok(trailer) => trailer,
+            Err(error) => panic!("rewritten trailer should parse: {error}"),
+        };
+        assert!(!trailer.contains_key(b"Size".as_slice()));
+        assert!(!trailer.contains_key(b"Root".as_slice()));
+
+        let id = match trailer.get(b"ID".as_slice()) {
+            Some(OwnedObject::Array(id)) => id,
+            other => panic!("expected trailer ID array, got {other:?}"),
+        };
+        assert_eq!(
+            id,
+            &vec![
+                OwnedObject::String(vec![0x01, 0x02]),
+                OwnedObject::String(b"abc".to_vec()),
+            ]
+        );
+
+        let info_id = match trailer.get(b"Info".as_slice()) {
+            Some(OwnedObject::Reference(ObjectHandle::Existing(id))) => *id,
+            other => panic!("expected indirect Info dictionary, got {other:?}"),
+        };
+        let info = match rewritten.materialize(info_id) {
+            Ok(OwnedObject::Dictionary(info)) => info,
+            Ok(other) => panic!("expected Info dictionary, got {other:?}"),
+            Err(error) => panic!("Info dictionary should survive: {error}"),
+        };
+        assert_eq!(
+            info.get(b"Producer".as_slice()),
+            Some(&OwnedObject::String(b"pdf-redox-test".to_vec()))
+        );
+
+        let custom = match trailer.get(b"Custom".as_slice()) {
+            Some(OwnedObject::Dictionary(custom)) => custom,
+            other => panic!("expected custom trailer dictionary, got {other:?}"),
+        };
+        assert_eq!(
+            custom.get(b"Flag".as_slice()),
+            Some(&OwnedObject::Boolean(true))
+        );
+        let custom_ref = match custom.get(b"Ref".as_slice()) {
+            Some(OwnedObject::Reference(ObjectHandle::Existing(id))) => *id,
+            other => panic!("expected custom trailer reference, got {other:?}"),
+        };
+        match rewritten.materialize(custom_ref) {
+            Ok(OwnedObject::Dictionary(dictionary)) => assert_eq!(
+                dictionary.get(b"Kept".as_slice()),
+                Some(&OwnedObject::Boolean(true))
+            ),
+            Ok(other) => panic!("expected retained custom object, got {other:?}"),
+            Err(error) => panic!("custom trailer reference should survive: {error}"),
+        }
+    }
+
+    #[test]
+    fn compact_writer_preserves_xref_stream_trailer_state_without_xref_mechanics() {
+        let document = match EditDocument::from_bytes(sample_xref_stream_pdf_with_trailer_state()) {
+            Ok(document) => document,
+            Err(error) => panic!("xref-stream sample should parse: {error}"),
+        };
+        let output = match write_pdf(&document) {
+            Ok(output) => output,
+            Err(error) => panic!("rewrite should succeed: {error}"),
+        };
+        assert!(
+            output
+                .windows(b"xref\n".len())
+                .any(|window| window == b"xref\n")
+        );
+        assert!(!output.windows(b"/W ".len()).any(|window| window == b"/W "));
+        assert!(
+            !output
+                .windows(b"/Index ".len())
+                .any(|window| window == b"/Index ")
+        );
+
+        let rewritten = match SourcePdf::from_bytes(output) {
+            Ok(source) => source,
+            Err(error) => panic!("rewritten PDF should parse: {error}"),
+        };
+        assert_eq!(rewritten.object_count(), 4);
+        let trailer = match rewritten.preserved_trailer() {
+            Ok(trailer) => trailer,
+            Err(error) => panic!("rewritten trailer should parse: {error}"),
+        };
+        assert!(trailer.contains_key(b"Info".as_slice()));
+        assert!(trailer.contains_key(b"ID".as_slice()));
+        let custom = match trailer.get(b"Custom".as_slice()) {
+            Some(OwnedObject::Dictionary(custom)) => custom,
+            other => panic!("expected custom trailer dictionary, got {other:?}"),
+        };
+        assert_eq!(
+            custom.get(b"Flag".as_slice()),
+            Some(&OwnedObject::Boolean(true))
+        );
+        assert!(!trailer.contains_key(b"Type".as_slice()));
+        assert!(!trailer.contains_key(b"W".as_slice()));
+        assert!(!trailer.contains_key(b"Index".as_slice()));
+        assert!(!trailer.contains_key(b"Length".as_slice()));
+        assert!(!trailer.contains_key(b"DL".as_slice()));
+    }
+
+    #[test]
     fn undefined_source_reference_rewrites_as_null() {
         let mut document = match EditDocument::from_bytes(sample_pdf(false)) {
             Ok(document) => document,
@@ -599,6 +731,116 @@ mod tests {
             panic!("integer should serialize: {error}");
         }
         assert_eq!(output, b"9007199254740993");
+    }
+
+    fn sample_xref_stream_pdf_with_trailer_state() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Producer (pdf-redox-test) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Kept true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Orphan true >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        let mut entries = Vec::new();
+        push_xref_entry(&mut entries, 0, 0, 65535);
+        for &offset in &offsets {
+            push_xref_entry(&mut entries, 1, offset as u32, 0);
+        }
+        push_xref_entry(&mut entries, 1, xref_offset as u32, 0);
+
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Info 3 0 R /ID [<0102> (abc)] /Custom << /Flag true /Ref 4 0 R >> /Length {} /DL {} >>\nstream\n",
+                entries.len(),
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&entries);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    fn push_xref_entry(entries: &mut Vec<u8>, kind: u8, field2: u32, field3: u16) {
+        entries.push(kind);
+        entries.extend_from_slice(&field2.to_be_bytes());
+        entries.extend_from_slice(&field3.to_be_bytes());
+    }
+
+    fn sample_pdf_with_trailer_state() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Producer (pdf-redox-test) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Kept true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Orphan true >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 8 /Root 1 0 R /Info 5 0 R /ID [<0102> (abc)] /Custom << /Flag true /Ref 6 0 R >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
     }
 
     fn sample_pdf(include_orphan: bool) -> Vec<u8> {

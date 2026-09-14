@@ -1,4 +1,5 @@
 use crate::{Error, Result, SourceLoadError};
+use flpdf::{ObjectHandle as FlObjectHandle, Pdf as FlPdf};
 use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
@@ -6,8 +7,18 @@ use hayro_syntax::{
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    io::Cursor,
     sync::Arc,
 };
+
+#[derive(Clone)]
+struct SharedSource(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedSource {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 /// Immutable, lazily parsed source PDF backed by Hayro.
 ///
@@ -15,6 +26,7 @@ use std::{
 /// belong in [`ObjectOverlay`] rather than in this source representation.
 pub struct SourcePdf {
     pdf: Pdf,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl SourcePdf {
@@ -25,13 +37,13 @@ impl SourcePdf {
 
     /// Parse PDF bytes already held in shared storage.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
-        let pdf = Pdf::new(bytes).map_err(SourceLoadError::from)?;
-        Ok(Self { pdf })
+        let pdf = Pdf::new(bytes.clone()).map_err(SourceLoadError::from)?;
+        Ok(Self { pdf, bytes })
     }
 
     /// Original source bytes, unchanged.
     pub fn bytes(&self) -> &[u8] {
-        self.pdf.data().as_ref()
+        self.bytes.as_slice()
     }
 
     /// Number of objects indexed by the source cross-reference graph.
@@ -111,6 +123,108 @@ impl SourcePdf {
                 })?;
         Ok(stream.raw_data())
     }
+
+    /// Return trailer entries that belong to document semantics rather than
+    /// the input xref/encryption machinery.
+    ///
+    /// This is a transitional bridge until Hayro exposes its already-parsed
+    /// trailer dictionary publicly. flpdf reads the same shared source bytes,
+    /// and the returned values are immediately converted into pdf-redox COS
+    /// values without resolving indirect children.
+    pub(crate) fn preserved_trailer(&self) -> Result<OwnedDictionary> {
+        let mut pdf = FlPdf::open(Cursor::new(SharedSource(self.bytes.clone())))?;
+        let trailer = pdf.trailer();
+        let entries = trailer.try_get_dict_as_map()?;
+        let xref_stream = entries
+            .get(b"/Type".as_slice())
+            .and_then(FlObjectHandle::as_name)
+            .is_some_and(|name| name == b"XRef");
+
+        let mut preserved = OwnedDictionary::new();
+        for (key, value) in entries {
+            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+            if is_writer_owned_trailer_key(name, xref_stream) {
+                continue;
+            }
+            preserved.insert(name.to_vec(), owned_from_flpdf(&value, 0)?);
+        }
+        Ok(preserved)
+    }
+}
+
+const MAX_TRAILER_NESTING: usize = 256;
+
+fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
+    matches!(name, b"Size" | b"Root" | b"Encrypt" | b"Prev" | b"XRefStm")
+        || xref_stream
+            && matches!(
+                name,
+                b"Type"
+                    | b"W"
+                    | b"Index"
+                    | b"Length"
+                    | b"Filter"
+                    | b"DecodeParms"
+                    | b"DL"
+                    | b"F"
+                    | b"FFilter"
+                    | b"FDecodeParms"
+            )
+}
+
+fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
+    if depth > MAX_TRAILER_NESTING {
+        return Err(Error::Invalid(
+            "trailer direct-object nesting exceeds the supported limit".to_owned(),
+        ));
+    }
+
+    if let Some(reference) = handle.object_ref() {
+        let number = i32::try_from(reference.number).map_err(|_| {
+            Error::Invalid("trailer object number exceeds the supported range".to_owned())
+        })?;
+        return Ok(OwnedObject::Reference(ObjectHandle::Existing(
+            ObjectId::new(number, i32::from(reference.generation)),
+        )));
+    }
+    if handle.is_null() {
+        return Ok(OwnedObject::Null);
+    }
+    if let Some(value) = handle.as_boolean() {
+        return Ok(OwnedObject::Boolean(value));
+    }
+    if let Some(value) = handle.as_integer() {
+        return Ok(OwnedObject::Integer(value));
+    }
+    if let Some(value) = handle.as_real() {
+        return Ok(OwnedObject::Real(value));
+    }
+    if let Some(value) = handle.as_name() {
+        return Ok(OwnedObject::Name(value));
+    }
+    if let Some(value) = handle.as_string() {
+        return Ok(OwnedObject::String(value));
+    }
+    if let Some(values) = handle.as_array() {
+        let values = values
+            .iter()
+            .map(|value| owned_from_flpdf(value, depth + 1))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(OwnedObject::Array(values));
+    }
+    if let Some(entries) = handle.as_dictionary() {
+        let mut dictionary = OwnedDictionary::new();
+        for (key, value) in entries {
+            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+            dictionary.insert(name.to_vec(), owned_from_flpdf(&value, depth + 1)?);
+        }
+        return Ok(OwnedObject::Dictionary(dictionary));
+    }
+
+    Err(Error::Invalid(format!(
+        "unsupported direct trailer object type {}",
+        handle.type_name()?
+    )))
 }
 
 /// Stable identifier of an existing indirect PDF object.
@@ -342,8 +456,9 @@ impl EditDocument {
     /// Write the current Hayro/COW graph as a compact fresh PDF.
     ///
     /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]
-    /// yet. In particular, trailer-only state that Hayro does not currently
-    /// expose publicly, including `/Info` and `/ID`, is not preserved.
+    /// yet. Trailer-only semantic state such as `/Info`, `/ID`, and extension
+    /// entries is preserved through a temporary shared-buffer flpdf bridge until
+    /// Hayro exposes its already-parsed final trailer dictionary publicly.
     pub fn write_compact_experimental(&self) -> Result<Vec<u8>> {
         crate::writer::write_pdf(self)
     }
