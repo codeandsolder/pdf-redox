@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
@@ -25,7 +25,7 @@ impl SourcePdf {
 
     /// Parse PDF bytes already held in shared storage.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
-        let pdf = Pdf::new(bytes).map_err(Error::HayroLoad)?;
+        let pdf = Pdf::new(bytes).map_err(SourceLoadError::from)?;
         Ok(Self { pdf })
     }
 
@@ -60,15 +60,21 @@ impl SourcePdf {
     /// source-backed, so materializing a dictionary does not recursively clone
     /// the object graph or duplicate large encoded streams.
     pub fn materialize(&self, id: ObjectId) -> Result<OwnedObject> {
-        let object =
-            self.pdf
-                .xref()
-                .get::<Object<'_>>(id.into())
-                .ok_or(Error::MissingSourceObject {
-                    number: id.number,
-                    generation: id.generation,
-                })?;
-        Ok(owned_from_hayro(object, Some(id)))
+        Ok(owned_from_hayro(self.object(id)?, Some(id)))
+    }
+
+    pub(crate) fn object(&self, id: ObjectId) -> Result<Object<'_>> {
+        self.pdf
+            .xref()
+            .get::<Object<'_>>(id.into())
+            .ok_or(Error::MissingSourceObject {
+                number: id.number,
+                generation: id.generation,
+            })
+    }
+
+    pub(crate) fn contains_object(&self, id: ObjectId) -> bool {
+        self.pdf.xref().get::<Object<'_>>(id.into()).is_some()
     }
 
     /// Collect indirect references reachable directly from one source object.
@@ -333,6 +339,15 @@ impl EditDocument {
         self.overlay.edit(&self.source, id)
     }
 
+    /// Write the current Hayro/COW graph as a compact fresh PDF.
+    ///
+    /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]
+    /// yet. In particular, trailer-only state that Hayro does not currently
+    /// expose publicly, including `/Info` and `/ID`, is not preserved.
+    pub fn write_compact_experimental(&self) -> Result<Vec<u8>> {
+        crate::writer::write_pdf(self)
+    }
+
     /// Collect all objects reachable from the document catalog after applying
     /// overlay replacements/deletions.
     pub fn reachable_objects(&self) -> Result<Vec<ObjectHandle>> {
@@ -348,11 +363,22 @@ impl EditDocument {
         let mut pending = roots.into_iter().collect::<Vec<_>>();
 
         while let Some(handle) = pending.pop() {
-            if !seen.insert(handle) {
+            if seen.contains(&handle) {
                 continue;
             }
 
-            for reference in self.references_for_handle(handle)? {
+            let references = match self.references_for_handle(handle) {
+                Ok(references) => references,
+                Err(Error::MissingSourceObject { .. })
+                    if matches!(handle, ObjectHandle::Existing(_)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            seen.insert(handle);
+            for reference in references {
                 if !seen.contains(&reference) {
                     pending.push(reference);
                 }
@@ -399,7 +425,10 @@ fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<Objec
             }
         }
         Object::Stream(stream) => {
-            for (_, value) in stream.dict().entries() {
+            for (name, value) in stream.dict().entries() {
+                if name.as_ref() == b"Length" {
+                    continue;
+                }
                 collect_hayro_maybe_ref(value, references);
             }
         }
@@ -430,9 +459,16 @@ fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<Obje
                 collect_owned_references(value, references);
             }
         }
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+        OwnedObject::Dictionary(dictionary) => {
             for value in dictionary.values() {
                 collect_owned_references(value, references);
+            }
+        }
+        OwnedObject::Stream { dictionary, .. } => {
+            for (name, value) in dictionary {
+                if name.as_slice() != b"Length" {
+                    collect_owned_references(value, references);
+                }
             }
         }
         OwnedObject::Null

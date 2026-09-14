@@ -12,13 +12,14 @@ mod print;
 mod report;
 mod scrub;
 mod source;
+mod writer;
 
 pub use analyze::analyze_pdf;
 pub use config::{
     AnnotationPolicy, Config, ConfigBuilder, FlatePolicy, HiddenTextPolicy, ImagePolicy,
     OutputProfile, PreservationConfig, PrivacyConfig, PrivacyLevel,
 };
-pub use error::{Error, Result};
+pub use error::{Error, Result, SourceLoadError};
 pub use optimize::{optimize_pdf, optimize_pdf_with_analysis};
 pub use report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism,
