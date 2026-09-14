@@ -14,6 +14,10 @@ pub enum Error {
     ExpectedSourceStream { number: i32, generation: i32 },
     #[error("source object {number} {generation} was deleted from the overlay")]
     DeletedSourceObject { number: i32, generation: i32 },
+    #[error("reachable object {number} {generation} was deleted from the overlay")]
+    DeletedReferencedObject { number: i32, generation: i32 },
+    #[error("overlay object {index} is missing")]
+    MissingNewObject { index: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

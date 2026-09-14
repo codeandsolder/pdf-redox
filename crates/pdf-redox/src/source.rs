@@ -5,7 +5,7 @@ use hayro_syntax::{
 };
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     sync::Arc,
 };
 
@@ -69,6 +69,25 @@ impl SourcePdf {
                     generation: id.generation,
                 })?;
         Ok(owned_from_hayro(object, Some(id)))
+    }
+
+    /// Collect indirect references reachable directly from one source object.
+    ///
+    /// This walks only the borrowed COS structure of that object. Referenced
+    /// objects are not resolved or materialized, and stream payload bytes are
+    /// never touched.
+    pub fn references(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
+        let object =
+            self.pdf
+                .xref()
+                .get::<Object<'_>>(id.into())
+                .ok_or(Error::MissingSourceObject {
+                    number: id.number,
+                    generation: id.generation,
+                })?;
+        let mut references = BTreeSet::new();
+        collect_hayro_references(&object, &mut references);
+        Ok(references.into_iter().collect())
     }
 
     /// Return the encoded/decrypted bytes of a source stream on demand.
@@ -200,6 +219,13 @@ impl OwnedObject {
             _ => None,
         }
     }
+
+    /// Collect indirect references contained in this owned COS value.
+    pub fn references(&self) -> Vec<ObjectHandle> {
+        let mut references = BTreeSet::new();
+        collect_owned_references(self, &mut references);
+        references.into_iter().collect()
+    }
 }
 
 /// Mutation applied to an object that already exists in the source PDF.
@@ -305,6 +331,116 @@ impl EditDocument {
 
     pub fn edit_object(&mut self, id: ObjectId) -> Result<&mut OwnedObject> {
         self.overlay.edit(&self.source, id)
+    }
+
+    /// Collect all objects reachable from the document catalog after applying
+    /// overlay replacements/deletions.
+    pub fn reachable_objects(&self) -> Result<Vec<ObjectHandle>> {
+        self.reachable_from([ObjectHandle::Existing(self.source.catalog_id())])
+    }
+
+    /// Collect all objects reachable from an explicit root set.
+    pub fn reachable_from(
+        &self,
+        roots: impl IntoIterator<Item = ObjectHandle>,
+    ) -> Result<Vec<ObjectHandle>> {
+        let mut seen = BTreeSet::new();
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+
+        while let Some(handle) = pending.pop() {
+            if !seen.insert(handle) {
+                continue;
+            }
+
+            for reference in self.references_for_handle(handle)? {
+                if !seen.contains(&reference) {
+                    pending.push(reference);
+                }
+            }
+        }
+
+        Ok(seen.into_iter().collect())
+    }
+
+    fn references_for_handle(&self, handle: ObjectHandle) -> Result<Vec<ObjectHandle>> {
+        match handle {
+            ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                Some(ExistingObjectChange::Replace(object)) => Ok(object.references()),
+                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
+                    number: id.number,
+                    generation: id.generation,
+                }),
+                None => Ok(self
+                    .source
+                    .references(id)?
+                    .into_iter()
+                    .map(ObjectHandle::Existing)
+                    .collect()),
+            },
+            ObjectHandle::New(id) => self
+                .overlay
+                .added(id)
+                .map(OwnedObject::references)
+                .ok_or(Error::MissingNewObject { index: id.index() }),
+        }
+    }
+}
+
+fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<ObjectId>) {
+    match object {
+        Object::Dict(dictionary) => {
+            for (_, value) in dictionary.entries() {
+                collect_hayro_maybe_ref(value, references);
+            }
+        }
+        Object::Array(array) => {
+            for value in array.raw_iter() {
+                collect_hayro_maybe_ref(value, references);
+            }
+        }
+        Object::Stream(stream) => {
+            for (_, value) in stream.dict().entries() {
+                collect_hayro_maybe_ref(value, references);
+            }
+        }
+        Object::Null(_)
+        | Object::Boolean(_)
+        | Object::Number(_)
+        | Object::String(_)
+        | Object::Name(_) => {}
+    }
+}
+
+fn collect_hayro_maybe_ref(value: MaybeRef<Object<'_>>, references: &mut BTreeSet<ObjectId>) {
+    match value {
+        MaybeRef::Ref(reference) => {
+            references.insert(reference.into());
+        }
+        MaybeRef::NotRef(object) => collect_hayro_references(&object, references),
+    }
+}
+
+fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<ObjectHandle>) {
+    match object {
+        OwnedObject::Reference(reference) => {
+            references.insert(*reference);
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                collect_owned_references(value, references);
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for value in dictionary.values() {
+                collect_owned_references(value, references);
+            }
+        }
+        OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
     }
 }
 
@@ -442,6 +578,76 @@ mod tests {
         dictionary.insert(b"Lang".to_vec(), OwnedObject::String(b"en".to_vec()));
 
         assert_eq!(document.overlay().changes().count(), 1);
+    }
+
+    #[test]
+    fn reachability_walks_source_without_materializing_overlay() {
+        let document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let reachable = match document.reachable_objects() {
+            Ok(reachable) => reachable,
+            Err(error) => panic!("source graph should be reachable: {error}"),
+        };
+
+        assert_eq!(
+            reachable,
+            vec![
+                ObjectHandle::Existing(ObjectId::new(1, 0)),
+                ObjectHandle::Existing(ObjectId::new(2, 0)),
+                ObjectHandle::Existing(ObjectId::new(3, 0)),
+                ObjectHandle::Existing(ObjectId::new(4, 0)),
+            ]
+        );
+        assert!(document.overlay().is_empty());
+    }
+
+    #[test]
+    fn reachability_follows_new_overlay_references() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let added = document
+            .overlay_mut()
+            .add(OwnedObject::Dictionary(OwnedDictionary::new()));
+        let catalog_id = document.source().catalog_id();
+        let catalog = match document.edit_object(catalog_id) {
+            Ok(object) => object,
+            Err(error) => panic!("catalog should materialize: {error}"),
+        };
+        let dictionary = match catalog.as_dictionary_mut() {
+            Some(dictionary) => dictionary,
+            None => panic!("catalog should be a dictionary"),
+        };
+        dictionary.insert(
+            b"PieceInfo".to_vec(),
+            OwnedObject::Reference(ObjectHandle::New(added)),
+        );
+
+        let reachable = match document.reachable_objects() {
+            Ok(reachable) => reachable,
+            Err(error) => panic!("overlay graph should be reachable: {error}"),
+        };
+        assert!(reachable.contains(&ObjectHandle::New(added)));
+    }
+
+    #[test]
+    fn reachability_rejects_dangling_deleted_reference() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        document.overlay_mut().delete(ObjectId::new(4, 0));
+
+        match document.reachable_objects() {
+            Err(Error::DeletedReferencedObject {
+                number: 4,
+                generation: 0,
+            }) => {}
+            other => panic!("expected dangling-reference error, got {other:?}"),
+        }
     }
 
     fn sample_pdf() -> Vec<u8> {
