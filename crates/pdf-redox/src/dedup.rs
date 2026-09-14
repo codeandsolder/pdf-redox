@@ -2603,7 +2603,7 @@ mod tests {
                 ObjectHandle::dictionary(vec![
                     (
                         b"/Creator".to_vec(),
-                        ObjectHandle::string(b"pdf-deshit-test".to_vec()),
+                        ObjectHandle::string(b"pdf-redox-test".to_vec()),
                     ),
                     (
                         b"/Subtype".to_vec(),

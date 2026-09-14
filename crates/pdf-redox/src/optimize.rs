@@ -166,7 +166,7 @@ fn optimize_pdf_with_before(
                 optimize_images_with_resize_targets(
                     &mut pdf,
                     &logger,
-                    "pdf-deshit",
+                    "pdf-redox",
                     false,
                     ImageOptimizationOptions {
                         min_width: 0,
@@ -192,7 +192,7 @@ fn optimize_pdf_with_before(
             optimize_images_with_stats(
                 &mut pdf,
                 &logger,
-                "pdf-deshit",
+                "pdf-redox",
                 false,
                 ImageOptimizationOptions {
                     keep_inline_images: true,

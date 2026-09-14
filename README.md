@@ -1,4 +1,4 @@
-# pdf-deshit
+# pdf-redox
 
 A pure-Rust PDF normalization/optimization engine with a tiny client-side WebAssembly UI.
 
@@ -12,13 +12,13 @@ Design goals:
 - never require uploading the document to a server;
 - preserve unsupported/opaque streams rather than damaging them.
 
-The implementation uses `flpdf` for qpdf-style parsing and fresh rewrites. A fresh rewrite is important: it discards incremental-update history and unreachable objects instead of appending yet another revision.
+Hayro is the selected long-term source parser. The migration keeps source bytes immutable and lazily parsed, layers mutations in a sparse copy-on-write object overlay, then feeds reachable objects to a compact fresh writer. The existing `flpdf` backend remains temporarily in place for mature mutation/rewrite passes while they are moved across incrementally. A fresh rewrite is important: it discards incremental-update history and unreachable objects instead of appending yet another revision.
 
 ## Workspace
 
-- `pdf-deshit`: core library
-- `pdf-deshit-cli`: native CLI
-- `pdf-deshit-wasm`: WASM bindings
+- `pdf-redox`: core library
+- `pdf-redox-cli`: native CLI
+- `pdf-redox-wasm`: WASM bindings
 - `web/`: static no-framework site
 - `third_party/flpdf/`: minimal vendored `flpdf` 0.5.1 fork used by the core; provenance and local API extensions are documented in `third_party/flpdf/PATCHES.md`
 

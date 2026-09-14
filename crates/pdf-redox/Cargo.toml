@@ -1,5 +1,5 @@
 [package]
-name = "pdf-deshit"
+name = "pdf-redox"
 description = "Pure-Rust PDF normalization, optimization, diagnostics, and privacy scrubbing"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 flpdf.workspace = true
+hayro-syntax.workspace = true
 flate2.workspace = true
 sha2.workspace = true
 serde.workspace = true

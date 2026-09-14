@@ -1,20 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/pdf-deshit",
-  "crates/pdf-deshit-cli",
-  "crates/pdf-deshit-wasm",
+  "crates/pdf-redox",
+  "crates/pdf-redox-cli",
+  "crates/pdf-redox-wasm",
 ]
 exclude = ["third_party/flpdf"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
 flpdf = { version = "0.5.1", path = "third_party/flpdf/crates/flpdf" }
+hayro-syntax = { git = "https://github.com/LaurenzV/hayro.git", rev = "a728f7cb6826c1e167973b8fd71867ebb4cf39af", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

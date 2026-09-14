@@ -1,4 +1,4 @@
-use pdf_deshit::{HiddenTextCategory, HiddenTextMechanism, PdfAnalysis, RiskKind, analyze_pdf};
+use pdf_redox::{HiddenTextCategory, HiddenTextMechanism, PdfAnalysis, RiskKind, analyze_pdf};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};

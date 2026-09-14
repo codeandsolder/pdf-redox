@@ -1,6 +1,6 @@
 [package]
-name = "pdf-deshit-cli"
-description = "CLI for pdf-deshit"
+name = "pdf-redox-cli"
+description = "CLI for pdf-redox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,11 @@ license.workspace = true
 workspace = true
 
 [[bin]]
-name = "pdf-deshit"
+name = "pdf-redox"
 path = "src/main.rs"
 
 [dependencies]
-pdf-deshit = { path = "../pdf-deshit" }
+pdf-redox = { path = "../pdf-redox" }
 clap.workspace = true
 serde_json.workspace = true
 serde.workspace = true

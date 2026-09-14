@@ -1,6 +1,6 @@
 [package]
-name = "pdf-deshit-wasm"
-description = "WASM bindings for pdf-deshit"
+name = "pdf-redox-wasm"
+description = "WASM bindings for pdf-redox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pdf-deshit = { path = "../pdf-deshit" }
+pdf-redox = { path = "../pdf-redox" }
 wasm-bindgen.workspace = true
 serde-wasm-bindgen.workspace = true
 serde.workspace = true

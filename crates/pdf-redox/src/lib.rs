@@ -11,6 +11,7 @@ mod preservation;
 mod print;
 mod report;
 mod scrub;
+mod source;
 
 pub use analyze::analyze_pdf;
 pub use config::{
@@ -22,4 +23,8 @@ pub use optimize::{optimize_pdf, optimize_pdf_with_analysis};
 pub use report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism,
     OptimizationReport, PageRect, PdfAnalysis, RiskFinding, RiskKind,
+};
+pub use source::{
+    EditDocument, ExistingObjectChange, NewObjectId, ObjectHandle, ObjectId, ObjectOverlay,
+    OwnedDictionary, OwnedObject, SourcePdf, StreamData,
 };

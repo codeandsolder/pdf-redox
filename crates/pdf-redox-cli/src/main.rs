@@ -1,7 +1,7 @@
 mod corpus;
 
 use clap::{Parser, ValueEnum};
-use pdf_deshit::{AnnotationPolicy, Config, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
+use pdf_redox::{AnnotationPolicy, Config, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -36,8 +36,8 @@ enum AnnotationPolicyArg {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pdf-deshit",
-    about = "Pure-Rust PDF normalization and deshittification"
+    name = "pdf-redox",
+    about = "Pure-Rust PDF normalization, optimization, and cleanup"
 )]
 struct Args {
     input: PathBuf,

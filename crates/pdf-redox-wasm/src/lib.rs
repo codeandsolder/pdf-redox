@@ -1,4 +1,4 @@
-use pdf_deshit::{
+use pdf_redox::{
     Config, HiddenTextPolicy, PdfAnalysis, PrivacyLevel, analyze_pdf, optimize_pdf,
     optimize_pdf_with_analysis,
 };
@@ -13,7 +13,7 @@ thread_local! {
 #[derive(Serialize)]
 struct WasmResult {
     pdf: Vec<u8>,
-    report: pdf_deshit::OptimizationReport,
+    report: pdf_redox::OptimizationReport,
 }
 
 #[wasm_bindgen(start)]

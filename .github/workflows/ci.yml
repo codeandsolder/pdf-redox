@@ -24,4 +24,4 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
       - name: WASM check
-        run: cargo check -p pdf-deshit-wasm --target wasm32-unknown-unknown
+        run: cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown

@@ -11,7 +11,7 @@ and large integration-test fixtures are intentionally omitted.
 ## Local image-optimization extensions
 
 The local fork keeps qpdf-compatible behavior as the default while exposing a
-few opt-in controls needed by pdf-deshit:
+few opt-in controls needed by pdf-redox:
 
 - `ImageOptimizationOptions::jpeg_quality` controls DCT/JPEG quality. The
   default remains qpdf-compatible quality 75.
@@ -23,7 +23,7 @@ few opt-in controls needed by pdf-deshit:
   encoded bytes, and shared source references reused.
 - shared indirect source Image XObjects are transcoded once and the resulting
   Image XObject is reused across resource dictionaries. Distinct source
-  objects are never merged merely because their bytes match; pdf-deshit's
+  objects are never merged merely because their bytes match; pdf-redox's
   separate exact-image canonicalizer handles that case.
 - `optimize_images_with_resize_targets()` accepts explicit `(page, source
   image) -> pixel target` entries and uses `fast_image_resize` with Lanczos3.
@@ -72,7 +72,7 @@ that the savings gate rejects an otherwise-smaller conversion, that repeated
 inline images reuse one indirect XObject across pages while differing image
 semantics stay separate, same-scope-only repetition stays inline, and
 non-mutable resource scopes cannot create a false duplicate-selection signal.
-pdf-deshit's own tests construct a two-page PDF sharing one lossless image and
+pdf-redox's own tests construct a two-page PDF sharing one lossless image and
 verify one transcode plus one cached-reference reuse through a complete
 write/reopen round trip.
 

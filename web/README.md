@@ -2,7 +2,7 @@
 
 ```sh
 cargo install wasm-pack
-wasm-pack build crates/pdf-deshit-wasm --target web --release --out-dir ../../web/pkg
+wasm-pack build crates/pdf-redox-wasm --target web --release --out-dir ../../web/pkg
 python3 -m http.server -d web 8080
 ```
 
