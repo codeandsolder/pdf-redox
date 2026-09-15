@@ -486,6 +486,18 @@ impl EditDocument {
         Ok(crate::scrub::scrub_edit_document_metadata(self)?.removed)
     }
 
+    /// Apply the currently migrated dictionary-only privacy operations.
+    ///
+    /// This migration API rejects configuration knobs whose specialized
+    /// JPEG/action/attachment/signature implementations have not moved yet.
+    #[doc(hidden)]
+    pub fn scrub_cos_privacy_experimental(
+        &mut self,
+        cfg: &crate::PrivacyConfig,
+    ) -> Result<BTreeMap<String, usize>> {
+        Ok(crate::scrub::scrub_edit_document_cos_privacy(self, cfg)?.removed)
+    }
+
     /// Write the current Hayro/COW graph as a compact fresh PDF.
     ///
     /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]

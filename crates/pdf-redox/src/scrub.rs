@@ -52,43 +52,107 @@ const METADATA_PRIVACY_KEYS: [(&[u8], &str); 3] = [
     (b"LastModified", "last-modified"),
 ];
 
-fn owned_dictionary_needs_metadata_scrub(object: &OwnedObject) -> bool {
+const FORM_VALUE_KEYS: [&[u8]; 3] = [b"V", b"DV", b"RV"];
+
+fn dictionary_needs_cos_privacy_scrub(
+    contains_key: impl Fn(&[u8]) -> bool,
+    cfg: &PrivacyConfig,
+) -> bool {
+    if cfg.level == PrivacyLevel::None {
+        return false;
+    }
+    if METADATA_PRIVACY_KEYS
+        .iter()
+        .any(|(key, _)| contains_key(key))
+    {
+        return true;
+    }
+    if cfg.level != PrivacyLevel::BestEffort {
+        return false;
+    }
+    if contains_key(b"Thumb") {
+        return true;
+    }
+    cfg.remove_form_values
+        && contains_key(b"FT")
+        && FORM_VALUE_KEYS.iter().any(|key| contains_key(key))
+}
+
+fn owned_dictionary_needs_cos_privacy_scrub(object: &OwnedObject, cfg: &PrivacyConfig) -> bool {
     object.as_dictionary().is_some_and(|dictionary| {
-        METADATA_PRIVACY_KEYS
-            .iter()
-            .any(|(key, _)| dictionary.contains_key(*key))
+        dictionary_needs_cos_privacy_scrub(|key| dictionary.contains_key(key), cfg)
     })
 }
 
-fn hayro_object_needs_metadata_scrub(object: &HayroObject<'_>) -> bool {
-    let has_key = |dictionary: &hayro_syntax::object::Dict<'_>| {
-        METADATA_PRIVACY_KEYS
-            .iter()
-            .any(|(key, _)| dictionary.contains_key(*key))
+fn hayro_object_needs_cos_privacy_scrub(object: &HayroObject<'_>, cfg: &PrivacyConfig) -> bool {
+    let needs_scrub = |dictionary: &hayro_syntax::object::Dict<'_>| {
+        dictionary_needs_cos_privacy_scrub(|key| dictionary.contains_key(key), cfg)
     };
     match object {
-        HayroObject::Dict(dictionary) => has_key(dictionary),
-        HayroObject::Stream(stream) => has_key(stream.dict()),
+        HayroObject::Dict(dictionary) => needs_scrub(dictionary),
+        HayroObject::Stream(stream) => needs_scrub(stream.dict()),
         _ => false,
     }
 }
 
-fn scrub_owned_metadata_dictionary(dictionary: &mut OwnedDictionary, stats: &mut ScrubStats) {
+fn scrub_owned_cos_privacy_dictionary(
+    dictionary: &mut OwnedDictionary,
+    cfg: &PrivacyConfig,
+    stats: &mut ScrubStats,
+) {
     for (key, label) in METADATA_PRIVACY_KEYS {
         if dictionary.remove(key).is_some() {
             stats.bump(label);
         }
     }
+
+    if cfg.level != PrivacyLevel::BestEffort {
+        return;
+    }
+    if dictionary.remove(b"Thumb".as_slice()).is_some() {
+        stats.bump("thumbnail");
+    }
+    if cfg.remove_form_values && dictionary.contains_key(b"FT".as_slice()) {
+        for key in FORM_VALUE_KEYS {
+            if dictionary.remove(key).is_some() {
+                stats.bump("form-value");
+            }
+        }
+    }
 }
 
-/// Remove the COS-level metadata handled by `PrivacyLevel::Metadata` from the
-/// Hayro/COW document without materializing unaffected source objects.
+fn validate_hayro_cos_privacy_config(cfg: &PrivacyConfig) -> Result<()> {
+    if cfg.strip_jpeg_metadata
+        || cfg.aggressive_jpeg_app_scrub
+        || cfg.remove_attachments
+        || cfg.remove_active_content
+        || cfg.remove_signatures
+    {
+        return Err(crate::Error::Invalid(
+            "Hayro COS privacy migration does not yet support JPEG, attachment, active-content, or signature scrubbing"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Remove the migrated dictionary-only privacy state from the Hayro/COW graph
+/// without materializing unaffected source objects.
 ///
-/// This is the first optimizer pass migrated to the sparse overlay. JPEG
-/// marker scrubbing and all best-effort privacy operations intentionally stay
+/// Supported today: Metadata-level `/Info`, `/ID`, `/Metadata`, `/PieceInfo`,
+/// and `/LastModified`; BestEffort additionally removes `/Thumb` and, when
+/// requested, `/V`, `/DV`, and `/RV` from field dictionaries carrying `/FT`.
+/// Specialized JPEG, attachment, active-content, and signature operations stay
 /// on the existing flpdf path for now.
-pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
+pub(crate) fn scrub_edit_document_cos_privacy(
+    document: &mut EditDocument,
+    cfg: &PrivacyConfig,
+) -> Result<ScrubStats> {
+    validate_hayro_cos_privacy_config(cfg)?;
     let mut stats = ScrubStats::default();
+    if cfg.level == PrivacyLevel::None {
+        return Ok(stats);
+    }
 
     for (key, label) in [
         (b"Info".as_slice(), "info-dictionary"),
@@ -100,11 +164,9 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
     }
 
     // Walk the post-trailer-removal output graph once. For untouched source
-    // objects, inspect metadata keys and collect outgoing references from the
+    // objects, inspect privacy keys and collect outgoing references from the
     // same Hayro parse. Only the sparse set of dictionaries that actually need
-    // mutation is parsed a second time when it is materialized into the COW
-    // overlay. This matters for compressed object streams, where repeated xref
-    // lookups can otherwise repeatedly decode the containing object stream.
+    // mutation is parsed a second time when materialized into the COW overlay.
     let mut seen = BTreeSet::new();
     let mut pending = document.output_roots();
     while let Some(handle) = pending.pop() {
@@ -116,7 +178,7 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
             CowObjectHandle::Existing(id) => match document.overlay().change(id) {
                 Some(ExistingObjectChange::Replace(object)) => (
                     object.references(),
-                    owned_dictionary_needs_metadata_scrub(object),
+                    owned_dictionary_needs_cos_privacy_scrub(object, cfg),
                 ),
                 Some(ExistingObjectChange::Delete) => {
                     return Err(crate::Error::DeletedReferencedObject {
@@ -134,7 +196,7 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
                         }
                         Err(error) => return Err(error),
                     };
-                    let needs_edit = hayro_object_needs_metadata_scrub(&object);
+                    let needs_edit = hayro_object_needs_cos_privacy_scrub(&object, cfg);
                     (
                         references
                             .into_iter()
@@ -151,7 +213,7 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
                     .ok_or(crate::Error::MissingNewObject { index: id.index() })?;
                 (
                     object.references(),
-                    owned_dictionary_needs_metadata_scrub(object),
+                    owned_dictionary_needs_cos_privacy_scrub(object, cfg),
                 )
             }
         };
@@ -169,20 +231,30 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
         match handle {
             CowObjectHandle::Existing(id) => {
                 if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut() {
-                    scrub_owned_metadata_dictionary(dictionary, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, &mut stats);
                 }
             }
             CowObjectHandle::New(id) => {
                 if let Some(object) = document.overlay_mut().added_mut(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                 {
-                    scrub_owned_metadata_dictionary(dictionary, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, &mut stats);
                 }
             }
         }
     }
 
     Ok(stats)
+}
+
+pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
+    scrub_edit_document_cos_privacy(
+        document,
+        &PrivacyConfig {
+            level: PrivacyLevel::Metadata,
+            ..PrivacyConfig::default()
+        },
+    )
 }
 
 fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
@@ -415,6 +487,126 @@ mod tests {
             Some(&OwnedObject::Boolean(true))
         );
         Ok(())
+    }
+
+    #[test]
+    fn hayro_best_effort_thumbnail_and_form_values_match_flpdf() -> Result<()> {
+        let input = best_effort_fixture();
+        let config = PrivacyConfig {
+            level: PrivacyLevel::BestEffort,
+            remove_form_values: true,
+            ..PrivacyConfig::default()
+        };
+
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = scrub_pdf(&mut flpdf, &config)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = scrub_edit_document_cos_privacy(&mut document, &config)?;
+        assert_eq!(actual.removed, expected.removed);
+        assert_eq!(actual.jpeg_metadata_bytes_removed, 0);
+        assert_eq!(document.overlay().changes().count(), 3);
+
+        let output = document.write_compact_experimental()?;
+        let rewritten = EditDocument::from_bytes(output)?;
+        assert_eq!(rewritten.source().object_count(), 6);
+
+        let mut saw_field = false;
+        let mut saw_non_field = false;
+        for handle in rewritten.reachable_objects()? {
+            let CowObjectHandle::Existing(id) = handle else {
+                continue;
+            };
+            let object = rewritten.source().materialize(id)?;
+            let Some(dictionary) = object.as_dictionary() else {
+                continue;
+            };
+            assert!(!dictionary.contains_key(b"Thumb".as_slice()));
+            match dictionary.get(b"Marker".as_slice()) {
+                Some(OwnedObject::Name(name)) if name == b"Field" => {
+                    saw_field = true;
+                    assert!(dictionary.contains_key(b"FT".as_slice()));
+                    for key in FORM_VALUE_KEYS {
+                        assert!(!dictionary.contains_key(key));
+                    }
+                }
+                Some(OwnedObject::Name(name)) if name == b"NonField" => {
+                    saw_non_field = true;
+                    assert!(!dictionary.contains_key(b"FT".as_slice()));
+                    for key in FORM_VALUE_KEYS {
+                        assert!(dictionary.contains_key(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_field);
+        assert!(saw_non_field);
+        Ok(())
+    }
+
+    fn best_effort_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R /AcroForm << /Fields [8 0 R 9 0 R] >> >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R /Thumb 7 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Producer (pdf-redox-test) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Metadata /Subtype /XML /Length 4 >>\nstream\n<x/>\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /ThumbnailPayload true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /FT /Tx /Marker /Field /V (secret) /DV (default) /RV (rich) /Keep true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Marker /NonField /V (keep-v) /DV (keep-dv) /RV (keep-rv) /Keep true >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 10 /Root 1 0 R /Info 5 0 R /ID [(left) (right)] >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
     }
 
     fn metadata_fixture() -> Vec<u8> {
