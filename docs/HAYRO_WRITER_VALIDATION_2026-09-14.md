@@ -69,7 +69,7 @@ The corrected all-case render harness includes both `.pdf` and `.PDF`: **405/405
 
 ## Code gates
 
-Final current-tree gates at `d1f98ce` are green: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-features` (**81/81 tests pass**); `cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown`; and `git diff --check`.
+Final current-tree gates at `f1f6c94` are green: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-features` (**82/82 tests pass**); `cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown`; and `git diff --check`.
 
 Standalone flpdf validation with the writer regression previously passed its full 2,718-test suite. The pdf-redox workspace-visible regression also passes independently.
 
@@ -124,6 +124,35 @@ On the current release build, `ALLK.pdf` (16,317 source objects, 215 pages) rewr
 
 Validation artifacts are under `/srv/scratch/pdf-desht-build/hayro-metadata-privacy-20260915-v2/`, including `summary.json`, rewritten outputs, and `render12/summary.json`.
 
+## Second migrated dictionary slice: best-effort COS privacy — 2026-09-15
+
+Checkpoint `f1f6c94` (`Extend Hayro COS privacy scrub`) extends the same sparse traversal with two dictionary-only BestEffort operations while keeping specialized byte transforms and graph-specific helpers on flpdf.
+
+New migrated behavior:
+
+- BestEffort removes `/Thumb` wherever it occurs on the reachable output graph;
+- when `remove_form_values` is enabled, `/V`, `/DV`, and `/RV` are removed only from dictionaries that directly carry `/FT`, matching the existing flpdf condition;
+- unsupported Hayro migration options for JPEG metadata, attachments, active content/actions, and signatures fail explicitly instead of silently running a partial scrub.
+
+The second implementation deliberately reuses the concrete one-pass traversal rather than introducing a generic visitor abstraction yet. The predicate/mutation split now has two real policy shapes to learn from: unconditional key removal and conditional field-dictionary removal.
+
+Focused flpdf parity coverage exercises a page thumbnail, a real field dictionary containing `/FT` + `/V` + `/DV` + `/RV`, and a non-field dictionary containing the same three value keys. Hayro reports exactly the same removals as flpdf, removes the values only from the field, retains the non-field values, and keeps sparse materialization.
+
+For the corpus gate, `remove_form_values` stays off because that option intentionally changes interactive form state. The default BestEffort dictionary addition therefore validates `/Thumb` removal on the same 405-file corpus:
+
+- rewrite success: **405/405**;
+- Poppler reparse/page count: **405/405**;
+- exact `pdftotext -enc UTF-8`: **405/405**;
+- 12 DPI Poppler rendering: **17,612/17,612 pixel-identical pages**;
+- render failures/page-count mismatches/differing pixels: zero;
+- real `/Thumb` removals: **225**;
+- output: **781,552,697 bytes**;
+- delta versus metadata-only Hayro checkpoint: **-191,547 bytes**;
+- delta versus plain validated Hayro rewrite: **-37,871,873 bytes**;
+- output remains 3,991,330 bytes (+0.5133%) above source because the writer still expands object streams/classic xref.
+
+Validation artifacts are under `/srv/scratch/pdf-desht-build/hayro-best-effort-dictionary-20260915/`, including `summary.json`, rewritten outputs, and `render12/summary.json`.
+
 ## Performance comparison
 
 A representative benchmark harness is preserved as `bench_hayro_vs_flpdf.py`, but the final timing run was deliberately deferred on this server: it is restricted to one effective CPU while unrelated long-running jobs kept load around 7–12 with substantial storage wait. Running it concurrently would produce misleading wall-time numbers. Re-run the harness on an otherwise idle host (or a dedicated instance) before treating wall time as evidence; production-vs-Hayro is also intentionally end-to-end rather than writer-only.
@@ -132,4 +161,4 @@ Production-vs-Hayro timing is deliberately described as end-to-end rather than w
 
 ## Next migration slice
 
-The first dictionary-only optimizer pass is now migrated and validated. Migrate one more small dictionary-oriented pass before designing a generic traversal/visitor abstraction; use the second implementation to expose the actual common shape instead of guessing it. Good candidates are the non-JPEG/non-attachment parts of best-effort privacy or another preservation key-pruning slice. Keep production `optimize_pdf()` on flpdf until a coherent group of passes has equivalent Hayro coverage. Continue to avoid image transforms and graph-wide dedup until the sparse mutation model has more mileage, and retain the 405-file structural/text plus 17,612-page render gate after each migration group.
+Two dictionary-oriented privacy slices are now implemented and validated. Before adding more one-off traversal code, compare the two implementations and extract only the genuinely repeated source/overlay graph-walk mechanism; keep pass-specific predicates and mutation logic local. A sensible next semantic target is active-content dictionary surgery (`/AA`, dangerous `/A`/`/OpenAction`, and the Catalog JavaScript name tree), because it will force the first cross-object/action inspection requirement without yet involving stream byte transforms. Keep attachments/signatures/JPEG transforms separate, keep production `optimize_pdf()` on flpdf until a coherent pass group has Hayro equivalence, and retain the 405-file structural/text plus 17,612-page render gate after each migration group.
