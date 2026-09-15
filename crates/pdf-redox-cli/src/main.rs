@@ -2,7 +2,8 @@ mod corpus;
 
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
-    AnnotationPolicy, Config, EditDocument, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf,
+    AnnotationPolicy, Config, EditDocument, FlatePolicy, PrivacyConfig, PrivacyLevel, analyze_pdf,
+    optimize_pdf,
 };
 use std::{
     io::{self, Write},
@@ -165,28 +166,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if a.hayro_rewrite_experimental {
-        if a.scrub_jpeg_metadata
-            || a.remove_attachments
-            || a.remove_active_content
-            || a.remove_signatures
-        {
+        if a.scrub_jpeg_metadata || a.remove_attachments || a.remove_signatures {
             return Err(
-                "Hayro experimental mode has not migrated JPEG/best-effort privacy operations yet"
+                "Hayro experimental mode has not migrated JPEG, attachment, or signature privacy operations yet"
                     .into(),
             );
         }
         let input_bytes = input.len();
         let mut document = EditDocument::from_bytes(input)?;
-        let privacy_items_removed = match a.privacy {
-            PrivacyArg::None => Default::default(),
-            PrivacyArg::Metadata => document.scrub_metadata_privacy_experimental()?,
-            PrivacyArg::BestEffort => {
-                return Err(
-                    "Hayro experimental mode currently supports only --privacy none|metadata"
-                        .into(),
-                );
-            }
+        let privacy_level = match a.privacy {
+            PrivacyArg::None => PrivacyLevel::None,
+            PrivacyArg::Metadata => PrivacyLevel::Metadata,
+            PrivacyArg::BestEffort => PrivacyLevel::BestEffort,
         };
+        let privacy_items_removed = document.scrub_cos_privacy_experimental(&PrivacyConfig {
+            level: privacy_level,
+            remove_active_content: a.remove_active_content,
+            ..PrivacyConfig::default()
+        })?;
         let page_count = document.source().page_count();
         let source_objects = document.source().object_count();
         let output = document.write_compact_experimental()?;

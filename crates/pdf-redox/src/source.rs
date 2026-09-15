@@ -489,7 +489,7 @@ impl EditDocument {
     /// Apply the currently migrated dictionary-only privacy operations.
     ///
     /// This migration API rejects configuration knobs whose specialized
-    /// JPEG/action/attachment/signature implementations have not moved yet.
+    /// JPEG/attachment/signature implementations have not moved yet.
     #[doc(hidden)]
     pub fn scrub_cos_privacy_experimental(
         &mut self,

@@ -54,6 +54,131 @@ const METADATA_PRIVACY_KEYS: [(&[u8], &str); 3] = [
 
 const FORM_VALUE_KEYS: [&[u8]; 3] = [b"V", b"DV", b"RV"];
 
+const DANGEROUS_ACTION_NAMES: [&[u8]; 6] = [
+    b"JavaScript",
+    b"Launch",
+    b"SubmitForm",
+    b"ImportData",
+    b"Rendition",
+    b"RichMediaExecute",
+];
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ActiveContentPlan {
+    remove_action: bool,
+    remove_open_action: bool,
+}
+
+fn current_object(document: &EditDocument, handle: CowObjectHandle) -> Result<Option<OwnedObject>> {
+    match handle {
+        CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+            Some(ExistingObjectChange::Replace(object)) => Ok(Some(object.clone())),
+            Some(ExistingObjectChange::Delete) => Err(crate::Error::DeletedReferencedObject {
+                number: id.number(),
+                generation: id.generation(),
+            }),
+            None => match document.source().materialize(id) {
+                Ok(object) => Ok(Some(object)),
+                Err(crate::Error::MissingSourceObject { .. }) => Ok(None),
+                Err(error) => Err(error),
+            },
+        },
+        CowObjectHandle::New(id) => document
+            .overlay()
+            .added(id)
+            .cloned()
+            .ok_or(crate::Error::MissingNewObject { index: id.index() })
+            .map(Some),
+    }
+}
+
+fn resolve_owned_value(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<OwnedObject>> {
+    let mut value = value.clone();
+    let mut seen = BTreeSet::new();
+    loop {
+        let OwnedObject::Reference(handle) = value else {
+            return Ok(Some(value));
+        };
+        if !seen.insert(handle) {
+            return Ok(None);
+        }
+        let Some(next) = current_object(document, handle)? else {
+            return Ok(None);
+        };
+        value = next;
+    }
+}
+
+fn owned_action_is_dangerous(document: &EditDocument, action: &OwnedObject) -> Result<bool> {
+    let Some(action) = resolve_owned_value(document, action)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Dictionary(dictionary) = action else {
+        return Ok(false);
+    };
+    let Some(kind) = dictionary.get(b"S".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(kind) = resolve_owned_value(document, kind)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Name(name) = kind else {
+        return Ok(false);
+    };
+    Ok(DANGEROUS_ACTION_NAMES.contains(&name.as_slice()))
+}
+
+fn active_content_plan_for_handle(
+    document: &EditDocument,
+    handle: CowObjectHandle,
+) -> Result<ActiveContentPlan> {
+    let Some(object) = current_object(document, handle)? else {
+        return Ok(ActiveContentPlan::default());
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(ActiveContentPlan::default());
+    };
+    Ok(ActiveContentPlan {
+        remove_action: match dictionary.get(b"A".as_slice()) {
+            Some(action) => owned_action_is_dangerous(document, action)?,
+            None => false,
+        },
+        remove_open_action: match dictionary.get(b"OpenAction".as_slice()) {
+            Some(action) => owned_action_is_dangerous(document, action)?,
+            None => false,
+        },
+    })
+}
+
+fn dictionary_has_active_action_candidate(
+    contains_key: impl Fn(&[u8]) -> bool,
+    cfg: &PrivacyConfig,
+) -> bool {
+    cfg.level == PrivacyLevel::BestEffort
+        && cfg.remove_active_content
+        && (contains_key(b"A") || contains_key(b"OpenAction"))
+}
+
+fn owned_object_has_active_action_candidate(object: &OwnedObject, cfg: &PrivacyConfig) -> bool {
+    object.as_dictionary().is_some_and(|dictionary| {
+        dictionary_has_active_action_candidate(|key| dictionary.contains_key(key), cfg)
+    })
+}
+
+fn hayro_object_has_active_action_candidate(object: &HayroObject<'_>, cfg: &PrivacyConfig) -> bool {
+    let has_candidate = |dictionary: &hayro_syntax::object::Dict<'_>| {
+        dictionary_has_active_action_candidate(|key| dictionary.contains_key(key), cfg)
+    };
+    match object {
+        HayroObject::Dict(dictionary) => has_candidate(dictionary),
+        HayroObject::Stream(stream) => has_candidate(stream.dict()),
+        _ => false,
+    }
+}
+
 fn dictionary_needs_cos_privacy_scrub(
     contains_key: impl Fn(&[u8]) -> bool,
     cfg: &PrivacyConfig,
@@ -71,6 +196,9 @@ fn dictionary_needs_cos_privacy_scrub(
         return false;
     }
     if contains_key(b"Thumb") {
+        return true;
+    }
+    if cfg.remove_active_content && contains_key(b"AA") {
         return true;
     }
     cfg.remove_form_values
@@ -98,6 +226,7 @@ fn hayro_object_needs_cos_privacy_scrub(object: &HayroObject<'_>, cfg: &PrivacyC
 fn scrub_owned_cos_privacy_dictionary(
     dictionary: &mut OwnedDictionary,
     cfg: &PrivacyConfig,
+    active_content: ActiveContentPlan,
     stats: &mut ScrubStats,
 ) {
     for (key, label) in METADATA_PRIVACY_KEYS {
@@ -112,6 +241,19 @@ fn scrub_owned_cos_privacy_dictionary(
     if dictionary.remove(b"Thumb".as_slice()).is_some() {
         stats.bump("thumbnail");
     }
+    if cfg.remove_active_content {
+        if dictionary.remove(b"AA".as_slice()).is_some() {
+            stats.bump("additional-actions");
+        }
+        if active_content.remove_action && dictionary.remove(b"A".as_slice()).is_some() {
+            stats.bump("dangerous-action");
+        }
+        if active_content.remove_open_action
+            && dictionary.remove(b"OpenAction".as_slice()).is_some()
+        {
+            stats.bump("dangerous-open-action");
+        }
+    }
     if cfg.remove_form_values && dictionary.contains_key(b"FT".as_slice()) {
         for key in FORM_VALUE_KEYS {
             if dictionary.remove(key).is_some() {
@@ -125,11 +267,10 @@ fn validate_hayro_cos_privacy_config(cfg: &PrivacyConfig) -> Result<()> {
     if cfg.strip_jpeg_metadata
         || cfg.aggressive_jpeg_app_scrub
         || cfg.remove_attachments
-        || cfg.remove_active_content
         || cfg.remove_signatures
     {
         return Err(crate::Error::Invalid(
-            "Hayro COS privacy migration does not yet support JPEG, attachment, active-content, or signature scrubbing"
+            "Hayro COS privacy migration does not yet support JPEG, attachment, or signature scrubbing"
                 .to_owned(),
         ));
     }
@@ -142,8 +283,9 @@ fn validate_hayro_cos_privacy_config(cfg: &PrivacyConfig) -> Result<()> {
 /// Supported today: Metadata-level `/Info`, `/ID`, `/Metadata`, `/PieceInfo`,
 /// and `/LastModified`; BestEffort additionally removes `/Thumb` and, when
 /// requested, `/V`, `/DV`, and `/RV` from field dictionaries carrying `/FT`.
-/// Specialized JPEG, attachment, active-content, and signature operations stay
-/// on the existing flpdf path for now.
+/// Active-content mode removes `/AA`, dangerous `/A` and `/OpenAction` actions,
+/// and the Catalog JavaScript name tree. Specialized JPEG, attachment, and
+/// signature operations stay on the existing flpdf path for now.
 pub(crate) fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
@@ -174,11 +316,12 @@ pub(crate) fn scrub_edit_document_cos_privacy(
             continue;
         }
 
-        let (references, needs_edit) = match handle {
+        let (references, needs_edit, inspect_actions) = match handle {
             CowObjectHandle::Existing(id) => match document.overlay().change(id) {
                 Some(ExistingObjectChange::Replace(object)) => (
                     object.references(),
                     owned_dictionary_needs_cos_privacy_scrub(object, cfg),
+                    owned_object_has_active_action_candidate(object, cfg),
                 ),
                 Some(ExistingObjectChange::Delete) => {
                     return Err(crate::Error::DeletedReferencedObject {
@@ -197,12 +340,14 @@ pub(crate) fn scrub_edit_document_cos_privacy(
                         Err(error) => return Err(error),
                     };
                     let needs_edit = hayro_object_needs_cos_privacy_scrub(&object, cfg);
+                    let inspect_actions = hayro_object_has_active_action_candidate(&object, cfg);
                     (
                         references
                             .into_iter()
                             .map(CowObjectHandle::Existing)
                             .collect(),
                         needs_edit,
+                        inspect_actions,
                     )
                 }
             },
@@ -214,6 +359,7 @@ pub(crate) fn scrub_edit_document_cos_privacy(
                 (
                     object.references(),
                     owned_dictionary_needs_cos_privacy_scrub(object, cfg),
+                    owned_object_has_active_action_candidate(object, cfg),
                 )
             }
         };
@@ -225,26 +371,96 @@ pub(crate) fn scrub_edit_document_cos_privacy(
             }
         }
 
+        let active_content = if inspect_actions {
+            active_content_plan_for_handle(document, handle)?
+        } else {
+            ActiveContentPlan::default()
+        };
+        let needs_edit =
+            needs_edit || active_content.remove_action || active_content.remove_open_action;
         if !needs_edit {
             continue;
         }
         match handle {
             CowObjectHandle::Existing(id) => {
                 if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut() {
-                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
                 }
             }
             CowObjectHandle::New(id) => {
                 if let Some(object) = document.overlay_mut().added_mut(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                 {
-                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
                 }
             }
         }
     }
 
+    if cfg.level == PrivacyLevel::BestEffort && cfg.remove_active_content {
+        scrub_catalog_javascript_name_tree(document, &mut stats)?;
+    }
+
     Ok(stats)
+}
+
+fn scrub_catalog_javascript_name_tree(
+    document: &mut EditDocument,
+    stats: &mut ScrubStats,
+) -> Result<()> {
+    let catalog = CowObjectHandle::Existing(document.source().catalog_id());
+    let Some(catalog_object) = current_object(document, catalog)? else {
+        return Ok(());
+    };
+    let Some(catalog_dictionary) = catalog_object.as_dictionary() else {
+        return Ok(());
+    };
+    let Some(names) = catalog_dictionary.get(b"Names".as_slice()).cloned() else {
+        return Ok(());
+    };
+
+    match names {
+        OwnedObject::Reference(handle) => {
+            let Some(names_object) = current_object(document, handle)? else {
+                return Ok(());
+            };
+            let Some(names_dictionary) = names_object.as_dictionary() else {
+                return Ok(());
+            };
+            if !names_dictionary.contains_key(b"JavaScript".as_slice()) {
+                return Ok(());
+            }
+            match handle {
+                CowObjectHandle::Existing(id) => {
+                    if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut()
+                        && dictionary.remove(b"JavaScript".as_slice()).is_some()
+                    {
+                        stats.bump("javascript-name-tree");
+                    }
+                }
+                CowObjectHandle::New(id) => {
+                    if let Some(object) = document.overlay_mut().added_mut(id)
+                        && let Some(dictionary) = object.as_dictionary_mut()
+                        && dictionary.remove(b"JavaScript".as_slice()).is_some()
+                    {
+                        stats.bump("javascript-name-tree");
+                    }
+                }
+            }
+        }
+        OwnedObject::Dictionary(_) => {
+            let catalog_id = document.source().catalog_id();
+            if let Some(catalog_dictionary) = document.edit_object(catalog_id)?.as_dictionary_mut()
+                && let Some(OwnedObject::Dictionary(names_dictionary)) =
+                    catalog_dictionary.get_mut(b"Names".as_slice())
+                && names_dictionary.remove(b"JavaScript".as_slice()).is_some()
+            {
+                stats.bump("javascript-name-tree");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
@@ -543,6 +759,162 @@ mod tests {
         assert!(saw_field);
         assert!(saw_non_field);
         Ok(())
+    }
+
+    #[test]
+    fn hayro_active_content_scrub_matches_flpdf_and_preserves_safe_actions() -> Result<()> {
+        let input = active_content_fixture();
+        let config = PrivacyConfig {
+            level: PrivacyLevel::BestEffort,
+            remove_active_content: true,
+            ..PrivacyConfig::default()
+        };
+
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = scrub_pdf(&mut flpdf, &config)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = scrub_edit_document_cos_privacy(&mut document, &config)?;
+        assert_eq!(actual.removed, expected.removed);
+
+        let output = document.write_compact_experimental()?;
+        let rewritten = EditDocument::from_bytes(output)?;
+        let catalog_id = rewritten.source().catalog_id();
+        let catalog = rewritten.source().materialize(catalog_id)?;
+        let catalog = match catalog.as_dictionary() {
+            Some(dictionary) => dictionary,
+            None => panic!("catalog should remain a dictionary"),
+        };
+        assert!(!catalog.contains_key(b"AA".as_slice()));
+        assert!(!catalog.contains_key(b"OpenAction".as_slice()));
+
+        let names = match catalog.get(b"Names".as_slice()) {
+            Some(OwnedObject::Dictionary(dictionary)) => dictionary,
+            other => panic!("expected direct Names dictionary, got {other:?}"),
+        };
+        assert!(!names.contains_key(b"JavaScript".as_slice()));
+        assert!(names.contains_key(b"Dests".as_slice()));
+
+        let mut saw_safe_action = false;
+        let mut saw_page = false;
+        for handle in rewritten.reachable_objects()? {
+            let CowObjectHandle::Existing(id) = handle else {
+                continue;
+            };
+            let object = rewritten.source().materialize(id)?;
+            let Some(dictionary) = object.as_dictionary() else {
+                continue;
+            };
+            assert!(!dictionary.contains_key(b"AA".as_slice()));
+            if dictionary.get(b"Marker".as_slice())
+                == Some(&OwnedObject::Name(b"SafeHolder".to_vec()))
+            {
+                saw_safe_action = true;
+                assert!(dictionary.contains_key(b"A".as_slice()));
+            }
+            if dictionary.get(b"Marker".as_slice()) == Some(&OwnedObject::Name(b"Page".to_vec())) {
+                saw_page = true;
+                assert!(!dictionary.contains_key(b"A".as_slice()));
+                assert!(dictionary.contains_key(b"OpenAction".as_slice()));
+            }
+        }
+        assert!(saw_safe_action);
+        assert!(saw_page);
+        Ok(())
+    }
+
+    fn active_content_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AA << /WC 11 0 R >> /OpenAction 11 0 R /Names << /JavaScript 14 0 R /Dests 15 0 R >> >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Marker /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R /AA << /O 11 0 R >> /A 11 0 R /OpenAction 12 0 R /Annots [8 0 R] >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Producer (pdf-redox-test) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Unused true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Unused true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /Annot /Subtype /Link /Marker /SafeHolder /Rect [0 0 1 1] /A 12 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Unused true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"10 0 obj\n<< /Unused true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"11 0 obj\n<< /S /JavaScript /JS (app.alert('x')) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"12 0 obj\n<< /S /URI /URI (https://example.test/) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"13 0 obj\n<< /S /Launch /F (calc.exe) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"14 0 obj\n<< /Names [(script) 11 0 R] >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"15 0 obj\n<< /Names [(dest) [3 0 R /Fit]] >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 16 /Root 1 0 R /Info 5 0 R /ID [(left) (right)] >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
     }
 
     fn best_effort_fixture() -> Vec<u8> {
