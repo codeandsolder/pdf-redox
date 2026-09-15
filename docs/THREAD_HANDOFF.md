@@ -1,4 +1,4 @@
-# pdf-redox thread handoff — 2026-09-14
+# pdf-redox thread handoff — 2026-09-15
 
 ## Canonical locations
 
@@ -9,76 +9,71 @@
 - Architecture page: `https://app.notion.com/p/3dbf74be90208135ade6e9d916d40ffa`
 - Validation detail page: `https://app.notion.com/p/3dbf74be90208145b1e8fb3ad5d56670`
 - Representative writer corpus: `/srv/scratch/pdf-redox-writer-corpus`
-- Validation artifacts: `/srv/scratch/pdf-desht-build/hayro-writer-validation-20260914`
+- Writer/production validation root: `/srv/scratch/pdf-desht-build/hayro-writer-validation-20260914`
+- First-pass validation root: `/srv/scratch/pdf-desht-build/hayro-metadata-privacy-20260915-v2`
 
 ## Current validated state
 
-Latest validated and pushed production checkpoint: **`321d9f7` — `Fix compression of empty PDF streams`**. The detailed validation record is `docs/HAYRO_WRITER_VALIDATION_2026-09-14.md`; the repository should be rechecked for synchronization after any documentation-only checkpoint.
+Latest validated and pushed code checkpoint: **`d1f98ce` — `Migrate metadata scrub to Hayro COW`**.
 
 Target architecture remains:
 
 `immutable/lazy Hayro source -> sparse copy-on-write overlay -> reachability/optimization passes -> compact fresh writer`
 
-Hayro is the selected source/parser layer. Do not fork it pre-emptively. Production `optimize_pdf()` still uses flpdf while passes migrate incrementally; the Hayro writer remains hidden behind `--hayro-rewrite-experimental`.
+Production `optimize_pdf()` still uses flpdf for the mature optimizer pipeline. The Hayro writer and migrated metadata pass remain migration-only behind hidden `--hayro-rewrite-experimental`; do not describe the production optimizer as Hayro-backed yet.
 
-## Hayro writer
+Current final gates at `d1f98ce` are green: formatter, strict workspace/all-target/all-feature Clippy, **81/81 workspace tests**, wasm32 check, and `git diff --check`.
 
-Checkpoint `9a7e5b0` introduced the validated trailer-preserving Hayro/COW writer. On the 405-file / 777,561,367-byte / 17,612-page corpus:
+## First migrated optimizer pass: metadata privacy
+
+`d1f98ce` moves semantic trailer ownership into `EditDocument` and ports the COS-level metadata scrub onto the sparse Hayro/COW graph.
+
+The migrated pass removes trailer `/Info` and `/ID` plus reachable `/Metadata`, `/PieceInfo`, and `/LastModified`. JPEG marker scrubbing, attachments, signatures, and other best-effort privacy behavior remain on flpdf. Unsupported Hayro experimental privacy switches fail explicitly.
+
+Traversal is single-pass for untouched source objects: key inspection and outgoing-reference collection use the same Hayro parse. Only dictionaries that actually need mutation are materialized into the overlay. A focused regression matches the existing flpdf removal accounting and verifies sparse materialization.
+
+405-file validation:
+
+- rewrite: 405/405;
+- reparse/page count: 405/405;
+- extracted text: 405/405 exact;
+- render: **17,612/17,612 pages pixel-identical at 12 DPI**;
+- output: **781,744,244 bytes** vs 819,424,570 bytes for the plain validated Hayro rewrite;
+- metadata/history reachability reduction: **37,680,326 bytes**.
+
+Removed across the corpus: 371 document IDs, 399 Info dictionaries, 5,387 XMP references, 711 PieceInfo references, and 864 LastModified entries.
+
+`ALLK.pdf` release sanity check on the current build: plain rewrite ~0.29–0.31 s; metadata rewrite ~0.42–0.44 s. Do not resurrect the earlier debug-vs-release comparison as a performance result.
+
+## Hayro writer baseline
+
+Checkpoint `9a7e5b0` is the validated trailer-preserving fresh writer baseline. On the same 405-file / 777,561,367-byte / 17,612-page corpus:
 
 - rewrite/reparse/page count: 405/405;
 - text extraction: 405/405 exact;
-- 12 DPI render: 17,612/17,612 pixel-identical pages;
+- render: 17,612/17,612 pixel-identical pages;
 - 12 encrypted inputs rewrite correctly without stale `/Encrypt` state;
 - output: 819,424,570 bytes (1.053839098x aggregate; median file ratio 1.001604x).
 
-Object-stream expansion/classic xref explains the Hayro size tail. It is a compactness follow-up, not a correctness blocker.
+Object-stream expansion/classic xref remains the main Hayro writer compactness deficit, but it is not a correctness blocker.
 
-The temporary trailer-shell bridge still uses flpdf over the same shared source buffer. A minimal Hayro accessor is committed locally at `/srv/scratch/hayro-trailer-upstream`, branch `pdf-redox-expose-trailer`, commit `d950536` (`Expose final trailer dictionary from XRef`). The worktree is clean; nothing has been pushed upstream.
+Semantic trailer state is now owned by `EditDocument`; the temporary flpdf trailer bridge is used only during document construction. A minimal Hayro accessor is still committed locally at `/srv/scratch/hayro-trailer-upstream`, branch `pdf-redox-expose-trailer`, commit `d950536` (`Expose final trailer dictionary from XRef`). It has not been pushed upstream and no PR has been opened.
 
-## Production flpdf writer compatibility fix
+## Production flpdf compatibility checkpoint
 
-A corpus comparison exposed one real production regression in `C157624.pdf`: all 72 pages lost a later Form XObject invocation after an empty page-content stream.
+`321d9f7` fixed empty-stream compression compatibility. flpdf had emitted zero-byte streams carrying `/Filter /FlateDecode`, causing Poppler to stop a page `/Contents` array before later visible content. The fix follows qpdf's compatibility behavior: remove source filter state but do not label an empty encoded payload as Flate.
 
-Root cause: flpdf emitted a zero-byte stream with `/Filter /FlateDecode`. qpdf explicitly disables compression for empty streams because its Flate pipeline produces no zlib bytes until data is written. Poppler stopped processing the page `/Contents` array at the malformed stream.
-
-The writer now keeps empty streams on the filtering path to remove source filter parameters but disables replacement Flate compression. Replacement `/FlateDecode` is derived from actual encode flags, not the global compression policy.
-
-Regression coverage exists in both flpdf and the normal pdf-redox workspace suite. A scan of the old production corpus found exactly two malformed outputs: `C157624.pdf` and `Electrophoresis in Practice 4th ed.www.forumakademi.org.pdf`.
-
-Corrected production corpus:
-
-- rewrite/reparse/page count: 405/405;
-- extracted text: 405/405 exact;
-- output: 643,059,556 bytes = 0.8270209700x input;
-- patched corpus contains zero `/Length 0` + `/FlateDecode` dictionaries;
-- `C157624.pdf`: 72/72 pixel-identical pages, -32 bytes vs old output;
-- electrophoresis book: 427/427 pixel-identical pages, -20 bytes vs old output.
-
-Corrected all-case rendering is also fully green: **405/405 files, 17,612/17,612 pixel-identical pages at 12 DPI**, including uppercase `.PDF`; zero render failures, page-count mismatches, or differing pixels.
-
-Final current-tree gates at `321d9f7` are green: `cargo-fmt --all --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-features` (**80/80 tests pass**); `cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown`; and `git diff --check`.
-
-## Validation artifacts
-
-Important files under `/srv/scratch/pdf-desht-build/hayro-writer-validation-20260914`:
-
-- `hayro-results.jsonl`, `hayro-summary.json`
-- `text-compare.jsonl`, `text-compare-summary.json`
-- `render12/`
-- `flpdf-optimize-results.jsonl`, `flpdf-optimize-summary.json` — old production baseline
-- `flpdf-optimize-fixed/` — corrected production outputs
-- `flpdf-optimize-fixed-results.jsonl`
-- `flpdf-optimize-fixed-text.jsonl`
-- `flpdf-render12-fixed/` — corrected all-case render validation
-- `bench_hayro_vs_flpdf.py` — representative resource benchmark harness
+Corrected production corpus remains fully green: 405/405 structural, 405/405 exact text, 17,612/17,612 exact render, zero malformed `/Length 0` + `/FlateDecode` outputs, and 643,059,556 output bytes.
 
 ## Next ordered work
 
-1. Treat the empty-stream writer fix as a closed compatibility issue once the final checkpoint above is clean/pushed.
-2. Decide whether to open the minimal Hayro trailer accessor upstream; do not mix unrelated Rust 1.98 lint cleanup into it.
-3. Begin migrating production optimizer passes onto the Hayro/COW overlay one small pass at a time, preserving structural/text/render corpus gates after each group.
-4. Prefer a simple dictionary/object mutation pass first. Avoid starting with image transforms or graph-wide dedup because they would pull eager flpdf graph semantics back into the new architecture.
-5. Object-stream generation/xref streams remain the main writer-size follow-up once pass migration is underway.
+1. Migrate a second small dictionary-oriented optimizer slice before introducing any generic COW visitor abstraction; let two concrete passes determine the reusable API.
+2. Strong candidates: non-JPEG/non-attachment best-effort privacy dictionary surgery (`/Thumb`, `/AA`, dangerous action references, form values, catalog JavaScript/name roots) or another preservation key-pruning slice.
+3. Keep attachments/signatures/JPEG transforms separate because they currently depend on specialized flpdf helpers or byte transforms.
+4. Keep production `optimize_pdf()` on flpdf until a coherent pass group has Hayro equivalence.
+5. Preserve the 405-file structural/text and 17,612-page render gates after each migration group.
+6. Decide separately whether to upstream Hayro trailer accessor `d950536`; do not mix unrelated lint cleanup into that contribution.
+7. Defer image transforms, graph-wide dedup, and object-stream/xref-stream output work until the sparse mutation architecture has another pass or two of real use.
 
 ## Git/auth discipline
 

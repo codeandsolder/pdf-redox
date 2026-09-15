@@ -69,7 +69,7 @@ The corrected all-case render harness includes both `.pdf` and `.PDF`: **405/405
 
 ## Code gates
 
-Final current-tree gates at `321d9f7` are green: `cargo-fmt --all --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-features` (**80/80 tests pass**); `cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown`; and `git diff --check`.
+Final current-tree gates at `d1f98ce` are green: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-features` (**81/81 tests pass**); `cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown`; and `git diff --check`.
 
 Standalone flpdf validation with the writer regression previously passed its full 2,718-test suite. The pdf-redox workspace-visible regression also passes independently.
 
@@ -79,6 +79,51 @@ The temporary pdf-redox trailer bridge still uses flpdf only to parse the final 
 
 A clean Hayro worktree at `/srv/scratch/hayro-trailer-upstream` now has that patch committed locally as `d950536` (`Expose final trailer dictionary from XRef`) on branch `pdf-redox-expose-trailer`. The worktree is clean. The commit has not been pushed upstream and no PR has been opened.
 
+## First migrated optimizer pass: metadata privacy — 2026-09-15
+
+Checkpoint `d1f98ce` (`Migrate metadata scrub to Hayro COW`) is the first validated optimizer pass on the new source/overlay/writer architecture. Production `optimize_pdf()` still uses the mature flpdf pipeline; this pass is exercised through the hidden Hayro migration path.
+
+The slice also moves semantic trailer ownership into `EditDocument`. `/Info`, `/ID`, and arbitrary preserved trailer roots are captured once at document construction rather than re-read by the writer. The temporary flpdf bridge therefore remains only at Hayro document construction and can later be replaced by the small upstream Hayro trailer accessor without changing pass or writer ownership.
+
+The migrated COS metadata scrub removes:
+
+- trailer `/Info`;
+- trailer `/ID`;
+- reachable dictionary/stream-dictionary `/Metadata`;
+- reachable `/PieceInfo`;
+- reachable `/LastModified`.
+
+JPEG marker scrubbing and best-effort privacy operations remain on flpdf. Hidden `--hayro-rewrite-experimental --privacy metadata` exposes only this migrated slice; unsupported JPEG/best-effort switches fail explicitly rather than being silently ignored.
+
+The traversal is deliberately sparse. Untouched source objects are inspected and their outgoing references collected from the same Hayro parse; only dictionaries that actually contain one of the target keys are materialized into the COW overlay. This avoids a second full source-object parse pass, which is especially important for objects stored in compressed object streams.
+
+Focused parity coverage constructs trailer `/Info` and `/ID`, Catalog XMP, page `/PieceInfo` and `/LastModified`, a custom trailer root, and unreachable state. The Hayro pass reports the same removals as the existing flpdf COS scrub while materializing only three changed dictionaries. Fresh-writer reachability then drops orphaned Info/XMP/PieceInfo payload objects naturally.
+
+Full corpus validation against `/srv/scratch/pdf-redox-writer-corpus` is green:
+
+- files: 405;
+- input bytes: 777,561,367;
+- rewrite success: 405/405;
+- Poppler reparse and page count: 405/405;
+- exact `pdftotext -enc UTF-8`: 405/405;
+- 12 DPI Poppler rendering: **17,612/17,612 pixel-identical pages**;
+- render failures/page-count mismatches/differing pixels: zero;
+- metadata-scrub Hayro output: **781,744,244 bytes**;
+- plain validated Hayro output: 819,424,570 bytes;
+- delta from making metadata/history subgraphs unreachable: **-37,680,326 bytes**.
+
+Corpus removal counts:
+
+- `document-id`: 371;
+- `info-dictionary`: 399;
+- `xmp-reference`: 5,387;
+- `piece-info`: 711;
+- `last-modified`: 864.
+
+On the current release build, `ALLK.pdf` (16,317 source objects, 215 pages) rewrites in roughly 0.29–0.31 s without the pass and 0.42–0.44 s with metadata scrubbing on this host. That is an intentionally full-graph inspection pass; the earlier apparent multi-second regression was a debug-vs-release comparison error, not an architectural result.
+
+Validation artifacts are under `/srv/scratch/pdf-desht-build/hayro-metadata-privacy-20260915-v2/`, including `summary.json`, rewritten outputs, and `render12/summary.json`.
+
 ## Performance comparison
 
 A representative benchmark harness is preserved as `bench_hayro_vs_flpdf.py`, but the final timing run was deliberately deferred on this server: it is restricted to one effective CPU while unrelated long-running jobs kept load around 7–12 with substantial storage wait. Running it concurrently would produce misleading wall-time numbers. Re-run the harness on an otherwise idle host (or a dedicated instance) before treating wall time as evidence; production-vs-Hayro is also intentionally end-to-end rather than writer-only.
@@ -87,4 +132,4 @@ Production-vs-Hayro timing is deliberately described as end-to-end rather than w
 
 ## Next migration slice
 
-With writer preservation and the production writer regression checkpointed, migrate production passes incrementally onto the sparse Hayro/COW overlay. Prefer a structurally simple pass first; avoid starting with image transforms or graph-wide dedup because they would prematurely recreate flpdf's eager graph semantics. Every migrated pass should retain corpus structural/text/render gates before moving to the next group.
+The first dictionary-only optimizer pass is now migrated and validated. Migrate one more small dictionary-oriented pass before designing a generic traversal/visitor abstraction; use the second implementation to expose the actual common shape instead of guessing it. Good candidates are the non-JPEG/non-attachment parts of best-effort privacy or another preservation key-pruning slice. Keep production `optimize_pdf()` on flpdf until a coherent group of passes has equivalent Hayro coverage. Continue to avoid image transforms and graph-wide dedup until the sparse mutation model has more mileage, and retain the 405-file structural/text plus 17,612-page render gate after each migration group.
