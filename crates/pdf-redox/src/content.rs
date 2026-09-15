@@ -47,7 +47,7 @@ fn replace_page_content(
         ObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));

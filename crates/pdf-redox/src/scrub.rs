@@ -233,7 +233,7 @@ fn validate_hayro_cos_privacy_config(_cfg: &PrivacyConfig) -> Result<()> {
 /// materializing unaffected source objects.
 ///
 /// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
-/// `/LastModified`. BestEffort can additionally remove thumbnails and form
+/// `/LastModified`. `BestEffort` can additionally remove thumbnails and form
 /// values, active content, attachment roots, signature values, and JPEG metadata.
 pub(crate) fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
@@ -304,7 +304,7 @@ pub(crate) fn scrub_edit_document_cos_privacy(
                 let object = document
                     .overlay()
                     .added(id)
-                    .ok_or(crate::Error::MissingNewObject { index: id.index() })?;
+                    .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?;
                 (
                     object.references(),
                     owned_dictionary_needs_cos_privacy_scrub(object, cfg),
@@ -652,7 +652,7 @@ fn scrub_jpeg_metadata_hayro(
             CowObjectHandle::New(id) => document
                 .overlay_mut()
                 .added_mut(id)
-                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
         };
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(clean);

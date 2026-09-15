@@ -50,7 +50,7 @@ pub struct PreservationConfig {
     /// Preserve viewer layout/mode/preferences.
     pub viewer_preferences: bool,
     /// Preserve Catalog/page metadata-like auxiliary entries such as XMP,
-    /// PieceInfo, LastModified, and thumbnails. Privacy scrubbing is still a
+    /// `PieceInfo`, `LastModified`, and thumbnails. Privacy scrubbing is still a
     /// separate policy and may remove these afterward.
     pub metadata: bool,
     /// Preserve embedded-font tables used for later text editing/reflow but not
@@ -222,7 +222,7 @@ pub struct Config {
     pub image_policy: ImagePolicy,
     pub privacy: PrivacyConfig,
     pub hidden_text: HiddenTextPolicy,
-    /// Repack eligible small indirect objects into ObjStm containers.
+    /// Repack eligible small indirect objects into `ObjStm` containers.
     pub generate_object_streams: bool,
     /// Normalize lexical representation of page content streams.
     pub normalize_content_streams: bool,
@@ -246,10 +246,10 @@ pub struct Config {
     /// Minimum duplicated encoded payload bytes for one exact inline-image fingerprint.
     /// Inline-image header savings are deliberately ignored by this gate.
     pub inline_image_min_duplicate_payload_bytes: usize,
-    /// Canonicalize byte- and dictionary-identical Image XObjects referenced from
+    /// Canonicalize byte- and dictionary-identical Image `XObjects` referenced from
     /// `/Resources /XObject` dictionaries.
     pub deduplicate_image_xobjects: bool,
-    /// Canonicalize byte- and dictionary-identical Form XObjects referenced from
+    /// Canonicalize byte- and dictionary-identical Form `XObjects` referenced from
     /// `/Resources /XObject` dictionaries.
     pub deduplicate_form_xobjects: bool,
     /// Canonicalize byte- and dictionary-identical Form appearance streams referenced from

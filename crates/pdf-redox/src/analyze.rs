@@ -38,7 +38,7 @@ fn push_risk(
     if count == 0 {
         return;
     }
-    let entry = map.entry(kind).or_insert((0, note.to_owned()));
+    let entry = map.entry(kind).or_insert_with(|| (0, note.to_owned()));
     entry.0 += count;
 }
 

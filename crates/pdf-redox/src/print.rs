@@ -1434,7 +1434,7 @@ fn cow_image_resize_safe(
         && dictionary.get(b"DecodeParms".as_slice()).is_some_and(|v| {
             !matches!(
                 document.resolve_owned_value(v),
-                Ok(Some(crate::OwnedObject::Null)) | Ok(None)
+                Ok(Some(crate::OwnedObject::Null) | None)
             )
         })
     {

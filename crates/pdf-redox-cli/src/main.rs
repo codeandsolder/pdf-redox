@@ -112,13 +112,13 @@ struct Args {
     /// Preserve separate exact duplicate embedded font-program stream objects.
     #[arg(long)]
     no_font_program_dedup: bool,
-    /// Preserve separate exact duplicate ToUnicode CMap stream objects.
+    /// Preserve separate exact duplicate `ToUnicode` `CMap` stream objects.
     #[arg(long)]
     no_to_unicode_dedup: bool,
-    /// Preserve separate exact duplicate Image XObjects instead of canonicalizing them.
+    /// Preserve separate exact duplicate Image `XObjects` instead of canonicalizing them.
     #[arg(long)]
     no_image_dedup: bool,
-    /// Preserve separate exact duplicate Form XObjects instead of canonicalizing them.
+    /// Preserve separate exact duplicate Form `XObjects` instead of canonicalizing them.
     #[arg(long)]
     no_form_dedup: bool,
     /// Preserve separate exact duplicate annotation appearance streams instead of canonicalizing them.
@@ -127,7 +127,7 @@ struct Args {
     /// Preserve separate exact duplicate page content streams instead of canonicalizing them.
     #[arg(long)]
     no_page_content_dedup: bool,
-    /// Preserve separate exact duplicate Type3 CharProc streams instead of canonicalizing them.
+    /// Preserve separate exact duplicate Type3 `CharProc` streams instead of canonicalizing them.
     #[arg(long)]
     no_type3_charproc_dedup: bool,
     /// Preserve separate exact duplicate ICC profile streams instead of canonicalizing them.

@@ -201,7 +201,7 @@ fn install_page_resources(
         ObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -219,7 +219,7 @@ fn install_form_resources(
         ObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));

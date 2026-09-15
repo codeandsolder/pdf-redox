@@ -129,7 +129,7 @@ fn write_handle_object(
             let object = document
                 .overlay()
                 .added(id)
-                .ok_or(Error::MissingNewObject { index: id.index() })?;
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?;
             write_owned_object(output, object, document, plan)
         }
     }
@@ -469,7 +469,7 @@ fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Re
             document
                 .overlay()
                 .added(id)
-                .ok_or(Error::MissingNewObject { index: id.index() })?,
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
             OwnedObject::Stream { .. }
         ),
     })

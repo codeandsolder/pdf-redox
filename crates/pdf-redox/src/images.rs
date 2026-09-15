@@ -131,7 +131,7 @@ fn install_transform(
         ObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     let OwnedObject::Stream { dictionary, data } = object else {
         return Ok(());

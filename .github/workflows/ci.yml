@@ -8,11 +8,22 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - name: Check declared MSRV
+        run: cargo check --locked --workspace --all-targets --all-features
+
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt,clippy
           targets: wasm32-unknown-unknown
@@ -20,8 +31,8 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
       - name: WASM check
-        run: cargo check -p pdf-redox-wasm --target wasm32-unknown-unknown
+        run: cargo check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown

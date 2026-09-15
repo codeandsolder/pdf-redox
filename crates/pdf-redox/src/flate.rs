@@ -109,7 +109,7 @@ pub(crate) fn apply_flate_policy_hayro(
             crate::ObjectHandle::New(id) => document
                 .overlay_mut()
                 .added_mut(id)
-                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
         };
         if let crate::OwnedObject::Stream { data, .. } = object {
             *data = crate::StreamData::Owned(repacked);
@@ -135,7 +135,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
         let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
             !matches!(
                 document.resolve_owned_value(value),
-                Ok(Some(crate::OwnedObject::Null)) | Ok(None)
+                Ok(Some(crate::OwnedObject::Null) | None)
             )
         });
         if raw.is_empty() {
@@ -145,7 +145,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
                     crate::ObjectHandle::New(id) => document
                         .overlay_mut()
                         .added_mut(id)
-                        .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+                        .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
                 };
                 if let crate::OwnedObject::Stream { dictionary, data } = object {
                     dictionary.remove(b"Filter".as_slice());
@@ -171,7 +171,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
             crate::ObjectHandle::New(id) => document
                 .overlay_mut()
                 .added_mut(id)
-                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
         };
         if let crate::OwnedObject::Stream { dictionary, data } = object {
             dictionary.insert(

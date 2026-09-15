@@ -105,7 +105,7 @@ fn preservation_target_mut<'a>(
         CowObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     Ok(
         preservation_object_at_path_mut(root, &target.path)
@@ -673,7 +673,7 @@ fn appearance_as_form_hayro(
                 CowObjectHandle::New(id) => document
                     .overlay_mut()
                     .added_mut(id)
-                    .ok_or(Error::MissingNewObject { index: id.index() })?,
+                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
             };
             let Some(dictionary) = object.as_dictionary_mut() else {
                 return Err(Error::Invalid(

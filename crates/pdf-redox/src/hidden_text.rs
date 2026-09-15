@@ -824,8 +824,10 @@ impl<'a> PageScanner<'a> {
             .filter(|text| {
                 matches!(
                     text.initial_mechanism,
-                    Some(HiddenTextMechanism::RenderingModeInvisible)
-                        | Some(HiddenTextMechanism::ZeroOpacity)
+                    Some(
+                        HiddenTextMechanism::RenderingModeInvisible
+                            | HiddenTextMechanism::ZeroOpacity
+                    )
                 )
             })
             .count();
@@ -1063,7 +1065,7 @@ fn replace_page_content_hayro(
         CowObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));

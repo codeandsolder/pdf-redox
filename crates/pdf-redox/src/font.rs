@@ -1,6 +1,6 @@
 use crate::{
-    EditDocument, Error, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
-    OwnedObject, Result, StreamData,
+    EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
+    StreamData, source::CurrentObject,
 };
 #[cfg(test)]
 use flpdf::{DecodeLevel, ObjectRef, Pdf};
@@ -9,7 +9,7 @@ use flpdf::{
     filters::{decode_stream_data, encode_stream_data_with_flate_level},
 };
 use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::{
     collections::HashSet,
@@ -77,7 +77,7 @@ fn is_sfnt_magic(magic: &[u8]) -> bool {
 ///
 /// PDF's embedded-TrueType rules require the outline/metric/hinting core and,
 /// for simple fonts, `cmap`. Advanced line-layout tables are not required for
-/// display. PDF also defines vertical metrics through CIDFont `/DW2`/`/W2`,
+/// display. PDF also defines vertical metrics through `CIDFont` `/DW2`/`/W2`,
 /// making sfnt `vhea`/`vmtx` irrelevant to PDF rendering.
 fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<u8>, usize)> {
     if bytes.len() < 12 || !is_sfnt_magic(&bytes[..4]) {
@@ -458,7 +458,7 @@ fn replace_current_stream_data(
         CowObjectHandle::New(id) => document
             .overlay_mut()
             .added_mut(id)
-            .ok_or(Error::MissingNewObject { index: id.index() })?,
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
     };
     match object {
         OwnedObject::Stream { data, .. } => {
@@ -482,83 +482,38 @@ pub(crate) fn strip_font_editing_tables_hayro(
 ) -> Result<FontOptimizationStats> {
     let mut descriptor_usage_edges = Vec::new();
     let mut descriptor_program_edges = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut pending = document.output_roots();
-
-    while let Some(handle) = pending.pop() {
-        if !seen.insert(handle) {
-            continue;
-        }
-        let references = match handle {
-            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
-                Some(ExistingObjectChange::Replace(object)) => {
-                    if let Some(dictionary) = object.as_dictionary() {
-                        inspect_owned_font_dictionary(
-                            document,
-                            handle,
-                            dictionary,
-                            &mut descriptor_usage_edges,
-                            &mut descriptor_program_edges,
-                        )?;
-                    }
-                    object.references()
-                }
-                Some(ExistingObjectChange::Delete) => {
-                    return Err(Error::DeletedReferencedObject {
-                        number: id.number(),
-                        generation: id.generation(),
-                    });
-                }
-                None => {
-                    let (object, references) = match document.source().object_with_references(id) {
-                        Ok(value) => value,
-                        Err(Error::MissingSourceObject { .. }) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    match &object {
-                        HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
-                            handle,
-                            dictionary,
-                            &mut descriptor_usage_edges,
-                            &mut descriptor_program_edges,
-                        ),
-                        HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
-                            handle,
-                            stream.dict(),
-                            &mut descriptor_usage_edges,
-                            &mut descriptor_program_edges,
-                        ),
-                        _ => {}
-                    }
-                    references
-                        .into_iter()
-                        .map(CowObjectHandle::Existing)
-                        .collect()
-                }
-            },
-            CowObjectHandle::New(id) => {
-                let object = document
-                    .overlay()
-                    .added(id)
-                    .ok_or(Error::MissingNewObject { index: id.index() })?;
-                if let Some(dictionary) = object.as_dictionary() {
-                    inspect_owned_font_dictionary(
-                        document,
-                        handle,
-                        dictionary,
-                        &mut descriptor_usage_edges,
-                        &mut descriptor_program_edges,
-                    )?;
-                }
-                object.references()
+    document.walk_output_objects(|handle, object| match object {
+        CurrentObject::Source(object) => {
+            match &object {
+                HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
+                    handle,
+                    dictionary,
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                ),
+                HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
+                    handle,
+                    stream.dict(),
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                ),
+                _ => {}
             }
-        };
-        for reference in references {
-            if !seen.contains(&reference) {
-                pending.push(reference);
-            }
+            Ok(())
         }
-    }
+        CurrentObject::Owned(object) => {
+            if let Some(dictionary) = object.as_dictionary() {
+                inspect_owned_font_dictionary(
+                    document,
+                    handle,
+                    dictionary,
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                )?;
+            }
+            Ok(())
+        }
+    })?;
 
     let mut descriptor_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
     for (descriptor, usage) in descriptor_usage_edges {

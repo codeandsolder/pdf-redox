@@ -367,7 +367,7 @@ pub enum OwnedObject {
     Name(Vec<u8>),
     String(Vec<u8>),
     Reference(ObjectHandle),
-    Array(Vec<OwnedObject>),
+    Array(Vec<Self>),
     Dictionary(OwnedDictionary),
     Stream {
         dictionary: OwnedDictionary,
@@ -474,6 +474,14 @@ impl ObjectOverlay {
     pub fn is_empty(&self) -> bool {
         self.existing.is_empty() && self.added.is_empty()
     }
+}
+
+/// Borrowed view of one object encountered while walking the current COW graph.
+pub(crate) enum CurrentObject<'a> {
+    /// Object parsed lazily from the immutable Hayro source.
+    Source(Object<'a>),
+    /// Object already materialized in the overlay.
+    Owned(&'a OwnedObject),
 }
 
 /// A lazily parsed source document plus the objects changed by optimization
@@ -654,7 +662,7 @@ impl EditDocument {
                 .overlay
                 .added(id)
                 .cloned()
-                .ok_or(Error::MissingNewObject { index: id.index() })
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
                 .map(Some),
         }
     }
@@ -816,6 +824,65 @@ impl EditDocument {
         self.reachable_from(self.output_roots())
     }
 
+    /// Visit every object reachable from the current output roots exactly once.
+    ///
+    /// Untouched source objects stay as borrowed Hayro values, while overlay
+    /// replacements and newly added objects are passed by reference. This keeps
+    /// inspection passes lazy and gives all of them the same missing/deleted
+    /// object semantics instead of open-coding the COW traversal repeatedly.
+    pub(crate) fn walk_output_objects<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: for<'a> FnMut(ObjectHandle, CurrentObject<'a>) -> Result<()>,
+    {
+        let mut seen = BTreeSet::new();
+        let mut pending = self.output_roots();
+
+        while let Some(handle) = pending.pop() {
+            if !seen.insert(handle) {
+                continue;
+            }
+
+            let references = match handle {
+                ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                    Some(ExistingObjectChange::Replace(object)) => {
+                        visit(handle, CurrentObject::Owned(object))?;
+                        object.references()
+                    }
+                    Some(ExistingObjectChange::Delete) => {
+                        return Err(Error::DeletedReferencedObject {
+                            number: id.number,
+                            generation: id.generation,
+                        });
+                    }
+                    None => {
+                        let (object, references) = match self.source.object_with_references(id) {
+                            Ok(value) => value,
+                            Err(Error::MissingSourceObject { .. }) => continue,
+                            Err(error) => return Err(error),
+                        };
+                        visit(handle, CurrentObject::Source(object))?;
+                        references.into_iter().map(ObjectHandle::Existing).collect()
+                    }
+                },
+                ObjectHandle::New(id) => {
+                    let object = self
+                        .overlay
+                        .added(id)
+                        .ok_or_else(|| Error::MissingNewObject { index: id.index() })?;
+                    visit(handle, CurrentObject::Owned(object))?;
+                    object.references()
+                }
+            };
+
+            pending.extend(
+                references
+                    .into_iter()
+                    .filter(|reference| !seen.contains(reference)),
+            );
+        }
+        Ok(())
+    }
+
     /// Collect all objects reachable from an explicit root set.
     pub fn reachable_from(
         &self,
@@ -869,7 +936,7 @@ impl EditDocument {
                 .overlay
                 .added(id)
                 .map(OwnedObject::references)
-                .ok_or(Error::MissingNewObject { index: id.index() }),
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() }),
         }
     }
 }
