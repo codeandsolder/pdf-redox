@@ -3,7 +3,7 @@ use crate::{
     OwnedObject, Result, StreamData,
 };
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
-use hayro_syntax::object::Object as HayroObject;
+use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Object as HayroObject};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
@@ -2087,6 +2087,295 @@ pub(crate) fn canonicalize_font_program_streams_hayro(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirectPathStep {
+    DictKey(Vec<u8>),
+    ArrayIndex(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HayroToUnicodeHolder {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+    cmap: CowObjectHandle,
+}
+
+fn inspect_hayro_to_unicode_dictionary(
+    root: CowObjectHandle,
+    dictionary: &hayro_syntax::object::Dict<'_>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<HayroToUnicodeHolder>,
+) {
+    if let Some(cmap) = dictionary.get_ref(b"ToUnicode") {
+        holders.push(HayroToUnicodeHolder {
+            root,
+            path: path.clone(),
+            cmap: CowObjectHandle::Existing(cmap.into()),
+        });
+    }
+
+    for (name, value) in dictionary.entries() {
+        if name.as_ref() == b"ToUnicode" {
+            continue;
+        }
+        let HayroMaybeRef::NotRef(value) = value else {
+            continue;
+        };
+        path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+        inspect_hayro_to_unicode_object(root, &value, path, holders);
+        path.pop();
+    }
+}
+
+fn inspect_hayro_to_unicode_object(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<HayroToUnicodeHolder>,
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            inspect_hayro_to_unicode_dictionary(root, dictionary, path, holders);
+        }
+        HayroObject::Stream(stream) => {
+            inspect_hayro_to_unicode_dictionary(root, stream.dict(), path, holders);
+        }
+        HayroObject::Array(array) => {
+            for (index, value) in array.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_hayro_to_unicode_object(root, &value, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn inspect_owned_to_unicode_object(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<HayroToUnicodeHolder>,
+) {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if let Some(OwnedObject::Reference(cmap)) = dictionary.get(b"ToUnicode".as_slice()) {
+                holders.push(HayroToUnicodeHolder {
+                    root,
+                    path: path.clone(),
+                    cmap: *cmap,
+                });
+            }
+            for (name, value) in dictionary {
+                if name.as_slice() == b"ToUnicode" || matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_to_unicode_object(root, value, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_to_unicode_object(root, value, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+fn hayro_to_unicode_holders(document: &EditDocument) -> Result<Vec<HayroToUnicodeHolder>> {
+    let mut holders = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let references = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    inspect_owned_to_unicode_object(handle, object, &mut Vec::new(), &mut holders);
+                    object.references()
+                }
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    inspect_hayro_to_unicode_object(handle, &object, &mut Vec::new(), &mut holders);
+                    references
+                        .into_iter()
+                        .map(CowObjectHandle::Existing)
+                        .collect()
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(Error::MissingNewObject { index: id.index() })?;
+                inspect_owned_to_unicode_object(handle, object, &mut Vec::new(), &mut holders);
+                object.references()
+            }
+        };
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+    }
+
+    Ok(holders)
+}
+
+fn hayro_to_unicode_fingerprint(
+    document: &EditDocument,
+    cmap: CowObjectHandle,
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(object) = document.current_owned_object(cmap)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, b"to-unicode");
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+
+    let semantic_entries = dictionary
+        .iter()
+        .filter(|(key, _)| key.as_slice() != b"Length")
+        .collect::<Vec<_>>();
+    hasher.update((semantic_entries.len() as u64).to_le_bytes());
+    for (key, value) in semantic_entries {
+        hash_len_prefixed(&mut hasher, key);
+        hash_owned_object(&mut hasher, value)?;
+    }
+
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn object_at_direct_path_mut<'a>(
+    mut object: &'a mut OwnedObject,
+    path: &[DirectPathStep],
+) -> Option<&'a mut OwnedObject> {
+    for step in path {
+        object = match step {
+            DirectPathStep::DictKey(key) => object.as_dictionary_mut()?.get_mut(key.as_slice())?,
+            DirectPathStep::ArrayIndex(index) => match object {
+                OwnedObject::Array(values) => values.get_mut(*index)?,
+                _ => return None,
+            },
+        };
+    }
+    Some(object)
+}
+
+fn rewrite_to_unicode_holder(
+    document: &mut EditDocument,
+    holder: &HayroToUnicodeHolder,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let root = match holder.root {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(holder_object) = object_at_direct_path_mut(root, &holder.path) else {
+        return Ok(false);
+    };
+    let Some(dictionary) = holder_object.as_dictionary_mut() else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Reference(current)) = dictionary.get(b"ToUnicode".as_slice()) else {
+        return Ok(false);
+    };
+    if *current != holder.cmap {
+        return Ok(false);
+    }
+    dictionary.insert(b"ToUnicode".to_vec(), OwnedObject::Reference(canonical));
+    Ok(true)
+}
+
+/// Hayro/COW ToUnicode canonicalization.
+///
+/// This deliberately walks the reachable Hayro graph rather than reproducing
+/// flpdf `get_all_objects()` coverage. On damaged or oddly indexed PDFs Hayro
+/// can therefore find additional real `/ToUnicode` holders that the legacy
+/// pass skipped; every rewrite still requires an exact stream fingerprint.
+pub(crate) fn canonicalize_to_unicode_cmaps_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = hayro_to_unicode_holders(document)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for holder in &holders {
+        let Some((fingerprint, raw_bytes)) = hayro_to_unicode_fingerprint(document, holder.cmap)?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != holder.cmap {
+                redirects.insert(holder.cmap, canonical);
+                if duplicate_refs.insert(holder.cmap) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, holder.cmap);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.cmap).copied() else {
+            continue;
+        };
+        if rewrite_to_unicode_holder(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3710,6 +3999,78 @@ mod tests {
                 font_program,
             )]))?,
         )
+    }
+
+    fn serialized_to_unicode_dedup_fixture() -> Result<Vec<u8>> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"exact direct font cmap";
+        let first = to_unicode_stream(&mut pdf, payload, None)?;
+        let second = to_unicode_stream(&mut pdf, payload, None)?;
+        let different = to_unicode_stream(
+            &mut pdf,
+            payload,
+            Some((b"/UseCMap", ObjectHandle::name(b"Identity-H".to_vec()))),
+        )?;
+
+        let fonts = ObjectHandle::dictionary(vec![
+            (
+                b"/F1".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/ToUnicode".to_vec(), first)]),
+            ),
+            (
+                b"/Nested".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                    b"/ToUnicode".to_vec(),
+                    second,
+                )])]),
+            ),
+            (
+                b"/Different".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/ToUnicode".to_vec(), different)]),
+            ),
+        ]);
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFonts", fonts)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn hayro_to_unicode_dedup_matches_flpdf_for_nested_direct_holders() -> Result<()> {
+        let input = serialized_to_unicode_dedup_fixture()?;
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = canonicalize_to_unicode_cmaps(&mut flpdf)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = canonicalize_to_unicode_cmaps_hayro(&mut document)?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.duplicate_streams_detected, 1);
+        assert_eq!(actual.references_canonicalized, 1);
+
+        let output = document.write_compact_experimental()?;
+        let mut reparsed = Pdf::open(Cursor::new(output))?;
+        let fonts = reparsed.root_handle()?.try_get_key(b"/TestFonts")?;
+        let first = fonts
+            .try_get_key(b"/F1")?
+            .try_get_key(b"/ToUnicode")?
+            .object_ref();
+        let nested = fonts
+            .try_get_key(b"/Nested")?
+            .try_get_array_item(0)?
+            .try_get_key(b"/ToUnicode")?
+            .object_ref();
+        let different = fonts
+            .try_get_key(b"/Different")?
+            .try_get_key(b"/ToUnicode")?
+            .object_ref();
+        assert_eq!(first, nested);
+        assert_ne!(first, different);
+        Ok(())
     }
 
     fn serialized_font_program_dedup_fixture() -> Result<Vec<u8>> {

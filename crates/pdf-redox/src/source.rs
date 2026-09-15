@@ -584,6 +584,23 @@ impl EditDocument {
         ]))
     }
 
+    /// Canonicalize exact duplicate ToUnicode CMap streams, including holders nested in direct objects.
+    #[doc(hidden)]
+    pub fn canonicalize_to_unicode_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_to_unicode_cmaps_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
     /// Write the current Hayro/COW graph as a compact fresh PDF.
     ///
     /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]
