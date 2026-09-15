@@ -85,6 +85,16 @@ impl SourcePdf {
             })
     }
 
+    pub(crate) fn object_with_references(
+        &self,
+        id: ObjectId,
+    ) -> Result<(Object<'_>, Vec<ObjectId>)> {
+        let object = self.object(id)?;
+        let mut references = BTreeSet::new();
+        collect_hayro_references(&object, &mut references);
+        Ok((object, references.into_iter().collect()))
+    }
+
     pub(crate) fn contains_object(&self, id: ObjectId) -> bool {
         self.pdf.xref().get::<Object<'_>>(id.into()).is_some()
     }
@@ -95,17 +105,7 @@ impl SourcePdf {
     /// objects are not resolved or materialized, and stream payload bytes are
     /// never touched.
     pub fn references(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
-        let object =
-            self.pdf
-                .xref()
-                .get::<Object<'_>>(id.into())
-                .ok_or(Error::MissingSourceObject {
-                    number: id.number,
-                    generation: id.generation,
-                })?;
-        let mut references = BTreeSet::new();
-        collect_hayro_references(&object, &mut references);
-        Ok(references.into_iter().collect())
+        Ok(self.object_with_references(id)?.1)
     }
 
     /// Return the encoded/decrypted bytes of a source stream on demand.
@@ -333,6 +333,13 @@ pub enum OwnedObject {
 }
 
 impl OwnedObject {
+    pub fn as_dictionary(&self) -> Option<&OwnedDictionary> {
+        match self {
+            Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
+            _ => None,
+        }
+    }
+
     pub fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
@@ -413,6 +420,10 @@ impl ObjectOverlay {
         self.added.get(id.index())
     }
 
+    pub fn added_mut(&mut self, id: NewObjectId) -> Option<&mut OwnedObject> {
+        self.added.get_mut(id.index())
+    }
+
     pub fn added_objects(&self) -> &[OwnedObject] {
         &self.added
     }
@@ -426,19 +437,31 @@ impl ObjectOverlay {
 /// passes. This is the target architecture for the Hayro migration.
 pub struct EditDocument {
     source: SourcePdf,
+    trailer: OwnedDictionary,
     overlay: ObjectOverlay,
 }
 
 impl EditDocument {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let source = SourcePdf::from_bytes(bytes)?;
+        let trailer = source.preserved_trailer()?;
         Ok(Self {
-            source: SourcePdf::from_bytes(bytes)?,
+            source,
+            trailer,
             overlay: ObjectOverlay::default(),
         })
     }
 
     pub fn source(&self) -> &SourcePdf {
         &self.source
+    }
+
+    pub fn trailer(&self) -> &OwnedDictionary {
+        &self.trailer
+    }
+
+    pub fn trailer_mut(&mut self) -> &mut OwnedDictionary {
+        &mut self.trailer
     }
 
     pub fn overlay(&self) -> &ObjectOverlay {
@@ -453,12 +476,22 @@ impl EditDocument {
         self.overlay.edit(&self.source, id)
     }
 
+    /// Apply the first migrated privacy pass to the Hayro/COW graph.
+    ///
+    /// This removes trailer `/Info` and `/ID` plus reachable dictionary
+    /// `/Metadata`, `/PieceInfo`, and `/LastModified` entries. JPEG marker
+    /// scrubbing and best-effort privacy operations remain on the flpdf path.
+    #[doc(hidden)]
+    pub fn scrub_metadata_privacy_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        Ok(crate::scrub::scrub_edit_document_metadata(self)?.removed)
+    }
+
     /// Write the current Hayro/COW graph as a compact fresh PDF.
     ///
     /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]
     /// yet. Trailer-only semantic state such as `/Info`, `/ID`, and extension
-    /// entries is preserved through a temporary shared-buffer flpdf bridge until
-    /// Hayro exposes its already-parsed final trailer dictionary publicly.
+    /// entries is owned by this edit document after construction, so later COW
+    /// passes can mutate it just like indirect document state.
     pub fn write_compact_experimental(&self) -> Result<Vec<u8>> {
         crate::writer::write_pdf(self)
     }
@@ -467,6 +500,18 @@ impl EditDocument {
     /// overlay replacements/deletions.
     pub fn reachable_objects(&self) -> Result<Vec<ObjectHandle>> {
         self.reachable_from([ObjectHandle::Existing(self.source.catalog_id())])
+    }
+
+    pub(crate) fn output_roots(&self) -> Vec<ObjectHandle> {
+        let mut roots = vec![ObjectHandle::Existing(self.source.catalog_id())];
+        for value in self.trailer.values() {
+            roots.extend(value.references());
+        }
+        roots
+    }
+
+    pub(crate) fn reachable_output_objects(&self) -> Result<Vec<ObjectHandle>> {
+        self.reachable_from(self.output_roots())
     }
 
     /// Collect all objects reachable from an explicit root set.

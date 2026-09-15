@@ -1,7 +1,11 @@
 use crate::jpeg::strip_jpeg_metadata;
-use crate::{PrivacyConfig, PrivacyLevel, Result};
+use crate::{
+    EditDocument, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
+    OwnedObject, PrivacyConfig, PrivacyLevel, Result,
+};
 use flpdf::{ObjectHandle, Pdf};
-use std::collections::BTreeMap;
+use hayro_syntax::object::Object as HayroObject;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -40,6 +44,145 @@ fn remove_key<R: Read + Seek + 'static>(
         stats.bump(label);
     }
     Ok(())
+}
+
+const METADATA_PRIVACY_KEYS: [(&[u8], &str); 3] = [
+    (b"Metadata", "xmp-reference"),
+    (b"PieceInfo", "piece-info"),
+    (b"LastModified", "last-modified"),
+];
+
+fn owned_dictionary_needs_metadata_scrub(object: &OwnedObject) -> bool {
+    object.as_dictionary().is_some_and(|dictionary| {
+        METADATA_PRIVACY_KEYS
+            .iter()
+            .any(|(key, _)| dictionary.contains_key(*key))
+    })
+}
+
+fn hayro_object_needs_metadata_scrub(object: &HayroObject<'_>) -> bool {
+    let has_key = |dictionary: &hayro_syntax::object::Dict<'_>| {
+        METADATA_PRIVACY_KEYS
+            .iter()
+            .any(|(key, _)| dictionary.contains_key(*key))
+    };
+    match object {
+        HayroObject::Dict(dictionary) => has_key(dictionary),
+        HayroObject::Stream(stream) => has_key(stream.dict()),
+        _ => false,
+    }
+}
+
+fn scrub_owned_metadata_dictionary(dictionary: &mut OwnedDictionary, stats: &mut ScrubStats) {
+    for (key, label) in METADATA_PRIVACY_KEYS {
+        if dictionary.remove(key).is_some() {
+            stats.bump(label);
+        }
+    }
+}
+
+/// Remove the COS-level metadata handled by `PrivacyLevel::Metadata` from the
+/// Hayro/COW document without materializing unaffected source objects.
+///
+/// This is the first optimizer pass migrated to the sparse overlay. JPEG
+/// marker scrubbing and all best-effort privacy operations intentionally stay
+/// on the existing flpdf path for now.
+pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
+    let mut stats = ScrubStats::default();
+
+    for (key, label) in [
+        (b"Info".as_slice(), "info-dictionary"),
+        (b"ID".as_slice(), "document-id"),
+    ] {
+        if document.trailer_mut().remove(key).is_some() {
+            stats.bump(label);
+        }
+    }
+
+    // Walk the post-trailer-removal output graph once. For untouched source
+    // objects, inspect metadata keys and collect outgoing references from the
+    // same Hayro parse. Only the sparse set of dictionaries that actually need
+    // mutation is parsed a second time when it is materialized into the COW
+    // overlay. This matters for compressed object streams, where repeated xref
+    // lookups can otherwise repeatedly decode the containing object stream.
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+    while let Some(handle) = pending.pop() {
+        if seen.contains(&handle) {
+            continue;
+        }
+
+        let (references, needs_edit) = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => (
+                    object.references(),
+                    owned_dictionary_needs_metadata_scrub(object),
+                ),
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(crate::Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(crate::Error::MissingSourceObject { .. }) => {
+                            // PDF semantics treat a missing indirect object as null.
+                            seen.insert(handle);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let needs_edit = hayro_object_needs_metadata_scrub(&object);
+                    (
+                        references
+                            .into_iter()
+                            .map(CowObjectHandle::Existing)
+                            .collect(),
+                        needs_edit,
+                    )
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(crate::Error::MissingNewObject { index: id.index() })?;
+                (
+                    object.references(),
+                    owned_dictionary_needs_metadata_scrub(object),
+                )
+            }
+        };
+
+        seen.insert(handle);
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+
+        if !needs_edit {
+            continue;
+        }
+        match handle {
+            CowObjectHandle::Existing(id) => {
+                if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut() {
+                    scrub_owned_metadata_dictionary(dictionary, &mut stats);
+                }
+            }
+            CowObjectHandle::New(id) => {
+                if let Some(object) = document.overlay_mut().added_mut(id)
+                    && let Some(dictionary) = object.as_dictionary_mut()
+                {
+                    scrub_owned_metadata_dictionary(dictionary, &mut stats);
+                }
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
@@ -204,4 +347,142 @@ pub(crate) fn scrub_pdf<R: Read + Seek + 'static>(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ObjectHandle as CowObjectHandle, OwnedObject};
+    use std::io::Cursor;
+
+    #[test]
+    fn hayro_metadata_scrub_matches_flpdf_and_stays_sparse() -> Result<()> {
+        let input = metadata_fixture();
+        let config = PrivacyConfig {
+            level: PrivacyLevel::Metadata,
+            ..PrivacyConfig::default()
+        };
+
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = scrub_pdf(&mut flpdf, &config)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = scrub_edit_document_metadata(&mut document)?;
+        assert_eq!(actual.removed, expected.removed);
+        assert_eq!(actual.jpeg_metadata_bytes_removed, 0);
+        assert_eq!(document.overlay().changes().count(), 3);
+        assert!(!document.trailer().contains_key(b"Info".as_slice()));
+        assert!(!document.trailer().contains_key(b"ID".as_slice()));
+
+        let output = document.write_compact_experimental()?;
+        let rewritten = EditDocument::from_bytes(output)?;
+        assert_eq!(rewritten.source().object_count(), 5);
+        assert!(!rewritten.trailer().contains_key(b"Info".as_slice()));
+        assert!(!rewritten.trailer().contains_key(b"ID".as_slice()));
+
+        for handle in rewritten.reachable_objects()? {
+            let CowObjectHandle::Existing(id) = handle else {
+                continue;
+            };
+            let object = rewritten.source().materialize(id)?;
+            let Some(dictionary) = object.as_dictionary() else {
+                continue;
+            };
+            for (key, _) in METADATA_PRIVACY_KEYS {
+                assert!(
+                    !dictionary.contains_key(key),
+                    "rewritten object retained metadata key {}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+
+        let custom = match rewritten.trailer().get(b"Custom".as_slice()) {
+            Some(custom) => custom,
+            None => panic!("custom trailer root should survive"),
+        };
+        let custom_id = match custom {
+            OwnedObject::Reference(CowObjectHandle::Existing(id)) => *id,
+            other => panic!("expected custom trailer reference, got {other:?}"),
+        };
+        let custom = rewritten.source().materialize(custom_id)?;
+        let custom = match custom.as_dictionary() {
+            Some(dictionary) => dictionary,
+            None => panic!("custom trailer object should remain a dictionary"),
+        };
+        assert_eq!(
+            custom.get(b"Keep".as_slice()),
+            Some(&OwnedObject::Boolean(true))
+        );
+        Ok(())
+    }
+
+    fn metadata_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R /PieceInfo 7 0 R /LastModified (yesterday) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Producer (pdf-redox-test) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Metadata /Subtype /XML /Length 4 >>\nstream\n<x/>\nendstream\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Private (secret) >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Metadata 6 0 R /Keep true >>\nendobj\n",
+        );
+        append_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Keep true >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 10 /Root 1 0 R /Info 5 0 R /ID [(left) (right)] /Custom 8 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn append_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &[u8]) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object);
+    }
 }

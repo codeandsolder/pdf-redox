@@ -1,14 +1,11 @@
 //! Compact generic writer for the Hayro/COW migration.
 //!
 //! This is intentionally not wired into the production optimizer yet. The body
-//! graph is fully Hayro/COW-backed; trailer-only semantic state is currently
-//! recovered through a temporary flpdf view over the same shared source buffer
-//! until Hayro exposes its already-parsed final trailer dictionary publicly.
-//! The writer is exercised independently before optimizer passes migrate onto it.
+//! graph is fully Hayro/COW-backed and trailer semantic state is owned by the
+//! edit document. The writer is exercised independently before optimizer passes
+//! migrate onto it.
 
-use crate::{
-    EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedDictionary, OwnedObject, Result,
-};
+use crate::{EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result};
 use hayro_syntax::{
     PdfVersion,
     object::{Dict, MaybeRef, Object, Stream},
@@ -28,13 +25,9 @@ struct OutputPlan {
 }
 
 impl OutputPlan {
-    fn new(document: &EditDocument, trailer: &OwnedDictionary) -> Result<Self> {
+    fn new(document: &EditDocument) -> Result<Self> {
         let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
-        let mut roots = vec![catalog_handle];
-        for value in trailer.values() {
-            roots.extend(value.references());
-        }
-        let reachable = document.reachable_from(roots)?;
+        let reachable = document.reachable_output_objects()?;
         if reachable.len() > i32::MAX as usize {
             return Err(Error::TooManyOutputObjects {
                 count: reachable.len(),
@@ -71,8 +64,7 @@ impl OutputPlan {
 }
 
 pub(crate) fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
-    let trailer = document.source().preserved_trailer()?;
-    let plan = OutputPlan::new(document, &trailer)?;
+    let plan = OutputPlan::new(document)?;
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
     output.extend_from_slice(version_bytes(document.source().version()));
@@ -103,7 +95,7 @@ pub(crate) fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
     write!(&mut output, "{}", plan.order.len() + 1)?;
     output.extend_from_slice(b" /Root ");
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
-    for (name, value) in &trailer {
+    for (name, value) in document.trailer() {
         output.push(b' ');
         write_pdf_name(&mut output, name);
         output.push(b' ');

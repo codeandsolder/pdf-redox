@@ -165,8 +165,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if a.hayro_rewrite_experimental {
+        if a.scrub_jpeg_metadata
+            || a.remove_attachments
+            || a.remove_active_content
+            || a.remove_signatures
+        {
+            return Err(
+                "Hayro experimental mode has not migrated JPEG/best-effort privacy operations yet"
+                    .into(),
+            );
+        }
         let input_bytes = input.len();
-        let document = EditDocument::from_bytes(input)?;
+        let mut document = EditDocument::from_bytes(input)?;
+        let privacy_items_removed = match a.privacy {
+            PrivacyArg::None => Default::default(),
+            PrivacyArg::Metadata => document.scrub_metadata_privacy_experimental()?,
+            PrivacyArg::BestEffort => {
+                return Err(
+                    "Hayro experimental mode currently supports only --privacy none|metadata"
+                        .into(),
+                );
+            }
+        };
         let page_count = document.source().page_count();
         let source_objects = document.source().object_count();
         let output = document.write_compact_experimental()?;
@@ -193,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "output_bytes": output_bytes,
                 "page_count": page_count,
                 "source_objects": source_objects,
+                "privacy_items_removed": privacy_items_removed,
             });
             if out_path.as_os_str() == "-" {
                 eprintln!("{}", serde_json::to_string(&summary)?);
