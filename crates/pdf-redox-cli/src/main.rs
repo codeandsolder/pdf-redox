@@ -189,6 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Default::default()
         };
+        let font_program_dedup = if a.no_font_program_dedup {
+            Default::default()
+        } else {
+            document.canonicalize_font_programs_experimental()?
+        };
         let page_count = document.source().page_count();
         let source_objects = document.source().object_count();
         let output = document.write_compact_experimental()?;
@@ -217,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "source_objects": source_objects,
                 "privacy_items_removed": privacy_items_removed,
                 "font_optimization": font_optimization,
+                "font_program_dedup": font_program_dedup,
             });
             if out_path.as_os_str() == "-" {
                 eprintln!("{}", serde_json::to_string(&summary)?);

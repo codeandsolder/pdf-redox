@@ -1,7 +1,11 @@
-use crate::Result;
+use crate::{
+    EditDocument, Error, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
+    OwnedObject, Result, StreamData,
+};
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
+use hayro_syntax::object::Object as HayroObject;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1796,10 +1800,299 @@ pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
     })
 }
 
+const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HayroFontProgramHolder {
+    holder: CowObjectHandle,
+    key: Vec<u8>,
+    program: CowObjectHandle,
+}
+
+fn inspect_hayro_font_program_holders(
+    holder: CowObjectHandle,
+    dictionary: &hayro_syntax::object::Dict<'_>,
+    holders: &mut Vec<HayroFontProgramHolder>,
+) {
+    for key in HAYRO_FONT_FILE_KEYS {
+        if let Some(program) = dictionary.get_ref(key) {
+            holders.push(HayroFontProgramHolder {
+                holder,
+                key: key.to_vec(),
+                program: CowObjectHandle::Existing(program.into()),
+            });
+        }
+    }
+}
+
+fn inspect_owned_font_program_holders(
+    holder: CowObjectHandle,
+    dictionary: &OwnedDictionary,
+    holders: &mut Vec<HayroFontProgramHolder>,
+) {
+    for key in HAYRO_FONT_FILE_KEYS {
+        let Some(OwnedObject::Reference(program)) = dictionary.get(key) else {
+            continue;
+        };
+        holders.push(HayroFontProgramHolder {
+            holder,
+            key: key.to_vec(),
+            program: *program,
+        });
+    }
+}
+
+fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<HayroFontProgramHolder>> {
+    let mut holders = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let references = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    if let Some(dictionary) = object.as_dictionary() {
+                        inspect_owned_font_program_holders(handle, dictionary, &mut holders);
+                    }
+                    object.references()
+                }
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    match &object {
+                        HayroObject::Dict(dictionary) => {
+                            inspect_hayro_font_program_holders(handle, dictionary, &mut holders);
+                        }
+                        HayroObject::Stream(stream) => {
+                            inspect_hayro_font_program_holders(handle, stream.dict(), &mut holders);
+                        }
+                        _ => {}
+                    }
+                    references
+                        .into_iter()
+                        .map(CowObjectHandle::Existing)
+                        .collect()
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(Error::MissingNewObject { index: id.index() })?;
+                if let Some(dictionary) = object.as_dictionary() {
+                    inspect_owned_font_program_holders(handle, dictionary, &mut holders);
+                }
+                object.references()
+            }
+        };
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+    }
+    Ok(holders)
+}
+
+fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_cow_handle(hasher: &mut Sha256, handle: CowObjectHandle) {
+    match handle {
+        CowObjectHandle::Existing(id) => {
+            hasher.update([0x70]);
+            hasher.update(id.number().to_le_bytes());
+            hasher.update(id.generation().to_le_bytes());
+        }
+        CowObjectHandle::New(id) => {
+            hasher.update([0x71]);
+            hasher.update((id.index() as u64).to_le_bytes());
+        }
+    }
+}
+
+fn hash_owned_object(hasher: &mut Sha256, object: &OwnedObject) -> Result<()> {
+    match object {
+        OwnedObject::Null => hasher.update([0x00]),
+        OwnedObject::Boolean(value) => hasher.update([0x01, u8::from(*value)]),
+        OwnedObject::Integer(value) => {
+            hasher.update([0x02]);
+            hasher.update(value.to_le_bytes());
+        }
+        OwnedObject::Real(value) => {
+            hasher.update([0x03]);
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        OwnedObject::Name(value) => {
+            hasher.update([0x04]);
+            hash_len_prefixed(hasher, value);
+        }
+        OwnedObject::String(value) => {
+            hasher.update([0x05]);
+            hash_len_prefixed(hasher, value);
+        }
+        OwnedObject::Reference(handle) => hash_cow_handle(hasher, *handle),
+        OwnedObject::Array(values) => {
+            hasher.update([0x06]);
+            hasher.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hash_owned_object(hasher, value)?;
+            }
+        }
+        OwnedObject::Dictionary(dictionary) => {
+            hasher.update([0x07]);
+            hasher.update((dictionary.len() as u64).to_le_bytes());
+            for (key, value) in dictionary {
+                hash_len_prefixed(hasher, key);
+                hash_owned_object(hasher, value)?;
+            }
+        }
+        OwnedObject::Stream { dictionary, data } => {
+            hasher.update([0x08]);
+            hasher.update((dictionary.len() as u64).to_le_bytes());
+            for (key, value) in dictionary {
+                hash_len_prefixed(hasher, key);
+                hash_owned_object(hasher, value)?;
+            }
+            match data {
+                StreamData::Source(id) => {
+                    hasher.update([0x80]);
+                    hasher.update(id.number().to_le_bytes());
+                    hasher.update(id.generation().to_le_bytes());
+                }
+                StreamData::Owned(bytes) => {
+                    hasher.update([0x81]);
+                    hash_len_prefixed(hasher, bytes);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hayro_font_program_fingerprint(
+    document: &EditDocument,
+    program: CowObjectHandle,
+    key: &[u8],
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(object) = document.current_owned_object(program)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    let domain = [b"/".as_slice(), key].concat();
+    hash_len_prefixed(&mut hasher, &domain);
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+
+    hasher.update((dictionary.len() as u64).to_le_bytes());
+    for (dict_key, value) in &dictionary {
+        hash_len_prefixed(&mut hasher, dict_key);
+        if matches!(dict_key.as_slice(), b"Length1" | b"Length2" | b"Length3")
+            && let Some(OwnedObject::Integer(integer)) = document.resolve_owned_value(value)?
+        {
+            hash_owned_object(&mut hasher, &OwnedObject::Integer(integer))?;
+        } else {
+            hash_owned_object(&mut hasher, value)?;
+        }
+    }
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn rewrite_font_program_holder(
+    document: &mut EditDocument,
+    holder: &HayroFontProgramHolder,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let object = match holder.holder {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(dictionary) = object.as_dictionary_mut() else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.key.as_slice()) else {
+        return Ok(false);
+    };
+    if *current != holder.program {
+        return Ok(false);
+    }
+    dictionary.insert(holder.key.clone(), OwnedObject::Reference(canonical));
+    Ok(true)
+}
+
+pub(crate) fn canonicalize_font_program_streams_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = hayro_font_program_holders(document)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<(Vec<u8>, CowObjectHandle), CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for holder in &holders {
+        let Some((fingerprint, raw_bytes)) =
+            hayro_font_program_fingerprint(document, holder.program, &holder.key)?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != holder.program {
+                redirects.insert((holder.key.clone(), holder.program), canonical);
+                if duplicate_refs.insert(holder.program) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, holder.program);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for holder in &holders {
+        let Some(canonical) = redirects
+            .get(&(holder.key.clone(), holder.program))
+            .copied()
+        else {
+            continue;
+        };
+        if rewrite_font_program_holder(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Error;
+    use flpdf::PdfWriter;
+    use std::io::Cursor;
     use std::rc::Rc;
 
     fn metadata_stream(
@@ -3417,6 +3710,85 @@ mod tests {
                 font_program,
             )]))?,
         )
+    }
+
+    fn serialized_font_program_dedup_fixture() -> Result<Vec<u8>> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"same-font-program";
+        let first = font_program(&mut pdf, payload)?;
+        let second = font_program(&mut pdf, payload)?;
+        let different_key = font_program(&mut pdf, payload)?;
+        let different_dict = font_program(&mut pdf, payload)?;
+
+        for stream in [&first, &second] {
+            let length =
+                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+            let dict = stream
+                .as_stream_dict()
+                .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
+            dict.replace_key(b"/Length1", length)?;
+            pdf.mark_object_handle_dirty(&dict)?;
+        }
+        let different_dict_handle = different_dict
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
+        different_dict_handle.replace_key(b"/Custom", ObjectHandle::integer(1))?;
+        pdf.mark_object_handle_dirty(&different_dict_handle)?;
+
+        let first_descriptor = font_descriptor(&mut pdf, b"/FontFile2", first)?;
+        let second_descriptor = font_descriptor(&mut pdf, b"/FontFile2", second)?;
+        let different_key_descriptor = font_descriptor(&mut pdf, b"/FontFile3", different_key)?;
+        let different_dict_descriptor = font_descriptor(&mut pdf, b"/FontFile2", different_dict)?;
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestFontA", first_descriptor)?;
+        root.replace_key(b"/TestFontB", second_descriptor)?;
+        root.replace_key(b"/TestFontC", different_key_descriptor)?;
+        root.replace_key(b"/TestFontD", different_dict_descriptor)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn hayro_font_program_dedup_matches_flpdf() -> Result<()> {
+        let input = serialized_font_program_dedup_fixture()?;
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = canonicalize_font_program_streams(&mut flpdf)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = canonicalize_font_program_streams_hayro(&mut document)?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.duplicate_streams_detected, 1);
+        assert_eq!(actual.references_canonicalized, 1);
+        assert!(actual.duplicate_raw_bytes >= b"same-font-program".len());
+
+        let output = document.write_compact_experimental()?;
+        let mut reparsed = Pdf::open(Cursor::new(output))?;
+        let root = reparsed.root_handle()?;
+        let first = root
+            .try_get_key(b"/TestFontA")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        let second = root
+            .try_get_key(b"/TestFontB")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        let different_key = root
+            .try_get_key(b"/TestFontC")?
+            .try_get_key(b"/FontFile3")?
+            .object_ref();
+        let different_dict = root
+            .try_get_key(b"/TestFontD")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        assert_eq!(first, second);
+        assert_ne!(first, different_key);
+        assert_ne!(first, different_dict);
+        Ok(())
     }
 
     #[test]
