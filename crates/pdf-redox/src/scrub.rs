@@ -69,51 +69,8 @@ struct ActiveContentPlan {
     remove_open_action: bool,
 }
 
-fn current_object(document: &EditDocument, handle: CowObjectHandle) -> Result<Option<OwnedObject>> {
-    match handle {
-        CowObjectHandle::Existing(id) => match document.overlay().change(id) {
-            Some(ExistingObjectChange::Replace(object)) => Ok(Some(object.clone())),
-            Some(ExistingObjectChange::Delete) => Err(crate::Error::DeletedReferencedObject {
-                number: id.number(),
-                generation: id.generation(),
-            }),
-            None => match document.source().materialize(id) {
-                Ok(object) => Ok(Some(object)),
-                Err(crate::Error::MissingSourceObject { .. }) => Ok(None),
-                Err(error) => Err(error),
-            },
-        },
-        CowObjectHandle::New(id) => document
-            .overlay()
-            .added(id)
-            .cloned()
-            .ok_or(crate::Error::MissingNewObject { index: id.index() })
-            .map(Some),
-    }
-}
-
-fn resolve_owned_value(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<OwnedObject>> {
-    let mut value = value.clone();
-    let mut seen = BTreeSet::new();
-    loop {
-        let OwnedObject::Reference(handle) = value else {
-            return Ok(Some(value));
-        };
-        if !seen.insert(handle) {
-            return Ok(None);
-        }
-        let Some(next) = current_object(document, handle)? else {
-            return Ok(None);
-        };
-        value = next;
-    }
-}
-
 fn owned_action_is_dangerous(document: &EditDocument, action: &OwnedObject) -> Result<bool> {
-    let Some(action) = resolve_owned_value(document, action)? else {
+    let Some(action) = document.resolve_owned_value(action)? else {
         return Ok(false);
     };
     let OwnedObject::Dictionary(dictionary) = action else {
@@ -122,7 +79,7 @@ fn owned_action_is_dangerous(document: &EditDocument, action: &OwnedObject) -> R
     let Some(kind) = dictionary.get(b"S".as_slice()) else {
         return Ok(false);
     };
-    let Some(kind) = resolve_owned_value(document, kind)? else {
+    let Some(kind) = document.resolve_owned_value(kind)? else {
         return Ok(false);
     };
     let OwnedObject::Name(name) = kind else {
@@ -135,7 +92,7 @@ fn active_content_plan_for_handle(
     document: &EditDocument,
     handle: CowObjectHandle,
 ) -> Result<ActiveContentPlan> {
-    let Some(object) = current_object(document, handle)? else {
+    let Some(object) = document.current_owned_object(handle)? else {
         return Ok(ActiveContentPlan::default());
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -409,7 +366,7 @@ fn scrub_catalog_javascript_name_tree(
     stats: &mut ScrubStats,
 ) -> Result<()> {
     let catalog = CowObjectHandle::Existing(document.source().catalog_id());
-    let Some(catalog_object) = current_object(document, catalog)? else {
+    let Some(catalog_object) = document.current_owned_object(catalog)? else {
         return Ok(());
     };
     let Some(catalog_dictionary) = catalog_object.as_dictionary() else {
@@ -421,7 +378,7 @@ fn scrub_catalog_javascript_name_tree(
 
     match names {
         OwnedObject::Reference(handle) => {
-            let Some(names_object) = current_object(document, handle)? else {
+            let Some(names_object) = document.current_owned_object(handle)? else {
                 return Ok(());
             };
             let Some(names_dictionary) = names_object.as_dictionary() else {

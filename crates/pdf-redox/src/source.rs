@@ -476,6 +476,51 @@ impl EditDocument {
         self.overlay.edit(&self.source, id)
     }
 
+    /// Materialize the current value of an object handle from either the source
+    /// graph or the COW overlay without mutating the document.
+    pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
+        match handle {
+            ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                Some(ExistingObjectChange::Replace(object)) => Ok(Some(object.clone())),
+                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
+                    number: id.number,
+                    generation: id.generation,
+                }),
+                None => match self.source.materialize(id) {
+                    Ok(object) => Ok(Some(object)),
+                    Err(Error::MissingSourceObject { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                },
+            },
+            ObjectHandle::New(id) => self
+                .overlay
+                .added(id)
+                .cloned()
+                .ok_or(Error::MissingNewObject { index: id.index() })
+                .map(Some),
+        }
+    }
+
+    /// Resolve a chain of indirect references against the current COW graph.
+    /// Cycles and missing source objects resolve to `None`, matching PDF null-like
+    /// behavior used by the migration passes.
+    pub(crate) fn resolve_owned_value(&self, value: &OwnedObject) -> Result<Option<OwnedObject>> {
+        let mut value = value.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            let OwnedObject::Reference(handle) = value else {
+                return Ok(Some(value));
+            };
+            if !seen.insert(handle) {
+                return Ok(None);
+            }
+            let Some(next) = self.current_owned_object(handle)? else {
+                return Ok(None);
+            };
+            value = next;
+        }
+    }
+
     /// Apply the first migrated privacy pass to the Hayro/COW graph.
     ///
     /// This removes trailer `/Info` and `/ID` plus reachable dictionary
@@ -496,6 +541,30 @@ impl EditDocument {
         cfg: &crate::PrivacyConfig,
     ) -> Result<BTreeMap<String, usize>> {
         Ok(crate::scrub::scrub_edit_document_cos_privacy(self, cfg)?.removed)
+    }
+
+    /// Strip embedded sfnt tables that PDF rendering does not consume.
+    #[doc(hidden)]
+    pub fn strip_font_editing_tables_experimental(
+        &mut self,
+        flate_level: i32,
+    ) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::font::strip_font_editing_tables_hayro(self, flate_level)?;
+        Ok(BTreeMap::from([
+            ("programs-optimized".to_owned(), stats.programs_optimized),
+            (
+                "original-encoded-bytes".to_owned(),
+                stats.original_encoded_bytes,
+            ),
+            (
+                "optimized-encoded-bytes".to_owned(),
+                stats.optimized_encoded_bytes,
+            ),
+            (
+                "decoded-table-bytes-removed".to_owned(),
+                stats.decoded_table_bytes_removed,
+            ),
+        ]))
     }
 
     /// Write the current Hayro/COW graph as a compact fresh PDF.

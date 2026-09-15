@@ -184,6 +184,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             remove_active_content: a.remove_active_content,
             ..PrivacyConfig::default()
         })?;
+        let font_optimization = if a.drop_font_editing_support {
+            document.strip_font_editing_tables_experimental(Config::optimize_only().flate_level)?
+        } else {
+            Default::default()
+        };
         let page_count = document.source().page_count();
         let source_objects = document.source().object_count();
         let output = document.write_compact_experimental()?;
@@ -211,6 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "page_count": page_count,
                 "source_objects": source_objects,
                 "privacy_items_removed": privacy_items_removed,
+                "font_optimization": font_optimization,
             });
             if out_path.as_os_str() == "-" {
                 eprintln!("{}", serde_json::to_string(&summary)?);
