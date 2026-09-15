@@ -189,6 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Default::default()
         };
+        let metadata_dedup = if a.no_metadata_dedup {
+            Default::default()
+        } else {
+            document.canonicalize_metadata_streams_experimental()?
+        };
         let font_program_dedup = if a.no_font_program_dedup {
             Default::default()
         } else {
@@ -198,6 +203,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Default::default()
         } else {
             document.canonicalize_to_unicode_experimental()?
+        };
+        let icc_dedup = if a.no_icc_dedup {
+            Default::default()
+        } else {
+            document.canonicalize_icc_profiles_experimental()?
         };
         let type3_charproc_dedup = if a.no_type3_charproc_dedup {
             Default::default()
@@ -232,8 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "source_objects": source_objects,
                 "privacy_items_removed": privacy_items_removed,
                 "font_optimization": font_optimization,
+                "metadata_dedup": metadata_dedup,
                 "font_program_dedup": font_program_dedup,
                 "to_unicode_dedup": to_unicode_dedup,
+                "icc_dedup": icc_dedup,
                 "type3_charproc_dedup": type3_charproc_dedup,
             });
             if out_path.as_os_str() == "-" {

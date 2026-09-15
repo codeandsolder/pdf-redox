@@ -3,7 +3,10 @@ use crate::{
     OwnedObject, Result, StreamData,
 };
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
-use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject};
+use hayro_syntax::{
+    PdfVersion,
+    object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject},
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
@@ -1984,6 +1987,45 @@ fn hash_owned_object(hasher: &mut Sha256, object: &OwnedObject) -> Result<()> {
     Ok(())
 }
 
+fn hayro_stream_fingerprint_ignoring(
+    document: &EditDocument,
+    stream: CowObjectHandle,
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(object) = document.current_owned_object(stream)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+
+    let semantic_entries = dictionary
+        .iter()
+        .filter(|(key, _)| {
+            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+        })
+        .collect::<Vec<_>>();
+    hasher.update((semantic_entries.len() as u64).to_le_bytes());
+    for (key, value) in semantic_entries {
+        hash_len_prefixed(&mut hasher, key);
+        hash_owned_object(&mut hasher, value)?;
+    }
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn hayro_stream_fingerprint(
+    document: &EditDocument,
+    stream: CowObjectHandle,
+    domain: &[u8],
+) -> Result<Option<([u8; 32], usize)>> {
+    hayro_stream_fingerprint_ignoring(document, stream, domain, &[])
+}
+
 fn hayro_font_program_fingerprint(
     document: &EditDocument,
     program: CowObjectHandle,
@@ -2091,6 +2133,518 @@ pub(crate) fn canonicalize_font_program_streams_hayro(
 enum DirectPathStep {
     DictKey(Vec<u8>),
     ArrayIndex(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectReferenceHolder {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+    key: Vec<u8>,
+    target: CowObjectHandle,
+}
+
+fn inspect_hayro_direct_reference_holders(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    key: &[u8],
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<DirectReferenceHolder>,
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            if let Some(target) = dictionary.get_ref(key) {
+                holders.push(DirectReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    key: key.to_vec(),
+                    target: CowObjectHandle::Existing(target.into()),
+                });
+            }
+            for (name, value) in dictionary.entries() {
+                if name.as_ref() == key {
+                    continue;
+                }
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Stream(stream) => {
+            let dictionary = stream.dict();
+            if let Some(target) = dictionary.get_ref(key) {
+                holders.push(DirectReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    key: key.to_vec(),
+                    target: CowObjectHandle::Existing(target.into()),
+                });
+            }
+            for (name, value) in dictionary.entries() {
+                if name.as_ref() == key {
+                    continue;
+                }
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Array(array) => {
+            for (index, value) in array.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn inspect_owned_direct_reference_holders(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    key: &[u8],
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<DirectReferenceHolder>,
+) {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if let Some(OwnedObject::Reference(target)) = dictionary.get(key) {
+                holders.push(DirectReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    key: key.to_vec(),
+                    target: *target,
+                });
+            }
+            for (name, value) in dictionary {
+                if name.as_slice() == key || matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_direct_reference_holders(root, value, key, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_direct_reference_holders(root, value, key, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+fn hayro_direct_reference_holders(
+    document: &EditDocument,
+    key: &[u8],
+) -> Result<Vec<DirectReferenceHolder>> {
+    let mut holders = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let references = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    inspect_owned_direct_reference_holders(
+                        handle,
+                        object,
+                        key,
+                        &mut Vec::new(),
+                        &mut holders,
+                    );
+                    object.references()
+                }
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    inspect_hayro_direct_reference_holders(
+                        handle,
+                        &object,
+                        key,
+                        &mut Vec::new(),
+                        &mut holders,
+                    );
+                    references
+                        .into_iter()
+                        .map(CowObjectHandle::Existing)
+                        .collect()
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(Error::MissingNewObject { index: id.index() })?;
+                inspect_owned_direct_reference_holders(
+                    handle,
+                    object,
+                    key,
+                    &mut Vec::new(),
+                    &mut holders,
+                );
+                object.references()
+            }
+        };
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+    }
+    Ok(holders)
+}
+
+fn rewrite_direct_reference_holder(
+    document: &mut EditDocument,
+    holder: &DirectReferenceHolder,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let root = match holder.root {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(holder_object) = object_at_direct_path_mut(root, &holder.path) else {
+        return Ok(false);
+    };
+    let Some(dictionary) = holder_object.as_dictionary_mut() else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.key.as_slice()) else {
+        return Ok(false);
+    };
+    if *current != holder.target {
+        return Ok(false);
+    }
+    dictionary.insert(holder.key.clone(), OwnedObject::Reference(canonical));
+    Ok(true)
+}
+
+fn canonicalize_named_stream_references_hayro(
+    document: &mut EditDocument,
+    key: &[u8],
+    domain: &[u8],
+) -> Result<TargetedDedupStats> {
+    let holders = hayro_direct_reference_holders(document, key)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    for holder in &holders {
+        let Some((fingerprint, raw_bytes)) =
+            hayro_stream_fingerprint(document, holder.target, domain)?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != holder.target {
+                redirects.insert(holder.target, canonical);
+                if duplicate_refs.insert(holder.target) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, holder.target);
+        }
+    }
+    let mut references_canonicalized = 0_usize;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.target).copied() else {
+            continue;
+        };
+        if rewrite_direct_reference_holder(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+pub(crate) fn canonicalize_metadata_streams_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    canonicalize_named_stream_references_hayro(document, b"Metadata", b"metadata")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectArrayReferenceHolder {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+    index: usize,
+    target: CowObjectHandle,
+}
+
+fn inspect_hayro_icc_arrays(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<DirectArrayReferenceHolder>,
+) {
+    match object {
+        HayroObject::Array(array) => {
+            let is_icc = matches!(array.iter::<HayroObject<'_>>().next(), Some(HayroObject::Name(name)) if name.as_ref() == b"ICCBased");
+            if is_icc && let Some(HayroMaybeRef::Ref(profile)) = array.raw_iter().nth(1) {
+                holders.push(DirectArrayReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    index: 1,
+                    target: CowObjectHandle::Existing(profile.into()),
+                });
+                return;
+            }
+            for (index, value) in array.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_hayro_icc_arrays(root, &value, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Dict(dictionary) => {
+            for (name, value) in dictionary.entries() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                inspect_hayro_icc_arrays(root, &value, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Stream(stream) => {
+            for (name, value) in stream.dict().entries() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                inspect_hayro_icc_arrays(root, &value, path, holders);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn inspect_owned_icc_arrays(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<DirectArrayReferenceHolder>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Array(values) => {
+            let is_icc = values.first().is_some_and(|first| {
+                matches!(document.resolve_owned_value(first), Ok(Some(OwnedObject::Name(name))) if name == b"ICCBased")
+            });
+            if is_icc && let Some(OwnedObject::Reference(profile)) = values.get(1) {
+                holders.push(DirectArrayReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    index: 1,
+                    target: *profile,
+                });
+                return Ok(());
+            }
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_icc_arrays(document, root, value, path, holders)?;
+                path.pop();
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for (name, value) in dictionary {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_icc_arrays(document, root, value, path, holders)?;
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+    Ok(())
+}
+
+fn hayro_icc_array_holders(document: &EditDocument) -> Result<Vec<DirectArrayReferenceHolder>> {
+    let mut holders = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let references = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    inspect_owned_icc_arrays(
+                        document,
+                        handle,
+                        object,
+                        &mut Vec::new(),
+                        &mut holders,
+                    )?;
+                    object.references()
+                }
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    inspect_hayro_icc_arrays(handle, &object, &mut Vec::new(), &mut holders);
+                    references
+                        .into_iter()
+                        .map(CowObjectHandle::Existing)
+                        .collect()
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(Error::MissingNewObject { index: id.index() })?;
+                inspect_owned_icc_arrays(document, handle, object, &mut Vec::new(), &mut holders)?;
+                object.references()
+            }
+        };
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+    }
+    Ok(holders)
+}
+
+fn rewrite_direct_array_reference_holder(
+    document: &mut EditDocument,
+    holder: &DirectArrayReferenceHolder,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let root = match holder.root {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(array_object) = object_at_direct_path_mut(root, &holder.path) else {
+        return Ok(false);
+    };
+    let OwnedObject::Array(values) = array_object else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Reference(current)) = values.get(holder.index) else {
+        return Ok(false);
+    };
+    if *current != holder.target {
+        return Ok(false);
+    }
+    values[holder.index] = OwnedObject::Reference(canonical);
+    Ok(true)
+}
+
+pub(crate) fn canonicalize_icc_profiles_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = hayro_icc_array_holders(document)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    for holder in &holders {
+        let Some((fingerprint, raw_bytes)) =
+            hayro_stream_fingerprint(document, holder.target, b"icc-profile")?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != holder.target {
+                redirects.insert(holder.target, canonical);
+                if duplicate_refs.insert(holder.target) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, holder.target);
+        }
+    }
+    let mut references_canonicalized = 0_usize;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.target).copied() else {
+            continue;
+        };
+        if rewrite_direct_array_reference_holder(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2730,6 +3284,1211 @@ pub(crate) fn canonicalize_type3_charprocs_hayro(
         }
     }
 
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+fn canonical_cow_redirect(
+    mut handle: CowObjectHandle,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> CowObjectHandle {
+    let mut seen = HashSet::new();
+    while let Some(next) = redirects.get(&handle).copied() {
+        if next == handle || !seen.insert(handle) {
+            break;
+        }
+        handle = next;
+    }
+    handle
+}
+
+fn hash_owned_object_with_redirects(
+    hasher: &mut Sha256,
+    object: &OwnedObject,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Reference(handle) => {
+            hasher.update([0x70]);
+            hash_cow_handle(hasher, canonical_cow_redirect(*handle, redirects));
+        }
+        OwnedObject::Array(values) => {
+            hasher.update([0x06]);
+            hasher.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hash_owned_object_with_redirects(hasher, value, redirects)?;
+            }
+        }
+        OwnedObject::Dictionary(dictionary) => {
+            hasher.update([0x07]);
+            hasher.update((dictionary.len() as u64).to_le_bytes());
+            for (key, value) in dictionary {
+                hash_len_prefixed(hasher, key);
+                hash_owned_object_with_redirects(hasher, value, redirects)?;
+            }
+        }
+        OwnedObject::Stream { dictionary, data } => {
+            hasher.update([0x08]);
+            hasher.update((dictionary.len() as u64).to_le_bytes());
+            for (key, value) in dictionary {
+                hash_len_prefixed(hasher, key);
+                hash_owned_object_with_redirects(hasher, value, redirects)?;
+            }
+            match data {
+                StreamData::Source(id) => {
+                    hasher.update([0x80]);
+                    hasher.update(id.number().to_le_bytes());
+                    hasher.update(id.generation().to_le_bytes());
+                }
+                StreamData::Owned(bytes) => {
+                    hasher.update([0x81]);
+                    hash_len_prefixed(hasher, bytes);
+                }
+            }
+        }
+        other => hash_owned_object(hasher, other)?,
+    }
+    Ok(())
+}
+
+fn hayro_stream_fingerprint_with_redirects(
+    document: &EditDocument,
+    stream: CowObjectHandle,
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(object) = document.current_owned_object(stream)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+    let entries = dictionary
+        .iter()
+        .filter(|(key, _)| {
+            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+        })
+        .collect::<Vec<_>>();
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
+        hash_len_prefixed(&mut hasher, key);
+        hash_owned_object_with_redirects(&mut hasher, value, redirects)?;
+    }
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn reachable_streams_with_subtype(
+    document: &EditDocument,
+    subtype: &[u8],
+) -> Result<Vec<CowObjectHandle>> {
+    let mut streams = Vec::new();
+    for handle in document.reachable_output_objects()? {
+        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
+            continue;
+        };
+        if matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == subtype)
+        {
+            streams.push(handle);
+        }
+    }
+    Ok(streams)
+}
+
+fn exact_stream_redirects_hayro(
+    document: &EditDocument,
+    streams: &[CowObjectHandle],
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+    dependency_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    duplicate_refs: &mut HashSet<CowObjectHandle>,
+    duplicate_raw_bytes: &mut usize,
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::new();
+    for &stream in streams {
+        let Some((fingerprint, raw_bytes)) = hayro_stream_fingerprint_with_redirects(
+            document,
+            stream,
+            domain,
+            ignored_dictionary_keys,
+            dependency_redirects,
+        )?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != stream {
+                redirects.insert(stream, canonical);
+                if duplicate_refs.insert(stream) {
+                    *duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, stream);
+        }
+    }
+    Ok(redirects)
+}
+
+fn rewrite_dictionary_reference_keys(
+    document: &mut EditDocument,
+    handle: CowObjectHandle,
+    keys: &[&[u8]],
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<usize> {
+    let Some(object) = document.current_owned_object(handle)? else {
+        return Ok(0);
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(0);
+    };
+    let mut changes = Vec::new();
+    for &key in keys {
+        let Some(OwnedObject::Reference(target)) = dictionary.get(key) else {
+            continue;
+        };
+        let canonical = canonical_cow_redirect(*target, redirects);
+        if canonical != *target {
+            changes.push((key.to_vec(), canonical));
+        }
+    }
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    let object = match handle {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(dictionary) = object.as_dictionary_mut() else {
+        return Ok(0);
+    };
+    let count = changes.len();
+    for (key, target) in changes {
+        dictionary.insert(key, OwnedObject::Reference(target));
+    }
+    Ok(count)
+}
+
+fn inspect_owned_dictionary_target(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    key: &[u8],
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if let Some(value) = dictionary.get(key) {
+                match value {
+                    OwnedObject::Reference(target) => {
+                        targets.insert(DirectDictionaryTarget {
+                            root: *target,
+                            path: Vec::new(),
+                        });
+                    }
+                    OwnedObject::Dictionary(_) => {
+                        let mut target_path = path.clone();
+                        target_path.push(DirectPathStep::DictKey(key.to_vec()));
+                        targets.insert(DirectDictionaryTarget {
+                            root,
+                            path: target_path,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for (name, value) in dictionary {
+                if name.as_slice() == key || matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_dictionary_target(root, value, key, path, targets);
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_dictionary_target(root, value, key, path, targets);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hayro_dictionary_targets(
+    document: &EditDocument,
+    key: &[u8],
+) -> Result<BTreeSet<DirectDictionaryTarget>> {
+    let mut targets = BTreeSet::new();
+    for root in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(root)? else {
+            continue;
+        };
+        inspect_owned_dictionary_target(root, &object, key, &mut Vec::new(), &mut targets);
+    }
+    Ok(targets)
+}
+
+fn rewrite_dictionary_target_entries(
+    document: &mut EditDocument,
+    targets: &BTreeSet<DirectDictionaryTarget>,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<usize> {
+    let mut rewritten = 0;
+    for target in targets {
+        let Some(root_snapshot) = document.current_owned_object(target.root)? else {
+            continue;
+        };
+        let Some(dictionary) = object_at_direct_path(&root_snapshot, &target.path)
+            .and_then(OwnedObject::as_dictionary)
+        else {
+            continue;
+        };
+        let changes = dictionary
+            .iter()
+            .filter_map(|(name, value)| {
+                let OwnedObject::Reference(reference) = value else {
+                    return None;
+                };
+                let canonical = canonical_cow_redirect(*reference, redirects);
+                (canonical != *reference).then(|| (name.clone(), canonical))
+            })
+            .collect::<Vec<_>>();
+        if changes.is_empty() {
+            continue;
+        }
+        let root = match target.root {
+            CowObjectHandle::Existing(id) => document.edit_object(id)?,
+            CowObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or(Error::MissingNewObject { index: id.index() })?,
+        };
+        let Some(dictionary) =
+            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
+        else {
+            continue;
+        };
+        for (name, canonical) in changes {
+            dictionary.insert(name, OwnedObject::Reference(canonical));
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
+}
+
+pub(crate) fn canonicalize_image_xobjects_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let images = reachable_streams_with_subtype(document, b"Image")?;
+    let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
+        &[b"Name"]
+    } else {
+        &[]
+    };
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    let empty_redirects = HashMap::new();
+    let mask_redirects = exact_stream_redirects_hayro(
+        document,
+        &images,
+        b"image-xobject",
+        ignored,
+        &empty_redirects,
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    let mut references_canonicalized = 0;
+    for &image in &images {
+        references_canonicalized += rewrite_dictionary_reference_keys(
+            document,
+            image,
+            &[b"Mask", b"SMask"],
+            &mask_redirects,
+        )?;
+    }
+    let redirects = exact_stream_redirects_hayro(
+        document,
+        &images,
+        b"image-xobject",
+        ignored,
+        &empty_redirects,
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    let xobject_targets = hayro_dictionary_targets(document, b"XObject")?;
+    references_canonicalized +=
+        rewrite_dictionary_target_entries(document, &xobject_targets, &redirects)?;
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+fn hash_non_stream_object_with_redirects(
+    document: &EditDocument,
+    handle: CowObjectHandle,
+    domain: &[u8],
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<Option<[u8; 32]>> {
+    let Some(object) = document.current_owned_object(handle)? else {
+        return Ok(None);
+    };
+    if matches!(object, OwnedObject::Stream { .. }) {
+        return Ok(None);
+    }
+    if !matches!(object, OwnedObject::Dictionary(_) | OwnedObject::Array(_)) {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hash_owned_object_with_redirects(&mut hasher, &object, redirects)?;
+    Ok(Some(hasher.finalize().into()))
+}
+
+fn collect_form_resource_handles_from_value(
+    document: &EditDocument,
+    value: &OwnedObject,
+    seen: &mut BTreeSet<CowObjectHandle>,
+    handles: &mut BTreeSet<CowObjectHandle>,
+) -> Result<()> {
+    match value {
+        OwnedObject::Reference(handle) => {
+            if !seen.insert(*handle) {
+                return Ok(());
+            }
+            let Some(object) = document.current_owned_object(*handle)? else {
+                return Ok(());
+            };
+            if matches!(object, OwnedObject::Dictionary(_) | OwnedObject::Array(_)) {
+                handles.insert(*handle);
+            }
+            collect_form_resource_handles_from_value(document, &object, seen, handles)?;
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for child in dictionary.values() {
+                collect_form_resource_handles_from_value(document, child, seen, handles)?;
+            }
+        }
+        OwnedObject::Array(values) => {
+            for child in values {
+                collect_form_resource_handles_from_value(document, child, seen, handles)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn form_resource_handles(
+    document: &EditDocument,
+    forms: &[CowObjectHandle],
+) -> Result<Vec<CowObjectHandle>> {
+    let mut seen = BTreeSet::new();
+    let mut handles = BTreeSet::new();
+    for &form in forms {
+        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(form)?
+        else {
+            continue;
+        };
+        let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
+            continue;
+        };
+        collect_form_resource_handles_from_value(document, resources, &mut seen, &mut handles)?;
+    }
+    Ok(handles.into_iter().collect())
+}
+
+fn exact_non_stream_resource_redirects_hayro(
+    document: &EditDocument,
+    handles: &[CowObjectHandle],
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut redirects = HashMap::new();
+    for _ in 0..=handles.len() {
+        let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+        let mut next = HashMap::new();
+        for &handle in handles {
+            let Some(fingerprint) = hash_non_stream_object_with_redirects(
+                document,
+                handle,
+                b"form-resource-exact-object",
+                &redirects,
+            )?
+            else {
+                continue;
+            };
+            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical != handle {
+                    next.insert(handle, canonical);
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, handle);
+            }
+        }
+        if next == redirects {
+            return Ok(next);
+        }
+        redirects = next;
+    }
+    Ok(redirects)
+}
+
+fn exact_form_font_redirects_hayro(
+    document: &EditDocument,
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::new();
+    for handle in document.reachable_output_objects()? {
+        let Some(OwnedObject::Dictionary(dictionary)) = document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let Some(value) = dictionary.get(b"Type".as_slice()) else {
+            continue;
+        };
+        if !matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == b"Font")
+        {
+            continue;
+        }
+        let Some(fingerprint) = hash_non_stream_object_with_redirects(
+            document,
+            handle,
+            b"form-font-resource-dictionary",
+            exact_redirects,
+        )?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != handle {
+                redirects.insert(handle, canonical);
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, handle);
+        }
+    }
+    Ok(redirects)
+}
+
+fn hayro_stream_fingerprint_top_level_redirects(
+    document: &EditDocument,
+    stream: CowObjectHandle,
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<Option<[u8; 32]>> {
+    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(stream)?
+    else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+    let entries = dictionary
+        .iter()
+        .filter(|(key, _)| {
+            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+        })
+        .collect::<Vec<_>>();
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
+        hash_len_prefixed(&mut hasher, key);
+        if let OwnedObject::Reference(handle) = value {
+            hash_cow_handle(&mut hasher, canonical_cow_redirect(*handle, redirects));
+        } else {
+            hash_owned_object(&mut hasher, value)?;
+        }
+    }
+    Ok(Some(hasher.finalize().into()))
+}
+
+fn virtual_form_image_redirects_hayro(
+    document: &EditDocument,
+    images: &[CowObjectHandle],
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
+        &[b"Name"]
+    } else {
+        &[]
+    };
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::new();
+    for &image in images {
+        let Some(fingerprint) = hayro_stream_fingerprint_top_level_redirects(
+            document,
+            image,
+            b"form-resource-image",
+            ignored,
+            exact_redirects,
+        )?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != image {
+                redirects.insert(image, canonical);
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, image);
+        }
+    }
+    Ok(redirects)
+}
+
+fn redirect_reference_value(
+    value: &OwnedObject,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> OwnedObject {
+    match value {
+        OwnedObject::Reference(handle) => {
+            OwnedObject::Reference(canonical_cow_redirect(*handle, redirects))
+        }
+        _ => value.clone(),
+    }
+}
+
+fn resolved_dictionary_clone(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<OwnedDictionary>> {
+    Ok(document
+        .resolve_owned_value(value)?
+        .and_then(|object| match object {
+            OwnedObject::Dictionary(dictionary) => Some(dictionary),
+            OwnedObject::Stream { dictionary, .. } => Some(dictionary),
+            _ => None,
+        }))
+}
+
+fn normalized_named_form_resource_hayro(
+    document: &EditDocument,
+    value: &OwnedObject,
+    resource_kind: &[u8],
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<OwnedObject> {
+    let Some(dictionary) = resolved_dictionary_clone(document, value)? else {
+        return Ok(value.clone());
+    };
+    let normalized = dictionary
+        .into_iter()
+        .map(|(name, target)| {
+            let target = match resource_kind {
+                b"Font" => redirect_reference_value(&target, font_redirects),
+                b"XObject" => match &target {
+                    OwnedObject::Reference(handle) if form_redirects.contains_key(handle) => {
+                        redirect_reference_value(&target, form_redirects)
+                    }
+                    OwnedObject::Reference(_) => redirect_reference_value(&target, image_redirects),
+                    _ => target,
+                },
+                b"ColorSpace" | b"ExtGState" | b"Properties" => {
+                    redirect_reference_value(&target, exact_redirects)
+                }
+                _ => target,
+            };
+            (name, target)
+        })
+        .collect();
+    Ok(OwnedObject::Dictionary(normalized))
+}
+
+fn normalized_form_resources_hayro(
+    document: &EditDocument,
+    value: &OwnedObject,
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<OwnedObject> {
+    let Some(dictionary) = resolved_dictionary_clone(document, value)? else {
+        return Ok(value.clone());
+    };
+    let mut normalized = OwnedDictionary::new();
+    for (key, value) in dictionary {
+        let value = match key.as_slice() {
+            b"Font" | b"XObject" | b"ColorSpace" | b"ExtGState" | b"Properties" => {
+                normalized_named_form_resource_hayro(
+                    document,
+                    &value,
+                    &key,
+                    exact_redirects,
+                    font_redirects,
+                    image_redirects,
+                    form_redirects,
+                )?
+            }
+            b"ProcSet" => redirect_reference_value(&value, exact_redirects),
+            _ => value,
+        };
+        normalized.insert(key, value);
+    }
+    Ok(OwnedObject::Dictionary(normalized))
+}
+
+fn hayro_form_fingerprint(
+    document: &EditDocument,
+    form: CowObjectHandle,
+    ignored_dictionary_keys: &[&[u8]],
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(form)?
+    else {
+        return Ok(None);
+    };
+    let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
+        return Ok(None);
+    };
+    if !matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Form")
+    {
+        return Ok(None);
+    }
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, b"form-xobject");
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+    let entries = dictionary
+        .iter()
+        .filter(|(key, _)| {
+            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+        })
+        .collect::<Vec<_>>();
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
+        hash_len_prefixed(&mut hasher, key);
+        if key.as_slice() == b"Resources" {
+            let normalized = normalized_form_resources_hayro(
+                document,
+                value,
+                exact_redirects,
+                font_redirects,
+                image_redirects,
+                form_redirects,
+            )?;
+            hash_owned_object(&mut hasher, &normalized)?;
+        } else {
+            hash_owned_object(&mut hasher, value)?;
+        }
+    }
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn fixed_point_form_redirects_hayro(
+    document: &EditDocument,
+    forms: &[CowObjectHandle],
+    ignored_dictionary_keys: &[&[u8]],
+    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut redirects = HashMap::new();
+    for _ in 0..=forms.len() {
+        let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+        let mut next = HashMap::new();
+        for &form in forms {
+            let Some((fingerprint, _)) = hayro_form_fingerprint(
+                document,
+                form,
+                ignored_dictionary_keys,
+                exact_redirects,
+                font_redirects,
+                image_redirects,
+                &redirects,
+            )?
+            else {
+                continue;
+            };
+            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical != form {
+                    next.insert(form, canonical);
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, form);
+            }
+        }
+        if next == redirects {
+            return Ok(next);
+        }
+        redirects = next;
+    }
+    Ok(redirects)
+}
+
+fn inspect_widget_mk_targets(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            let is_widget = dictionary.get(b"Subtype".as_slice()).is_some_and(|value| {
+                matches!(document.resolve_owned_value(value), Ok(Some(OwnedObject::Name(name))) if name == b"Widget")
+            });
+            if is_widget {
+                if let Some(mk) = dictionary.get(b"MK".as_slice()) {
+                    match mk {
+                        OwnedObject::Reference(handle) => {
+                            targets.insert(DirectDictionaryTarget {
+                                root: *handle,
+                                path: Vec::new(),
+                            });
+                        }
+                        OwnedObject::Dictionary(_) => {
+                            let mut target_path = path.clone();
+                            target_path.push(DirectPathStep::DictKey(b"MK".to_vec()));
+                            targets.insert(DirectDictionaryTarget {
+                                root,
+                                path: target_path,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for (name, value) in dictionary {
+                if is_widget && name.as_slice() == b"MK" {
+                    continue;
+                }
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_widget_mk_targets(document, root, value, path, targets)?;
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_widget_mk_targets(document, root, value, path, targets)?;
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn widget_mk_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
+    let mut targets = BTreeSet::new();
+    for root in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(root)? else {
+            continue;
+        };
+        inspect_widget_mk_targets(document, root, &object, &mut Vec::new(), &mut targets)?;
+    }
+    Ok(targets)
+}
+
+fn rewrite_selected_dictionary_entries(
+    document: &mut EditDocument,
+    targets: &BTreeSet<DirectDictionaryTarget>,
+    keys: &[&[u8]],
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<usize> {
+    let mut rewritten = 0;
+    for target in targets {
+        let Some(snapshot) = document.current_owned_object(target.root)? else {
+            continue;
+        };
+        let Some(dictionary) =
+            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
+        else {
+            continue;
+        };
+        let mut changes = Vec::new();
+        for &key in keys {
+            let Some(OwnedObject::Reference(reference)) = dictionary.get(key) else {
+                continue;
+            };
+            let canonical = canonical_cow_redirect(*reference, redirects);
+            if canonical != *reference {
+                changes.push((key.to_vec(), canonical));
+            }
+        }
+        if changes.is_empty() {
+            continue;
+        }
+        let root = match target.root {
+            CowObjectHandle::Existing(id) => document.edit_object(id)?,
+            CowObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or(Error::MissingNewObject { index: id.index() })?,
+        };
+        let Some(dictionary) =
+            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
+        else {
+            continue;
+        };
+        for (key, canonical) in changes {
+            dictionary.insert(key, OwnedObject::Reference(canonical));
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
+}
+
+fn form_dependency_redirects_hayro(
+    document: &EditDocument,
+    ignored_form_dictionary_keys: &[&[u8]],
+) -> Result<(
+    Vec<CowObjectHandle>,
+    HashMap<CowObjectHandle, CowObjectHandle>,
+    HashMap<CowObjectHandle, CowObjectHandle>,
+    HashMap<CowObjectHandle, CowObjectHandle>,
+    HashMap<CowObjectHandle, CowObjectHandle>,
+)> {
+    let forms = reachable_streams_with_subtype(document, b"Form")?;
+    let images = reachable_streams_with_subtype(document, b"Image")?;
+    let resources = form_resource_handles(document, &forms)?;
+    let exact_redirects = exact_non_stream_resource_redirects_hayro(document, &resources)?;
+    let font_redirects = exact_form_font_redirects_hayro(document, &exact_redirects)?;
+    let image_redirects = virtual_form_image_redirects_hayro(document, &images, &exact_redirects)?;
+    let form_redirects = fixed_point_form_redirects_hayro(
+        document,
+        &forms,
+        ignored_form_dictionary_keys,
+        &exact_redirects,
+        &font_redirects,
+        &image_redirects,
+    )?;
+    Ok((
+        forms,
+        exact_redirects,
+        font_redirects,
+        image_redirects,
+        form_redirects,
+    ))
+}
+
+pub(crate) fn canonicalize_form_xobjects_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
+        &[b"Name"]
+    } else {
+        &[]
+    };
+    let (forms, _exact, _fonts, _images, redirects) =
+        form_dependency_redirects_hayro(document, ignored)?;
+    let mut duplicate_raw_bytes = 0_usize;
+    for &form in &forms {
+        if redirects.contains_key(&form)
+            && let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(form)?
+        {
+            duplicate_raw_bytes += data.bytes(document.source())?.len();
+        }
+    }
+    let xobject_targets = hayro_dictionary_targets(document, b"XObject")?;
+    let mut references_canonicalized =
+        rewrite_dictionary_target_entries(document, &xobject_targets, &redirects)?;
+    let icon_targets = widget_mk_targets(document)?;
+    references_canonicalized += rewrite_selected_dictionary_entries(
+        document,
+        &icon_targets,
+        &[b"I", b"RI", b"IX"],
+        &redirects,
+    )?;
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: redirects.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+fn appearance_dictionary_targets(
+    document: &EditDocument,
+) -> Result<BTreeSet<DirectDictionaryTarget>> {
+    let mut targets = hayro_dictionary_targets(document, b"AP")?;
+    let initial = targets.iter().cloned().collect::<Vec<_>>();
+    for target in initial {
+        let Some(snapshot) = document.current_owned_object(target.root)? else {
+            continue;
+        };
+        let Some(dictionary) =
+            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
+        else {
+            continue;
+        };
+        for key in [b"N".as_slice(), b"R".as_slice(), b"D".as_slice()] {
+            let Some(value) = dictionary.get(key) else {
+                continue;
+            };
+            match value {
+                OwnedObject::Reference(handle) => {
+                    if matches!(
+                        document.current_owned_object(*handle)?,
+                        Some(OwnedObject::Dictionary(_))
+                    ) {
+                        targets.insert(DirectDictionaryTarget {
+                            root: *handle,
+                            path: Vec::new(),
+                        });
+                    }
+                }
+                OwnedObject::Dictionary(_) => {
+                    let mut path = target.path.clone();
+                    path.push(DirectPathStep::DictKey(key.to_vec()));
+                    targets.insert(DirectDictionaryTarget {
+                        root: target.root,
+                        path,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(targets)
+}
+
+pub(crate) fn canonicalize_appearance_streams_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = appearance_dictionary_targets(document)?;
+    if holders.is_empty() {
+        return Ok(TargetedDedupStats::default());
+    }
+    let (_forms, exact_redirects, font_redirects, image_redirects, dependency_redirects) =
+        form_dependency_redirects_hayro(document, &[])?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    for holder in &holders {
+        let Some(snapshot) = document.current_owned_object(holder.root)? else {
+            continue;
+        };
+        let Some(dictionary) =
+            object_at_direct_path(&snapshot, &holder.path).and_then(OwnedObject::as_dictionary)
+        else {
+            continue;
+        };
+        for appearance in dictionary.values() {
+            let OwnedObject::Reference(appearance_ref) = appearance else {
+                continue;
+            };
+            let Some((fingerprint, raw_bytes)) = hayro_form_fingerprint(
+                document,
+                *appearance_ref,
+                &[],
+                &exact_redirects,
+                &font_redirects,
+                &image_redirects,
+                &dependency_redirects,
+            )?
+            else {
+                continue;
+            };
+            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+                if canonical != *appearance_ref {
+                    redirects.insert(*appearance_ref, canonical);
+                    if duplicate_refs.insert(*appearance_ref) {
+                        duplicate_raw_bytes += raw_bytes;
+                    }
+                }
+            } else {
+                canonical_by_fingerprint.insert(fingerprint, *appearance_ref);
+            }
+        }
+    }
+    let references_canonicalized =
+        rewrite_dictionary_target_entries(document, &holders, &redirects)?;
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PageContentHolder {
+    Dictionary(DirectReferenceHolder),
+    Array(DirectArrayReferenceHolder),
+}
+
+impl PageContentHolder {
+    fn target(&self) -> CowObjectHandle {
+        match self {
+            Self::Dictionary(holder) => holder.target,
+            Self::Array(holder) => holder.target,
+        }
+    }
+
+    fn rewrite(&self, document: &mut EditDocument, canonical: CowObjectHandle) -> Result<bool> {
+        match self {
+            Self::Dictionary(holder) => {
+                rewrite_direct_reference_holder(document, holder, canonical)
+            }
+            Self::Array(holder) => {
+                rewrite_direct_array_reference_holder(document, holder, canonical)
+            }
+        }
+    }
+}
+
+fn page_handles_hayro(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
+    let mut pages = BTreeSet::new();
+    pages.extend(
+        document
+            .source()
+            .page_ids()
+            .into_iter()
+            .map(CowObjectHandle::Existing),
+    );
+    for handle in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(value) = dictionary.get(b"Type".as_slice()) else {
+            continue;
+        };
+        if matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == b"Page")
+        {
+            pages.insert(handle);
+        }
+    }
+    Ok(pages.into_iter().collect())
+}
+
+fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
+    let mut holders = Vec::new();
+    for page in page_handles_hayro(document)? {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        match contents {
+            OwnedObject::Reference(target) => match document.current_owned_object(*target)? {
+                Some(OwnedObject::Stream { .. }) => {
+                    holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
+                        root: page,
+                        path: Vec::new(),
+                        key: b"Contents".to_vec(),
+                        target: *target,
+                    }))
+                }
+                Some(OwnedObject::Array(values)) => {
+                    for (index, value) in values.iter().enumerate() {
+                        let OwnedObject::Reference(stream) = value else {
+                            continue;
+                        };
+                        if matches!(
+                            document.current_owned_object(*stream)?,
+                            Some(OwnedObject::Stream { .. })
+                        ) {
+                            holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
+                                root: *target,
+                                path: Vec::new(),
+                                index,
+                                target: *stream,
+                            }));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OwnedObject::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    let OwnedObject::Reference(stream) = value else {
+                        continue;
+                    };
+                    if matches!(
+                        document.current_owned_object(*stream)?,
+                        Some(OwnedObject::Stream { .. })
+                    ) {
+                        holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
+                            root: page,
+                            path: vec![DirectPathStep::DictKey(b"Contents".to_vec())],
+                            index,
+                            target: *stream,
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(holders)
+}
+
+pub(crate) fn canonicalize_page_contents_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = page_content_holders_hayro(document)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0_usize;
+    for holder in &holders {
+        let stream = holder.target();
+        let Some((fingerprint, raw_bytes)) =
+            hayro_stream_fingerprint(document, stream, b"page-content")?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != stream {
+                redirects.insert(stream, canonical);
+                if duplicate_refs.insert(stream) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, stream);
+        }
+    }
+    let mut references_canonicalized = 0;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.target()).copied() else {
+            continue;
+        };
+        if holder.rewrite(document, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
     Ok(TargetedDedupStats {
         duplicate_streams_detected: duplicate_refs.len(),
         duplicate_raw_bytes,

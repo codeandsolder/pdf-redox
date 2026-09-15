@@ -56,6 +56,15 @@ impl SourcePdf {
         self.pdf.pages().len()
     }
 
+    /// Object identifiers of pages resolved from the source page tree.
+    pub fn page_ids(&self) -> Vec<ObjectId> {
+        self.pdf
+            .pages()
+            .iter()
+            .filter_map(|page| page.raw().obj_id().map(Into::into))
+            .collect()
+    }
+
     /// Effective PDF version reported by Hayro.
     pub fn version(&self) -> PdfVersion {
         self.pdf.version()
@@ -567,6 +576,25 @@ impl EditDocument {
         ]))
     }
 
+    /// Canonicalize exact duplicate metadata streams referenced through `/Metadata`.
+    #[doc(hidden)]
+    pub fn canonicalize_metadata_streams_experimental(
+        &mut self,
+    ) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_metadata_streams_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
     /// Canonicalize exact duplicate embedded font-program streams.
     #[doc(hidden)]
     pub fn canonicalize_font_programs_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
@@ -588,6 +616,93 @@ impl EditDocument {
     #[doc(hidden)]
     pub fn canonicalize_to_unicode_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
         let stats = crate::dedup::canonicalize_to_unicode_cmaps_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
+    /// Canonicalize exact duplicate annotation appearance Form streams.
+    #[doc(hidden)]
+    pub fn canonicalize_appearance_streams_experimental(
+        &mut self,
+    ) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_appearance_streams_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
+    /// Canonicalize exact duplicate page content streams.
+    #[doc(hidden)]
+    pub fn canonicalize_page_contents_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_page_contents_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
+    /// Canonicalize exact duplicate Form XObjects through their exact resource graphs.
+    #[doc(hidden)]
+    pub fn canonicalize_form_xobjects_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_form_xobjects_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
+    /// Canonicalize exact duplicate Image XObjects.
+    #[doc(hidden)]
+    pub fn canonicalize_image_xobjects_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_image_xobjects_hayro(self)?;
+        Ok(BTreeMap::from([
+            (
+                "duplicate-streams-detected".to_owned(),
+                stats.duplicate_streams_detected,
+            ),
+            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
+            (
+                "references-canonicalized".to_owned(),
+                stats.references_canonicalized,
+            ),
+        ]))
+    }
+
+    /// Canonicalize exact duplicate ICC profile streams used by `[/ICCBased …]` arrays.
+    #[doc(hidden)]
+    pub fn canonicalize_icc_profiles_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
+        let stats = crate::dedup::canonicalize_icc_profiles_hayro(self)?;
         Ok(BTreeMap::from([
             (
                 "duplicate-streams-detected".to_owned(),
