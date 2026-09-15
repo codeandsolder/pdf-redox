@@ -3,7 +3,7 @@ use crate::{
     OwnedObject, Result, StreamData,
 };
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
-use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Object as HayroObject};
+use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
@@ -2087,7 +2087,7 @@ pub(crate) fn canonicalize_font_program_streams_hayro(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum DirectPathStep {
     DictKey(Vec<u8>),
     ArrayIndex(usize),
@@ -2365,6 +2365,367 @@ pub(crate) fn canonicalize_to_unicode_cmaps_hayro(
             continue;
         };
         if rewrite_to_unicode_holder(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct DirectDictionaryTarget {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HayroType3GlyphHolder {
+    target: DirectDictionaryTarget,
+    name: Vec<u8>,
+    glyph: CowObjectHandle,
+}
+
+fn object_at_direct_path<'a>(
+    mut object: &'a OwnedObject,
+    path: &[DirectPathStep],
+) -> Option<&'a OwnedObject> {
+    for step in path {
+        object = match step {
+            DirectPathStep::DictKey(key) => object.as_dictionary()?.get(key.as_slice())?,
+            DirectPathStep::ArrayIndex(index) => match object {
+                OwnedObject::Array(values) => values.get(*index)?,
+                _ => return None,
+            },
+        };
+    }
+    Some(object)
+}
+
+fn inspect_hayro_type3_dictionary(
+    root: CowObjectHandle,
+    dictionary: &hayro_syntax::object::Dict<'_>,
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) {
+    let is_type3 = dictionary
+        .get::<HayroName<'_>>(b"Subtype")
+        .is_some_and(|name| name.as_ref() == b"Type3");
+    if is_type3 {
+        if let Some(charprocs) = dictionary.get_ref(b"CharProcs") {
+            targets.insert(DirectDictionaryTarget {
+                root: CowObjectHandle::Existing(charprocs.into()),
+                path: Vec::new(),
+            });
+        } else if matches!(
+            dictionary.get_raw::<HayroObject<'_>>(b"CharProcs"),
+            Some(HayroMaybeRef::NotRef(HayroObject::Dict(_)))
+        ) {
+            let mut target_path = path.clone();
+            target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
+            targets.insert(DirectDictionaryTarget {
+                root,
+                path: target_path,
+            });
+        }
+    }
+
+    for (name, value) in dictionary.entries() {
+        if name.as_ref() == b"CharProcs" {
+            continue;
+        }
+        let HayroMaybeRef::NotRef(value) = value else {
+            continue;
+        };
+        path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+        inspect_hayro_type3_object(root, &value, path, targets);
+        path.pop();
+    }
+}
+
+fn inspect_hayro_type3_object(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            inspect_hayro_type3_dictionary(root, dictionary, path, targets);
+        }
+        HayroObject::Stream(stream) => {
+            inspect_hayro_type3_dictionary(root, stream.dict(), path, targets);
+        }
+        HayroObject::Array(array) => {
+            for (index, value) in array.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_hayro_type3_object(root, &value, path, targets);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn owned_dictionary_is_type3(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<bool> {
+    let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        document.resolve_owned_value(subtype)?,
+        Some(OwnedObject::Name(name)) if name == b"Type3"
+    ))
+}
+
+fn inspect_owned_type3_object(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if owned_dictionary_is_type3(document, dictionary)? {
+                match dictionary.get(b"CharProcs".as_slice()) {
+                    Some(OwnedObject::Reference(charprocs)) => {
+                        targets.insert(DirectDictionaryTarget {
+                            root: *charprocs,
+                            path: Vec::new(),
+                        });
+                    }
+                    Some(OwnedObject::Dictionary(_)) => {
+                        let mut target_path = path.clone();
+                        target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
+                        targets.insert(DirectDictionaryTarget {
+                            root,
+                            path: target_path,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for (name, value) in dictionary {
+                if name.as_slice() == b"CharProcs" || matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_type3_object(document, root, value, path, targets)?;
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_type3_object(document, root, value, path, targets)?;
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+    Ok(())
+}
+
+fn hayro_type3_charproc_targets(
+    document: &EditDocument,
+) -> Result<BTreeSet<DirectDictionaryTarget>> {
+    let mut targets = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = document.output_roots();
+
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let references = match handle {
+            CowObjectHandle::Existing(id) => match document.overlay().change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    inspect_owned_type3_object(
+                        document,
+                        handle,
+                        object,
+                        &mut Vec::new(),
+                        &mut targets,
+                    )?;
+                    object.references()
+                }
+                Some(ExistingObjectChange::Delete) => {
+                    return Err(Error::DeletedReferencedObject {
+                        number: id.number(),
+                        generation: id.generation(),
+                    });
+                }
+                None => {
+                    let (object, references) = match document.source().object_with_references(id) {
+                        Ok(value) => value,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    inspect_hayro_type3_object(handle, &object, &mut Vec::new(), &mut targets);
+                    references
+                        .into_iter()
+                        .map(CowObjectHandle::Existing)
+                        .collect()
+                }
+            },
+            CowObjectHandle::New(id) => {
+                let object = document
+                    .overlay()
+                    .added(id)
+                    .ok_or(Error::MissingNewObject { index: id.index() })?;
+                inspect_owned_type3_object(
+                    document,
+                    handle,
+                    object,
+                    &mut Vec::new(),
+                    &mut targets,
+                )?;
+                object.references()
+            }
+        };
+        for reference in references {
+            if !seen.contains(&reference) {
+                pending.push(reference);
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn hayro_type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
+    let mut holders = Vec::new();
+    for target in hayro_type3_charproc_targets(document)? {
+        let Some(root) = document.current_owned_object(target.root)? else {
+            continue;
+        };
+        let Some(charprocs) = object_at_direct_path(&root, &target.path) else {
+            continue;
+        };
+        let Some(dictionary) = charprocs.as_dictionary() else {
+            continue;
+        };
+        for (name, glyph) in dictionary {
+            let OwnedObject::Reference(glyph) = glyph else {
+                continue;
+            };
+            holders.push(HayroType3GlyphHolder {
+                target: target.clone(),
+                name: name.clone(),
+                glyph: *glyph,
+            });
+        }
+    }
+    Ok(holders)
+}
+
+fn hayro_type3_glyph_fingerprint(
+    document: &EditDocument,
+    glyph: CowObjectHandle,
+) -> Result<Option<([u8; 32], usize)>> {
+    let Some(object) = document.current_owned_object(glyph)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, b"type3-charproc");
+    hash_len_prefixed(&mut hasher, raw.as_ref());
+    let semantic_entries = dictionary
+        .iter()
+        .filter(|(key, _)| key.as_slice() != b"Length")
+        .collect::<Vec<_>>();
+    hasher.update((semantic_entries.len() as u64).to_le_bytes());
+    for (key, value) in semantic_entries {
+        hash_len_prefixed(&mut hasher, key);
+        hash_owned_object(&mut hasher, value)?;
+    }
+    Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn rewrite_type3_glyph_holder(
+    document: &mut EditDocument,
+    holder: &HayroType3GlyphHolder,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let root = match holder.target.root {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(Error::MissingNewObject { index: id.index() })?,
+    };
+    let Some(charprocs) = object_at_direct_path_mut(root, &holder.target.path) else {
+        return Ok(false);
+    };
+    let Some(dictionary) = charprocs.as_dictionary_mut() else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.name.as_slice()) else {
+        return Ok(false);
+    };
+    if *current != holder.glyph {
+        return Ok(false);
+    }
+    dictionary.insert(holder.name.clone(), OwnedObject::Reference(canonical));
+    Ok(true)
+}
+
+pub(crate) fn canonicalize_type3_charprocs_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let holders = hayro_type3_glyph_holders(document)?;
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
+    let mut duplicate_raw_bytes = 0_usize;
+
+    for holder in &holders {
+        let Some((fingerprint, raw_bytes)) = hayro_type3_glyph_fingerprint(document, holder.glyph)?
+        else {
+            continue;
+        };
+        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != holder.glyph {
+                redirects.insert(holder.glyph, canonical);
+                if duplicate_refs.insert(holder.glyph) {
+                    duplicate_raw_bytes += raw_bytes;
+                }
+            }
+        } else {
+            canonical_by_fingerprint.insert(fingerprint, holder.glyph);
+        }
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.glyph).copied() else {
+            continue;
+        };
+        if rewrite_type3_glyph_holder(document, holder, canonical)? {
             references_canonicalized += 1;
         }
     }
@@ -3885,6 +4246,99 @@ mod tests {
             .object_ref();
         assert_eq!(first_ref, second_ref);
         assert_ne!(first_ref, different_ref);
+        Ok(())
+    }
+
+    fn serialized_type3_charproc_dedup_fixture() -> Result<Vec<u8>> {
+        let mut pdf = Pdf::empty()?;
+        let payload = b"500 0 0 0 500 700 d1 0 0 500 700 re f";
+        let first = type3_charproc_stream(&mut pdf, payload, None)?;
+        let second = type3_charproc_stream(&mut pdf, payload, None)?;
+        let third = type3_charproc_stream(&mut pdf, payload, None)?;
+        let different = type3_charproc_stream(
+            &mut pdf,
+            payload,
+            Some((b"/PrivateMarker", ObjectHandle::integer(1))),
+        )?;
+
+        let first_font = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type3".to_vec())),
+            (
+                b"/CharProcs".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"/A".to_vec(), first),
+                    (b"/Different".to_vec(), different),
+                ]),
+            ),
+        ]);
+        let second_font = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type3".to_vec())),
+            (
+                b"/CharProcs".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/B".to_vec(), second)]),
+            ),
+        ]);
+        let third_charprocs = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(b"/C".to_vec(), third)]))?;
+        let third_font = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type3".to_vec())),
+            (b"/CharProcs".to_vec(), third_charprocs),
+        ]);
+        let fonts = ObjectHandle::dictionary(vec![
+            (b"/F1".to_vec(), first_font),
+            (b"/Nested".to_vec(), ObjectHandle::array(vec![second_font])),
+            (b"/F3".to_vec(), third_font),
+        ]);
+        let root = pdf.root_handle()?;
+        root.replace_key(b"/TestType3Fonts", fonts)?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.write()?;
+        Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn hayro_type3_charproc_dedup_matches_flpdf_for_direct_and_indirect_charprocs() -> Result<()> {
+        let input = serialized_type3_charproc_dedup_fixture()?;
+        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
+        let expected = canonicalize_type3_charprocs(&mut flpdf)?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let actual = canonicalize_type3_charprocs_hayro(&mut document)?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.duplicate_streams_detected, 2);
+        assert_eq!(actual.references_canonicalized, 2);
+
+        let output = document.write_compact_experimental()?;
+        let mut reparsed = Pdf::open(Cursor::new(output))?;
+        let fonts = reparsed.root_handle()?.try_get_key(b"/TestType3Fonts")?;
+        let first = fonts
+            .try_get_key(b"/F1")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/A")?
+            .object_ref();
+        let second = fonts
+            .try_get_key(b"/Nested")?
+            .try_get_array_item(0)?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/B")?
+            .object_ref();
+        let third = fonts
+            .try_get_key(b"/F3")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/C")?
+            .object_ref();
+        let different = fonts
+            .try_get_key(b"/F1")?
+            .try_get_key(b"/CharProcs")?
+            .try_get_key(b"/Different")?
+            .object_ref();
+        assert_eq!(first, second);
+        assert_eq!(first, third);
+        assert_ne!(first, different);
         Ok(())
     }
 

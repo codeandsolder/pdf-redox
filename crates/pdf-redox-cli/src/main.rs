@@ -199,6 +199,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             document.canonicalize_to_unicode_experimental()?
         };
+        let type3_charproc_dedup = if a.no_type3_charproc_dedup {
+            Default::default()
+        } else {
+            document.canonicalize_type3_charprocs_experimental()?
+        };
         let page_count = document.source().page_count();
         let source_objects = document.source().object_count();
         let output = document.write_compact_experimental()?;
@@ -229,6 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "font_optimization": font_optimization,
                 "font_program_dedup": font_program_dedup,
                 "to_unicode_dedup": to_unicode_dedup,
+                "type3_charproc_dedup": type3_charproc_dedup,
             });
             if out_path.as_os_str() == "-" {
                 eprintln!("{}", serde_json::to_string(&summary)?);
