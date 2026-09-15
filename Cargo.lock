@@ -396,12 +396,14 @@ dependencies = [
 [[package]]
 name = "hayro-ccitt"
 version = "0.3.0"
-source = "git+https://github.com/LaurenzV/hayro.git?rev=a728f7cb6826c1e167973b8fd71867ebb4cf39af#a728f7cb6826c1e167973b8fd71867ebb4cf39af"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f4d0e94ddd48749f06bbe4e5389fb9799a0c45bcaf00495042076ef05e3241a"
 
 [[package]]
 name = "hayro-jbig2"
 version = "0.3.0"
-source = "git+https://github.com/LaurenzV/hayro.git?rev=a728f7cb6826c1e167973b8fd71867ebb4cf39af#a728f7cb6826c1e167973b8fd71867ebb4cf39af"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69374b3668dd45aeb3d3145cda68f2c7b4f223aaa2511e67d076f1c7d741388d"
 dependencies = [
  "hayro-ccitt",
 ]
@@ -409,12 +411,12 @@ dependencies = [
 [[package]]
 name = "hayro-jpeg2000"
 version = "0.4.0"
-source = "git+https://github.com/LaurenzV/hayro.git?rev=a728f7cb6826c1e167973b8fd71867ebb4cf39af#a728f7cb6826c1e167973b8fd71867ebb4cf39af"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bab0c77d09c0d9b144d429d0bf0fcd4c63c01d5f6c33f9b8ed501283e0f1ef76"
 
 [[package]]
 name = "hayro-syntax"
 version = "0.7.2"
-source = "git+https://github.com/LaurenzV/hayro.git?rev=a728f7cb6826c1e167973b8fd71867ebb4cf39af#a728f7cb6826c1e167973b8fd71867ebb4cf39af"
 dependencies = [
  "hayro-jbig2",
  "hayro-jpeg2000",

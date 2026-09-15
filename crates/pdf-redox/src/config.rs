@@ -228,8 +228,8 @@ pub struct Config {
     pub normalize_content_streams: bool,
     /// Policy for preserving or recompressing existing Flate streams.
     pub flate_policy: FlatePolicy,
-    /// Remove unused `/Font` and `/XObject` resource entries using flpdf's
-    /// qpdf-compatible parse-gated pruning pass. Experimental until corpus validation.
+    /// Remove unused `/Font` and `/XObject` resource entries using the
+    /// parse-gated Hayro/COW pruning pass. Experimental until corpus validation.
     pub prune_resources: bool,
     /// Canonicalize byte- and dictionary-identical `/Metadata` streams so a fresh rewrite
     /// can garbage-collect duplicate XMP objects.

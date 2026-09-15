@@ -1,9 +1,7 @@
-//! Compact generic writer for the Hayro/COW migration.
+//! Compact fresh writer for the production Hayro/COW document graph.
 //!
-//! This is intentionally not wired into the production optimizer yet. The body
-//! graph is fully Hayro/COW-backed and trailer semantic state is owned by the
-//! edit document. The writer is exercised independently before optimizer passes
-//! migrate onto it.
+//! Trailer semantic state is owned by the edit document; unreachable objects and
+//! incremental-update history are omitted from the rewritten output.
 
 use crate::{EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result};
 use hayro_syntax::{
@@ -448,6 +446,188 @@ const fn version_bytes(version: PdfVersion) -> &'static [u8] {
         PdfVersion::Pdf16 => b"1.6",
         PdfVersion::Pdf17 => b"1.7",
         PdfVersion::Pdf20 => b"2.0",
+    }
+}
+
+const OBJECTS_PER_STREAM: usize = 100;
+
+fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
+    Ok(match handle {
+        ObjectHandle::Existing(id) => match document.overlay().change(id) {
+            Some(ExistingObjectChange::Replace(object)) => {
+                matches!(object, OwnedObject::Stream { .. })
+            }
+            Some(ExistingObjectChange::Delete) => {
+                return Err(Error::DeletedReferencedObject {
+                    number: id.number(),
+                    generation: id.generation(),
+                });
+            }
+            None => matches!(document.source().object(id)?, Object::Stream(_)),
+        },
+        ObjectHandle::New(id) => matches!(
+            document
+                .overlay()
+                .added(id)
+                .ok_or(Error::MissingNewObject { index: id.index() })?,
+            OwnedObject::Stream { .. }
+        ),
+    })
+}
+
+fn zlib_encode(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
+    use flate2::{Compression, write::ZlibEncoder};
+    let compression = if (0..=9).contains(&level) {
+        Compression::new(level as u32)
+    } else {
+        Compression::default()
+    };
+    let mut encoder = ZlibEncoder::new(Vec::new(), compression);
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+fn write_objstm(
+    output: &mut Vec<u8>,
+    document: &EditDocument,
+    plan: &OutputPlan,
+    handles: &[ObjectHandle],
+    level: i32,
+) -> Result<()> {
+    let mut body = Vec::new();
+    let mut header = Vec::new();
+    for handle in handles {
+        let id = plan.id(*handle)?;
+        write!(&mut header, "{} {} ", id.0, body.len())?;
+        write_handle_object(&mut body, document, plan, *handle)?;
+        body.push(b'\n');
+    }
+    let first = header.len();
+    header.extend_from_slice(&body);
+    let encoded = zlib_encode(&header, level)?;
+    write!(
+        output,
+        "<< /Type /ObjStm /N {} /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+        handles.len(),
+        first,
+        encoded.len()
+    )?;
+    output.extend_from_slice(&encoded);
+    output.extend_from_slice(b"\nendstream");
+    Ok(())
+}
+
+fn push_xref_stream_entry(output: &mut Vec<u8>, kind: u8, field2: u64, field3: u16) {
+    output.push(kind);
+    output.extend_from_slice(&field2.to_be_bytes());
+    output.extend_from_slice(&field3.to_be_bytes());
+}
+
+fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<Vec<u8>> {
+    let plan = OutputPlan::new(document)?;
+    let mut compressed = BTreeMap::<ObjectHandle, (u32, u16)>::new();
+    let mut objstm_groups = Vec::<Vec<ObjectHandle>>::new();
+    let mut current = Vec::new();
+    let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
+    for handle in plan.order.iter().copied() {
+        if handle == catalog_handle || current_handle_is_stream(document, handle)? {
+            continue;
+        }
+        current.push(handle);
+        if current.len() == OBJECTS_PER_STREAM {
+            objstm_groups.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        objstm_groups.push(current);
+    }
+
+    let base_count = plan.order.len() as u32;
+    for (group_index, group) in objstm_groups.iter().enumerate() {
+        let objstm_id = base_count + group_index as u32 + 1;
+        for (index, handle) in group.iter().copied().enumerate() {
+            compressed.insert(handle, (objstm_id, index as u16));
+        }
+    }
+    let xref_id = base_count + objstm_groups.len() as u32 + 1;
+    let size = xref_id + 1;
+
+    let mut output = Vec::with_capacity(document.source().bytes().len());
+    output.extend_from_slice(b"%PDF-");
+    let version = document.source().version().max(PdfVersion::Pdf15);
+    output.extend_from_slice(version_bytes(version));
+    output.extend_from_slice(b"\n%\xE2\xE3\xCF\xD3\n");
+
+    let mut normal_offsets = BTreeMap::<u32, usize>::new();
+    for handle in plan.order.iter().copied() {
+        if compressed.contains_key(&handle) {
+            continue;
+        }
+        let id = plan.id(handle)?;
+        normal_offsets.insert(id.0, output.len());
+        writeln!(&mut output, "{} 0 obj", id.0)?;
+        write_handle_object(&mut output, document, &plan, handle)?;
+        output.extend_from_slice(b"\nendobj\n");
+    }
+
+    for (group_index, group) in objstm_groups.iter().enumerate() {
+        let id = base_count + group_index as u32 + 1;
+        normal_offsets.insert(id, output.len());
+        writeln!(&mut output, "{} 0 obj", id)?;
+        write_objstm(&mut output, document, &plan, group, level)?;
+        output.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = output.len();
+    normal_offsets.insert(xref_id, xref_offset);
+    let mut xref_data = Vec::with_capacity(size as usize * 11);
+    push_xref_stream_entry(&mut xref_data, 0, 0, 65535);
+    let mut compressed_by_id = BTreeMap::<u32, (u32, u16)>::new();
+    for (handle, entry) in &compressed {
+        compressed_by_id.insert(plan.id(*handle)?.0, *entry);
+    }
+    for id in 1..size {
+        if let Some(&(objstm, index)) = compressed_by_id.get(&id) {
+            push_xref_stream_entry(&mut xref_data, 2, u64::from(objstm), index);
+        } else {
+            let offset = normal_offsets.get(&id).copied().ok_or_else(|| {
+                Error::Invalid(format!("missing xref-stream offset for output object {id}"))
+            })?;
+            push_xref_stream_entry(&mut xref_data, 1, offset as u64, 0);
+        }
+    }
+    let encoded_xref = zlib_encode(&xref_data, level)?;
+
+    writeln!(&mut output, "{} 0 obj", xref_id)?;
+    output.extend_from_slice(b"<< /Type /XRef /Size ");
+    write!(&mut output, "{}", size)?;
+    output.extend_from_slice(b" /W [1 8 2] /Root ");
+    write!(&mut output, "{} 0 R", plan.catalog.0)?;
+    for (name, value) in document.trailer() {
+        output.push(b' ');
+        write_pdf_name(&mut output, name);
+        output.push(b' ');
+        write_owned_object(&mut output, value, document, &plan)?;
+    }
+    output.extend_from_slice(b" /Filter /FlateDecode /Length ");
+    write!(&mut output, "{}", encoded_xref.len())?;
+    output.extend_from_slice(b" >>\nstream\n");
+    output.extend_from_slice(&encoded_xref);
+    output.extend_from_slice(b"\nendstream\nendobj\nstartxref\n");
+    writeln!(&mut output, "{xref_offset}")?;
+    output.extend_from_slice(b"%%EOF\n");
+    Ok(output)
+}
+
+pub(crate) fn write_pdf_with_options(
+    document: &EditDocument,
+    generate_object_streams: bool,
+    compression_level: i32,
+) -> Result<Vec<u8>> {
+    if generate_object_streams {
+        write_pdf_with_object_streams(document, compression_level)
+    } else {
+        write_pdf(document)
     }
 }
 

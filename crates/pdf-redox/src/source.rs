@@ -1,5 +1,5 @@
 use crate::{Error, Result, SourceLoadError};
-use flpdf::{ObjectHandle as FlObjectHandle, Pdf as FlPdf};
+use flpdf::{DecodeLevel, ObjectHandle as FlObjectHandle};
 use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
@@ -7,18 +7,9 @@ use hayro_syntax::{
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    io::Cursor,
+    rc::Rc,
     sync::Arc,
 };
-
-#[derive(Clone)]
-struct SharedSource(Arc<Vec<u8>>);
-
-impl AsRef<[u8]> for SharedSource {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-}
 
 /// Immutable, lazily parsed source PDF backed by Hayro.
 ///
@@ -49,6 +40,16 @@ impl SourcePdf {
     /// Number of objects indexed by the source cross-reference graph.
     pub fn object_count(&self) -> usize {
         self.pdf.len()
+    }
+
+    /// Object identifiers indexed by the source cross-reference graph.
+    pub(crate) fn object_ids(&self) -> Vec<ObjectId> {
+        self.pdf
+            .xref()
+            .object_ids()
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     /// Number of pages in the source page tree.
@@ -133,29 +134,43 @@ impl SourcePdf {
         Ok(stream.raw_data())
     }
 
+    /// Return fully decoded bytes of a source stream on demand.
+    pub fn decoded_stream_data(&self, id: ObjectId) -> Result<Cow<'_, [u8]>> {
+        let stream =
+            self.pdf
+                .xref()
+                .get::<Stream<'_>>(id.into())
+                .ok_or(Error::ExpectedSourceStream {
+                    number: id.number,
+                    generation: id.generation,
+                })?;
+        stream
+            .decoded()
+            .map_err(|error| Error::Invalid(format!("failed to decode source stream: {error:?}")))
+    }
+
     /// Return trailer entries that belong to document semantics rather than
     /// the input xref/encryption machinery.
     ///
-    /// This is a transitional bridge until Hayro exposes its already-parsed
-    /// trailer dictionary publicly. flpdf reads the same shared source bytes,
-    /// and the returned values are immediately converted into pdf-redox COS
-    /// values without resolving indirect children.
+    /// The vendored Hayro accessor exposes the final already-parsed trailer
+    /// dictionary, so document construction no longer reparses the PDF through
+    /// a second parser merely to preserve `/Info`, `/ID`, or custom roots.
     pub(crate) fn preserved_trailer(&self) -> Result<OwnedDictionary> {
-        let mut pdf = FlPdf::open(Cursor::new(SharedSource(self.bytes.clone())))?;
-        let trailer = pdf.trailer();
-        let entries = trailer.try_get_dict_as_map()?;
-        let xref_stream = entries
-            .get(b"/Type".as_slice())
-            .and_then(FlObjectHandle::as_name)
-            .is_some_and(|name| name == b"XRef");
+        let Some(trailer) = self.pdf.xref().trailer() else {
+            return Ok(OwnedDictionary::new());
+        };
+        let xref_stream = trailer.entries().any(|(name, value)| {
+            name.as_ref() == b"Type"
+                && matches!(value, MaybeRef::NotRef(Object::Name(value)) if value.as_ref() == b"XRef")
+        });
 
         let mut preserved = OwnedDictionary::new();
-        for (key, value) in entries {
-            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+        for (name, value) in trailer.entries() {
+            let name = name.as_ref();
             if is_writer_owned_trailer_key(name, xref_stream) {
                 continue;
             }
-            preserved.insert(name.to_vec(), owned_from_flpdf(&value, 0)?);
+            preserved.insert(name.to_vec(), owned_from_maybe_ref(value));
         }
         Ok(preserved)
     }
@@ -181,7 +196,7 @@ fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
             )
 }
 
-fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
+pub(crate) fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
     if depth > MAX_TRAILER_NESTING {
         return Err(Error::Invalid(
             "trailer direct-object nesting exceeds the supported limit".to_owned(),
@@ -196,6 +211,11 @@ fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject
             ObjectId::new(number, i32::from(reference.generation)),
         )));
     }
+
+    // Detached flpdf helper results may carry lazily provided direct values.
+    // Force only those non-reference handles to materialize before inspecting
+    // their concrete type; source indirect references have already returned.
+    let _ = handle.type_name()?;
     if handle.is_null() {
         return Ok(OwnedObject::Null);
     }
@@ -220,6 +240,20 @@ fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject
             .map(|value| owned_from_flpdf(value, depth + 1))
             .collect::<Result<Vec<_>>>()?;
         return Ok(OwnedObject::Array(values));
+    }
+    if let Some(stream_dictionary) = handle.as_stream_dict() {
+        let mut dictionary = OwnedDictionary::new();
+        let entries = stream_dictionary.as_dictionary().ok_or_else(|| {
+            Error::Invalid("direct trailer stream dictionary is not a dictionary".to_owned())
+        })?;
+        for (key, value) in entries {
+            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+            dictionary.insert(name.to_vec(), owned_from_flpdf(&value, depth + 1)?);
+        }
+        return Ok(OwnedObject::Stream {
+            dictionary,
+            data: StreamData::Owned(handle.get_raw_stream_data()?.as_ref().clone()),
+        });
     }
     if let Some(entries) = handle.as_dictionary() {
         let mut dictionary = OwnedDictionary::new();
@@ -487,6 +521,121 @@ impl EditDocument {
 
     /// Materialize the current value of an object handle from either the source
     /// graph or the COW overlay without mutating the document.
+    pub(crate) fn detached_flpdf_object(&self, value: &OwnedObject) -> Result<FlObjectHandle> {
+        self.owned_to_flpdf_detached(value, 0)
+    }
+
+    fn owned_to_flpdf_detached(&self, value: &OwnedObject, depth: usize) -> Result<FlObjectHandle> {
+        if depth > 256 {
+            return Err(Error::Invalid(
+                "detached COS conversion nesting exceeds supported depth".to_owned(),
+            ));
+        }
+        match value {
+            OwnedObject::Reference(handle) => {
+                let Some(value) = self.current_owned_object(*handle)? else {
+                    return Ok(FlObjectHandle::null());
+                };
+                self.owned_to_flpdf_detached(&value, depth + 1)
+            }
+            OwnedObject::Null => Ok(FlObjectHandle::null()),
+            OwnedObject::Boolean(value) => Ok(FlObjectHandle::boolean(*value)),
+            OwnedObject::Integer(value) => Ok(FlObjectHandle::integer(*value)),
+            OwnedObject::Real(value) => Ok(FlObjectHandle::real(*value)),
+            OwnedObject::Name(value) => Ok(FlObjectHandle::name(value.clone())),
+            OwnedObject::String(value) => Ok(FlObjectHandle::string(value.clone())),
+            OwnedObject::Array(values) => Ok(FlObjectHandle::array(
+                values
+                    .iter()
+                    .map(|value| self.owned_to_flpdf_detached(value, depth + 1))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            OwnedObject::Dictionary(dictionary) => Ok(FlObjectHandle::dictionary(
+                dictionary
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            [b"/".as_slice(), key.as_slice()].concat(),
+                            self.owned_to_flpdf_detached(value, depth + 1)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            OwnedObject::Stream { dictionary, data } => {
+                let bytes = data.bytes(self.source())?.into_owned();
+                let mut entries = dictionary
+                    .iter()
+                    .filter(|(key, _)| key.as_slice() != b"Length")
+                    .map(|(key, value)| {
+                        Ok((
+                            [b"/".as_slice(), key.as_slice()].concat(),
+                            self.owned_to_flpdf_detached(value, depth + 1)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entries.push((
+                    b"/Length".to_vec(),
+                    FlObjectHandle::integer(bytes.len() as i64),
+                ));
+                let dictionary = FlObjectHandle::dictionary(entries);
+                Ok(FlObjectHandle::stream(dictionary, Rc::new(bytes)))
+            }
+        }
+    }
+
+    /// Decode a current stream value through flpdf's standalone filter codecs.
+    ///
+    /// Only filter-related dictionary entries are materialized into the
+    /// detached helper object. Decoding does not need resources, metadata, or
+    /// other semantic stream keys, and avoiding them prevents unrelated COS
+    /// cycles/deep graphs from being copied merely to inflate a stream.
+    pub(crate) fn decoded_owned_stream_data(
+        &self,
+        stream: &OwnedObject,
+        level: DecodeLevel,
+    ) -> Result<Vec<u8>> {
+        let OwnedObject::Stream { dictionary, data } = stream else {
+            return Err(Error::Invalid("object is not a stream".to_owned()));
+        };
+        let bytes = data.bytes(self.source())?.into_owned();
+        let mut entries = Vec::new();
+        for key in [
+            b"Filter".as_slice(),
+            b"DecodeParms".as_slice(),
+            b"F".as_slice(),
+            b"FFilter".as_slice(),
+            b"FDecodeParms".as_slice(),
+        ] {
+            let Some(value) = dictionary.get(key) else {
+                continue;
+            };
+            entries.push((
+                [b"/".as_slice(), key].concat(),
+                self.owned_to_flpdf_detached(value, 0)?,
+            ));
+        }
+        entries.push((
+            b"/Length".to_vec(),
+            FlObjectHandle::integer(bytes.len() as i64),
+        ));
+        let handle = FlObjectHandle::stream(FlObjectHandle::dictionary(entries), Rc::new(bytes));
+        Ok(handle.get_stream_data(level)?.as_ref().clone())
+    }
+
+    /// Decode a current indirect stream through the standalone filter-codec bridge.
+    pub(crate) fn decoded_stream_data(
+        &self,
+        handle: ObjectHandle,
+        level: DecodeLevel,
+    ) -> Result<Vec<u8>> {
+        let Some(stream) = self.current_owned_object(handle)? else {
+            return Err(Error::Invalid(
+                "stream reference resolves to null".to_owned(),
+            ));
+        };
+        self.decoded_owned_stream_data(&stream, level)
+    }
+
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
@@ -530,217 +679,123 @@ impl EditDocument {
         }
     }
 
-    /// Apply the first migrated privacy pass to the Hayro/COW graph.
-    ///
-    /// This removes trailer `/Info` and `/ID` plus reachable dictionary
-    /// `/Metadata`, `/PieceInfo`, and `/LastModified` entries. JPEG marker
-    /// scrubbing and best-effort privacy operations remain on the flpdf path.
-    #[doc(hidden)]
-    pub fn scrub_metadata_privacy_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        Ok(crate::scrub::scrub_edit_document_metadata(self)?.removed)
-    }
-
-    /// Apply the currently migrated dictionary-only privacy operations.
-    ///
-    /// This migration API rejects configuration knobs whose specialized
-    /// JPEG/attachment/signature implementations have not moved yet.
-    #[doc(hidden)]
-    pub fn scrub_cos_privacy_experimental(
-        &mut self,
-        cfg: &crate::PrivacyConfig,
-    ) -> Result<BTreeMap<String, usize>> {
-        Ok(crate::scrub::scrub_edit_document_cos_privacy(self, cfg)?.removed)
-    }
-
-    /// Strip embedded sfnt tables that PDF rendering does not consume.
-    #[doc(hidden)]
-    pub fn strip_font_editing_tables_experimental(
-        &mut self,
-        flate_level: i32,
-    ) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::font::strip_font_editing_tables_hayro(self, flate_level)?;
-        Ok(BTreeMap::from([
-            ("programs-optimized".to_owned(), stats.programs_optimized),
-            (
-                "original-encoded-bytes".to_owned(),
-                stats.original_encoded_bytes,
-            ),
-            (
-                "optimized-encoded-bytes".to_owned(),
-                stats.optimized_encoded_bytes,
-            ),
-            (
-                "decoded-table-bytes-removed".to_owned(),
-                stats.decoded_table_bytes_removed,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate metadata streams referenced through `/Metadata`.
-    #[doc(hidden)]
-    pub fn canonicalize_metadata_streams_experimental(
-        &mut self,
-    ) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_metadata_streams_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate embedded font-program streams.
-    #[doc(hidden)]
-    pub fn canonicalize_font_programs_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_font_program_streams_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate ToUnicode CMap streams, including holders nested in direct objects.
-    #[doc(hidden)]
-    pub fn canonicalize_to_unicode_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_to_unicode_cmaps_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate annotation appearance Form streams.
-    #[doc(hidden)]
-    pub fn canonicalize_appearance_streams_experimental(
-        &mut self,
-    ) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_appearance_streams_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate page content streams.
-    #[doc(hidden)]
-    pub fn canonicalize_page_contents_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_page_contents_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate Form XObjects through their exact resource graphs.
-    #[doc(hidden)]
-    pub fn canonicalize_form_xobjects_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_form_xobjects_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate Image XObjects.
-    #[doc(hidden)]
-    pub fn canonicalize_image_xobjects_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_image_xobjects_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate ICC profile streams used by `[/ICCBased …]` arrays.
-    #[doc(hidden)]
-    pub fn canonicalize_icc_profiles_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_icc_profiles_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Canonicalize exact duplicate Type3 glyph streams referenced through `/CharProcs`.
-    #[doc(hidden)]
-    pub fn canonicalize_type3_charprocs_experimental(&mut self) -> Result<BTreeMap<String, usize>> {
-        let stats = crate::dedup::canonicalize_type3_charprocs_hayro(self)?;
-        Ok(BTreeMap::from([
-            (
-                "duplicate-streams-detected".to_owned(),
-                stats.duplicate_streams_detected,
-            ),
-            ("duplicate-raw-bytes".to_owned(), stats.duplicate_raw_bytes),
-            (
-                "references-canonicalized".to_owned(),
-                stats.references_canonicalized,
-            ),
-        ]))
-    }
-
-    /// Write the current Hayro/COW graph as a compact fresh PDF.
-    ///
-    /// This is an experimental migration API and is not used by [`crate::optimize_pdf`]
-    /// yet. Trailer-only semantic state such as `/Info`, `/ID`, and extension
-    /// entries is owned by this edit document after construction, so later COW
-    /// passes can mutate it just like indirect document state.
-    pub fn write_compact_experimental(&self) -> Result<Vec<u8>> {
+    /// Write the current COW graph as a compact fresh PDF using classic xref output.
+    /// Production optimization normally selects writer options through `Config`.
+    pub fn write_compact(&self) -> Result<Vec<u8>> {
         crate::writer::write_pdf(self)
+    }
+
+    /// Current indirect page handles, including overlay-added/replaced page dictionaries.
+    pub(crate) fn page_handles(&self) -> Result<Vec<ObjectHandle>> {
+        // Walk the raw current page tree ourselves instead of relying on
+        // Hayro's cached `Pages`. Hayro deliberately falls back to a
+        // brute-force object scan when a damaged page tree defeats its typed
+        // traversal, and that fallback cannot preserve page order. Stable page
+        // numbers are part of hidden-text finding IDs and per-page policy.
+        let catalog_handle = ObjectHandle::Existing(self.source.catalog_id());
+        let Some(catalog) = self.current_owned_object(catalog_handle)? else {
+            return Ok(Vec::new());
+        };
+        let Some(catalog) = catalog.as_dictionary() else {
+            return Ok(Vec::new());
+        };
+        let Some(root) = catalog.get(b"Pages".as_slice()).cloned() else {
+            return Ok(Vec::new());
+        };
+
+        let mut pages = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            let (handle, object) = match value {
+                OwnedObject::Reference(handle) => {
+                    if !seen.insert(handle) {
+                        continue;
+                    }
+                    let Some(object) = self.current_owned_object(handle)? else {
+                        continue;
+                    };
+                    (Some(handle), object)
+                }
+                object => (None, object),
+            };
+            let Some(dictionary) = object.as_dictionary() else {
+                continue;
+            };
+
+            let kind = match dictionary.get(b"Type".as_slice()) {
+                Some(value) => self.resolve_owned_value(value)?,
+                None => None,
+            };
+            if matches!(kind, Some(OwnedObject::Name(name)) if name == b"Page") {
+                if let Some(handle) = handle {
+                    pages.push(handle);
+                }
+                continue;
+            }
+
+            let Some(kids) = dictionary.get(b"Kids".as_slice()) else {
+                // Be lenient with damaged leaf page dictionaries that omit
+                // `/Type /Page`, matching PDF readers' common recovery path.
+                if let Some(handle) = handle
+                    && dictionary.contains_key(b"Parent".as_slice())
+                {
+                    pages.push(handle);
+                }
+                continue;
+            };
+            let Some(OwnedObject::Array(kids)) = self.resolve_owned_value(kids)? else {
+                continue;
+            };
+            for kid in kids.into_iter().rev() {
+                pending.push(kid);
+            }
+        }
+
+        if !pages.is_empty() {
+            return Ok(pages);
+        }
+
+        // Last-resort recovery for files whose raw page tree is too damaged to
+        // traverse. This may not preserve order, but retaining readable pages
+        // is preferable to returning an empty document.
+        Ok(self
+            .source
+            .page_ids()
+            .into_iter()
+            .map(ObjectHandle::Existing)
+            .collect())
+    }
+
+    /// Resolve one inheritable page-tree value from a current page dictionary.
+    pub(crate) fn inherited_page_value(
+        &self,
+        page: ObjectHandle,
+        key: &[u8],
+    ) -> Result<Option<OwnedObject>> {
+        let Some(mut object) = self.current_owned_object(page)? else {
+            return Ok(None);
+        };
+        let mut seen = BTreeSet::new();
+        for _ in 0..=100 {
+            let Some(dictionary) = object.as_dictionary() else {
+                return Ok(None);
+            };
+            if let Some(value) = dictionary.get(key) {
+                return Ok(Some(value.clone()));
+            }
+            let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice()) else {
+                return Ok(None);
+            };
+            if !seen.insert(*parent) {
+                return Ok(None);
+            }
+            let Some(parent_object) = self.current_owned_object(*parent)? else {
+                return Ok(None);
+            };
+            object = parent_object;
+        }
+        Ok(None)
     }
 
     /// Collect all objects reachable from the document catalog after applying

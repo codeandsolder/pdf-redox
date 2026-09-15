@@ -1,25 +1,27 @@
 use crate::{
-    Config, FlatePolicy, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
+    Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{analyze_pdf, input_sha256},
+    content::normalize_page_contents_hayro,
     dedup::{
-        canonicalize_appearance_streams, canonicalize_font_program_streams,
-        canonicalize_form_xobjects, canonicalize_icc_profiles, canonicalize_image_xobjects,
-        canonicalize_metadata_streams, canonicalize_page_contents, canonicalize_to_unicode_cmaps,
-        canonicalize_type3_charprocs,
+        canonicalize_appearance_streams_hayro, canonicalize_font_program_streams_hayro,
+        canonicalize_form_xobjects_hayro, canonicalize_icc_profiles_hayro,
+        canonicalize_image_xobjects_hayro, canonicalize_metadata_streams_hayro,
+        canonicalize_page_contents_hayro, canonicalize_to_unicode_cmaps_hayro,
+        canonicalize_type3_charprocs_hayro,
     },
-    flate::apply_flate_policy,
-    font::strip_font_editing_tables,
-    hidden_text::apply_hidden_text_policy,
-    preservation::{PreservationStats, apply_preservation_policy},
-    print::{PrintPlan, plan_print_downsampling},
-    scrub::scrub_pdf,
+    flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
+    font::strip_font_editing_tables_hayro,
+    hidden_text::apply_hidden_text_policy_hayro,
+    images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
+    inline_images::externalize_duplicate_inline_images_hayro,
+    preservation::{PreservationStats, apply_preservation_policy_hayro},
+    print::{PrintPlanHayro, plan_print_downsampling_hayro},
+    prune::prune_resources_hayro,
+    scrub::scrub_edit_document_cos_privacy,
 };
-use flpdf::{
-    ImageOptimizationOptions, ImageOptimizationStats, ObjectStreamMode, PageDocumentHelper, Pdf,
-    PdfWriter, QPDFLogger, StreamDataMode, externalize_duplicate_inline_images,
-    optimize_images_with_resize_targets, optimize_images_with_stats,
-};
-use std::io::Cursor;
+use flpdf::{ImageOptimizationOptions, ImageOptimizationStats};
+#[cfg(test)]
+use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
 
 fn validate_config(cfg: &Config) -> Result<()> {
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
@@ -69,39 +71,39 @@ fn optimize_pdf_with_before(
     cfg: &Config,
     before: PdfAnalysis,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
-    let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
+    let mut document = EditDocument::from_bytes(input.to_vec())?;
     let preservation = if cfg.preservation == crate::PreservationConfig::functional() {
         PreservationStats::default()
     } else {
-        apply_preservation_policy(&mut pdf, &cfg.preservation)?
+        apply_preservation_policy_hayro(&mut document, &cfg.preservation)?
     };
-    let hidden_text = apply_hidden_text_policy(&mut pdf, &cfg.hidden_text)?;
-    let scrub = scrub_pdf(&mut pdf, &cfg.privacy)?;
-    // Strip rendering-irrelevant embedded-font editing/layout tables before
-    // font-program dedup. Different producer subsets can become identical once
-    // non-rendering font state is removed, increasing the later dedup win.
+    let hidden_text = apply_hidden_text_policy_hayro(&mut document, &cfg.hidden_text)?;
+    let scrub = scrub_edit_document_cos_privacy(&mut document, &cfg.privacy)?;
+
+    // Strip rendering-irrelevant editing/layout state before font-program
+    // dedup so producer subsets can converge to the same program.
     let font_rendering = if cfg.preservation.font_editing_support {
         Default::default()
     } else {
-        strip_font_editing_tables(&mut pdf, cfg.flate_level)?
+        strip_font_editing_tables_hayro(&mut document, cfg.flate_level)?
     };
     let metadata_dedup = if cfg.deduplicate_metadata_streams {
-        canonicalize_metadata_streams(&mut pdf)?
+        canonicalize_metadata_streams_hayro(&mut document)?
     } else {
         Default::default()
     };
     let font_dedup = if cfg.deduplicate_font_programs {
-        canonicalize_font_program_streams(&mut pdf)?
+        canonicalize_font_program_streams_hayro(&mut document)?
     } else {
         Default::default()
     };
     let to_unicode_dedup = if cfg.deduplicate_to_unicode_cmaps {
-        canonicalize_to_unicode_cmaps(&mut pdf)?
+        canonicalize_to_unicode_cmaps_hayro(&mut document)?
     } else {
         Default::default()
     };
     let icc_dedup = if cfg.deduplicate_icc_profiles {
-        canonicalize_icc_profiles(&mut pdf)?
+        canonicalize_icc_profiles_hayro(&mut document)?
     } else {
         Default::default()
     };
@@ -109,48 +111,47 @@ fn optimize_pdf_with_before(
         && before.duplicate_inline_image_payload_wasted_bytes
             >= cfg.inline_image_min_duplicate_payload_bytes
     {
-        externalize_duplicate_inline_images(
-            &mut pdf,
+        externalize_duplicate_inline_images_hayro(
+            &mut document,
             0,
             cfg.inline_image_min_duplicate_payload_bytes,
         )?
     } else {
         Default::default()
     };
-    // Canonicalize exact source images after duplicate inline-image
-    // externalization and before any raster transform. This lets newly
-    // externalized images share existing byte-identical Image XObjects and
-    // gives lossy transforms one canonical source identity, avoiding
-    // duplicate decode/resample/re-encode work.
+
+    // Exact image canonicalization follows inline-image externalization so the
+    // latter can converge with already-existing Image XObjects.
     let image_dedup = if cfg.deduplicate_image_xobjects {
-        canonicalize_image_xobjects(&mut pdf)?
+        canonicalize_image_xobjects_hayro(&mut document)?
     } else {
         Default::default()
     };
     let form_dedup = if cfg.deduplicate_form_xobjects {
-        canonicalize_form_xobjects(&mut pdf)?
+        canonicalize_form_xobjects_hayro(&mut document)?
     } else {
         Default::default()
     };
     let appearance_dedup = if cfg.deduplicate_appearance_streams {
-        canonicalize_appearance_streams(&mut pdf)?
+        canonicalize_appearance_streams_hayro(&mut document)?
     } else {
         Default::default()
     };
     let type3_charproc_dedup = if cfg.deduplicate_type3_charprocs {
-        canonicalize_type3_charprocs(&mut pdf)?
+        canonicalize_type3_charprocs_hayro(&mut document)?
     } else {
         Default::default()
     };
+
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
             let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
-            match plan_print_downsampling(&mut pdf, u32::from(target_ppi)) {
+            match plan_print_downsampling_hayro(&document, u32::from(target_ppi)) {
                 Ok(plan) => (plan, None),
-                Err(error) => (PrintPlan::default(), Some(error.to_string())),
+                Err(error) => (PrintPlanHayro::default(), Some(error.to_string())),
             }
         }
-        _ => (PrintPlan::default(), None),
+        _ => (PrintPlanHayro::default(), None),
     };
     let raster_transform = match &cfg.image_policy {
         ImagePolicy::Preserve => ImageOptimizationStats::default(),
@@ -162,12 +163,8 @@ fn optimize_pdf_with_before(
             if print_plan.resize_targets.is_empty() {
                 ImageOptimizationStats::default()
             } else {
-                let logger = QPDFLogger::create();
-                optimize_images_with_resize_targets(
-                    &mut pdf,
-                    &logger,
-                    "pdf-redox",
-                    false,
+                optimize_images_with_resize_targets_hayro(
+                    &mut document,
                     ImageOptimizationOptions {
                         min_width: 0,
                         min_height: 0,
@@ -187,52 +184,41 @@ fn optimize_pdf_with_before(
             jpeg_quality,
             min_savings_percent,
             ..
-        } => {
-            let logger = QPDFLogger::create();
-            optimize_images_with_stats(
-                &mut pdf,
-                &logger,
-                "pdf-redox",
-                false,
-                ImageOptimizationOptions {
-                    keep_inline_images: true,
-                    jpeg_quality: *jpeg_quality,
-                    min_savings_bytes: 1,
-                    min_savings_percent: *min_savings_percent,
-                    ..ImageOptimizationOptions::default()
-                },
-            )?
-        }
+        } => optimize_images_hayro(
+            &mut document,
+            ImageOptimizationOptions {
+                keep_inline_images: true,
+                jpeg_quality: *jpeg_quality,
+                min_savings_bytes: 1,
+                min_savings_percent: *min_savings_percent,
+                ..ImageOptimizationOptions::default()
+            },
+        )?,
     };
+
     if cfg.prune_resources {
-        PageDocumentHelper::new(&mut pdf).remove_unreferenced_resources()?;
+        prune_resources_hayro(&mut document)?;
     }
-    let flate = apply_flate_policy(&mut pdf, cfg.flate_policy, cfg.flate_level)?;
-    // Content streams must be canonicalized after every transform that can
-    // mutate them (hidden-text removal, inline-image externalization, and
-    // Flate recompression). Sharing them earlier would couple later writes
-    // across pages that originally had independent stream objects.
+    let flate = apply_flate_policy_hayro(&mut document, cfg.flate_policy, cfg.flate_level)?;
+    if cfg.normalize_content_streams {
+        normalize_page_contents_hayro(&mut document)?;
+    }
+    // Content streams are canonicalized only after every pass that can mutate
+    // them, including lexical normalization.
     let page_content_dedup = if cfg.deduplicate_page_contents {
-        canonicalize_page_contents(&mut pdf)?
+        canonicalize_page_contents_hayro(&mut document)?
     } else {
         Default::default()
     };
 
-    let mut writer = PdfWriter::new(&mut pdf);
-    writer.set_output_memory()?;
-    writer.set_preserve_unreferenced_objects(false);
-    writer.set_stream_data_mode(StreamDataMode::Compress);
-    writer.set_recompress_flate(matches!(cfg.flate_policy, FlatePolicy::RecompressAll));
-    writer.set_compression_level(cfg.flate_level);
-    writer.set_content_normalization(cfg.normalize_content_streams);
-    writer.set_object_stream_mode(if cfg.generate_object_streams {
-        ObjectStreamMode::Generate
-    } else {
-        ObjectStreamMode::Preserve
-    });
-    writer.set_suppress_original_object_ids(true);
-    writer.write()?;
-    let output = writer.get_buffer()?;
+    // Match the historical writer's StreamDataMode::Compress policy explicitly
+    // before handing the graph to the deliberately-simple fresh writer.
+    compress_unfiltered_streams_hayro(&mut document, cfg.flate_level)?;
+    let output = crate::writer::write_pdf_with_options(
+        &document,
+        cfg.generate_object_streams,
+        cfg.flate_level,
+    )?;
 
     let mut notes = Vec::new();
     if cfg.preservation != crate::PreservationConfig::functional() {

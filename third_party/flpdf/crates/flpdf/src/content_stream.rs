@@ -127,6 +127,20 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     parse_content_stream_handles_internal(input, context, source_description, callbacks).map(|_| ())
 }
 
+/// Parse detached decoded content bytes through the qpdf-shaped object callback boundary.
+///
+/// This is intentionally document-agnostic: callers provide already-decoded bytes, and
+/// malformed-content diagnostics are returned as errors because there is no owning PDF
+/// warning sink. It exists so higher-level consumers can reuse flpdf's proven lexical/COS
+/// content parser without adopting flpdf's mutable document model.
+pub fn parse_detached_content_stream<C: ObjectHandleParserCallbacks>(
+    input: &[u8],
+    source_description: &str,
+    callbacks: &mut C,
+) -> Result<()> {
+    parse_content_stream_handles(input, None, source_description, callbacks)
+}
+
 fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
     input: &[u8],
     context: Option<Rc<dyn DocumentResolver>>,

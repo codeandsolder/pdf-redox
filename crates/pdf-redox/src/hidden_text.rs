@@ -1,19 +1,39 @@
-use crate::Result;
 use crate::config::HiddenTextPolicy;
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
 };
+use crate::{EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result};
 use flpdf::{
-    DecodeLevel, Matrix, ObjectHandle, ObjectHandleParserCallbacks, ObjectRef, PageObjectHelper,
-    ParseControl, Pdf, Rectangle,
+    DecodeLevel, Matrix, ObjectHandle, ObjectHandleParserCallbacks, ObjectRef, ParseControl,
+    Rectangle,
 };
+#[cfg(test)]
+use flpdf::{PageObjectHelper, Pdf};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
 use std::io::{Read, Seek};
+#[cfg(test)]
 use std::rc::Rc;
 
 const ALPHA_INVISIBLE: f64 = 0.001;
 const ALPHA_OPAQUE: f64 = 0.995;
 const COVERAGE_THRESHOLD: f64 = 0.97;
+
+type ObjectKey = (i32, i32);
+
+fn flpdf_object_key(reference: ObjectRef) -> ObjectKey {
+    (
+        i32::try_from(reference.number).unwrap_or(i32::MAX),
+        i32::from(reference.generation),
+    )
+}
+
+fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
+    match handle {
+        CowObjectHandle::Existing(id) => Some((id.number(), id.generation())),
+        CowObjectHandle::New(_) => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -210,7 +230,7 @@ struct Resources {
     fonts: BTreeMap<Vec<u8>, FontInfo>,
     ext_gstates: BTreeMap<Vec<u8>, ExtGStateInfo>,
     images: BTreeMap<Vec<u8>, bool>,
-    properties: BTreeMap<Vec<u8>, Option<ObjectRef>>,
+    properties: BTreeMap<Vec<u8>, Option<ObjectKey>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -312,9 +332,9 @@ struct PageScanner<'a> {
     page_number: usize,
     crop: Rect,
     resources: &'a Resources,
-    hidden_ocgs: &'a BTreeSet<ObjectRef>,
+    hidden_ocgs: &'a BTreeSet<ObjectKey>,
     base_ocg_off: bool,
-    on_ocgs: &'a BTreeSet<ObjectRef>,
+    on_ocgs: &'a BTreeSet<ObjectKey>,
     graphics: GraphicsState,
     graphics_stack: Vec<(GraphicsState, TextState)>,
     text: TextState,
@@ -332,9 +352,9 @@ impl<'a> PageScanner<'a> {
         page_number: usize,
         crop: Rect,
         resources: &'a Resources,
-        hidden_ocgs: &'a BTreeSet<ObjectRef>,
+        hidden_ocgs: &'a BTreeSet<ObjectKey>,
         base_ocg_off: bool,
-        on_ocgs: &'a BTreeSet<ObjectRef>,
+        on_ocgs: &'a BTreeSet<ObjectKey>,
     ) -> Self {
         Self {
             page_number,
@@ -554,9 +574,9 @@ impl<'a> PageScanner<'a> {
                     && let Some(object_ref) = properties.object_ref()
                 {
                     optional_hidden = if self.base_ocg_off {
-                        !self.on_ocgs.contains(&object_ref)
+                        !self.on_ocgs.contains(&flpdf_object_key(object_ref))
                     } else {
-                        self.hidden_ocgs.contains(&object_ref)
+                        self.hidden_ocgs.contains(&flpdf_object_key(object_ref))
                     };
                 }
                 if let Ok(value) = properties.try_get_key(b"/ActualText")
@@ -964,24 +984,16 @@ pub(crate) struct HiddenTextApplyStats {
 }
 
 struct OptionalContentState {
-    off: BTreeSet<ObjectRef>,
-    on: BTreeSet<ObjectRef>,
+    off: BTreeSet<ObjectKey>,
+    on: BTreeSet<ObjectKey>,
     base_off: bool,
 }
 
-pub(crate) fn analyze_hidden_text<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-) -> Result<Vec<HiddenTextFinding>> {
-    let ocg = optional_content_state(pdf)?;
-    let page_refs = flpdf::pages::page_refs(pdf)?;
-    let mut findings = Vec::new();
-    for (index, page_ref) in page_refs.into_iter().enumerate() {
-        let scan = scan_page(pdf, page_ref, index + 1, &ocg)?;
-        findings.extend(scan.findings.into_iter().map(|finding| finding.public));
-    }
-    Ok(findings)
-}
-
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "retained only until final flpdf/Hayro hidden-text parity sweep"
+)]
 pub(crate) fn apply_hidden_text_policy<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     policy: &HiddenTextPolicy,
@@ -1037,6 +1049,78 @@ pub(crate) fn apply_hidden_text_policy<R: Read + Seek + 'static>(
     Ok(stats)
 }
 
+fn replace_page_content_hayro(
+    document: &mut EditDocument,
+    page: CowObjectHandle,
+    decoded: Vec<u8>,
+) -> Result<()> {
+    let stream = CowObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+        dictionary: OwnedDictionary::new(),
+        data: crate::StreamData::Owned(decoded),
+    }));
+    let object = match page {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document
+            .overlay_mut()
+            .added_mut(id)
+            .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+    };
+    if let Some(dictionary) = object.as_dictionary_mut() {
+        dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
+    }
+    Ok(())
+}
+
+pub(crate) fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
+    let ocg = optional_content_state_hayro(document)?;
+    let pages = document.page_handles()?;
+    let mut findings = Vec::new();
+    for (index, page) in pages.into_iter().enumerate() {
+        let scan = scan_page_hayro(document, page, index + 1, &ocg)?;
+        findings.extend(scan.findings.into_iter().map(|finding| finding.public));
+    }
+    Ok(findings)
+}
+
+pub(crate) fn apply_hidden_text_policy_hayro(
+    document: &mut EditDocument,
+    policy: &HiddenTextPolicy,
+) -> Result<HiddenTextApplyStats> {
+    if policy.remove_categories.is_empty() && policy.overrides.is_empty() {
+        return Ok(HiddenTextApplyStats::default());
+    }
+    let ocg = optional_content_state_hayro(document)?;
+    let pages = document.page_handles()?;
+    let mut stats = HiddenTextApplyStats::default();
+    for (index, page) in pages.into_iter().enumerate() {
+        let mut scan = scan_page_hayro(document, page, index + 1, &ocg)?;
+        scan.findings
+            .retain(|finding| policy.should_remove(&finding.public));
+        if scan.findings.is_empty() {
+            continue;
+        }
+        let decoded = page_content_bytes_hayro(document, page)?;
+        let selected: BTreeSet<String> = scan
+            .findings
+            .iter()
+            .map(|finding| finding.public.id.clone())
+            .collect();
+        let mut ranges: Vec<(usize, usize)> = scan_page_hayro(document, page, index + 1, &ocg)?
+            .findings
+            .into_iter()
+            .filter(|finding| selected.contains(&finding.public.id))
+            .map(|finding| (finding.span_start, finding.span_end))
+            .collect();
+        if ranges.is_empty() {
+            continue;
+        }
+        ranges.sort_unstable();
+        stats.removed += ranges.len();
+        replace_page_content_hayro(document, page, remove_ranges(&decoded, &ranges))?;
+    }
+    Ok(stats)
+}
+
 fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0;
@@ -1051,6 +1135,449 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
+fn resolved_dictionary_hayro(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Option<OwnedDictionary>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(document
+        .resolve_owned_value(value)?
+        .and_then(|value| value.as_dictionary().cloned()))
+}
+
+fn resolved_array_hayro(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Vec<OwnedObject>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Array(values)) => values,
+        _ => Vec::new(),
+    })
+}
+
+fn resolved_name_hayro(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Vec<u8>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Name(name)) => name,
+        _ => Vec::new(),
+    })
+}
+
+fn resolved_u32_hayro(document: &EditDocument, value: &OwnedObject) -> Result<Option<u32>> {
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Integer(value)) => u32::try_from(value).ok(),
+        _ => None,
+    })
+}
+
+fn build_fonts_hayro(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeMap<Vec<u8>, FontInfo>> {
+    let Some(fonts) = resolved_dictionary_hayro(document, resources.get(b"Font".as_slice()))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in &fonts {
+        let Some(font) = resolved_dictionary_hayro(document, Some(value))? else {
+            continue;
+        };
+        out.insert(key.clone(), font_info_hayro(document, &font)?);
+    }
+    Ok(out)
+}
+
+fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
+    let mut info = FontInfo::default();
+    let subtype = resolved_name_hayro(document, font.get(b"Subtype".as_slice()))?;
+    let encoding = resolved_name_hayro(document, font.get(b"Encoding".as_slice()))?;
+    info.identity_two_byte =
+        subtype == b"Type0" && matches!(encoding.as_slice(), b"Identity-H" | b"Identity-V");
+    if info.identity_two_byte {
+        info.max_code_bytes = 2;
+    }
+
+    if let Some(to_unicode) = font.get(b"ToUnicode".as_slice())
+        && let Some(stream) = document.resolve_owned_value(to_unicode)?
+        && matches!(stream, OwnedObject::Stream { .. })
+        && let Ok(data) = document.decoded_owned_stream_data(&stream, DecodeLevel::Generalized)
+    {
+        info.unicode = parse_to_unicode(&data);
+        if let Some(max) = info.unicode.keys().map(Vec::len).max() {
+            info.max_code_bytes = info.max_code_bytes.max(max);
+        }
+    }
+
+    if subtype == b"Type0" {
+        let descendants = resolved_array_hayro(document, font.get(b"DescendantFonts".as_slice()))?;
+        if let Some(descendant) = descendants.first()
+            && let Some(descendant) = resolved_dictionary_hayro(document, Some(descendant))?
+        {
+            if let Some(dw) = descendant.get(b"DW".as_slice())
+                && let Some(value) = owned_number_value(document, dw)?
+            {
+                info.default_width = value;
+            } else {
+                info.default_width = 1000.0;
+            }
+            if let Some(widths) = descendant.get(b"W".as_slice()) {
+                parse_cid_widths_hayro(document, widths, &mut info.widths)?;
+            }
+        }
+    } else {
+        let first = match font.get(b"FirstChar".as_slice()) {
+            Some(value) => resolved_u32_hayro(document, value)?.unwrap_or(0),
+            None => 0,
+        };
+        let widths = resolved_array_hayro(document, font.get(b"Widths".as_slice()))?;
+        for (offset, width) in widths.iter().enumerate() {
+            if let Some(width) = owned_number_value(document, width)? {
+                info.widths.insert(
+                    first.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
+                    width,
+                );
+            }
+        }
+    }
+    Ok(info)
+}
+
+fn parse_cid_widths_hayro(
+    document: &EditDocument,
+    widths: &OwnedObject,
+    out: &mut HashMap<u32, f64>,
+) -> Result<()> {
+    let items = resolved_array_hayro(document, Some(widths))?;
+    let mut index = 0;
+    while index < items.len() {
+        let Some(start) = resolved_u32_hayro(document, &items[index])? else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+        let Some(next) = items.get(index) else {
+            break;
+        };
+        let array = resolved_array_hayro(document, Some(next))?;
+        if !array.is_empty() {
+            for (offset, width) in array.iter().enumerate() {
+                if let Some(width) = owned_number_value(document, width)? {
+                    out.insert(
+                        start.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
+                        width,
+                    );
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(end) = resolved_u32_hayro(document, next)? {
+            index += 1;
+            let Some(width) = items.get(index) else {
+                break;
+            };
+            if let Some(width) = owned_number_value(document, width)? {
+                for code in start..=end.min(start.saturating_add(65_535)) {
+                    out.insert(code, width);
+                }
+            }
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn build_ext_gstates_hayro(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeMap<Vec<u8>, ExtGStateInfo>> {
+    let Some(states) = resolved_dictionary_hayro(document, resources.get(b"ExtGState".as_slice()))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in &states {
+        let Some(state) = resolved_dictionary_hayro(document, Some(value))? else {
+            continue;
+        };
+        let fill_alpha = match state.get(b"ca".as_slice()) {
+            Some(value) => owned_number_value(document, value)?,
+            None => None,
+        };
+        let stroke_alpha = match state.get(b"CA".as_slice()) {
+            Some(value) => owned_number_value(document, value)?,
+            None => None,
+        };
+        let normal_blend = match state.get(b"BM".as_slice()) {
+            None => true,
+            Some(value) => match document.resolve_owned_value(value)? {
+                None | Some(OwnedObject::Null) => true,
+                Some(OwnedObject::Name(name)) => name == b"Normal",
+                _ => false,
+            },
+        };
+        out.insert(
+            key.clone(),
+            ExtGStateInfo {
+                fill_alpha,
+                stroke_alpha,
+                normal_blend,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn build_images_hayro(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeMap<Vec<u8>, bool>> {
+    let Some(xobjects) = resolved_dictionary_hayro(document, resources.get(b"XObject".as_slice()))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in &xobjects {
+        let Some(object) = document.resolve_owned_value(value)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, .. } = object else {
+            out.insert(key.clone(), false);
+            continue;
+        };
+        let is_image =
+            resolved_name_hayro(document, dictionary.get(b"Subtype".as_slice()))? == b"Image";
+        let unmasked = is_image
+            && !dictionary.contains_key(b"SMask".as_slice())
+            && !dictionary.contains_key(b"Mask".as_slice());
+        out.insert(key.clone(), unmasked);
+    }
+    Ok(out)
+}
+
+fn build_properties_hayro(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeMap<Vec<u8>, Option<ObjectKey>>> {
+    let Some(value) = resources.get(b"Properties".as_slice()) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(properties) = document.resolve_owned_value(value)? else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(properties) = properties.as_dictionary() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in properties {
+        let object_key = match value {
+            OwnedObject::Reference(handle) => cow_object_key(*handle),
+            _ => None,
+        };
+        out.insert(key.clone(), object_key);
+    }
+    Ok(out)
+}
+
+fn build_resources_hayro(
+    document: &EditDocument,
+    resources_value: Option<OwnedObject>,
+    _ocg: &OptionalContentState,
+) -> Result<Resources> {
+    let resources = match resources_value {
+        Some(value) => document.resolve_owned_value(&value)?,
+        None => None,
+    };
+    let dictionary = resources
+        .as_ref()
+        .and_then(OwnedObject::as_dictionary)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Resources {
+        fonts: build_fonts_hayro(document, &dictionary)?,
+        ext_gstates: build_ext_gstates_hayro(document, &dictionary)?,
+        images: build_images_hayro(document, &dictionary)?,
+        properties: build_properties_hayro(document, &dictionary)?,
+    })
+}
+
+fn optional_content_state_hayro(document: &EditDocument) -> Result<OptionalContentState> {
+    let mut out = OptionalContentState {
+        off: BTreeSet::new(),
+        on: BTreeSet::new(),
+        base_off: false,
+    };
+    let catalog = CowObjectHandle::Existing(document.source().catalog_id());
+    let Some(catalog) = document.current_owned_object(catalog)? else {
+        return Ok(out);
+    };
+    let Some(catalog) = catalog.as_dictionary() else {
+        return Ok(out);
+    };
+    let Some(ocp) = catalog.get(b"OCProperties".as_slice()) else {
+        return Ok(out);
+    };
+    let Some(ocp) = document.resolve_owned_value(ocp)? else {
+        return Ok(out);
+    };
+    let Some(ocp) = ocp.as_dictionary() else {
+        return Ok(out);
+    };
+    let Some(default) = ocp.get(b"D".as_slice()) else {
+        return Ok(out);
+    };
+    let Some(default) = document.resolve_owned_value(default)? else {
+        return Ok(out);
+    };
+    let Some(default) = default.as_dictionary() else {
+        return Ok(out);
+    };
+    if let Some(base) = default.get(b"BaseState".as_slice()) {
+        out.base_off = matches!(document.resolve_owned_value(base)?, Some(OwnedObject::Name(name)) if name == b"OFF");
+    }
+    for (key, target) in [
+        (b"OFF".as_slice(), &mut out.off),
+        (b"ON".as_slice(), &mut out.on),
+    ] {
+        let Some(value) = default.get(key) else {
+            continue;
+        };
+        let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+            continue;
+        };
+        for value in values {
+            if let OwnedObject::Reference(handle) = value
+                && let Some(key) = cow_object_key(handle)
+            {
+                target.insert(key);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decoded_content_value_hayro(
+    document: &EditDocument,
+    value: &OwnedObject,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let value = match value {
+        OwnedObject::Reference(handle) => {
+            let Some(value) = document.current_owned_object(*handle)? else {
+                return Ok(());
+            };
+            value
+        }
+        value => value.clone(),
+    };
+    match value {
+        OwnedObject::Stream { .. } => {
+            let bytes = document.decoded_owned_stream_data(&value, DecodeLevel::Specialized)?;
+            if !output.is_empty() && output.last() != Some(&b'\n') {
+                output.push(b'\n');
+            }
+            output.extend_from_slice(&bytes);
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                decoded_content_value_hayro(document, &value, output)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn page_content_bytes_hayro(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
+    let Some(page) = document.current_owned_object(page)? else {
+        return Ok(Vec::new());
+    };
+    let Some(dictionary) = page.as_dictionary() else {
+        return Ok(Vec::new());
+    };
+    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    decoded_content_value_hayro(document, contents, &mut output)?;
+    Ok(output)
+}
+
+fn owned_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Real(value)) => Some(value),
+        _ => None,
+    })
+}
+
+fn owned_number_array<const N: usize>(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<[f64; N]>> {
+    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+        return Ok(None);
+    };
+    if values.len() != N {
+        return Ok(None);
+    }
+    let mut out = [0.0; N];
+    for (index, value) in values.iter().enumerate() {
+        let Some(number) = owned_number_value(document, value)? else {
+            return Ok(None);
+        };
+        out[index] = number;
+    }
+    Ok(Some(out))
+}
+
+fn page_crop_hayro(document: &EditDocument, page: CowObjectHandle) -> Result<Rect> {
+    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+        if let Some(value) = document.inherited_page_value(page, key)?
+            && let Some(values) = owned_number_array::<4>(document, &value)?
+        {
+            return Ok(Rect::new(values[0], values[1], values[2], values[3]));
+        }
+    }
+    Ok(Rect::new(0.0, 0.0, 612.0, 792.0))
+}
+
+fn scan_page_hayro(
+    document: &EditDocument,
+    page: CowObjectHandle,
+    page_number: usize,
+    ocg: &OptionalContentState,
+) -> Result<PageScan> {
+    let crop = page_crop_hayro(document, page)?;
+    let resources = build_resources_hayro(
+        document,
+        document.inherited_page_value(page, b"Resources")?,
+        ocg,
+    )?;
+    let content = page_content_bytes_hayro(document, page)?;
+    let mut scanner = PageScanner::new(
+        page_number,
+        crop,
+        &resources,
+        &ocg.off,
+        ocg.base_off,
+        &ocg.on,
+    );
+    flpdf::parse_detached_content_stream(&content, "Hayro/COW page content", &mut scanner)?;
+    Ok(scanner.finish())
+}
+
+#[cfg(test)]
 fn scan_page<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -1078,6 +1605,7 @@ fn scan_page<R: Read + Seek + 'static>(
     Ok(scanner.finish())
 }
 
+#[cfg(test)]
 fn build_resources(resources: &ObjectHandle, ocg: &OptionalContentState) -> Result<Resources> {
     Ok(Resources {
         fonts: build_fonts(resources)?,
@@ -1087,6 +1615,7 @@ fn build_resources(resources: &ObjectHandle, ocg: &OptionalContentState) -> Resu
     })
 }
 
+#[cfg(test)]
 fn resource_dictionary(resources: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
     let value = resources.try_get_key(key)?;
     if value.try_is_dictionary()? {
@@ -1096,10 +1625,12 @@ fn resource_dictionary(resources: &ObjectHandle, key: &[u8]) -> Result<Option<Ob
     }
 }
 
+#[cfg(test)]
 fn normalized_resource_key(key: &[u8]) -> Vec<u8> {
     key.strip_prefix(b"/").unwrap_or(key).to_vec()
 }
 
+#[cfg(test)]
 fn build_fonts(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, FontInfo>> {
     let Some(fonts) = resource_dictionary(resources, b"/Font")? else {
         return Ok(BTreeMap::new());
@@ -1112,6 +1643,7 @@ fn build_fonts(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, FontInfo>> 
     Ok(out)
 }
 
+#[cfg(test)]
 fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
     let mut info = FontInfo::default();
     let subtype = font.try_get_key(b"/Subtype")?.as_name().unwrap_or_default();
@@ -1136,9 +1668,12 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
     }
 
     if subtype == b"Type0" {
-        let descendants = font
-            .try_get_key(b"/DescendantFonts")?
-            .try_get_array_as_vector()?;
+        let descendants = font.try_get_key(b"/DescendantFonts")?;
+        let descendants = if descendants.try_is_array()? {
+            descendants.try_get_array_as_vector()?
+        } else {
+            Vec::new()
+        };
         if let Some(descendant) = descendants.first() {
             let dw = descendant.try_get_key(b"/DW")?;
             if dw.try_is_number()? {
@@ -1146,7 +1681,10 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
             } else {
                 info.default_width = 1000.0;
             }
-            parse_cid_widths(&descendant.try_get_key(b"/W")?, &mut info.widths)?;
+            let widths = descendant.try_get_key(b"/W")?;
+            if widths.try_is_array()? {
+                parse_cid_widths(&widths, &mut info.widths)?;
+            }
         }
     } else {
         let first = font.try_get_key(b"/FirstChar")?;
@@ -1155,7 +1693,12 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
         } else {
             0
         };
-        let widths = font.try_get_key(b"/Widths")?.try_get_array_as_vector()?;
+        let widths = font.try_get_key(b"/Widths")?;
+        let widths = if widths.try_is_array()? {
+            widths.try_get_array_as_vector()?
+        } else {
+            Vec::new()
+        };
         for (offset, width) in widths.iter().enumerate() {
             if width.try_is_number()? {
                 info.widths.insert(
@@ -1168,6 +1711,7 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
     Ok(info)
 }
 
+#[cfg(test)]
 fn parse_cid_widths(widths: &ObjectHandle, out: &mut HashMap<u32, f64>) -> Result<()> {
     let items = widths.try_get_array_as_vector()?;
     let mut i = 0;
@@ -1209,6 +1753,7 @@ fn parse_cid_widths(widths: &ObjectHandle, out: &mut HashMap<u32, f64>) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn build_ext_gstates(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, ExtGStateInfo>> {
     let Some(states) = resource_dictionary(resources, b"/ExtGState")? else {
         return Ok(BTreeMap::new());
@@ -1240,6 +1785,7 @@ fn build_ext_gstates(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, ExtGS
     Ok(out)
 }
 
+#[cfg(test)]
 fn build_images(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, bool>> {
     let Some(xobjects) = resource_dictionary(resources, b"/XObject")? else {
         return Ok(BTreeMap::new());
@@ -1262,21 +1808,26 @@ fn build_images(resources: &ObjectHandle) -> Result<BTreeMap<Vec<u8>, bool>> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn build_properties(
     resources: &ObjectHandle,
     _ocg: &OptionalContentState,
-) -> Result<BTreeMap<Vec<u8>, Option<ObjectRef>>> {
+) -> Result<BTreeMap<Vec<u8>, Option<ObjectKey>>> {
     let Some(properties) = resource_dictionary(resources, b"/Properties")? else {
         return Ok(BTreeMap::new());
     };
     let mut out = BTreeMap::new();
     for key in properties.try_get_keys()? {
         let value = properties.try_get_key(&key)?;
-        out.insert(normalized_resource_key(&key), value.object_ref());
+        out.insert(
+            normalized_resource_key(&key),
+            value.object_ref().map(flpdf_object_key),
+        );
     }
     Ok(out)
 }
 
+#[cfg(test)]
 fn optional_content_state<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<OptionalContentState> {
@@ -1302,7 +1853,7 @@ fn optional_content_state<R: Read + Seek + 'static>(
     ] {
         for object in default.try_get_key(key)?.try_get_array_as_vector()? {
             if let Some(object_ref) = object.object_ref() {
-                target.insert(object_ref);
+                target.insert(flpdf_object_key(object_ref));
             }
         }
     }

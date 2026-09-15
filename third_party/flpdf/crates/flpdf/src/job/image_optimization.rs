@@ -1278,3 +1278,118 @@ mod tests {
         ));
     }
 }
+
+/// Encoded replacement produced by the detached image optimizer.
+#[derive(Debug, Clone)]
+pub struct DetachedImageTransform {
+    pub encoded: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub filter: Vec<u8>,
+    pub decode_params: ObjectHandle,
+    pub original_encoded_bytes: u64,
+    pub original_pixels: u64,
+    pub optimized_pixels: u64,
+    pub resized: bool,
+}
+
+/// Optimize one detached Image XObject stream without a mutable `Pdf` document.
+///
+/// `target=None` performs the ordinary lossless-source -> JPEG optimization;
+/// `Some(target)` performs the conservative caller-selected resize path.
+/// The returned bytes have already passed the configured savings gates.
+pub fn optimize_image_detached(
+    image: ObjectHandle,
+    options: ImageOptimizationOptions,
+    target: Option<ImageResizeTarget>,
+) -> Result<Option<DetachedImageTransform>> {
+    if image.as_stream_dict().is_none() {
+        return Ok(None);
+    }
+    if target.is_none() && !ImageOptimizer::preflight(&image)? {
+        return Ok(None);
+    }
+    let optimizer = match ImageOptimizer::prepare(image.clone(), options)? {
+        PrepareResult::Ready(optimizer) => optimizer,
+        PrepareResult::Skip(_) => return Ok(None),
+    };
+
+    if let Some(target) = target {
+        let dictionary = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Internal("detached image has no stream dictionary".to_owned()))?;
+        let conservative = match target.encoding {
+            ImageResizeEncoding::Jpeg => is_conservative_dct_resize_source(&dictionary)?,
+            ImageResizeEncoding::Flate => is_conservative_flate_resize_source(&dictionary)?,
+        };
+        if !conservative {
+            return Ok(None);
+        }
+        let Some(resized) = optimizer.resize_and_encode(target)? else {
+            return Ok(None);
+        };
+        let original = resized.original_encoded_bytes;
+        let optimized = resized.encoded.len() as u64;
+        let savings = original.saturating_sub(optimized);
+        if optimized >= original
+            || savings < options.min_savings_bytes
+            || u128::from(savings) * 100
+                < u128::from(original) * u128::from(options.min_savings_percent)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(DetachedImageTransform {
+            encoded: resized.encoded,
+            width: resized.width,
+            height: resized.height,
+            filter: match resized.encoding {
+                ImageResizeEncoding::Jpeg => b"DCTDecode".to_vec(),
+                ImageResizeEncoding::Flate => b"FlateDecode".to_vec(),
+            },
+            decode_params: resized.decode_params,
+            original_encoded_bytes: original,
+            original_pixels: u64::from(optimizer.width) * u64::from(optimizer.height),
+            optimized_pixels: u64::from(resized.width) * u64::from(resized.height),
+            resized: true,
+        }));
+    }
+
+    let Some(evaluation) = optimizer.evaluate()? else {
+        return Ok(None);
+    };
+    let Evaluation::Smaller {
+        original_length,
+        compressed_length: _,
+    } = evaluation
+    else {
+        return Ok(None);
+    };
+    let mut encoded = Vec::new();
+    {
+        let mut sink = PlString::new("detached optimized jpeg", None, &mut encoded);
+        let mut encoder = optimizer.encoder(&mut sink);
+        let mut filtering_attempted = false;
+        if !image.pipe_stream_data(
+            &mut encoder,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::Specialized,
+            false,
+            false,
+        )? {
+            return Ok(None);
+        }
+        encoder.finish()?;
+    }
+    Ok(Some(DetachedImageTransform {
+        encoded,
+        width: optimizer.width,
+        height: optimizer.height,
+        filter: b"DCTDecode".to_vec(),
+        decode_params: ObjectHandle::null(),
+        original_encoded_bytes: original_length,
+        original_pixels: u64::from(optimizer.width) * u64::from(optimizer.height),
+        optimized_pixels: u64::from(optimizer.width) * u64::from(optimizer.height),
+        resized: false,
+    }))
+}

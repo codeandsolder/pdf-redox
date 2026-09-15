@@ -2,13 +2,17 @@ use crate::{
     EditDocument, Error, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
     OwnedObject, Result, StreamData,
 };
+#[cfg(test)]
+use flpdf::{DecodeLevel, ObjectRef, Pdf};
 use flpdf::{
-    DecodeLevel, ObjectHandle as FlObjectHandle, ObjectRef, Pdf,
+    ObjectHandle as FlObjectHandle,
     filters::{decode_stream_data, encode_stream_data_with_flate_level},
 };
 use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject};
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::HashSet,
     io::{Read, Seek},
     rc::Rc,
 };
@@ -163,11 +167,13 @@ fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<
     Some((output, removed_bytes))
 }
 
+#[cfg(test)]
 fn is_lone_flate(stream_dict: &flpdf::ObjectHandle) -> Result<bool> {
     let filter = stream_dict.try_get_key(b"/Filter")?;
     Ok(filter.try_is_name_and_equals(b"FlateDecode")? && !stream_dict.try_has_key(b"/F")?)
 }
 
+#[cfg(test)]
 pub(crate) fn strip_font_editing_tables<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     flate_level: i32,
@@ -702,7 +708,7 @@ mod tests {
         assert!(actual.optimized_encoded_bytes < actual.original_encoded_bytes);
         assert_eq!(actual.decoded_table_bytes_removed, 8192);
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let reparsed = SourcePdf::from_bytes(output)?;
         assert_eq!(reparsed.page_count(), 1);
         Ok(())

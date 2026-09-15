@@ -1,12 +1,12 @@
-use crate::{PdfAnalysis, Result, RiskFinding, RiskKind, hidden_text::analyze_hidden_text};
-use flate2::{Compression, write::ZlibEncoder};
-use flpdf::{
-    DecodeLevel, ObjectHandle, ObjectHandleParserCallbacks, ObjectRef, PageObjectHelper,
-    ParseControl, Pdf,
+use crate::{
+    EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
+    RiskKind, hidden_text::analyze_hidden_text_hayro, prune::should_prune_resources_hayro,
 };
+use flate2::{Compression, write::ZlibEncoder};
+use flpdf::{DecodeLevel, ObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Read, Seek, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Write;
 
 pub(crate) fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -25,7 +25,7 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
     }
     haystack
         .windows(needle.len())
-        .filter(|w| *w == needle)
+        .filter(|window| *window == needle)
         .count()
 }
 
@@ -38,20 +38,28 @@ fn push_risk(
     if count == 0 {
         return;
     }
-    let e = map.entry(kind).or_insert((0, note.to_owned()));
-    e.0 += count;
+    let entry = map.entry(kind).or_insert((0, note.to_owned()));
+    entry.0 += count;
 }
 
-fn document_info_text<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Option<String>> {
-    let info = pdf.trailer().try_get_key(b"/Info")?;
-    if info.is_null() {
+fn document_info_text(document: &EditDocument, key: &[u8]) -> Result<Option<String>> {
+    let Some(info) = document.trailer().get(b"Info".as_slice()) else {
         return Ok(None);
-    }
-    let value = info.try_get_key(key)?;
-    if value.is_null() {
+    };
+    let Some(info) = document.resolve_owned_value(info)? else {
         return Ok(None);
-    }
-    let bytes = value.try_get_utf8_value()?;
+    };
+    let Some(dictionary) = info.as_dictionary() else {
+        return Ok(None);
+    };
+    let Some(value) = dictionary.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = document.resolve_owned_value(value)? else {
+        return Ok(None);
+    };
+    let handle = document.detached_flpdf_object(&value)?;
+    let bytes = handle.try_get_utf8_value()?;
     let text = String::from_utf8_lossy(&bytes).trim().to_owned();
     Ok((!text.is_empty()).then_some(text))
 }
@@ -71,202 +79,250 @@ fn duplicate_payload_stats(map: HashMap<[u8; 32], (usize, usize)>) -> (usize, us
         })
 }
 
-fn collect_page_content_refs<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-) -> Result<HashSet<ObjectRef>> {
-    let mut refs = HashSet::new();
-    for page_ref in flpdf::pages::page_refs(pdf)? {
-        let mut helper = PageObjectHelper::new(page_ref, pdf);
-        for stream in helper.get_page_contents()? {
-            if let Some(object_ref) = stream.object_ref() {
-                refs.insert(object_ref);
+fn all_source_objects(document: &EditDocument) -> Result<Vec<(CowObjectHandle, OwnedObject)>> {
+    let mut objects = Vec::new();
+    for id in document.source().object_ids() {
+        let handle = CowObjectHandle::Existing(id);
+        if let Some(object) = document.current_owned_object(handle)? {
+            objects.push((handle, object));
+        }
+    }
+    Ok(objects)
+}
+
+fn collect_content_stream_refs(
+    document: &EditDocument,
+    value: &OwnedObject,
+    refs: &mut HashSet<CowObjectHandle>,
+    seen: &mut HashSet<CowObjectHandle>,
+) -> Result<()> {
+    match value {
+        OwnedObject::Reference(handle) => {
+            if !seen.insert(*handle) {
+                return Ok(());
+            }
+            let Some(target) = document.current_owned_object(*handle)? else {
+                return Ok(());
+            };
+            match target {
+                OwnedObject::Stream { .. } => {
+                    refs.insert(*handle);
+                }
+                OwnedObject::Array(values) => {
+                    for value in &values {
+                        collect_content_stream_refs(document, value, refs, seen)?;
+                    }
+                }
+                _ => {}
             }
         }
+        OwnedObject::Array(values) => {
+            for value in values {
+                collect_content_stream_refs(document, value, refs, seen)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_page_content_refs(document: &EditDocument) -> Result<HashSet<CowObjectHandle>> {
+    let mut refs = HashSet::new();
+    for page in document.page_handles()? {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        collect_content_stream_refs(document, contents, &mut refs, &mut HashSet::new())?;
     }
     Ok(refs)
 }
 
 fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
     match key {
-        b"/Metadata" => Some("metadata"),
-        b"/ToUnicode" => Some("to-unicode"),
-        b"/CIDToGIDMap" => Some("cid-to-gid"),
-        b"/ColorSpace" | b"/DestOutputProfile" => Some("color-space-support"),
-        b"/XFA" => Some("xfa"),
-        b"/Function" => Some("function"),
-        b"/Shading" => Some("shading"),
-        b"/Pattern" => Some("pattern"),
+        b"Metadata" => Some("metadata"),
+        b"ToUnicode" => Some("to-unicode"),
+        b"CIDToGIDMap" => Some("cid-to-gid"),
+        b"ColorSpace" | b"DestOutputProfile" => Some("color-space-support"),
+        b"XFA" => Some("xfa"),
+        b"Function" => Some("function"),
+        b"Shading" => Some("shading"),
+        b"Pattern" => Some("pattern"),
         _ => None,
     }
 }
 
-fn collect_incoming_roles(objects: &[ObjectHandle]) -> HashMap<ObjectRef, HashSet<&'static str>> {
-    let objects_by_ref: HashMap<ObjectRef, ObjectHandle> = objects
-        .iter()
-        .filter_map(|object| {
-            object
-                .object_ref()
-                .map(|object_ref| (object_ref, object.clone()))
-        })
-        .collect();
-    let mut roles: HashMap<ObjectRef, HashSet<&'static str>> = HashMap::new();
+fn collect_incoming_roles(
+    objects: &[(CowObjectHandle, OwnedObject)],
+) -> HashMap<CowObjectHandle, HashSet<&'static str>> {
+    let objects_by_handle: HashMap<_, _> = objects.iter().cloned().collect();
+    let mut roles: HashMap<CowObjectHandle, HashSet<&'static str>> = HashMap::new();
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
 
-    for object in objects {
-        let dictionary = object.as_stream_dict().or_else(|| {
-            let is_dictionary = object.try_is_dictionary().ok()?;
-            if is_dictionary {
-                Some(object.clone())
-            } else {
-                object.as_stream_dict()
-            }
-        });
-        let Some(dictionary) = dictionary else {
+    for (_, object) in objects {
+        let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
-        if let Some(entries) = dictionary.as_dictionary() {
-            for (key, value) in entries {
-                if let Some(role) = incoming_role_for_key(&key) {
-                    queue.push_back((value, role));
-                }
+        for (key, value) in dictionary {
+            if let Some(role) = incoming_role_for_key(key) {
+                queue.push_back((value.clone(), role));
             }
         }
     }
 
     while let Some((value, role)) = queue.pop_front() {
-        if let Some(object_ref) = value.object_ref() {
-            if !seen.insert((object_ref, role)) {
-                continue;
-            }
-            let Some(target) = objects_by_ref.get(&object_ref) else {
-                continue;
-            };
-            let is_array = target.try_is_array().ok().unwrap_or(false);
-            if target.as_stream_dict().is_some() {
-                roles.entry(object_ref).or_default().insert(role);
-                continue;
-            }
-            if is_array {
-                if let Some(items) = target.as_array() {
-                    for item in items {
-                        queue.push_back((item, role));
-                    }
+        match value {
+            OwnedObject::Reference(handle) => {
+                if !seen.insert((handle, role)) {
+                    continue;
                 }
-            } else if target.try_is_dictionary().ok().unwrap_or(false)
-                && let Some(entries) = target.as_dictionary()
-            {
-                for (key, child) in entries {
+                let Some(target) = objects_by_handle.get(&handle) else {
+                    continue;
+                };
+                match target {
+                    OwnedObject::Stream { .. } => {
+                        roles.entry(handle).or_default().insert(role);
+                    }
+                    OwnedObject::Array(values) => {
+                        for value in values {
+                            queue.push_back((value.clone(), role));
+                        }
+                    }
+                    OwnedObject::Dictionary(dictionary) => {
+                        for (key, child) in dictionary {
+                            queue.push_back((
+                                child.clone(),
+                                incoming_role_for_key(key).unwrap_or(role),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OwnedObject::Array(values) => {
+                for value in values {
+                    queue.push_back((value, role));
+                }
+            }
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+                for (key, child) in dictionary {
                     queue.push_back((child, incoming_role_for_key(&key).unwrap_or(role)));
                 }
             }
-            continue;
-        }
-        if let Some(items) = value.as_array() {
-            for item in items {
-                queue.push_back((item, role));
-            }
-        } else if let Some(entries) = value.as_dictionary() {
-            for (key, child) in entries {
-                queue.push_back((child, incoming_role_for_key(&key).unwrap_or(role)));
-            }
+            _ => {}
         }
     }
 
     roles
 }
 
-fn collect_direct_icc_profile_refs(
-    value: &ObjectHandle,
-    include_indirect_root: bool,
-    refs: &mut HashSet<ObjectRef>,
-) {
-    if !include_indirect_root && value.object_ref().is_some() {
-        return;
-    }
-    let Ok(is_array) = value.try_is_array() else {
-        return;
-    };
-    if is_array {
-        let Some(items) = value.as_array() else {
-            return;
-        };
-        if items.len() >= 2 && matches!(items[0].try_is_name_and_equals(b"ICCBased"), Ok(true)) {
-            if let Some(profile_ref) = items[1].object_ref() {
-                refs.insert(profile_ref);
-            }
-            return;
-        }
-        for item in items {
-            collect_direct_icc_profile_refs(&item, false, refs);
-        }
-        return;
-    }
-    if let Some(dict) = value.as_stream_dict() {
-        if let Some(entries) = dict.as_dictionary() {
-            for (_, child) in entries {
-                collect_direct_icc_profile_refs(&child, false, refs);
-            }
-        }
-        return;
-    }
-    let Ok(is_dictionary) = value.try_is_dictionary() else {
-        return;
-    };
-    if is_dictionary && let Some(entries) = value.as_dictionary() {
-        for (_, child) in entries {
-            collect_direct_icc_profile_refs(&child, false, refs);
-        }
-    }
+fn is_name(document: &EditDocument, value: &OwnedObject, expected: &[u8]) -> Result<bool> {
+    Ok(matches!(
+        document.resolve_owned_value(value)?,
+        Some(OwnedObject::Name(name)) if name == expected
+    ))
 }
 
-fn collect_icc_profile_refs(objects: &[ObjectHandle]) -> HashSet<ObjectRef> {
-    let mut refs = HashSet::new();
-    for object in objects {
-        collect_direct_icc_profile_refs(object, true, &mut refs);
+fn collect_direct_icc_profile_refs(
+    document: &EditDocument,
+    value: &OwnedObject,
+    refs: &mut HashSet<CowObjectHandle>,
+) -> Result<()> {
+    match value {
+        OwnedObject::Array(values) => {
+            if values.len() >= 2 && is_name(document, &values[0], b"ICCBased")? {
+                if let OwnedObject::Reference(handle) = values[1] {
+                    refs.insert(handle);
+                }
+                return Ok(());
+            }
+            for value in values {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_direct_icc_profile_refs(document, value, refs)?;
+                }
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for value in dictionary.values() {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_direct_icc_profile_refs(document, value, refs)?;
+                }
+            }
+        }
+        _ => {}
     }
-    refs
+    Ok(())
+}
+
+fn collect_icc_profile_refs(
+    document: &EditDocument,
+    objects: &[(CowObjectHandle, OwnedObject)],
+) -> Result<HashSet<CowObjectHandle>> {
+    let mut refs = HashSet::new();
+    for (_, object) in objects {
+        collect_direct_icc_profile_refs(document, object, &mut refs)?;
+    }
+    Ok(refs)
+}
+
+fn dictionary_name(
+    document: &EditDocument,
+    dictionary: &BTreeMap<Vec<u8>, OwnedObject>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let Some(value) = dictionary.get(key) else {
+        return Ok(None);
+    };
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Name(name)) => Some(name),
+        _ => None,
+    })
 }
 
 fn stream_role(
-    object: &ObjectHandle,
-    object_ref: ObjectRef,
-    font_refs: &HashSet<ObjectRef>,
-    page_content_refs: &HashSet<ObjectRef>,
-    icc_profile_refs: &HashSet<ObjectRef>,
-    incoming_roles: &HashMap<ObjectRef, HashSet<&'static str>>,
+    document: &EditDocument,
+    object: &OwnedObject,
+    handle: CowObjectHandle,
+    font_refs: &HashSet<CowObjectHandle>,
+    page_content_refs: &HashSet<CowObjectHandle>,
+    icc_profile_refs: &HashSet<CowObjectHandle>,
+    incoming_roles: &HashMap<CowObjectHandle, HashSet<&'static str>>,
 ) -> Result<&'static str> {
-    let Some(dict) = object.as_stream_dict() else {
+    let OwnedObject::Stream { dictionary, .. } = object else {
         return Ok("other");
     };
-    let type_object = dict.try_get_key(b"/Type")?;
-    for (name, role) in [
-        (b"Metadata".as_slice(), "metadata"),
-        (b"EmbeddedFile".as_slice(), "embedded-file"),
-        (b"ObjStm".as_slice(), "object-stream"),
-        (b"XRef".as_slice(), "xref-stream"),
-    ] {
-        if type_object.try_is_name_and_equals(name)? {
-            return Ok(role);
+    if let Some(kind) = dictionary_name(document, dictionary, b"Type")? {
+        match kind.as_slice() {
+            b"Metadata" => return Ok("metadata"),
+            b"EmbeddedFile" => return Ok("embedded-file"),
+            b"ObjStm" => return Ok("object-stream"),
+            b"XRef" => return Ok("xref-stream"),
+            _ => {}
         }
     }
-    let subtype = dict.try_get_key(b"/Subtype")?;
-    if subtype.try_is_name_and_equals(b"Image")? {
-        return Ok("image");
+    if let Some(subtype) = dictionary_name(document, dictionary, b"Subtype")? {
+        match subtype.as_slice() {
+            b"Image" => return Ok("image"),
+            b"Form" => return Ok("form"),
+            _ => {}
+        }
     }
-    if subtype.try_is_name_and_equals(b"Form")? {
-        return Ok("form");
-    }
-    if font_refs.contains(&object_ref) {
+    if font_refs.contains(&handle) {
         return Ok("font-program");
     }
-    if page_content_refs.contains(&object_ref) {
+    if page_content_refs.contains(&handle) {
         return Ok("page-content");
     }
-    if icc_profile_refs.contains(&object_ref) {
+    if icc_profile_refs.contains(&handle) {
         return Ok("icc-profile");
     }
-    if let Some(roles) = incoming_roles.get(&object_ref) {
+    if let Some(roles) = incoming_roles.get(&handle) {
         if roles.len() == 1 {
             return Ok(roles.iter().next().copied().unwrap_or("other"));
         }
@@ -274,7 +330,7 @@ fn stream_role(
             return Ok("multi-reference");
         }
     }
-    if type_object.try_is_name_and_equals(b"CMap")? {
+    if dictionary_name(document, dictionary, b"Type")?.as_deref() == Some(b"CMap") {
         return Ok("cmap");
     }
     Ok("other")
@@ -282,8 +338,8 @@ fn stream_role(
 
 fn duplicate_payload_role_stats(
     payloads: &HashMap<[u8; 32], (usize, usize)>,
-    members: &HashMap<[u8; 32], Vec<ObjectRef>>,
-    roles: &HashMap<ObjectRef, &'static str>,
+    members: &HashMap<[u8; 32], Vec<CowObjectHandle>>,
+    roles: &HashMap<CowObjectHandle, &'static str>,
 ) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
     let mut groups = BTreeMap::new();
     let mut wasted = BTreeMap::new();
@@ -295,7 +351,7 @@ fn duplicate_payload_role_stats(
             .get(hash)
             .into_iter()
             .flatten()
-            .filter_map(|object_ref| roles.get(object_ref).copied())
+            .filter_map(|handle| roles.get(handle).copied())
             .collect();
         let role = if role_set.len() == 1 {
             role_set.into_iter().next().unwrap_or("other")
@@ -337,34 +393,84 @@ impl ObjectHandleParserCallbacks for InlineImageCounter {
     }
 }
 
-fn analyze_inline_images<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-) -> Result<(usize, usize, usize, usize)> {
-    let page_refs = flpdf::pages::page_refs(pdf)?;
+fn decoded_content_value(
+    document: &EditDocument,
+    value: &OwnedObject,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let value = match value {
+        OwnedObject::Reference(handle) => {
+            let Some(value) = document.current_owned_object(*handle)? else {
+                return Ok(());
+            };
+            value
+        }
+        value => value.clone(),
+    };
+    match value {
+        OwnedObject::Stream { .. } => {
+            let bytes = document.decoded_owned_stream_data(&value, DecodeLevel::Specialized)?;
+            if !output.is_empty() && output.last() != Some(&b'\n') {
+                output.push(b'\n');
+            }
+            output.extend_from_slice(&bytes);
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                decoded_content_value(document, &value, output)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn page_content(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
+    let Some(page) = document.current_owned_object(page)? else {
+        return Ok(Vec::new());
+    };
+    let Some(dictionary) = page.as_dictionary() else {
+        return Ok(Vec::new());
+    };
+    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+        return Ok(Vec::new());
+    };
+    let mut output = Vec::new();
+    decoded_content_value(document, contents, &mut output)?;
+    Ok(output)
+}
+
+fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize, usize)> {
     let mut counter = InlineImageCounter::default();
-    let mut seen_forms = HashSet::new();
+    for page in document.page_handles()? {
+        let content = page_content(document, page)?;
+        flpdf::parse_detached_content_stream(
+            &content,
+            "Hayro analysis page content",
+            &mut counter,
+        )?;
+    }
 
-    for page_ref in page_refs {
-        let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
-        page.parse_page_contents(&mut counter)?;
-
-        let mut forms = Vec::new();
-        {
-            let mut helper = PageObjectHelper::new(page_ref, pdf);
-            helper.for_each_form_xobject(true, |form, _, _| {
-                if form
-                    .object_ref()
-                    .is_none_or(|object_ref| seen_forms.insert(object_ref))
-                {
-                    forms.push(form);
-                }
-                Ok(())
-            })?;
+    let mut seen_forms = BTreeSet::new();
+    for handle in document.reachable_output_objects()? {
+        if !seen_forms.insert(handle) {
+            continue;
         }
-        for form in forms {
-            form.parse_as_contents(&mut counter)?;
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, .. } = &object else {
+            continue;
+        };
+        if dictionary_name(document, dictionary, b"Subtype")?.as_deref() != Some(b"Form") {
+            continue;
         }
+        let content = document.decoded_owned_stream_data(&object, DecodeLevel::Specialized)?;
+        flpdf::parse_detached_content_stream(
+            &content,
+            "Hayro analysis Form content",
+            &mut counter,
+        )?;
     }
 
     let (duplicate_groups, duplicate_wasted_bytes) = duplicate_payload_stats(counter.payloads);
@@ -376,31 +482,55 @@ fn analyze_inline_images<R: Read + Seek + 'static>(
     ))
 }
 
-pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
-    let mut pdf = Pdf::open(Cursor::new(input.to_vec()))?;
-    let page_count = flpdf::pages::page_refs(&mut pdf)?.len();
-    let objects = pdf.get_all_objects()?;
+fn raw_stream_bytes<'a>(
+    document: &'a EditDocument,
+    object: &'a OwnedObject,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    let OwnedObject::Stream { data, .. } = object else {
+        return Err(crate::Error::Invalid("object is not a stream".to_owned()));
+    };
+    data.bytes(document.source())
+}
 
+fn filter_name(
+    document: &EditDocument,
+    dictionary: &BTreeMap<Vec<u8>, OwnedObject>,
+) -> Result<String> {
+    let Some(value) = dictionary.get(b"Filter".as_slice()) else {
+        return Ok("null".to_owned());
+    };
+    let Some(value) = document.resolve_owned_value(value)? else {
+        return Ok("null".to_owned());
+    };
+    let detached = document.detached_flpdf_object(&value)?;
+    Ok(String::from_utf8_lossy(&detached.unparse_resolved()).into_owned())
+}
+
+pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
+    let document = EditDocument::from_bytes(input.to_vec())?;
+    let objects = all_source_objects(&document)?;
     let mut out = PdfAnalysis {
         input_bytes: input.len(),
         input_sha256: input_sha256(input),
-        page_count,
-        object_count: objects.len(),
+        page_count: document.source().page_count(),
+        object_count: document.source().object_count(),
         ..PdfAnalysis::default()
     };
-    match document_info_text(&mut pdf, b"/Producer") {
+
+    match document_info_text(&document, b"Producer") {
         Ok(value) => out.producer = value,
         Err(error) => out
             .warnings
             .push(format!("Producer metadata analysis skipped: {error}")),
     }
-    match document_info_text(&mut pdf, b"/Creator") {
+    match document_info_text(&document, b"Creator") {
         Ok(value) => out.creator = value,
         Err(error) => out
             .warnings
             .push(format!("Creator metadata analysis skipped: {error}")),
     }
-    let page_content_refs = match collect_page_content_refs(&mut pdf) {
+
+    let page_content_refs = match collect_page_content_refs(&document) {
         Ok(refs) => refs,
         Err(error) => {
             out.warnings
@@ -410,34 +540,30 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
     };
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut stream_payload_members: HashMap<[u8; 32], Vec<ObjectRef>> = HashMap::new();
+    let mut stream_payload_members: HashMap<[u8; 32], Vec<CowObjectHandle>> = HashMap::new();
     let mut metadata_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_refs = HashSet::new();
 
-    for object in &objects {
-        let dict = if let Some(d) = object.as_stream_dict() {
-            out.stream_count += 1;
-            let raw = object.get_raw_stream_data()?;
-            out.stream_raw_bytes += raw.len();
-            let hash = record_payload(&mut stream_payloads, raw.as_ref());
-            if let Some(object_ref) = object.object_ref() {
-                stream_payload_members
-                    .entry(hash)
-                    .or_default()
-                    .push(object_ref);
-            }
-            d
-        } else if object.try_is_dictionary()? {
-            object.clone()
-        } else {
+    for (handle, object) in &objects {
+        let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
+        let is_stream = matches!(object, OwnedObject::Stream { .. });
+        if is_stream {
+            out.stream_count += 1;
+            let raw = raw_stream_bytes(&document, object)?;
+            out.stream_raw_bytes += raw.len();
+            let hash = record_payload(&mut stream_payloads, raw.as_ref());
+            stream_payload_members
+                .entry(hash)
+                .or_default()
+                .push(*handle);
+        }
 
-        let keys = dict.try_get_keys()?;
-        if keys.contains(b"/PieceInfo".as_slice()) {
+        if dictionary.contains_key(b"PieceInfo".as_slice()) {
             push_risk(
                 &mut risks,
                 RiskKind::PieceInfo,
@@ -445,7 +571,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
                 "Adobe/private-piece metadata can contain authoring provenance and source paths",
             );
         }
-        if keys.contains(b"/Thumb".as_slice()) {
+        if dictionary.contains_key(b"Thumb".as_slice()) {
             push_risk(
                 &mut risks,
                 RiskKind::Thumbnail,
@@ -453,7 +579,9 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
                 "page thumbnail stream is separate hidden raster content",
             );
         }
-        if keys.contains(b"/AA".as_slice()) || keys.contains(b"/OpenAction".as_slice()) {
+        if dictionary.contains_key(b"AA".as_slice())
+            || dictionary.contains_key(b"OpenAction".as_slice())
+        {
             push_risk(
                 &mut risks,
                 RiskKind::AutomaticAction,
@@ -461,7 +589,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
                 "automatic PDF actions are executable/interactive hidden state",
             );
         }
-        if keys.contains(b"/OCProperties".as_slice()) {
+        if dictionary.contains_key(b"OCProperties".as_slice()) {
             push_risk(
                 &mut risks,
                 RiskKind::HiddenLayer,
@@ -469,7 +597,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
                 "optional-content groups can hide content from the default view",
             );
         }
-        if keys.contains(b"/ActualText".as_slice()) {
+        if dictionary.contains_key(b"ActualText".as_slice()) {
             push_risk(
                 &mut risks,
                 RiskKind::SuspiciousHiddenText,
@@ -477,7 +605,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
                 "ActualText may differ from visible glyphs and should be retained but audited in privacy mode",
             );
         }
-        if keys.contains(b"/V".as_slice()) && keys.contains(b"/FT".as_slice()) {
+        if dictionary.contains_key(b"V".as_slice()) && dictionary.contains_key(b"FT".as_slice()) {
             push_risk(
                 &mut risks,
                 RiskKind::FormValue,
@@ -487,47 +615,52 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         }
 
         for key in [
-            b"/FontFile".as_slice(),
-            b"/FontFile2".as_slice(),
-            b"/FontFile3".as_slice(),
+            b"FontFile".as_slice(),
+            b"FontFile2".as_slice(),
+            b"FontFile3".as_slice(),
         ] {
-            if !keys.contains(key) {
+            let Some(value) = dictionary.get(key) else {
                 continue;
-            }
-            let font = dict.try_get_key(key)?;
-            if let Some(r) = font.object_ref()
-                && !font_refs.insert(r)
+            };
+            let reference = match value {
+                OwnedObject::Reference(handle) => Some(*handle),
+                _ => None,
+            };
+            if let Some(reference) = reference
+                && !font_refs.insert(reference)
             {
                 continue;
             }
-            if let Ok(data) = font.get_raw_stream_data() {
-                out.font_program_count += 1;
-                out.font_program_bytes += data.len();
-                let duplicate_basis = font
-                    .get_stream_data(DecodeLevel::Generalized)
-                    .unwrap_or_else(|_| data.clone());
-                record_payload(&mut font_payloads, duplicate_basis.as_ref());
+            let Some(font) = document.resolve_owned_value(value)? else {
+                continue;
+            };
+            if !matches!(font, OwnedObject::Stream { .. }) {
+                continue;
             }
+            let raw = raw_stream_bytes(&document, &font)?;
+            out.font_program_count += 1;
+            out.font_program_bytes += raw.len();
+            let duplicate_basis = document
+                .decoded_owned_stream_data(&font, DecodeLevel::Generalized)
+                .unwrap_or_else(|_| raw.as_ref().to_vec());
+            record_payload(&mut font_payloads, &duplicate_basis);
         }
 
-        if object.as_stream_dict().is_none() {
+        if !is_stream {
             continue;
         }
-        let filter = dict.try_get_key(b"/Filter")?.unparse_resolved();
-        let filter_name = String::from_utf8_lossy(&filter).into_owned();
-        *out.filter_counts.entry(filter_name.clone()).or_default() += 1;
+        let filter = filter_name(&document, dictionary)?;
+        *out.filter_counts.entry(filter.clone()).or_default() += 1;
 
-        let subtype = dict.try_get_key(b"/Subtype")?;
-        let is_image = subtype.try_is_name_and_equals(b"Image")?;
-        let is_form = subtype.try_is_name_and_equals(b"Form")?;
+        let subtype = dictionary_name(&document, dictionary, b"Subtype")?;
+        let is_image = subtype.as_deref() == Some(b"Image");
+        let is_form = subtype.as_deref() == Some(b"Form");
         if is_image {
             out.image_count += 1;
-            let raw = object.get_raw_stream_data()?;
+            let raw = raw_stream_bytes(&document, object)?;
             out.image_raw_bytes += raw.len();
             record_payload(&mut image_payloads, raw.as_ref());
-            if filter_name.contains("DCTDecode") {
-                // APP1/APP13/COM are cheap byte-level privacy candidates; exact
-                // parsing/removal is performed by the scrubber.
+            if filter.contains("DCTDecode") {
                 let marker_hits = count_bytes(raw.as_ref(), &[0xff, 0xe1])
                     + count_bytes(raw.as_ref(), &[0xff, 0xed])
                     + count_bytes(raw.as_ref(), &[0xff, 0xfe]);
@@ -541,15 +674,14 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         }
         if is_form {
             out.form_xobject_count += 1;
-            let raw = object.get_raw_stream_data()?;
-            let duplicate_basis = object
-                .get_stream_data(DecodeLevel::Generalized)
-                .unwrap_or_else(|_| raw.clone());
-            record_payload(&mut form_payloads, duplicate_basis.as_ref());
+            let raw = raw_stream_bytes(&document, object)?;
+            let duplicate_basis = document
+                .decoded_owned_stream_data(object, DecodeLevel::Generalized)
+                .unwrap_or_else(|_| raw.as_ref().to_vec());
+            record_payload(&mut form_payloads, &duplicate_basis);
         }
-        let type_obj = dict.try_get_key(b"/Type")?;
-        if type_obj.try_is_name_and_equals(b"Metadata")? {
-            let raw = object.get_raw_stream_data()?;
+        if dictionary_name(&document, dictionary, b"Type")?.as_deref() == Some(b"Metadata") {
+            let raw = raw_stream_bytes(&document, object)?;
             out.metadata_stream_count += 1;
             out.metadata_stream_bytes += raw.len();
             record_payload(&mut metadata_payloads, raw.as_ref());
@@ -561,15 +693,17 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             );
         }
 
-        if filter_name == "/FlateDecode" {
+        if filter == "/FlateDecode" {
             out.flate_stream_count += 1;
             if !is_image {
                 out.non_image_flate_stream_count += 1;
             }
-            let raw = object.get_raw_stream_data()?;
-            if let Ok(decoded) = object.get_stream_data(DecodeLevel::Generalized) {
+            let raw = raw_stream_bytes(&document, object)?;
+            if let Ok(decoded) =
+                document.decoded_owned_stream_data(object, DecodeLevel::Generalized)
+            {
                 let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-                if encoder.write_all(decoded.as_ref()).is_ok()
+                if encoder.write_all(&decoded).is_ok()
                     && let Ok(repacked) = encoder.finish()
                 {
                     let saving = raw.len().saturating_sub(repacked.len());
@@ -587,18 +721,16 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
     }
 
     let incoming_roles = collect_incoming_roles(&objects);
-    let icc_profile_refs = collect_icc_profile_refs(&objects);
+    let icc_profile_refs = collect_icc_profile_refs(&document, &objects)?;
     let mut stream_roles = HashMap::new();
-    for object in &objects {
-        let Some(object_ref) = object.object_ref() else {
-            continue;
-        };
-        if object.as_stream_dict().is_none() {
+    for (handle, object) in &objects {
+        if !matches!(object, OwnedObject::Stream { .. }) {
             continue;
         }
         let role = stream_role(
+            &document,
             object,
-            object_ref,
+            *handle,
             &font_refs,
             &page_content_refs,
             &icc_profile_refs,
@@ -607,8 +739,8 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         *out.stream_role_counts.entry(role.to_owned()).or_default() += 1;
         *out.stream_role_raw_bytes
             .entry(role.to_owned())
-            .or_default() += object.get_raw_stream_data()?.len();
-        stream_roles.insert(object_ref, role);
+            .or_default() += raw_stream_bytes(&document, object)?.len();
+        stream_roles.insert(*handle, role);
     }
     (
         out.duplicate_stream_role_groups,
@@ -636,7 +768,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         out.duplicate_font_payload_wasted_bytes,
     ) = duplicate_payload_stats(font_payloads);
 
-    match analyze_inline_images(&mut pdf) {
+    match analyze_inline_images(&document) {
         Ok((count, bytes, duplicate_groups, duplicate_wasted_bytes)) => {
             out.inline_image_count = count;
             out.inline_image_bytes = bytes;
@@ -647,7 +779,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
             .warnings
             .push(format!("inline-image analysis skipped: {error}")),
     }
-    match flpdf::should_remove_unreferenced_resources(&mut pdf) {
+    match should_prune_resources_hayro(&document) {
         Ok(candidate) => out.resource_pruning_auto_triggered = candidate,
         Err(error) => out
             .warnings
@@ -687,7 +819,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
         "digital signatures can contain signer identity, certificates, timestamps, reason, and location",
     );
 
-    match analyze_hidden_text(&mut pdf) {
+    match analyze_hidden_text_hayro(&document) {
         Ok(findings) => {
             let suspicious = findings
                 .iter()

@@ -5,7 +5,7 @@ members = [
   "crates/pdf-redox-cli",
   "crates/pdf-redox-wasm",
 ]
-exclude = ["third_party/flpdf"]
+exclude = ["third_party/flpdf", "third_party/hayro-syntax"]
 
 [workspace.package]
 edition = "2024"
@@ -15,7 +15,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 flpdf = { version = "0.5.1", path = "third_party/flpdf/crates/flpdf" }
-hayro-syntax = { git = "https://github.com/LaurenzV/hayro.git", rev = "a728f7cb6826c1e167973b8fd71867ebb4cf39af", default-features = false, features = ["std"] }
+hayro-syntax = { path = "third_party/hayro-syntax", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

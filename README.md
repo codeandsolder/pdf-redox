@@ -12,7 +12,7 @@ Design goals:
 - never require uploading the document to a server;
 - preserve unsupported/opaque streams rather than damaging them.
 
-Hayro is the selected long-term source parser. The migration keeps source bytes immutable and lazily parsed, layers mutations in a sparse copy-on-write object overlay, then feeds reachable objects to a compact fresh writer. The existing `flpdf` backend remains temporarily in place for mature mutation/rewrite passes while they are moved across incrementally. A fresh rewrite is important: it discards incremental-update history and unreachable objects instead of appending yet another revision.
+Hayro is the production source parser. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. flpdf remains vendored for detached COS/content/filter/image codec utilities and compatibility tests, not as the production mutable document graph. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision.
 
 ## Workspace
 
@@ -44,4 +44,4 @@ Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB 
 
 ## Development handoff
 
-For the current Hayro/COW migration state, validated checkpoints, known upstream gap, and exact restart sequence, see [`docs/THREAD_HANDOFF.md`](docs/THREAD_HANDOFF.md). The preserved minimal Hayro trailer-access patch is in [`docs/hayro-trailer-access.patch`](docs/hayro-trailer-access.patch).
+For the Hayro/COW architecture, validation history, and development handoff, see [`docs/THREAD_HANDOFF.md`](docs/THREAD_HANDOFF.md). The preserved minimal Hayro trailer-access patch is in [`docs/hayro-trailer-access.patch`](docs/hayro-trailer-access.patch).

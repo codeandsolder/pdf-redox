@@ -1,10 +1,7 @@
 mod corpus;
 
 use clap::{Parser, ValueEnum};
-use pdf_redox::{
-    AnnotationPolicy, Config, EditDocument, FlatePolicy, PrivacyConfig, PrivacyLevel, analyze_pdf,
-    optimize_pdf,
-};
+use pdf_redox::{AnnotationPolicy, Config, FlatePolicy, PrivacyLevel, analyze_pdf, optimize_pdf};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -144,9 +141,6 @@ struct Args {
     corpus_top: usize,
     #[arg(long)]
     analyze_only: bool,
-    /// Migration-only fresh rewrite through the Hayro/COW backend.
-    #[arg(long, hide = true)]
-    hayro_rewrite_experimental: bool,
     #[arg(long)]
     json: bool,
 }
@@ -163,97 +157,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if a.analyze_only {
         let r = analyze_pdf(&input)?;
         println!("{}", serde_json::to_string_pretty(&r)?);
-        return Ok(());
-    }
-    if a.hayro_rewrite_experimental {
-        if a.scrub_jpeg_metadata || a.remove_attachments || a.remove_signatures {
-            return Err(
-                "Hayro experimental mode has not migrated JPEG, attachment, or signature privacy operations yet"
-                    .into(),
-            );
-        }
-        let input_bytes = input.len();
-        let mut document = EditDocument::from_bytes(input)?;
-        let privacy_level = match a.privacy {
-            PrivacyArg::None => PrivacyLevel::None,
-            PrivacyArg::Metadata => PrivacyLevel::Metadata,
-            PrivacyArg::BestEffort => PrivacyLevel::BestEffort,
-        };
-        let privacy_items_removed = document.scrub_cos_privacy_experimental(&PrivacyConfig {
-            level: privacy_level,
-            remove_active_content: a.remove_active_content,
-            ..PrivacyConfig::default()
-        })?;
-        let font_optimization = if a.drop_font_editing_support {
-            document.strip_font_editing_tables_experimental(Config::optimize_only().flate_level)?
-        } else {
-            Default::default()
-        };
-        let metadata_dedup = if a.no_metadata_dedup {
-            Default::default()
-        } else {
-            document.canonicalize_metadata_streams_experimental()?
-        };
-        let font_program_dedup = if a.no_font_program_dedup {
-            Default::default()
-        } else {
-            document.canonicalize_font_programs_experimental()?
-        };
-        let to_unicode_dedup = if a.no_to_unicode_dedup {
-            Default::default()
-        } else {
-            document.canonicalize_to_unicode_experimental()?
-        };
-        let icc_dedup = if a.no_icc_dedup {
-            Default::default()
-        } else {
-            document.canonicalize_icc_profiles_experimental()?
-        };
-        let type3_charproc_dedup = if a.no_type3_charproc_dedup {
-            Default::default()
-        } else {
-            document.canonicalize_type3_charprocs_experimental()?
-        };
-        let page_count = document.source().page_count();
-        let source_objects = document.source().object_count();
-        let output = document.write_compact_experimental()?;
-        let output_bytes = output.len();
-        let out_path = a.output.unwrap_or_else(|| {
-            let stem = a
-                .input
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output");
-            a.input.with_file_name(format!("{stem}.redox.pdf"))
-        });
-        if out_path.as_os_str() == "-" {
-            let stdout = io::stdout();
-            let mut lock = stdout.lock();
-            lock.write_all(&output)?;
-            lock.flush()?;
-        } else {
-            std::fs::write(&out_path, output)?;
-        }
-        if a.json {
-            let summary = serde_json::json!({
-                "input_bytes": input_bytes,
-                "output_bytes": output_bytes,
-                "page_count": page_count,
-                "source_objects": source_objects,
-                "privacy_items_removed": privacy_items_removed,
-                "font_optimization": font_optimization,
-                "metadata_dedup": metadata_dedup,
-                "font_program_dedup": font_program_dedup,
-                "to_unicode_dedup": to_unicode_dedup,
-                "icc_dedup": icc_dedup,
-                "type3_charproc_dedup": type3_charproc_dedup,
-            });
-            if out_path.as_os_str() == "-" {
-                eprintln!("{}", serde_json::to_string(&summary)?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-            }
-        }
         return Ok(());
     }
     let mut cfg = match a.profile {

@@ -141,6 +141,7 @@ pub mod reader;
 mod resource_finder;
 mod resource_replacer;
 pub mod resources;
+pub use resources::{find_resources_detached, DetachedResourceUsage};
 pub mod signatures;
 pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
@@ -158,7 +159,10 @@ pub use annotation_object_helper::AnnotationObjectHelper;
 pub use cache::{CacheEntry, ObjectCache};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
-pub use content_stream::{parse_content_operations, ObjectHandleParserCallbacks, ParseControl};
+pub use content_stream::{
+    parse_content_operations, parse_detached_content_stream, ObjectHandleParserCallbacks,
+    ParseControl,
+};
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::Diagnostics;
 pub use embedded_files::{
@@ -192,9 +196,10 @@ pub use job::{
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{
-    optimize_images, optimize_images_with_resize_targets, optimize_images_with_stats,
-    should_remove_unreferenced_resources, ImageOptimizationOptions, ImageOptimizationStats,
-    ImageResizeEncoding, ImageResizeTarget, RemoveUnreferencedResources,
+    optimize_image_detached, optimize_images, optimize_images_with_resize_targets,
+    optimize_images_with_stats, should_remove_unreferenced_resources, DetachedImageTransform,
+    ImageOptimizationOptions, ImageOptimizationStats, ImageResizeEncoding, ImageResizeTarget,
+    RemoveUnreferencedResources,
 };
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{
@@ -216,7 +221,9 @@ pub use page_label_document_helper::{
     PageLabelDocumentHelper,
 };
 pub use page_object_helper::{
-    externalize_duplicate_inline_images, DuplicateInlineImageStats, PageBox, PageObjectHelper,
+    externalize_duplicate_inline_images, inspect_duplicate_inline_images_detached,
+    rewrite_duplicate_inline_images_detached, DetachedInlineImage, DetachedInlineImageRewrite,
+    DuplicateInlineImageStats, InlineImageFingerprint, PageBox, PageObjectHelper,
 };
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};

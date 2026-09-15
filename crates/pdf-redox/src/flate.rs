@@ -1,5 +1,8 @@
 use crate::{FlatePolicy, Result};
-use flpdf::{DecodeLevel, ObjectHandle, Pdf, filters::encode_stream_data_with_flate_level};
+#[cfg(test)]
+use flpdf::Pdf;
+use flpdf::{DecodeLevel, ObjectHandle, filters::encode_stream_data_with_flate_level};
+#[cfg(test)]
 use std::{
     io::{Read, Seek},
     rc::Rc,
@@ -11,6 +14,7 @@ pub(crate) struct FlateOptimizationStats {
     pub estimated_savings_bytes: usize,
 }
 
+#[cfg(test)]
 fn is_safe_lone_flate(dict: &ObjectHandle) -> Result<bool> {
     let filter = dict.try_get_key(b"/Filter")?;
     if !filter.try_is_name_and_equals(b"FlateDecode")? {
@@ -29,6 +33,160 @@ fn is_safe_lone_flate(dict: &ObjectHandle) -> Result<bool> {
     Ok(true)
 }
 
+fn is_safe_lone_flate_hayro(
+    document: &crate::EditDocument,
+    dictionary: &crate::OwnedDictionary,
+) -> Result<bool> {
+    let Some(filter) = dictionary.get(b"Filter".as_slice()) else {
+        return Ok(false);
+    };
+    if !matches!(document.resolve_owned_value(filter)?, Some(crate::OwnedObject::Name(name)) if name == b"FlateDecode")
+    {
+        return Ok(false);
+    }
+    if dictionary.contains_key(b"F".as_slice()) {
+        return Ok(false);
+    }
+    if let Some(kind) = dictionary.get(b"Type".as_slice())
+        && matches!(document.resolve_owned_value(kind)?, Some(crate::OwnedObject::Name(name)) if matches!(name.as_slice(), b"Metadata" | b"ObjStm" | b"XRef"))
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(crate) fn apply_flate_policy_hayro(
+    document: &mut crate::EditDocument,
+    policy: FlatePolicy,
+    level: i32,
+) -> Result<FlateOptimizationStats> {
+    let (min_savings_bytes, min_savings_percent, force) = match policy {
+        FlatePolicy::Preserve => return Ok(FlateOptimizationStats::default()),
+        FlatePolicy::Selective {
+            min_savings_bytes,
+            min_savings_percent,
+        } => (min_savings_bytes, min_savings_percent, false),
+        FlatePolicy::RecompressAll => (0, 0, true),
+    };
+    let mut stats = FlateOptimizationStats::default();
+    for handle in document.reachable_output_objects()? {
+        let Some(crate::OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        if !is_safe_lone_flate_hayro(document, &dictionary)? {
+            continue;
+        }
+        let raw = data.bytes(document.source())?;
+        let Ok(decoded) = document.decoded_stream_data(handle, DecodeLevel::Generalized) else {
+            continue;
+        };
+        // Re-encoding only consults /Filter and /DecodeParms. Do not detach the
+        // whole stream dictionary: image/resource dictionaries may contain very
+        // deep or cyclic semantic graphs that are irrelevant to the codec.
+        let mut codec_dictionary = crate::OwnedDictionary::new();
+        for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
+            if let Some(value) = dictionary.get(key) {
+                codec_dictionary.insert(key.to_vec(), value.clone());
+            }
+        }
+        let detached =
+            document.detached_flpdf_object(&crate::OwnedObject::Dictionary(codec_dictionary))?;
+        let Ok(repacked) = encode_stream_data_with_flate_level(&detached, &decoded, level) else {
+            continue;
+        };
+        let saving = raw.len().saturating_sub(repacked.len());
+        if !force
+            && (saving < min_savings_bytes
+                || saving.saturating_mul(100)
+                    < raw.len().saturating_mul(usize::from(min_savings_percent)))
+        {
+            continue;
+        }
+        let object = match handle {
+            crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
+            crate::ObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+        };
+        if let crate::OwnedObject::Stream { data, .. } = object {
+            *data = crate::StreamData::Owned(repacked);
+            stats.streams_selected += 1;
+            stats.estimated_savings_bytes += saving;
+        }
+    }
+    Ok(stats)
+}
+
+pub(crate) fn compress_unfiltered_streams_hayro(
+    document: &mut crate::EditDocument,
+    level: i32,
+) -> Result<()> {
+    let handles = document.reachable_output_objects()?;
+    for handle in handles {
+        let Some(crate::OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let raw = data.bytes(document.source())?.into_owned();
+        let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
+            !matches!(
+                document.resolve_owned_value(value),
+                Ok(Some(crate::OwnedObject::Null)) | Ok(None)
+            )
+        });
+        if raw.is_empty() {
+            if has_filter {
+                let object = match handle {
+                    crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
+                    crate::ObjectHandle::New(id) => document
+                        .overlay_mut()
+                        .added_mut(id)
+                        .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+                };
+                if let crate::OwnedObject::Stream { dictionary, data } = object {
+                    dictionary.remove(b"Filter".as_slice());
+                    dictionary.remove(b"DecodeParms".as_slice());
+                    dictionary.remove(b"Length".as_slice());
+                    *data = crate::StreamData::Owned(Vec::new());
+                }
+            }
+            continue;
+        }
+        if has_filter {
+            continue;
+        }
+        // The writer's historical StreamDataMode::Compress behavior always
+        // applies Flate to non-empty unfiltered streams, even when a tiny stream grows.
+        let encoding_dictionary = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let encoded = encode_stream_data_with_flate_level(&encoding_dictionary, &raw, level)?;
+        let object = match handle {
+            crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
+            crate::ObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+        };
+        if let crate::OwnedObject::Stream { dictionary, data } = object {
+            dictionary.insert(
+                b"Filter".to_vec(),
+                crate::OwnedObject::Name(b"FlateDecode".to_vec()),
+            );
+            dictionary.remove(b"DecodeParms".as_slice());
+            dictionary.remove(b"Length".as_slice());
+            *data = crate::StreamData::Owned(encoded);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn apply_flate_policy<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     policy: FlatePolicy,

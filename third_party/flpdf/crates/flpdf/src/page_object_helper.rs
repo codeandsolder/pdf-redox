@@ -168,7 +168,25 @@ struct ObjectRecordingCallbacks {
     objects: Vec<ObjectHandle>,
 }
 
-type InlineImageFingerprint = [u8; 32];
+/// Stable semantic fingerprint of an inline image after dictionary expansion.
+pub type InlineImageFingerprint = [u8; 32];
+
+/// One image emitted by detached inline-image rewriting.
+#[derive(Debug, Clone)]
+pub struct DetachedInlineImage {
+    pub name: Vec<u8>,
+    pub dictionary: ObjectHandle,
+    pub data: Vec<u8>,
+    pub fingerprint: InlineImageFingerprint,
+}
+
+/// Result of detached inline-image rewriting.
+#[derive(Debug, Clone, Default)]
+pub struct DetachedInlineImageRewrite {
+    pub content: Vec<u8>,
+    pub images: Vec<DetachedInlineImage>,
+    pub externalized_occurrences: usize,
+}
 
 /// Statistics from exact duplicate-inline-image externalization.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -532,6 +550,69 @@ impl TokenFilter for InlineImageExternalizer {
         }
         Ok(())
     }
+}
+
+/// Inspect decoded detached content and count semantic inline-image fingerprints.
+pub fn inspect_duplicate_inline_images_detached(
+    content: &[u8],
+    min_size: usize,
+    color_spaces: Option<ObjectHandle>,
+) -> Result<HashMap<InlineImageFingerprint, (usize, usize)>> {
+    let stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(Vec::new()),
+        Rc::new(content.to_vec()),
+    );
+    let mut filter = InlineImageExternalizer::new_counter(min_size, color_spaces);
+    stream.filter_as_contents(&mut filter, None)?;
+    Ok(filter.fingerprint_counts)
+}
+
+/// Rewrite selected inline-image fingerprints in decoded detached content.
+/// Resource naming and color-space expansion use only the supplied detached
+/// dictionaries; no `Pdf` document or object cache is involved.
+pub fn rewrite_duplicate_inline_images_detached(
+    content: &[u8],
+    min_size: usize,
+    color_spaces: Option<ObjectHandle>,
+    resource_names: BTreeSet<Vec<u8>>,
+    selected: HashSet<InlineImageFingerprint>,
+) -> Result<DetachedInlineImageRewrite> {
+    let stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(Vec::new()),
+        Rc::new(content.to_vec()),
+    );
+    let mut filter = InlineImageExternalizer::new_selected(
+        min_size,
+        color_spaces,
+        resource_names,
+        Rc::new(selected),
+    );
+    let mut rewritten = Vec::new();
+    {
+        let mut sink = PlString::new(
+            "detached duplicate-inline image content",
+            None,
+            &mut rewritten,
+        );
+        stream.filter_as_contents(&mut filter, Some(&mut sink))?;
+    }
+    let images = filter
+        .images
+        .into_iter()
+        .filter_map(|image| {
+            image.fingerprint.map(|fingerprint| DetachedInlineImage {
+                name: image.name,
+                dictionary: image.dictionary,
+                data: image.data,
+                fingerprint,
+            })
+        })
+        .collect();
+    Ok(DetachedInlineImageRewrite {
+        content: rewritten,
+        images,
+        externalized_occurrences: filter.externalized_occurrences,
+    })
 }
 
 impl ObjectHandleParserCallbacks for ObjectRecordingCallbacks {

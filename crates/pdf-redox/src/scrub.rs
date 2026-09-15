@@ -1,12 +1,15 @@
 use crate::jpeg::strip_jpeg_metadata;
 use crate::{
     EditDocument, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
-    OwnedObject, PrivacyConfig, PrivacyLevel, Result,
+    OwnedObject, PrivacyConfig, PrivacyLevel, Result, StreamData,
 };
+#[cfg(test)]
 use flpdf::{ObjectHandle, Pdf};
 use hayro_syntax::object::Object as HayroObject;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::io::{Read, Seek};
+#[cfg(test)]
 use std::rc::Rc;
 
 #[derive(Debug, Default)]
@@ -21,6 +24,7 @@ impl ScrubStats {
     }
 }
 
+#[cfg(test)]
 fn dict_view(handle: &ObjectHandle) -> Option<ObjectHandle> {
     if let Some(d) = handle.as_stream_dict() {
         Some(d)
@@ -31,6 +35,7 @@ fn dict_view(handle: &ObjectHandle) -> Option<ObjectHandle> {
     }
 }
 
+#[cfg(test)]
 fn remove_key<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     dict: &ObjectHandle,
@@ -220,29 +225,16 @@ fn scrub_owned_cos_privacy_dictionary(
     }
 }
 
-fn validate_hayro_cos_privacy_config(cfg: &PrivacyConfig) -> Result<()> {
-    if cfg.strip_jpeg_metadata
-        || cfg.aggressive_jpeg_app_scrub
-        || cfg.remove_attachments
-        || cfg.remove_signatures
-    {
-        return Err(crate::Error::Invalid(
-            "Hayro COS privacy migration does not yet support JPEG, attachment, or signature scrubbing"
-                .to_owned(),
-        ));
-    }
+fn validate_hayro_cos_privacy_config(_cfg: &PrivacyConfig) -> Result<()> {
     Ok(())
 }
 
-/// Remove the migrated dictionary-only privacy state from the Hayro/COW graph
-/// without materializing unaffected source objects.
+/// Apply COS-level privacy cleanup directly to the Hayro/COW graph without
+/// materializing unaffected source objects.
 ///
-/// Supported today: Metadata-level `/Info`, `/ID`, `/Metadata`, `/PieceInfo`,
-/// and `/LastModified`; BestEffort additionally removes `/Thumb` and, when
-/// requested, `/V`, `/DV`, and `/RV` from field dictionaries carrying `/FT`.
-/// Active-content mode removes `/AA`, dangerous `/A` and `/OpenAction` actions,
-/// and the Catalog JavaScript name tree. Specialized JPEG, attachment, and
-/// signature operations stay on the existing flpdf path for now.
+/// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
+/// `/LastModified`. BestEffort can additionally remove thumbnails and form
+/// values, active content, attachment roots, signature values, and JPEG metadata.
 pub(crate) fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
@@ -357,8 +349,318 @@ pub(crate) fn scrub_edit_document_cos_privacy(
     if cfg.level == PrivacyLevel::BestEffort && cfg.remove_active_content {
         scrub_catalog_javascript_name_tree(document, &mut stats)?;
     }
+    if cfg.level == PrivacyLevel::BestEffort && cfg.remove_attachments {
+        scrub_catalog_attachments(document, &mut stats)?;
+    }
+    if cfg.level == PrivacyLevel::BestEffort
+        && cfg.remove_signatures
+        && strip_signature_values_hayro(document)?
+    {
+        stats.bump("signature-values");
+    }
+    if cfg.strip_jpeg_metadata {
+        scrub_jpeg_metadata_hayro(document, cfg.aggressive_jpeg_app_scrub, &mut stats)?;
+    }
 
     Ok(stats)
+}
+
+fn count_embedded_file_name_tree_entries(
+    document: &EditDocument,
+    value: &OwnedObject,
+    seen: &mut BTreeSet<CowObjectHandle>,
+) -> Result<usize> {
+    let object = match value {
+        OwnedObject::Reference(handle) => {
+            if !seen.insert(*handle) {
+                return Ok(0);
+            }
+            let Some(object) = document.current_owned_object(*handle)? else {
+                return Ok(0);
+            };
+            object
+        }
+        other => other.clone(),
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    if let Some(names) = dictionary.get(b"Names".as_slice())
+        && let Some(OwnedObject::Array(values)) = document.resolve_owned_value(names)?
+    {
+        count += values.len() / 2;
+    }
+    if let Some(kids) = dictionary.get(b"Kids".as_slice())
+        && let Some(OwnedObject::Array(values)) = document.resolve_owned_value(kids)?
+    {
+        for kid in &values {
+            count += count_embedded_file_name_tree_entries(document, kid, seen)?;
+        }
+    }
+    Ok(count)
+}
+
+fn scrub_catalog_attachments(document: &mut EditDocument, stats: &mut ScrubStats) -> Result<()> {
+    let catalog_handle = CowObjectHandle::Existing(document.source().catalog_id());
+    let Some(snapshot) = document.current_owned_object(catalog_handle)? else {
+        return Ok(());
+    };
+    let Some(catalog) = snapshot.as_dictionary() else {
+        return Ok(());
+    };
+    let names = catalog.get(b"Names".as_slice()).cloned();
+    let associated = catalog.contains_key(b"AF".as_slice());
+
+    if let Some(names) = names {
+        let embedded_value = match &names {
+            OwnedObject::Reference(handle) => {
+                document.current_owned_object(*handle)?.and_then(|object| {
+                    object
+                        .as_dictionary()
+                        .and_then(|dict| dict.get(b"EmbeddedFiles".as_slice()).cloned())
+                })
+            }
+            OwnedObject::Dictionary(dict) => dict.get(b"EmbeddedFiles".as_slice()).cloned(),
+            _ => None,
+        };
+        let embedded_count = if let Some(value) = embedded_value.as_ref() {
+            count_embedded_file_name_tree_entries(document, value, &mut BTreeSet::new())?
+        } else {
+            0
+        };
+        match names {
+            OwnedObject::Reference(handle) => match handle {
+                CowObjectHandle::Existing(id) => {
+                    if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut()
+                        && dictionary.remove(b"EmbeddedFiles".as_slice()).is_some()
+                    {
+                        stats.bump("embedded-file-name-tree");
+                        for _ in 0..embedded_count {
+                            stats.bump("embedded-file");
+                        }
+                    }
+                }
+                CowObjectHandle::New(id) => {
+                    if let Some(object) = document.overlay_mut().added_mut(id)
+                        && let Some(dictionary) = object.as_dictionary_mut()
+                        && dictionary.remove(b"EmbeddedFiles".as_slice()).is_some()
+                    {
+                        stats.bump("embedded-file-name-tree");
+                        for _ in 0..embedded_count {
+                            stats.bump("embedded-file");
+                        }
+                    }
+                }
+            },
+            OwnedObject::Dictionary(_) => {
+                let catalog_id = document.source().catalog_id();
+                if let Some(catalog) = document.edit_object(catalog_id)?.as_dictionary_mut()
+                    && let Some(OwnedObject::Dictionary(names)) =
+                        catalog.get_mut(b"Names".as_slice())
+                    && names.remove(b"EmbeddedFiles".as_slice()).is_some()
+                {
+                    stats.bump("embedded-file-name-tree");
+                    for _ in 0..embedded_count {
+                        stats.bump("embedded-file");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if associated {
+        let catalog_id = document.source().catalog_id();
+        if let Some(catalog) = document.edit_object(catalog_id)?.as_dictionary_mut()
+            && catalog.remove(b"AF".as_slice()).is_some()
+        {
+            stats.bump("associated-files");
+        }
+    }
+    Ok(())
+}
+
+fn signature_field_type(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    inherited: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(value) = dictionary.get(b"FT".as_slice()) else {
+        return Ok(inherited);
+    };
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Name(name)) => Some(name),
+        _ => inherited,
+    })
+}
+
+fn pure_widget_field(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
+    let is_widget = match dictionary.get(b"Subtype".as_slice()) {
+        Some(value) => {
+            matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == b"Widget")
+        }
+        None => false,
+    };
+    let has_field_entries = [
+        b"T".as_slice(),
+        b"FT",
+        b"Kids",
+        b"V",
+        b"DV",
+        b"Ff",
+        b"TU",
+        b"TM",
+    ]
+    .into_iter()
+    .any(|key| dictionary.contains_key(key));
+    Ok(is_widget && !has_field_entries)
+}
+
+fn strip_signature_field_hayro(
+    document: &mut EditDocument,
+    handle: CowObjectHandle,
+    inherited_type: Option<Vec<u8>>,
+    depth: usize,
+    seen: &mut BTreeSet<CowObjectHandle>,
+    changed: &mut bool,
+) -> Result<()> {
+    if depth > 100 || !seen.insert(handle) {
+        return Ok(());
+    }
+    let Some(snapshot) = document.current_owned_object(handle)? else {
+        return Ok(());
+    };
+    let Some(dictionary) = snapshot.as_dictionary() else {
+        return Ok(());
+    };
+    let field_type = signature_field_type(document, dictionary, inherited_type)?;
+    let kids = dictionary.get(b"Kids".as_slice()).cloned();
+    let remove_value =
+        field_type.as_deref() == Some(b"Sig") && dictionary.contains_key(b"V".as_slice());
+    if remove_value {
+        match handle {
+            CowObjectHandle::Existing(id) => {
+                if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut()
+                    && dictionary.remove(b"V".as_slice()).is_some()
+                {
+                    *changed = true;
+                }
+            }
+            CowObjectHandle::New(id) => {
+                if let Some(object) = document.overlay_mut().added_mut(id)
+                    && let Some(dictionary) = object.as_dictionary_mut()
+                    && dictionary.remove(b"V".as_slice()).is_some()
+                {
+                    *changed = true;
+                }
+            }
+        }
+    }
+    if depth == 100 {
+        return Ok(());
+    }
+    let Some(kids) = kids else {
+        return Ok(());
+    };
+    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(&kids)? else {
+        return Ok(());
+    };
+    for kid in values {
+        let OwnedObject::Reference(kid_handle) = kid else {
+            continue;
+        };
+        let Some(kid_object) = document.current_owned_object(kid_handle)? else {
+            continue;
+        };
+        let Some(kid_dictionary) = kid_object.as_dictionary() else {
+            continue;
+        };
+        if pure_widget_field(document, kid_dictionary)? {
+            continue;
+        }
+        strip_signature_field_hayro(
+            document,
+            kid_handle,
+            field_type.clone(),
+            depth + 1,
+            seen,
+            changed,
+        )?;
+    }
+    Ok(())
+}
+
+fn strip_signature_values_hayro(document: &mut EditDocument) -> Result<bool> {
+    let catalog_handle = CowObjectHandle::Existing(document.source().catalog_id());
+    let Some(catalog_object) = document.current_owned_object(catalog_handle)? else {
+        return Ok(false);
+    };
+    let Some(catalog) = catalog_object.as_dictionary() else {
+        return Ok(false);
+    };
+    let Some(acroform) = catalog.get(b"AcroForm".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(acroform_object) = document.resolve_owned_value(acroform)? else {
+        return Ok(false);
+    };
+    let Some(acroform_dictionary) = acroform_object.as_dictionary() else {
+        return Ok(false);
+    };
+    let Some(fields) = acroform_dictionary.get(b"Fields".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Array(fields)) = document.resolve_owned_value(fields)? else {
+        return Ok(false);
+    };
+    let mut seen = BTreeSet::new();
+    let mut changed = false;
+    for field in fields {
+        let OwnedObject::Reference(handle) = field else {
+            continue;
+        };
+        strip_signature_field_hayro(document, handle, None, 0, &mut seen, &mut changed)?;
+    }
+    Ok(changed)
+}
+
+fn scrub_jpeg_metadata_hayro(
+    document: &mut EditDocument,
+    aggressive: bool,
+    stats: &mut ScrubStats,
+) -> Result<()> {
+    let handles = document.reachable_output_objects()?;
+    for handle in handles {
+        let Some(OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let Some(filter) = dictionary.get(b"Filter".as_slice()) else {
+            continue;
+        };
+        if !matches!(document.resolve_owned_value(filter)?, Some(OwnedObject::Name(name)) if name == b"DCTDecode")
+        {
+            continue;
+        }
+        let raw = data.bytes(document.source())?;
+        let Some((clean, removed)) = strip_jpeg_metadata(raw.as_ref(), aggressive) else {
+            continue;
+        };
+        let object = match handle {
+            CowObjectHandle::Existing(id) => document.edit_object(id)?,
+            CowObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or(crate::Error::MissingNewObject { index: id.index() })?,
+        };
+        if let OwnedObject::Stream { data, .. } = object {
+            *data = StreamData::Owned(clean);
+            stats.bump("jpeg-metadata-stream");
+            stats.jpeg_metadata_bytes_removed += removed;
+        }
+    }
+    Ok(())
 }
 
 fn scrub_catalog_javascript_name_tree(
@@ -420,6 +722,7 @@ fn scrub_catalog_javascript_name_tree(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
     scrub_edit_document_cos_privacy(
         document,
@@ -430,6 +733,7 @@ pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Resul
     )
 }
 
+#[cfg(test)]
 fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
     if !action.try_is_dictionary()? {
         return Ok(false);
@@ -450,6 +754,7 @@ fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(test)]
 pub(crate) fn scrub_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     cfg: &PrivacyConfig,
@@ -619,7 +924,7 @@ mod tests {
         assert!(!document.trailer().contains_key(b"Info".as_slice()));
         assert!(!document.trailer().contains_key(b"ID".as_slice()));
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let rewritten = EditDocument::from_bytes(output)?;
         assert_eq!(rewritten.source().object_count(), 5);
         assert!(!rewritten.trailer().contains_key(b"Info".as_slice()));
@@ -680,7 +985,7 @@ mod tests {
         assert_eq!(actual.jpeg_metadata_bytes_removed, 0);
         assert_eq!(document.overlay().changes().count(), 3);
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let rewritten = EditDocument::from_bytes(output)?;
         assert_eq!(rewritten.source().object_count(), 6);
 
@@ -734,7 +1039,7 @@ mod tests {
         let actual = scrub_edit_document_cos_privacy(&mut document, &config)?;
         assert_eq!(actual.removed, expected.removed);
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let rewritten = EditDocument::from_bytes(output)?;
         let catalog_id = rewritten.source().catalog_id();
         let catalog = rewritten.source().materialize(catalog_id)?;

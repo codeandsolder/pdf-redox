@@ -2,6 +2,7 @@ use crate::{
     EditDocument, Error, ExistingObjectChange, ObjectHandle as CowObjectHandle, OwnedDictionary,
     OwnedObject, Result, StreamData,
 };
+#[cfg(test)]
 use flpdf::{ObjectHandle, ObjectRef, Pdf};
 use hayro_syntax::{
     PdfVersion,
@@ -9,6 +10,7 @@ use hayro_syntax::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18,6 +20,7 @@ pub(crate) struct TargetedDedupStats {
     pub references_canonicalized: usize,
 }
 
+#[cfg(test)]
 fn stream_fingerprint_ignoring(
     object: &ObjectHandle,
     domain: &[u8],
@@ -61,10 +64,12 @@ fn stream_fingerprint_ignoring(
     Ok(Some(hasher.finalize().into()))
 }
 
+#[cfg(test)]
 fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
     stream_fingerprint_ignoring(object, domain, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -126,6 +131,7 @@ pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn collect_direct_metadata_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -173,6 +179,7 @@ fn collect_direct_metadata_holders(
     }
 }
 
+#[cfg(test)]
 fn metadata_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     let mut holders = Vec::new();
     for object in objects {
@@ -181,6 +188,7 @@ fn metadata_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     holders
 }
 
+#[cfg(test)]
 fn collect_direct_icc_arrays(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -225,6 +233,7 @@ fn collect_direct_icc_arrays(
     }
 }
 
+#[cfg(test)]
 fn icc_arrays(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     let mut arrays = Vec::new();
     for object in objects {
@@ -233,6 +242,7 @@ fn icc_arrays(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     arrays
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -287,6 +297,7 @@ pub(crate) fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn xobject_fingerprint(
     object: &ObjectHandle,
     subtype_name: &[u8],
@@ -303,6 +314,7 @@ fn xobject_fingerprint(
     stream_fingerprint_ignoring(object, domain, ignored_dictionary_keys)
 }
 
+#[cfg(test)]
 fn collect_direct_xobject_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -350,6 +362,7 @@ fn collect_direct_xobject_holders(
     }
 }
 
+#[cfg(test)]
 fn xobject_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     let mut holders = Vec::new();
     for object in objects {
@@ -358,6 +371,7 @@ fn xobject_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     holders
 }
 
+#[cfg(test)]
 fn exact_xobject_redirects(
     objects: &[ObjectHandle],
     subtype_name: &[u8],
@@ -391,6 +405,7 @@ fn exact_xobject_redirects(
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn rewrite_xobject_resource_references<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     holders: Vec<ObjectHandle>,
@@ -422,6 +437,7 @@ fn rewrite_xobject_resource_references<R: Read + Seek + 'static>(
     Ok(references_canonicalized)
 }
 
+#[cfg(test)]
 fn collect_direct_form_icon_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -466,6 +482,7 @@ fn collect_direct_form_icon_holders(
     }
 }
 
+#[cfg(test)]
 fn form_icon_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     let mut holders = Vec::new();
     for object in objects {
@@ -474,6 +491,7 @@ fn form_icon_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     holders
 }
 
+#[cfg(test)]
 fn rewrite_form_icon_references<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     holders: Vec<ObjectHandle>,
@@ -502,6 +520,7 @@ fn rewrite_form_icon_references<R: Read + Seek + 'static>(
     Ok(references_canonicalized)
 }
 
+#[cfg(test)]
 fn xobject_name_is_ignorable(version: &str) -> bool {
     let Some((major, minor)) = version.split_once('.') else {
         return false;
@@ -512,6 +531,7 @@ fn xobject_name_is_ignorable(version: &str) -> bool {
     major > 1 || (major == 1 && minor > 0)
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -589,6 +609,7 @@ pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn dictionary_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
     if !object.try_is_dictionary()? {
         return Ok(None);
@@ -602,6 +623,7 @@ fn dictionary_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option
     Ok(Some(hasher.finalize().into()))
 }
 
+#[cfg(test)]
 fn canonical_redirect_ref(
     mut object_ref: ObjectRef,
     redirects: &HashMap<ObjectRef, ObjectRef>,
@@ -616,6 +638,7 @@ fn canonical_redirect_ref(
     object_ref
 }
 
+#[cfg(test)]
 fn redirected_handle<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     value: ObjectHandle,
@@ -627,6 +650,7 @@ fn redirected_handle<R: Read + Seek + 'static>(
         .unwrap_or(value)
 }
 
+#[cfg(test)]
 fn normalized_direct_resource_value<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     value: ObjectHandle,
@@ -654,6 +678,7 @@ fn normalized_direct_resource_value<R: Read + Seek + 'static>(
     value
 }
 
+#[cfg(test)]
 fn normalized_non_stream_resource_object<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
@@ -681,6 +706,7 @@ fn normalized_non_stream_resource_object<R: Read + Seek + 'static>(
     Ok(None)
 }
 
+#[cfg(test)]
 fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -716,6 +742,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn collect_form_resource_objects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
@@ -761,6 +788,7 @@ fn collect_form_resource_objects<R: Read + Seek + 'static>(
     }
 }
 
+#[cfg(test)]
 fn form_resource_objects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -785,6 +813,7 @@ fn form_resource_objects<R: Read + Seek + 'static>(
     resource_objects
 }
 
+#[cfg(test)]
 fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     resource_objects: &[ObjectHandle],
@@ -809,6 +838,7 @@ fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn normalized_dictionary_with_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
@@ -823,6 +853,7 @@ fn normalized_dictionary_with_redirects<R: Read + Seek + 'static>(
     Ok(Some(normalized))
 }
 
+#[cfg(test)]
 fn exact_form_font_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -865,6 +896,7 @@ fn exact_form_font_redirects<R: Read + Seek + 'static>(
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn virtual_form_image_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -924,6 +956,7 @@ fn virtual_form_image_redirects<R: Read + Seek + 'static>(
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn normalized_named_form_resource<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
@@ -971,6 +1004,7 @@ fn normalized_named_form_resource<R: Read + Seek + 'static>(
     ObjectHandle::dictionary(normalized)
 }
 
+#[cfg(test)]
 fn normalized_form_resources<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     resources: &ObjectHandle,
@@ -1014,6 +1048,7 @@ fn normalized_form_resources<R: Read + Seek + 'static>(
     ObjectHandle::dictionary(normalized)
 }
 
+#[cfg(test)]
 fn form_fingerprint<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
@@ -1067,6 +1102,7 @@ fn form_fingerprint<R: Read + Seek + 'static>(
     Ok(Some(hasher.finalize().into()))
 }
 
+#[cfg(test)]
 fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -1104,6 +1140,7 @@ fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     Ok(redirects)
 }
 
+#[cfg(test)]
 fn fixed_point_form_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -1140,6 +1177,7 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
     Ok(redirects)
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -1193,6 +1231,7 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn collect_direct_appearance_dictionaries(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -1230,6 +1269,7 @@ fn collect_direct_appearance_dictionaries(
     }
 }
 
+#[cfg(test)]
 fn appearance_holders<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -1264,6 +1304,7 @@ fn appearance_holders<R: Read + Seek + 'static>(
     holders
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -1355,6 +1396,7 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -1473,6 +1515,7 @@ pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn collect_direct_type3_charprocs(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -1514,6 +1557,7 @@ fn collect_direct_type3_charprocs(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -1586,6 +1630,7 @@ pub(crate) fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 fn collect_direct_to_unicode_holders(
     value: &ObjectHandle,
     include_indirect_root: bool,
@@ -1630,6 +1675,7 @@ fn collect_direct_to_unicode_holders(
     }
 }
 
+#[cfg(test)]
 fn to_unicode_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     let mut holders = Vec::new();
     for object in objects {
@@ -1638,6 +1684,7 @@ fn to_unicode_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
     holders
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -1696,8 +1743,10 @@ pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
     })
 }
 
+#[cfg(test)]
 const FONT_FILE_KEYS: [&[u8]; 3] = [b"/FontFile", b"/FontFile2", b"/FontFile3"];
 
+#[cfg(test)]
 fn font_program_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8; 32]>> {
     let Some(dict) = object.as_stream_dict() else {
         return Ok(None);
@@ -1734,6 +1783,7 @@ fn font_program_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Opti
     Ok(Some(hasher.finalize().into()))
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
@@ -4055,25 +4105,23 @@ fn inspect_widget_mk_targets(
             let is_widget = dictionary.get(b"Subtype".as_slice()).is_some_and(|value| {
                 matches!(document.resolve_owned_value(value), Ok(Some(OwnedObject::Name(name))) if name == b"Widget")
             });
-            if is_widget {
-                if let Some(mk) = dictionary.get(b"MK".as_slice()) {
-                    match mk {
-                        OwnedObject::Reference(handle) => {
-                            targets.insert(DirectDictionaryTarget {
-                                root: *handle,
-                                path: Vec::new(),
-                            });
-                        }
-                        OwnedObject::Dictionary(_) => {
-                            let mut target_path = path.clone();
-                            target_path.push(DirectPathStep::DictKey(b"MK".to_vec()));
-                            targets.insert(DirectDictionaryTarget {
-                                root,
-                                path: target_path,
-                            });
-                        }
-                        _ => {}
+            if is_widget && let Some(mk) = dictionary.get(b"MK".as_slice()) {
+                match mk {
+                    OwnedObject::Reference(handle) => {
+                        targets.insert(DirectDictionaryTarget {
+                            root: *handle,
+                            path: Vec::new(),
+                        });
                     }
+                    OwnedObject::Dictionary(_) => {
+                        let mut target_path = path.clone();
+                        target_path.push(DirectPathStep::DictKey(b"MK".to_vec()));
+                        targets.insert(DirectDictionaryTarget {
+                            root,
+                            path: target_path,
+                        });
+                    }
+                    _ => {}
                 }
             }
             for (name, value) in dictionary {
@@ -4163,16 +4211,18 @@ fn rewrite_selected_dictionary_entries(
     Ok(rewritten)
 }
 
-fn form_dependency_redirects_hayro(
-    document: &EditDocument,
-    ignored_form_dictionary_keys: &[&[u8]],
-) -> Result<(
+type FormDependencyRedirects = (
     Vec<CowObjectHandle>,
     HashMap<CowObjectHandle, CowObjectHandle>,
     HashMap<CowObjectHandle, CowObjectHandle>,
     HashMap<CowObjectHandle, CowObjectHandle>,
     HashMap<CowObjectHandle, CowObjectHandle>,
-)> {
+);
+
+fn form_dependency_redirects_hayro(
+    document: &EditDocument,
+    ignored_form_dictionary_keys: &[&[u8]],
+) -> Result<FormDependencyRedirects> {
     let forms = reachable_streams_with_subtype(document, b"Form")?;
     let images = reachable_streams_with_subtype(document, b"Image")?;
     let resources = form_resource_handles(document, &forms)?;
@@ -6071,7 +6121,7 @@ mod tests {
         assert_eq!(actual.duplicate_streams_detected, 2);
         assert_eq!(actual.references_canonicalized, 2);
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let mut reparsed = Pdf::open(Cursor::new(output))?;
         let fonts = reparsed.root_handle()?.try_get_key(b"/TestType3Fonts")?;
         let first = fonts
@@ -6265,7 +6315,7 @@ mod tests {
         assert_eq!(actual.duplicate_streams_detected, 1);
         assert_eq!(actual.references_canonicalized, 1);
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let mut reparsed = Pdf::open(Cursor::new(output))?;
         let fonts = reparsed.root_handle()?.try_get_key(b"/TestFonts")?;
         let first = fonts
@@ -6340,7 +6390,7 @@ mod tests {
         assert_eq!(actual.references_canonicalized, 1);
         assert!(actual.duplicate_raw_bytes >= b"same-font-program".len());
 
-        let output = document.write_compact_experimental()?;
+        let output = document.write_compact()?;
         let mut reparsed = Pdf::open(Cursor::new(output))?;
         let root = reparsed.root_handle()?;
         let first = root

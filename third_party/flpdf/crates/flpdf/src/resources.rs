@@ -23,6 +23,29 @@ use std::io::{Read, Seek};
 /// (`Font`, `XObject`, …) → set of referenced names.
 type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
+/// Detached resource-usage scan result for already-decoded content bytes.
+#[derive(Debug, Clone, Default)]
+pub struct DetachedResourceUsage {
+    pub names: BTreeSet<Vec<u8>>,
+    pub names_by_resource_type: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    pub pending_operands: bool,
+}
+
+/// Run qpdf-compatible resource-name discovery without a mutable PDF document.
+pub fn find_resources_detached(content: &[u8]) -> Result<DetachedResourceUsage> {
+    let mut finder = ResourceFinder::default();
+    crate::parse_detached_content_stream(content, "detached resource scan", &mut finder)?;
+    Ok(DetachedResourceUsage {
+        names: finder.names().clone(),
+        names_by_resource_type: finder
+            .names_by_resource_type()
+            .iter()
+            .map(|(kind, names)| (kind.clone(), names.keys().cloned().collect()))
+            .collect(),
+        pending_operands: finder.has_pending_operands(),
+    })
+}
+
 /// Snapshot qpdf's `QPDF::numWarnings` around a document-owned content parse
 /// (`QPDFPageObjectHelper.cc:547-557`).
 fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
