@@ -156,6 +156,7 @@ pub enum TokenizerStateError {
 pub(crate) struct PushedToken {
     pub(crate) token: Token,
     pub(crate) unread: Option<u8>,
+    pub(crate) raw_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,9 +318,47 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         };
+        let raw_len = self.raw.len();
         let token = self.take_ready_token();
         self.reset();
-        Some(PushedToken { token, unread })
+        Some(PushedToken {
+            token,
+            unread,
+            raw_len,
+        })
+    }
+
+    // Value-only content parsing does not need the token's raw spelling.
+    // Move the raw bytes into the decoded value for token kinds where they
+    // are identical instead of cloning the buffer.
+    pub(crate) fn get_scalar_token(&mut self) -> Option<PushedToken> {
+        if self.state != State::TokenReady {
+            return None;
+        }
+        let unread = if !self.in_token && !self.before_token {
+            self.char_to_unread
+        } else {
+            None
+        };
+        let raw_len = self.raw.len();
+        let value = if matches!(self.token_type, TokenType::Name | TokenType::String) {
+            std::mem::take(&mut self.value)
+        } else {
+            std::mem::take(&mut self.raw)
+        };
+        let token = Token::from_parts(
+            self.token_type,
+            value,
+            Vec::new(),
+            self.error_message.take(),
+            self.token_start..self.token_start.saturating_add(raw_len),
+        );
+        self.reset();
+        Some(PushedToken {
+            token,
+            unread,
+            raw_len,
+        })
     }
 
     fn reset(&mut self) {

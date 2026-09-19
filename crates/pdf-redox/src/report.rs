@@ -129,6 +129,11 @@ pub struct HiddenTextFinding {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PdfAnalysis {
     pub input_bytes: usize,
+    /// True when optional/deep analysis (duplicate payloads, trial recompression,
+    /// hidden-text census, graph inventory) was performed. Optimization reports
+    /// use a cheaper preflight analysis unless a full cached analysis is supplied.
+    #[serde(default)]
+    pub analysis_complete: bool,
     /// SHA-256 of the exact input bytes, as lowercase hexadecimal.
     #[serde(default)]
     pub input_sha256: String,
@@ -138,6 +143,15 @@ pub struct PdfAnalysis {
     pub creator: Option<String>,
     pub page_count: usize,
     pub object_count: usize,
+    /// Reachable indirect COS objects grouped by intrinsic structural role.
+    #[serde(default)]
+    pub object_role_counts: BTreeMap<String, usize>,
+    /// Dictionary keys observed on indirect objects, keyed as `role/key`.
+    #[serde(default)]
+    pub object_key_counts: BTreeMap<String, usize>,
+    /// Indirect-reference edges observed as `source-role/key->target-role`.
+    #[serde(default)]
+    pub object_reference_edge_counts: BTreeMap<String, usize>,
     pub stream_count: usize,
     pub stream_raw_bytes: usize,
     #[serde(default)]
@@ -190,9 +204,59 @@ pub struct OptimizationReport {
     pub after_bytes: usize,
     pub saved_bytes: isize,
     pub saved_percent: f64,
+    /// Wall-clock milliseconds spent in major optimizer stages. Intended for profiling, not stable API ordering.
+    #[serde(default)]
+    pub stage_timings_ms: BTreeMap<String, f64>,
     pub privacy_items_removed: BTreeMap<String, usize>,
     pub jpeg_metadata_bytes_removed: usize,
     pub hidden_text_items_removed: usize,
+    /// Self-contained large diagonal `BT..ET` text objects removed by the explicit watermark-like cleanup.
+    #[serde(default)]
+    pub large_diagonal_text_objects_removed: usize,
+    #[serde(default)]
+    pub repeated_page_object_groups_removed: usize,
+    #[serde(default)]
+    pub repeated_page_objects_removed: usize,
+    #[serde(default)]
+    pub repeated_page_text_objects_removed: usize,
+    #[serde(default)]
+    pub repeated_page_xobject_paints_removed: usize,
+    #[serde(default)]
+    pub repeated_page_object_pages_rewritten: usize,
+    #[serde(default)]
+    pub raster_hidden_text_items_pruned: usize,
+    #[serde(default)]
+    pub vector_pages_compacted: usize,
+    #[serde(default)]
+    pub vector_fill_groups_batched: usize,
+    #[serde(default)]
+    pub vector_covered_fills_pruned: usize,
+    #[serde(default)]
+    pub vector_fill_paints_eliminated: usize,
+    #[serde(default)]
+    pub vector_decoded_bytes_removed: usize,
+    #[serde(default)]
+    pub vector_estimated_flate_bytes_saved: usize,
+    #[serde(default)]
+    pub vector_path_forms_created: usize,
+    #[serde(default)]
+    pub vector_path_form_pages_rewritten: usize,
+    #[serde(default)]
+    pub vector_path_form_occurrences_replaced: usize,
+    #[serde(default)]
+    pub vector_path_form_decoded_bytes_factored: usize,
+    #[serde(default)]
+    pub vector_path_form_estimated_flate_bytes_saved: usize,
+    #[serde(default)]
+    pub vector_transformed_forms_created: usize,
+    #[serde(default)]
+    pub vector_transformed_form_pages_rewritten: usize,
+    #[serde(default)]
+    pub vector_transformed_form_occurrences_replaced: usize,
+    #[serde(default)]
+    pub vector_transformed_form_operators_eliminated: usize,
+    #[serde(default)]
+    pub vector_transformed_form_estimated_flate_bytes_saved: usize,
     pub metadata_duplicate_streams_detected: usize,
     pub metadata_duplicate_raw_bytes: usize,
     pub metadata_references_canonicalized: usize,
@@ -207,6 +271,10 @@ pub struct OptimizationReport {
     pub font_rendering_optimized_encoded_bytes: usize,
     #[serde(default)]
     pub font_rendering_decoded_table_bytes_removed: usize,
+    #[serde(default)]
+    pub font_programs_glyph_subset: usize,
+    #[serde(default)]
+    pub font_glyph_outline_bytes_removed: usize,
     pub to_unicode_duplicate_streams_detected: usize,
     pub to_unicode_duplicate_raw_bytes: usize,
     pub to_unicode_references_canonicalized: usize,
@@ -242,6 +310,66 @@ pub struct OptimizationReport {
     pub raster_optimized_encoded_bytes: u64,
     pub raster_original_pixels: u64,
     pub raster_optimized_pixels: u64,
+    #[serde(default)]
+    pub raster_inline_fragmented_scopes_rewritten: usize,
+    #[serde(default)]
+    pub raster_inline_occurrences_externalized: usize,
+    #[serde(default)]
+    pub raster_pixel_clusters_reconstructed: usize,
+    #[serde(default)]
+    pub raster_pixel_paints_reconstructed: usize,
+    #[serde(default)]
+    pub raster_native_fragment_groups_reconstructed: usize,
+    #[serde(default)]
+    pub raster_native_fragment_paints_reconstructed: usize,
+    #[serde(default)]
+    pub raster_stripe_groups_merged: usize,
+    #[serde(default)]
+    pub raster_stripe_paints_merged: usize,
+    #[serde(default)]
+    pub raster_masks_baked: usize,
+    #[serde(default)]
+    pub raster_transparent_paints_pruned: usize,
+    #[serde(default)]
+    pub raster_occluded_paints_pruned: usize,
+    #[serde(default)]
+    pub raster_transparent_margins_cropped: usize,
+    #[serde(default)]
+    pub raster_background_margins_cropped: usize,
+    #[serde(default)]
+    pub raster_cropped_pixels_removed: u64,
+    #[serde(default)]
+    pub raster_binary_images_packed: usize,
+    #[serde(default)]
+    pub raster_binary_masks_packed: usize,
+    #[serde(default)]
+    pub raster_stencil_images_emitted: usize,
+    #[serde(default)]
+    pub raster_relaxed_stencil_images_emitted: usize,
+    #[serde(default)]
+    pub exact_raster_rendering: bool,
+    #[serde(default)]
+    pub raster_binary_image_encoded_bytes_saved: u64,
+    #[serde(default)]
+    pub raster_deferred_tile_candidates: usize,
+    #[serde(default)]
+    pub raster_deferred_tile_paints_consumed: usize,
+    #[serde(default)]
+    pub raster_staging_xobject_entries_removed: usize,
+    #[serde(default)]
+    pub resource_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_font_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_xobject_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_ext_gstate_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_pattern_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_properties_entries_pruned: usize,
+    #[serde(default)]
+    pub resource_shading_entries_pruned: usize,
     pub print_images_placed: usize,
     pub print_image_uses: usize,
     pub print_geometry_complete: bool,
@@ -272,5 +400,7 @@ pub struct OptimizationReport {
     pub preservation_dropped_page_tree_keys: BTreeMap<String, usize>,
     #[serde(default)]
     pub preservation_dropped_catalog_keys: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub preservation_spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
     pub notes: Vec<String>,
 }

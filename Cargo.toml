@@ -19,6 +19,7 @@ flpdf = { version = "0.5.1", path = "third_party/flpdf/crates/flpdf" }
 hayro-syntax = { path = "third_party/hayro-syntax", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 sha2 = "0.11"
+smallvec = "1.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -41,9 +42,26 @@ or_fun_call = "warn"
 redundant_clone = "warn"
 unwrap_used = "deny"
 use_self = "warn"
+unused_self = "warn"
+wildcard_imports = "warn"
+match_wildcard_for_single_variants = "warn"
+semicolon_if_nothing_returned = "warn"
+used_underscore_binding = "warn"
+significant_drop_tightening = "warn"
+needless_collect = "warn"
+needless_pass_by_value = "warn"
+clone_on_ref_ptr = "warn"
+map_unwrap_or = "warn"
+implicit_clone = "warn"
+large_types_passed_by_value = "warn"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

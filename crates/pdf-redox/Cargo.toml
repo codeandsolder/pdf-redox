@@ -15,5 +15,6 @@ flpdf.workspace = true
 hayro-syntax.workspace = true
 flate2.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
 serde.workspace = true
 thiserror.workspace = true

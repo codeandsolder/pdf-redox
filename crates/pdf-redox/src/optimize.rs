@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::analyze::analyze_pdf;
 use crate::{
     Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
-    analyze::{analyze_pdf, input_sha256},
+    analyze::{analyze_document_for_optimization, input_sha256},
     content::normalize_page_contents_hayro,
     dedup::{
         canonicalize_appearance_streams_hayro, canonicalize_font_program_streams_hayro,
@@ -10,18 +12,37 @@ use crate::{
         canonicalize_type3_charprocs_hayro,
     },
     flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
-    font::strip_font_editing_tables_hayro,
-    hidden_text::apply_hidden_text_policy_hayro,
+    font::{strip_font_editing_tables_hayro, union_sparse_cid_font_programs_after_dedup_hayro},
+    hidden_text::{
+        apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
+        remove_large_diagonal_text_hayro,
+    },
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
     inline_images::externalize_duplicate_inline_images_hayro,
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
-    prune::prune_resources_hayro,
+    prune::{prune_resources_hayro, prune_resources_with_usage_hayro},
+    raster_layout::normalize_raster_layout_hayro,
+    repeated_page_objects::{
+        remove_repeated_page_objects_hayro, repeated_page_objects_prefix_possible_hayro,
+    },
     scrub::scrub_edit_document_cos_privacy,
+    vector_compact::{compact_vector_paths_hayro, processing_factor_candidate},
 };
 use flpdf::{ImageOptimizationOptions, ImageOptimizationStats};
 #[cfg(test)]
 use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
+
+fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let value = f();
+    timings.insert(name.to_owned(), started.elapsed().as_secs_f64() * 1000.0);
+    value
+}
 
 fn validate_config(cfg: &Config) -> Result<()> {
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
@@ -37,8 +58,14 @@ fn validate_config(cfg: &Config) -> Result<()> {
 
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
-    let before = analyze_pdf(input)?;
-    optimize_pdf_with_before(input, cfg, before)
+    let mut timings = BTreeMap::new();
+    let document = timed(&mut timings, "document-open", || {
+        EditDocument::from_bytes(input.to_vec())
+    })?;
+    let before = timed(&mut timings, "analysis", || {
+        analyze_document_for_optimization(input, &document)
+    })?;
+    optimize_pdf_with_document(document, cfg, before, timings)
 }
 
 /// Optimize `input`, reusing a previously computed analysis when it belongs
@@ -58,91 +85,207 @@ pub fn optimize_pdf_with_analysis(
     let matches = analysis.input_bytes == input.len()
         && !analysis.input_sha256.is_empty()
         && analysis.input_sha256 == input_sha256(input);
+    let mut timings = BTreeMap::new();
+    let document = timed(&mut timings, "document-open", || {
+        EditDocument::from_bytes(input.to_vec())
+    })?;
     let before = if matches {
         analysis.clone()
     } else {
-        analyze_pdf(input)?
+        timed(&mut timings, "analysis", || {
+            analyze_document_for_optimization(input, &document)
+        })?
     };
-    optimize_pdf_with_before(input, cfg, before)
+    optimize_pdf_with_document(document, cfg, before, timings)
 }
 
-fn optimize_pdf_with_before(
-    input: &[u8],
+fn optimize_pdf_with_document(
+    mut document: EditDocument,
     cfg: &Config,
     before: PdfAnalysis,
+    mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
-    let mut document = EditDocument::from_bytes(input.to_vec())?;
-    let preservation = if cfg.preservation == crate::PreservationConfig::functional() {
-        PreservationStats::default()
-    } else {
-        apply_preservation_policy_hayro(&mut document, &cfg.preservation)?
-    };
-    let hidden_text = apply_hidden_text_policy_hayro(&mut document, &cfg.hidden_text)?;
-    let scrub = scrub_edit_document_cos_privacy(&mut document, &cfg.privacy)?;
+    let preservation = timed(&mut timings, "preservation", || {
+        if cfg.preservation == crate::PreservationConfig::functional() {
+            Ok(PreservationStats::default())
+        } else {
+            apply_preservation_policy_hayro(&mut document, &cfg.preservation)
+        }
+    })?;
+    let hidden_text = timed(&mut timings, "hidden-text", || {
+        apply_hidden_text_policy_hayro(&mut document, &cfg.hidden_text)
+    })?;
+    let large_diagonal_text = timed(&mut timings, "large-diagonal-text", || {
+        if cfg.remove_large_diagonal_text {
+            remove_large_diagonal_text_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let scrub = timed(&mut timings, "privacy-scrub", || {
+        scrub_edit_document_cos_privacy(&mut document, &cfg.privacy)
+    })?;
 
     // Strip rendering-irrelevant editing/layout state before font-program
     // dedup so producer subsets can converge to the same program.
-    let font_rendering = if cfg.preservation.font_editing_support {
-        Default::default()
-    } else {
-        strip_font_editing_tables_hayro(&mut document, cfg.flate_level)?
-    };
-    let metadata_dedup = if cfg.deduplicate_metadata_streams {
-        canonicalize_metadata_streams_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let font_dedup = if cfg.deduplicate_font_programs {
-        canonicalize_font_program_streams_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let to_unicode_dedup = if cfg.deduplicate_to_unicode_cmaps {
-        canonicalize_to_unicode_cmaps_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let icc_dedup = if cfg.deduplicate_icc_profiles {
-        canonicalize_icc_profiles_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let inline_image_dedup = if cfg.deduplicate_inline_images
-        && before.duplicate_inline_image_payload_wasted_bytes
-            >= cfg.inline_image_min_duplicate_payload_bytes
+    let mut font_rendering = timed(&mut timings, "font-table-strip", || {
+        if cfg.preservation.font_editing_support {
+            Ok(Default::default())
+        } else {
+            strip_font_editing_tables_hayro(&mut document, cfg.flate_level)
+        }
+    })?;
+    let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
+        if cfg.deduplicate_metadata_streams {
+            canonicalize_metadata_streams_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let font_dedup = timed(&mut timings, "font-dedup", || {
+        if cfg.deduplicate_font_programs {
+            canonicalize_font_program_streams_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let font_sparse_union = timed(&mut timings, "font-sparse-union", || {
+        if cfg.preservation.font_editing_support {
+            Ok(Default::default())
+        } else {
+            union_sparse_cid_font_programs_after_dedup_hayro(&mut document, cfg.flate_level)
+        }
+    })?;
+    font_rendering.programs_optimized += font_sparse_union.programs_optimized;
+    font_rendering.programs_glyph_subset += font_sparse_union.programs_glyph_subset;
+    font_rendering.original_encoded_bytes += font_sparse_union.original_encoded_bytes;
+    font_rendering.optimized_encoded_bytes += font_sparse_union.optimized_encoded_bytes;
+    font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
+    font_rendering.glyph_outline_bytes_removed += font_sparse_union.glyph_outline_bytes_removed;
+    let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
+        if cfg.deduplicate_to_unicode_cmaps {
+            canonicalize_to_unicode_cmaps_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let icc_dedup = timed(&mut timings, "icc-dedup", || {
+        if cfg.deduplicate_icc_profiles {
+            canonicalize_icc_profiles_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
+        && cfg.optimization_goal == crate::OptimizationGoal::Processing
     {
-        externalize_duplicate_inline_images_hayro(
-            &mut document,
-            0,
-            cfg.inline_image_min_duplicate_payload_bytes,
-        )?
+        repeated_page_objects_prefix_possible_hayro(&document)?
     } else {
-        Default::default()
+        false
     };
+    let mut raster_vector_cache = BTreeMap::new();
+    let raster_layout = timed(&mut timings, "raster-layout", || {
+        let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
+            && !repeated_page_objects_may_rewrite)
+            .then_some(&mut raster_vector_cache);
+        normalize_raster_layout_hayro(
+            &mut document,
+            &cfg.raster_layout,
+            cfg.flate_level,
+            vector_cache,
+        )
+    })?;
+    for (name, micros) in [
+        ("inline-externalize", raster_layout.inline_externalize_us),
+        ("target-scan", raster_layout.target_scan_us),
+        ("hidden-prune", raster_layout.hidden_prune_us),
+        ("hidden-state", raster_layout.hidden_state_us),
+        ("hidden-visibility", raster_layout.hidden_visibility_us),
+        ("hidden-coverage", raster_layout.hidden_coverage_us),
+        ("hidden-rewrite", raster_layout.hidden_rewrite_us),
+        ("image-materialize", raster_layout.image_materialize_us),
+        ("native-plan", raster_layout.native_plan_us),
+        ("stripe-plan", raster_layout.stripe_plan_us),
+        ("pixel-plan", raster_layout.pixel_plan_us),
+        ("apply-plans", raster_layout.apply_plans_us),
+        ("staging-cleanup", raster_layout.staging_cleanup_us),
+    ] {
+        timings.insert(format!("raster/{name}"), micros as f64 / 1000.0);
+    }
+    let physically_hidden_text = timed(&mut timings, "physical-hidden-text", || {
+        if !cfg.raster_layout.enabled || !cfg.raster_layout.prune_hidden_paints {
+            return Ok(Default::default());
+        }
+        if raster_layout.page_hidden_text_inventory_complete {
+            let fallback = raster_layout
+                .page_hidden_text_candidates
+                .difference(&raster_layout.page_hidden_text_shared_complete)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if fallback.is_empty() {
+                Ok(Default::default())
+            } else {
+                prune_physically_hidden_text_hayro(&mut document, Some(&fallback))
+            }
+        } else {
+            prune_physically_hidden_text_hayro(&mut document, None)
+        }
+    })?;
+
+    let inline_image_dedup = timed(&mut timings, "inline-image-dedup", || {
+        let raster_proved_no_inline = cfg.raster_layout.enabled
+            && raster_layout.inline_inventory_complete
+            && raster_layout.inline_occurrences_remaining == 0;
+        if cfg.deduplicate_inline_images && !raster_proved_no_inline {
+            externalize_duplicate_inline_images_hayro(
+                &mut document,
+                0,
+                cfg.inline_image_min_duplicate_payload_bytes,
+            )
+        } else {
+            Ok(Default::default())
+        }
+    })?;
 
     // Exact image canonicalization follows inline-image externalization so the
     // latter can converge with already-existing Image XObjects.
-    let image_dedup = if cfg.deduplicate_image_xobjects {
-        canonicalize_image_xobjects_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let form_dedup = if cfg.deduplicate_form_xobjects {
-        canonicalize_form_xobjects_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let appearance_dedup = if cfg.deduplicate_appearance_streams {
-        canonicalize_appearance_streams_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
-    let type3_charproc_dedup = if cfg.deduplicate_type3_charprocs {
-        canonicalize_type3_charprocs_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
+    let image_dedup = timed(&mut timings, "image-dedup", || {
+        if cfg.deduplicate_image_xobjects {
+            canonicalize_image_xobjects_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let form_dedup = timed(&mut timings, "form-dedup", || {
+        if cfg.deduplicate_form_xobjects {
+            canonicalize_form_xobjects_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
+        if cfg.deduplicate_appearance_streams {
+            canonicalize_appearance_streams_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let type3_charproc_dedup = timed(&mut timings, "type3-dedup", || {
+        if cfg.deduplicate_type3_charprocs {
+            canonicalize_type3_charprocs_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+    let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
+        if cfg.remove_repeated_page_objects {
+            remove_repeated_page_objects_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
 
+    let print_plan_started = Instant::now();
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
             let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
@@ -153,6 +296,11 @@ fn optimize_pdf_with_before(
         }
         _ => (PrintPlanHayro::default(), None),
     };
+    timings.insert(
+        "print-plan".to_owned(),
+        print_plan_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    let raster_transform_started = Instant::now();
     let raster_transform = match &cfg.image_policy {
         ImagePolicy::Preserve => ImageOptimizationStats::default(),
         ImagePolicy::Print {
@@ -195,35 +343,115 @@ fn optimize_pdf_with_before(
             },
         )?,
     };
+    timings.insert(
+        "raster-transform".to_owned(),
+        raster_transform_started.elapsed().as_secs_f64() * 1000.0,
+    );
 
-    if cfg.prune_resources {
-        prune_resources_hayro(&mut document)?;
-    }
-    let flate = apply_flate_policy_hayro(&mut document, cfg.flate_policy, cfg.flate_level)?;
-    if cfg.normalize_content_streams {
-        normalize_page_contents_hayro(&mut document)?;
-    }
+    let vector_compaction = timed(&mut timings, "vector-compaction", || {
+        let raster_proved_no_vector_candidate = cfg.optimization_goal
+            != crate::OptimizationGoal::Processing
+            && cfg.raster_layout.enabled
+            && raster_layout.page_vector_inventory_complete
+            && !raster_layout.page_vector_merge_candidate;
+        let raster_cache_is_exact =
+            physically_hidden_text.removed == 0 && inline_image_dedup.occurrences_externalized == 0;
+        if raster_cache_is_exact {
+            for page in &repeated_page_objects.rewritten_pages {
+                raster_vector_cache.remove(page);
+            }
+        }
+        let processing_proved_no_vector_candidate = if cfg.optimization_goal
+            == crate::OptimizationGoal::Processing
+            && cfg.raster_layout.enabled
+            && raster_layout.page_vector_inventory_complete
+            && raster_cache_is_exact
+            && !raster_layout.page_vector_merge_candidate
+        {
+            raster_vector_cache.len() == raster_layout.page_count
+                && !processing_factor_candidate(&raster_vector_cache)
+        } else {
+            false
+        };
+        if cfg.compact_vector_paths
+            && !raster_proved_no_vector_candidate
+            && !processing_proved_no_vector_candidate
+        {
+            let vector_cache = if raster_cache_is_exact {
+                std::mem::take(&mut raster_vector_cache)
+            } else {
+                BTreeMap::new()
+            };
+            compact_vector_paths_hayro(
+                &mut document,
+                cfg.flate_level,
+                cfg.optimization_goal,
+                vector_cache,
+            )
+        } else {
+            Ok(Default::default())
+        }
+    })?;
+
+    let resource_prune = timed(&mut timings, "resource-prune", || {
+        if !cfg.prune_resources {
+            return Ok(Default::default());
+        }
+        let shared_usage_is_exact = cfg.raster_layout.enabled
+            && raster_layout.resource_inventory_complete
+            && physically_hidden_text.removed == 0
+            && inline_image_dedup.occurrences_externalized == 0
+            && repeated_page_objects.objects_removed == 0;
+        if shared_usage_is_exact {
+            prune_resources_with_usage_hayro(
+                &mut document,
+                &cfg.keep_unused_resources,
+                &raster_layout.page_resource_names,
+                &raster_layout.form_resource_names,
+                &raster_layout.page_resource_names_by_type,
+                &raster_layout.form_resource_names_by_type,
+                &vector_compaction.generated_page_xobjects,
+            )
+        } else {
+            prune_resources_hayro(&mut document, &cfg.keep_unused_resources)
+        }
+    })?;
+    let flate = timed(&mut timings, "flate-policy", || {
+        apply_flate_policy_hayro(&mut document, cfg.flate_policy, cfg.flate_level)
+    })?;
+    timed(&mut timings, "content-normalize", || -> Result<()> {
+        if cfg.normalize_content_streams {
+            normalize_page_contents_hayro(&mut document)?;
+        }
+        Ok(())
+    })?;
     // Content streams are canonicalized only after every pass that can mutate
     // them, including lexical normalization.
-    let page_content_dedup = if cfg.deduplicate_page_contents {
-        canonicalize_page_contents_hayro(&mut document)?
-    } else {
-        Default::default()
-    };
+    let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
+        if cfg.deduplicate_page_contents {
+            canonicalize_page_contents_hayro(&mut document)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
 
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
-    compress_unfiltered_streams_hayro(&mut document, cfg.flate_level)?;
-    let output = crate::writer::write_pdf_with_options(
-        &document,
-        cfg.generate_object_streams,
-        cfg.flate_level,
-    )?;
+    timed(&mut timings, "compress-unfiltered", || {
+        compress_unfiltered_streams_hayro(&mut document, cfg.flate_level)
+    })?;
+    let output = timed(&mut timings, "writer", || {
+        crate::writer::write_pdf_with_options(
+            &document,
+            cfg.generate_object_streams,
+            cfg.flate_level,
+        )
+    })?;
 
     let mut notes = Vec::new();
     if cfg.preservation != crate::PreservationConfig::functional() {
         notes.push(format!(
-            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}.",
+            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring metadata keys: {:?}.",
             preservation.pages,
             preservation.annotation_entries_flattened,
             preservation.annotation_entries_seen,
@@ -233,7 +461,8 @@ fn optimize_pdf_with_before(
             preservation.unflattened_annotation_subtypes,
             preservation.dropped_page_keys,
             preservation.dropped_page_tree_keys,
-            preservation.dropped_catalog_keys
+            preservation.dropped_catalog_keys,
+            preservation.dropped_authoring_metadata_keys
         ));
         if preservation
             .dropped_catalog_keys
@@ -279,6 +508,16 @@ fn optimize_pdf_with_before(
             raster_transform.images_optimized,
             jpeg_quality,
             raster_transform.saved_bytes()
+        ));
+    }
+    if repeated_page_objects.objects_removed > 0 {
+        notes.push(format!(
+            "Removed {} persistent page object(s) from {} repeated group(s) across {} page(s): {} text object(s), {} Image/Form paint(s).",
+            repeated_page_objects.objects_removed,
+            repeated_page_objects.groups_removed,
+            repeated_page_objects.pages_rewritten,
+            repeated_page_objects.text_objects_removed,
+            repeated_page_objects.xobject_paints_removed
         ));
     }
     if inline_image_dedup.occurrences_externalized > 0 {
@@ -362,6 +601,32 @@ fn optimize_pdf_with_before(
             font_rendering.decoded_table_bytes_removed
         ));
     }
+    if font_rendering.programs_glyph_subset > 0 {
+        notes.push(format!(
+            "Retain-GID subset {} CID TrueType font program(s), removing {} decoded glyph-outline bytes.",
+            font_rendering.programs_glyph_subset,
+            font_rendering.glyph_outline_bytes_removed
+        ));
+    }
+    if vector_compaction.path_forms_created > 0 {
+        notes.push(format!(
+            "Factored {} repeated painted path block(s) into Form XObjects across {} page(s), replacing {} occurrence(s) and removing about {} decoded duplicate bytes.",
+            vector_compaction.path_forms_created,
+            vector_compaction.path_form_pages_rewritten,
+            vector_compaction.path_form_occurrences_replaced,
+            vector_compaction.path_form_decoded_bytes_factored
+        ));
+    }
+    if vector_compaction.transformed_forms_created > 0 {
+        notes.push(format!(
+            "Factored {} repeated affine-placed vector block(s) into Form XObjects across {} page(s), replacing {} occurrence(s), eliminating {} repeated operators, and saving about {} encoded bytes in page/Form streams.",
+            vector_compaction.transformed_forms_created,
+            vector_compaction.transformed_form_pages_rewritten,
+            vector_compaction.transformed_form_occurrences_replaced,
+            vector_compaction.transformed_form_operators_eliminated,
+            vector_compaction.transformed_form_estimated_flate_bytes_saved
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -369,20 +634,51 @@ fn optimize_pdf_with_before(
         ));
     }
 
-    let saved_bytes = input.len() as isize - output.len() as isize;
-    let saved_percent = if input.is_empty() {
+    let input_bytes = before.input_bytes;
+    let saved_bytes = input_bytes as isize - output.len() as isize;
+    let saved_percent = if input_bytes == 0 {
         0.0
     } else {
-        saved_bytes as f64 * 100.0 / input.len() as f64
+        saved_bytes as f64 * 100.0 / input_bytes as f64
     };
     let report = OptimizationReport {
         before,
         after_bytes: output.len(),
         saved_bytes,
         saved_percent,
+        stage_timings_ms: timings,
         privacy_items_removed: scrub.removed,
         jpeg_metadata_bytes_removed: scrub.jpeg_metadata_bytes_removed,
         hidden_text_items_removed: hidden_text.removed,
+        large_diagonal_text_objects_removed: large_diagonal_text.removed,
+        repeated_page_object_groups_removed: repeated_page_objects.groups_removed,
+        repeated_page_objects_removed: repeated_page_objects.objects_removed,
+        repeated_page_text_objects_removed: repeated_page_objects.text_objects_removed,
+        repeated_page_xobject_paints_removed: repeated_page_objects.xobject_paints_removed,
+        repeated_page_object_pages_rewritten: repeated_page_objects.pages_rewritten,
+        raster_hidden_text_items_pruned: physically_hidden_text
+            .removed
+            .saturating_add(raster_layout.shared_hidden_text_paints_pruned),
+        vector_pages_compacted: vector_compaction.pages_compacted,
+        vector_fill_groups_batched: vector_compaction.fill_groups_batched,
+        vector_covered_fills_pruned: vector_compaction.covered_fills_pruned,
+        vector_fill_paints_eliminated: vector_compaction.fill_paints_eliminated,
+        vector_decoded_bytes_removed: vector_compaction.decoded_bytes_removed,
+        vector_estimated_flate_bytes_saved: vector_compaction.estimated_flate_bytes_saved,
+        vector_path_forms_created: vector_compaction.path_forms_created,
+        vector_path_form_pages_rewritten: vector_compaction.path_form_pages_rewritten,
+        vector_path_form_occurrences_replaced: vector_compaction.path_form_occurrences_replaced,
+        vector_path_form_decoded_bytes_factored: vector_compaction.path_form_decoded_bytes_factored,
+        vector_path_form_estimated_flate_bytes_saved: vector_compaction
+            .path_form_estimated_flate_bytes_saved,
+        vector_transformed_forms_created: vector_compaction.transformed_forms_created,
+        vector_transformed_form_pages_rewritten: vector_compaction.transformed_form_pages_rewritten,
+        vector_transformed_form_occurrences_replaced: vector_compaction
+            .transformed_form_occurrences_replaced,
+        vector_transformed_form_operators_eliminated: vector_compaction
+            .transformed_form_operators_eliminated,
+        vector_transformed_form_estimated_flate_bytes_saved: vector_compaction
+            .transformed_form_estimated_flate_bytes_saved,
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,
@@ -393,6 +689,8 @@ fn optimize_pdf_with_before(
         font_rendering_original_encoded_bytes: font_rendering.original_encoded_bytes,
         font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
         font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
+        font_programs_glyph_subset: font_rendering.programs_glyph_subset,
+        font_glyph_outline_bytes_removed: font_rendering.glyph_outline_bytes_removed,
         to_unicode_duplicate_streams_detected: to_unicode_dedup.duplicate_streams_detected,
         to_unicode_duplicate_raw_bytes: to_unicode_dedup.duplicate_raw_bytes,
         to_unicode_references_canonicalized: to_unicode_dedup.references_canonicalized,
@@ -428,6 +726,38 @@ fn optimize_pdf_with_before(
         raster_optimized_encoded_bytes: raster_transform.optimized_encoded_bytes,
         raster_original_pixels: raster_transform.original_pixels,
         raster_optimized_pixels: raster_transform.optimized_pixels,
+        raster_inline_fragmented_scopes_rewritten: raster_layout.inline.scopes_rewritten,
+        raster_inline_occurrences_externalized: raster_layout.inline.occurrences_externalized,
+        raster_pixel_clusters_reconstructed: raster_layout.pixel_clusters_reconstructed,
+        raster_pixel_paints_reconstructed: raster_layout.pixel_paints_reconstructed,
+        raster_native_fragment_groups_reconstructed: raster_layout
+            .native_fragment_groups_reconstructed,
+        raster_native_fragment_paints_reconstructed: raster_layout
+            .native_fragment_paints_reconstructed,
+        raster_stripe_groups_merged: raster_layout.stripe_groups_merged,
+        raster_stripe_paints_merged: raster_layout.stripe_paints_merged,
+        raster_masks_baked: raster_layout.masks_baked,
+        raster_transparent_paints_pruned: raster_layout.transparent_paints_pruned,
+        raster_occluded_paints_pruned: raster_layout.occluded_raster_paints_pruned,
+        raster_transparent_margins_cropped: raster_layout.transparent_margins_cropped,
+        raster_background_margins_cropped: raster_layout.background_margins_cropped,
+        raster_cropped_pixels_removed: raster_layout.cropped_pixels_removed,
+        raster_binary_images_packed: raster_layout.binary_images_packed,
+        raster_binary_masks_packed: raster_layout.binary_masks_packed,
+        raster_stencil_images_emitted: raster_layout.stencil_images_emitted,
+        raster_relaxed_stencil_images_emitted: raster_layout.relaxed_stencil_images_emitted,
+        exact_raster_rendering: cfg.raster_layout.exact_raster_rendering,
+        raster_binary_image_encoded_bytes_saved: raster_layout.binary_image_encoded_bytes_saved,
+        raster_deferred_tile_candidates: raster_layout.deferred_tile_candidates,
+        raster_deferred_tile_paints_consumed: raster_layout.deferred_tile_paints_consumed,
+        raster_staging_xobject_entries_removed: raster_layout.staging_xobject_entries_removed,
+        resource_entries_pruned: resource_prune.entries_removed,
+        resource_font_entries_pruned: resource_prune.font_entries_removed,
+        resource_xobject_entries_pruned: resource_prune.xobject_entries_removed,
+        resource_ext_gstate_entries_pruned: resource_prune.ext_gstate_entries_removed,
+        resource_pattern_entries_pruned: resource_prune.pattern_entries_removed,
+        resource_properties_entries_pruned: resource_prune.properties_entries_removed,
+        resource_shading_entries_pruned: resource_prune.shading_entries_removed,
         print_images_placed: print_plan.stats.images_placed,
         print_image_uses: print_plan.stats.image_uses,
         print_geometry_complete: print_plan.stats.geometry_complete,
@@ -449,6 +779,7 @@ fn optimize_pdf_with_before(
         preservation_dropped_page_keys: preservation.dropped_page_keys,
         preservation_dropped_page_tree_keys: preservation.dropped_page_tree_keys,
         preservation_dropped_catalog_keys: preservation.dropped_catalog_keys,
+        preservation_spliced_unknown_wrapper_keys: preservation.spliced_unknown_wrapper_keys,
         notes,
     };
     Ok((output, report))
@@ -780,7 +1111,9 @@ mod tests {
     #[test]
     fn print_profile_downsamples_a_simple_flate_image_and_keeps_flate_encoding() -> Result<()> {
         let input = perceptual_image_fixture()?;
-        let (output, report) = optimize_pdf(&input, &Config::print())?;
+        let mut config = Config::print();
+        config.max_image_ppi = Some(450);
+        let (output, report) = optimize_pdf(&input, &config)?;
 
         assert_eq!(report.print_images_placed, 1);
         assert_eq!(report.print_image_uses, 2);
@@ -886,7 +1219,9 @@ mod tests {
         let input = perceptual_image_fixture()?;
         let (jpeg_input, _) = optimize_pdf(&input, &Config::perceptual())?;
 
-        let (output, report) = optimize_pdf(&jpeg_input, &Config::print())?;
+        let mut config = Config::print();
+        config.max_image_ppi = Some(450);
+        let (output, report) = optimize_pdf(&jpeg_input, &config)?;
         assert_eq!(report.print_images_placed, 1);
         assert_eq!(report.print_image_uses, 2);
         assert!(report.print_geometry_complete);

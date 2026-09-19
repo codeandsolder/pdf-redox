@@ -225,10 +225,6 @@ fn scrub_owned_cos_privacy_dictionary(
     }
 }
 
-fn validate_hayro_cos_privacy_config(_cfg: &PrivacyConfig) -> Result<()> {
-    Ok(())
-}
-
 /// Apply COS-level privacy cleanup directly to the Hayro/COW graph without
 /// materializing unaffected source objects.
 ///
@@ -239,7 +235,6 @@ pub(crate) fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
 ) -> Result<ScrubStats> {
-    validate_hayro_cos_privacy_config(cfg)?;
     let mut stats = ScrubStats::default();
     if cfg.level == PrivacyLevel::None {
         return Ok(stats);

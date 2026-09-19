@@ -1,6 +1,6 @@
 use crate::{EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
 
-fn decoded_content_value(
+pub(crate) fn decoded_content_value(
     document: &EditDocument,
     value: &OwnedObject,
     out: &mut Vec<u8>,
@@ -10,6 +10,14 @@ fn decoded_content_value(
             let Some(value) = document.current_owned_object(*handle)? else {
                 return Ok(());
             };
+            if matches!(value, OwnedObject::Stream { .. }) {
+                let bytes = document.decoded_content_stream_data(*handle)?;
+                if !out.is_empty() && out.last() != Some(&b'\n') {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(&bytes);
+                return Ok(());
+            }
             value
         }
         value => value.clone(),
@@ -33,7 +41,61 @@ fn decoded_content_value(
     Ok(())
 }
 
-fn replace_page_content(
+pub(crate) fn resolved_dictionary(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Option<OwnedDictionary>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(document
+        .resolve_owned_value(value)?
+        .and_then(|value| value.as_dictionary().cloned()))
+}
+
+pub(crate) fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
+    let Some(page) = document.current_owned_object(page)? else {
+        return Ok(Vec::new());
+    };
+    let Some(dictionary) = page.as_dictionary() else {
+        return Ok(Vec::new());
+    };
+    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+        return Ok(Vec::new());
+    };
+    let mut decoded = Vec::new();
+    decoded_content_value(document, contents, &mut decoded)?;
+    Ok(decoded)
+}
+
+pub(crate) fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
+    document.decoded_stream_data(form, flpdf::DecodeLevel::Specialized)
+}
+
+pub(crate) fn page_resources(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<Option<OwnedDictionary>> {
+    let Some(value) = document.inherited_page_value(page, b"Resources")? else {
+        return Ok(None);
+    };
+    resolved_dictionary(document, Some(&value))
+}
+
+pub(crate) fn form_resources(
+    document: &EditDocument,
+    form: ObjectHandle,
+) -> Result<Option<OwnedDictionary>> {
+    let Some(object) = document.current_owned_object(form)? else {
+        return Ok(None);
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(None);
+    };
+    resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))
+}
+
+pub(crate) fn replace_page_content(
     document: &mut EditDocument,
     page: ObjectHandle,
     bytes: Vec<u8>,

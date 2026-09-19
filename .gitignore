@@ -2,9 +2,13 @@
 /third_party/flpdf/target/
 /.cargo/
 /.rustup/
+/.tmp/
 /vendor/
 /web/pkg/
 *.pdf
 *.zip
 *.bak.*
 .DS_Store
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/

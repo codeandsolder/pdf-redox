@@ -6,6 +6,7 @@ use hayro_syntax::{
 };
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     rc::Rc,
     sync::Arc,
@@ -28,7 +29,7 @@ impl SourcePdf {
 
     /// Parse PDF bytes already held in shared storage.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
-        let pdf = Pdf::new(bytes.clone()).map_err(SourceLoadError::from)?;
+        let pdf = Pdf::new(Arc::clone(&bytes)).map_err(SourceLoadError::from)?;
         Ok(Self { pdf, bytes })
     }
 
@@ -155,9 +156,9 @@ impl SourcePdf {
     /// The vendored Hayro accessor exposes the final already-parsed trailer
     /// dictionary, so document construction no longer reparses the PDF through
     /// a second parser merely to preserve `/Info`, `/ID`, or custom roots.
-    pub(crate) fn preserved_trailer(&self) -> Result<OwnedDictionary> {
+    pub(crate) fn preserved_trailer(&self) -> OwnedDictionary {
         let Some(trailer) = self.pdf.xref().trailer() else {
-            return Ok(OwnedDictionary::new());
+            return OwnedDictionary::new();
         };
         let xref_stream = trailer.entries().any(|(name, value)| {
             name.as_ref() == b"Type"
@@ -172,7 +173,7 @@ impl SourcePdf {
             }
             preserved.insert(name.to_vec(), owned_from_maybe_ref(value));
         }
-        Ok(preserved)
+        preserved
     }
 }
 
@@ -484,22 +485,60 @@ pub(crate) enum CurrentObject<'a> {
     Owned(&'a OwnedObject),
 }
 
+fn contains_indirect_reference(value: &OwnedObject) -> bool {
+    match value {
+        OwnedObject::Reference(_) => true,
+        OwnedObject::Array(values) => values.iter().any(contains_indirect_reference),
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            dictionary.values().any(contains_indirect_reference)
+        }
+        _ => false,
+    }
+}
+
+fn stream_filter_configuration_is_direct(stream: &OwnedObject) -> bool {
+    let OwnedObject::Stream { dictionary, .. } = stream else {
+        return false;
+    };
+    [
+        b"Filter".as_slice(),
+        b"DecodeParms".as_slice(),
+        b"F".as_slice(),
+        b"FFilter".as_slice(),
+        b"FDecodeParms".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|key| dictionary.get(key))
+    .all(|value| !contains_indirect_reference(value))
+}
+
+const MAX_DECODED_CONTENT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DECODED_CONTENT_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct DecodedContentCache {
+    bytes: usize,
+    streams: BTreeMap<ObjectId, Vec<u8>>,
+}
+
 /// A lazily parsed source document plus the objects changed by optimization
 /// passes. This is the target architecture for the Hayro migration.
 pub struct EditDocument {
     source: SourcePdf,
     trailer: OwnedDictionary,
     overlay: ObjectOverlay,
+    decoded_content_stream_cache: RefCell<DecodedContentCache>,
 }
 
 impl EditDocument {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let source = SourcePdf::from_bytes(bytes)?;
-        let trailer = source.preserved_trailer()?;
+        let trailer = source.preserved_trailer();
         Ok(Self {
             source,
             trailer,
             overlay: ObjectOverlay::default(),
+            decoded_content_stream_cache: RefCell::new(DecodedContentCache::default()),
         })
     }
 
@@ -642,6 +681,40 @@ impl EditDocument {
             ));
         };
         self.decoded_owned_stream_data(&stream, level)
+    }
+
+    /// Decode page/Form content while memoizing untouched source streams.
+    ///
+    /// The cache is intentionally content-specific rather than attached to the
+    /// generic stream decoder so large image/font payloads are never retained
+    /// merely because an optimization pass inspected them. Overlay-edited or
+    /// newly created streams bypass the cache, so mutations need no invalidation.
+    pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
+        if let ObjectHandle::Existing(id) = handle
+            && self.overlay.change(id).is_none()
+        {
+            let Some(stream) = self.current_owned_object(handle)? else {
+                return Err(Error::Invalid(
+                    "stream reference resolves to null".to_owned(),
+                ));
+            };
+            if stream_filter_configuration_is_direct(&stream) {
+                if let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id) {
+                    return Ok(decoded.clone());
+                }
+                let decoded = self.decoded_owned_stream_data(&stream, DecodeLevel::Specialized)?;
+                if decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES {
+                    let mut cache = self.decoded_content_stream_cache.borrow_mut();
+                    if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES
+                    {
+                        cache.bytes = cache.bytes.saturating_add(decoded.len());
+                        cache.streams.insert(id, decoded.clone());
+                    }
+                }
+                return Ok(decoded);
+            }
+        }
+        self.decoded_stream_data(handle, DecodeLevel::Specialized)
     }
 
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
@@ -1121,6 +1194,34 @@ mod tests {
             Err(error) => panic!("stream bytes should resolve: {error}"),
         };
         assert_eq!(bytes.as_ref(), b"q Q");
+    }
+
+    #[test]
+    fn decoded_source_stream_cache_is_bypassed_after_edit() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let stream_id = ObjectId::new(4, 0);
+        let handle = ObjectHandle::Existing(stream_id);
+        let first = match document.decoded_content_stream_data(handle) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("source stream should decode: {error}"),
+        };
+        assert_eq!(first, b"q Q");
+        let stream = match document.edit_object(stream_id) {
+            Ok(stream) => stream,
+            Err(error) => panic!("source stream should be editable: {error}"),
+        };
+        let OwnedObject::Stream { data, .. } = stream else {
+            panic!("fixture object should be a stream");
+        };
+        *data = StreamData::Owned(b"BT ET".to_vec());
+        let second = match document.decoded_content_stream_data(handle) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("edited stream should decode: {error}"),
+        };
+        assert_eq!(second, b"BT ET");
     }
 
     #[test]

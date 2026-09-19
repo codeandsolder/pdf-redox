@@ -1,92 +1,59 @@
-use crate::{EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result};
+use crate::{
+    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+    content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
+};
 use flpdf::{DetachedResourceUsage, find_resources_detached};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-fn resolved_dictionary(
-    document: &EditDocument,
-    value: Option<&OwnedObject>,
-) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|value| match value {
-            OwnedObject::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        }))
+type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ResourcePruneStats {
+    pub entries_removed: usize,
+    pub font_entries_removed: usize,
+    pub xobject_entries_removed: usize,
+    pub ext_gstate_entries_removed: usize,
+    pub pattern_entries_removed: usize,
+    pub properties_entries_removed: usize,
+    pub shading_entries_removed: usize,
 }
 
-fn decoded_content_value(
-    document: &EditDocument,
-    value: &OwnedObject,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let value = match value {
-        OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            value
-        }
-        value => value.clone(),
-    };
-    match value {
-        OwnedObject::Stream { .. } => {
-            let bytes =
-                document.decoded_owned_stream_data(&value, flpdf::DecodeLevel::Specialized)?;
-            if !out.is_empty() && out.last() != Some(&b'\n') {
-                out.push(b'\n');
-            }
-            out.extend_from_slice(&bytes);
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                decoded_content_value(document, &value, out)?;
-            }
-        }
-        _ => {}
+impl ResourcePruneStats {
+    fn record_category(&mut self, category: &[u8], count: usize) {
+        self.entries_removed = self.entries_removed.saturating_add(count);
+        let slot = match category {
+            b"Font" => &mut self.font_entries_removed,
+            b"XObject" => &mut self.xobject_entries_removed,
+            b"ExtGState" => &mut self.ext_gstate_entries_removed,
+            b"Pattern" => &mut self.pattern_entries_removed,
+            b"Properties" => &mut self.properties_entries_removed,
+            b"Shading" => &mut self.shading_entries_removed,
+            _ => return,
+        };
+        *slot = slot.saturating_add(count);
     }
-    Ok(())
-}
 
-fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
-    let Some(page) = document.current_owned_object(page)? else {
-        return Ok(Vec::new());
-    };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(Vec::new());
-    };
-    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    decoded_content_value(document, contents, &mut out)?;
-    Ok(out)
-}
-
-fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
-    document.decoded_stream_data(form, flpdf::DecodeLevel::Specialized)
-}
-
-fn form_resources(document: &EditDocument, form: ObjectHandle) -> Result<Option<OwnedDictionary>> {
-    let Some(object) = document.current_owned_object(form)? else {
-        return Ok(None);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))
-}
-
-fn page_resources(document: &EditDocument, page: ObjectHandle) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = document.inherited_page_value(page, b"Resources")? else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(&value)? {
-        Some(OwnedObject::Dictionary(dictionary)) => Some(dictionary),
-        _ => None,
-    })
+    fn merge(&mut self, other: Self) {
+        self.entries_removed = self.entries_removed.saturating_add(other.entries_removed);
+        self.font_entries_removed = self
+            .font_entries_removed
+            .saturating_add(other.font_entries_removed);
+        self.xobject_entries_removed = self
+            .xobject_entries_removed
+            .saturating_add(other.xobject_entries_removed);
+        self.ext_gstate_entries_removed = self
+            .ext_gstate_entries_removed
+            .saturating_add(other.ext_gstate_entries_removed);
+        self.pattern_entries_removed = self
+            .pattern_entries_removed
+            .saturating_add(other.pattern_entries_removed);
+        self.properties_entries_removed = self
+            .properties_entries_removed
+            .saturating_add(other.properties_entries_removed);
+        self.shading_entries_removed = self
+            .shading_entries_removed
+            .saturating_add(other.shading_entries_removed);
+    }
 }
 
 fn xobject_handles(
@@ -131,10 +98,20 @@ fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
         .filter(|usage| !usage.pending_operands)
 }
 
+fn extend_names_by_type(target: &mut ResourceNamesByType, source: &ResourceNamesByType) {
+    for (resource_type, names) in source {
+        target
+            .entry(resource_type.clone())
+            .or_default()
+            .extend(names.iter().cloned());
+    }
+}
+
 fn borrowed_form_names(
     document: &EditDocument,
     resources: &OwnedDictionary,
     root_usage: &DetachedResourceUsage,
+    used_by_type: &mut ResourceNamesByType,
 ) -> Result<BTreeSet<Vec<u8>>> {
     let mut used = BTreeSet::new();
     let mut pending = VecDeque::new();
@@ -161,6 +138,7 @@ fn borrowed_form_names(
             continue;
         };
         used.extend(usage.names.iter().cloned());
+        extend_names_by_type(used_by_type, &usage.names_by_resource_type);
         if let Some(names) = usage.names_by_resource_type.get(b"XObject".as_slice()) {
             for (name, handle) in &xobjects {
                 if names.contains(name) && is_form(document, *handle)? {
@@ -172,23 +150,82 @@ fn borrowed_form_names(
     Ok(used)
 }
 
+fn keep_unused_resource(selectors: &BTreeSet<String>, category: &[u8], name: &[u8]) -> bool {
+    if selectors.is_empty() {
+        return false;
+    }
+    if selectors.contains("*") {
+        return true;
+    }
+    let category = String::from_utf8_lossy(category);
+    let name = String::from_utf8_lossy(name);
+    selectors.iter().any(|selector| {
+        if selector == name.as_ref() {
+            return true;
+        }
+        let Some((selector_category, selector_name)) = selector.split_once(':') else {
+            return false;
+        };
+        selector_category == category && (selector_name == "*" || selector_name == name)
+    })
+}
+
+fn resource_entry_used(
+    category: &[u8],
+    name: &[u8],
+    used_names: &BTreeSet<Vec<u8>>,
+    extra_used_names: Option<&BTreeSet<Vec<u8>>>,
+    used_by_type: Option<&ResourceNamesByType>,
+) -> bool {
+    if matches!(category, b"Font" | b"XObject") {
+        // Preserve qpdf's conservative flat-name semantics for the two legacy
+        // categories: a same-named resource used by another operator is kept.
+        return used_names.contains(name)
+            || extra_used_names.is_some_and(|names| names.contains(name));
+    }
+    used_by_type
+        .and_then(|usage| usage.get(category))
+        .is_some_and(|names| names.contains(name))
+}
+
 fn pruned_resources(
     document: &EditDocument,
     mut resources: OwnedDictionary,
-    mut used_names: BTreeSet<Vec<u8>>,
-) -> Result<OwnedDictionary> {
-    for category in [b"Font".as_slice(), b"XObject".as_slice()] {
+    used_names: &BTreeSet<Vec<u8>>,
+    extra_used_names: Option<&BTreeSet<Vec<u8>>>,
+    used_by_type: Option<&ResourceNamesByType>,
+    keep_unused: &BTreeSet<String>,
+) -> Result<(OwnedDictionary, ResourcePruneStats)> {
+    let mut stats = ResourcePruneStats::default();
+    for category in [
+        b"Font".as_slice(),
+        b"XObject".as_slice(),
+        b"ExtGState".as_slice(),
+        b"Pattern".as_slice(),
+        b"Properties".as_slice(),
+        b"Shading".as_slice(),
+    ] {
+        // Typed categories are only destructive when typed usage was actually
+        // collected. This keeps legacy/shared callers without typed evidence
+        // conservative rather than treating missing evidence as "unused".
+        if !matches!(category, b"Font" | b"XObject") && used_by_type.is_none() {
+            continue;
+        }
         let Some(value) = resources.get(category).cloned() else {
             continue;
         };
         let Some(mut dictionary) = resolved_dictionary(document, Some(&value))? else {
             continue;
         };
-        dictionary.retain(|name, _| used_names.contains(name));
+        let before = dictionary.len();
+        dictionary.retain(|name, _| {
+            resource_entry_used(category, name, used_names, extra_used_names, used_by_type)
+                || keep_unused_resource(keep_unused, category, name)
+        });
+        stats.record_category(category, before.saturating_sub(dictionary.len()));
         resources.insert(category.to_vec(), OwnedObject::Dictionary(dictionary));
     }
-    used_names.clear();
-    Ok(resources)
+    Ok((resources, stats))
 }
 
 fn install_page_resources(
@@ -309,7 +346,60 @@ pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bo
     Ok(false)
 }
 
-pub(crate) fn prune_resources_hayro(document: &mut EditDocument) -> Result<()> {
+pub(crate) fn prune_resources_with_usage_hayro(
+    document: &mut EditDocument,
+    keep_unused: &BTreeSet<String>,
+    page_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
+    form_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
+    page_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
+    form_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
+    generated_page_xobjects: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
+) -> Result<ResourcePruneStats> {
+    let mut stats = ResourcePruneStats::default();
+
+    // This fast path is only called when the shared content inventory is
+    // complete, which implies every reachable Form has its own resource scope.
+    // Resource-less Forms require caller-scope borrowing and therefore use the
+    // canonical parsing path instead.
+    for (&form, names) in form_names {
+        let Some(resources) = form_resources(document, form)? else {
+            continue;
+        };
+        let (resources, pruned) = pruned_resources(
+            document,
+            resources,
+            names,
+            None,
+            form_names_by_type.get(&form),
+            keep_unused,
+        )?;
+        stats.merge(pruned);
+        install_form_resources(document, form, resources)?;
+    }
+
+    for (&page, names) in page_names {
+        let Some(resources) = page_resources(document, page)? else {
+            continue;
+        };
+        let (resources, pruned) = pruned_resources(
+            document,
+            resources,
+            names,
+            generated_page_xobjects.get(&page),
+            page_names_by_type.get(&page),
+            keep_unused,
+        )?;
+        stats.merge(pruned);
+        install_page_resources(document, page, resources)?;
+    }
+    Ok(stats)
+}
+
+pub(crate) fn prune_resources_hayro(
+    document: &mut EditDocument,
+    keep_unused: &BTreeSet<String>,
+) -> Result<ResourcePruneStats> {
+    let mut stats = ResourcePruneStats::default();
     // Prune forms with local resource scopes first. Resource-less forms are
     // intentionally accounted against their caller's scope below.
     let mut forms = BTreeSet::new();
@@ -329,8 +419,22 @@ pub(crate) fn prune_resources_hayro(document: &mut EditDocument) -> Result<()> {
             continue;
         };
         let mut names = usage.names.clone();
-        names.extend(borrowed_form_names(document, &resources, &usage)?);
-        let resources = pruned_resources(document, resources, names)?;
+        let mut names_by_type = usage.names_by_resource_type.clone();
+        names.extend(borrowed_form_names(
+            document,
+            &resources,
+            &usage,
+            &mut names_by_type,
+        )?);
+        let (resources, pruned) = pruned_resources(
+            document,
+            resources,
+            &names,
+            None,
+            Some(&names_by_type),
+            keep_unused,
+        )?;
+        stats.merge(pruned);
         install_form_resources(document, form, resources)?;
     }
 
@@ -345,9 +449,146 @@ pub(crate) fn prune_resources_hayro(document: &mut EditDocument) -> Result<()> {
             continue;
         };
         let mut names = usage.names.clone();
-        names.extend(borrowed_form_names(document, &resources, &usage)?);
-        let resources = pruned_resources(document, resources, names)?;
+        let mut names_by_type = usage.names_by_resource_type.clone();
+        names.extend(borrowed_form_names(
+            document,
+            &resources,
+            &usage,
+            &mut names_by_type,
+        )?);
+        let (resources, pruned) = pruned_resources(
+            document,
+            resources,
+            &names,
+            None,
+            Some(&names_by_type),
+            keep_unused,
+        )?;
+        stats.merge(pruned);
         install_page_resources(document, page, resources)?;
     }
-    Ok(())
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod resource_retention_tests {
+    use super::{ResourceNamesByType, keep_unused_resource, resource_entry_used};
+    use std::collections::BTreeSet;
+
+    fn selectors(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn unused_resource_selectors_match_expected_scope() {
+        assert!(keep_unused_resource(&selectors(&["*"]), b"Font", b"F1"));
+        assert!(keep_unused_resource(
+            &selectors(&["XObject:*"]),
+            b"XObject",
+            b"Im7"
+        ));
+        assert!(!keep_unused_resource(
+            &selectors(&["XObject:*"]),
+            b"Font",
+            b"F1"
+        ));
+        assert!(keep_unused_resource(
+            &selectors(&["Font:F1"]),
+            b"Font",
+            b"F1"
+        ));
+        assert!(!keep_unused_resource(
+            &selectors(&["Font:F1"]),
+            b"Font",
+            b"F2"
+        ));
+        assert!(keep_unused_resource(
+            &selectors(&["SharedName"]),
+            b"XObject",
+            b"SharedName"
+        ));
+    }
+
+    #[test]
+    fn typed_resource_usage_does_not_cross_namespaces() {
+        let flat = BTreeSet::from([b"Shared".to_vec()]);
+        let typed = ResourceNamesByType::from([
+            (b"ExtGState".to_vec(), BTreeSet::from([b"Shared".to_vec()])),
+            (b"Pattern".to_vec(), BTreeSet::from([b"P0".to_vec()])),
+        ]);
+
+        // Preserve legacy qpdf-style flat-name semantics for Font/XObject.
+        assert!(resource_entry_used(
+            b"Font",
+            b"Shared",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+        assert!(resource_entry_used(
+            b"XObject",
+            b"Shared",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+
+        assert!(resource_entry_used(
+            b"ExtGState",
+            b"Shared",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+        assert!(!resource_entry_used(
+            b"Pattern",
+            b"Shared",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+        assert!(resource_entry_used(
+            b"Pattern",
+            b"P0",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+        assert!(!resource_entry_used(
+            b"Shading",
+            b"P0",
+            &flat,
+            None,
+            Some(&typed)
+        ));
+    }
+
+    #[test]
+    fn generated_page_xobjects_extend_flat_usage_without_copying_maps() {
+        let flat = BTreeSet::new();
+        let generated = BTreeSet::from([b"Generated".to_vec()]);
+
+        assert!(resource_entry_used(
+            b"XObject",
+            b"Generated",
+            &flat,
+            Some(&generated),
+            None
+        ));
+        // Match the legacy flat-name behavior used by the old cloned overlay.
+        assert!(resource_entry_used(
+            b"Font",
+            b"Generated",
+            &flat,
+            Some(&generated),
+            None
+        ));
+        assert!(!resource_entry_used(
+            b"Pattern",
+            b"Generated",
+            &flat,
+            Some(&generated),
+            None
+        ));
+    }
 }

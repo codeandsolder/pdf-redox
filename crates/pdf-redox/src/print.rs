@@ -284,7 +284,7 @@ struct PlacementWalkState<'a> {
 #[cfg(test)]
 fn scan_form<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
-    form: ObjectHandle,
+    form: &ObjectHandle,
     outer_ctm: Matrix,
     inherited_xobjects: &BTreeMap<Vec<u8>, ObjectHandle>,
     state: &mut PlacementWalkState<'_>,
@@ -294,7 +294,7 @@ fn scan_form<R: Read + Seek + 'static>(
         *state.complete = false;
         return Ok(());
     }
-    pdf.resolve(&form)?;
+    pdf.resolve(form)?;
     let Some(dict) = form.as_stream_dict() else {
         *state.complete = false;
         return Ok(());
@@ -364,7 +364,7 @@ fn process_draws<R: Read + Seek + 'static>(
                 *state.complete = false;
             }
         } else if subtype.try_is_name_and_equals(b"Form")? {
-            scan_form(pdf, draw.target, draw.ctm, current_xobjects, state, depth)?;
+            scan_form(pdf, &draw.target, draw.ctm, current_xobjects, state, depth)?;
         }
     }
     Ok(())
@@ -1385,10 +1385,10 @@ fn cow_scan_form(
         for draw in scanner.draws {
             match cow_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, state.placements, draw.target, draw.ctm)?
+                    cow_record_image(document, state.placements, draw.target, draw.ctm)?;
                 }
                 Some(b"Form") => {
-                    cow_scan_form(document, draw.target, draw.ctm, &current, state, depth + 1)?
+                    cow_scan_form(document, draw.target, draw.ctm, &current, state, depth + 1)?;
                 }
                 _ => *state.complete = false,
             }
@@ -1450,13 +1450,12 @@ fn cow_image_resize_safe(
     ) {
         return Ok(false);
     }
-    let filter = match dictionary
+    let Some(Some(crate::OwnedObject::Name(filter))) = dictionary
         .get(b"Filter".as_slice())
-        .map(|v| document.resolve_owned_value(v))
+        .map(|value| document.resolve_owned_value(value))
         .transpose()?
-    {
-        Some(Some(crate::OwnedObject::Name(name))) => name,
-        _ => return Ok(false),
+    else {
+        return Ok(false);
     };
     if jpeg && !matches!(filter.as_slice(), b"DCTDecode" | b"DCT") {
         return Ok(false);
@@ -1464,13 +1463,12 @@ fn cow_image_resize_safe(
     if !jpeg && !matches!(filter.as_slice(), b"FlateDecode" | b"Fl") {
         return Ok(false);
     }
-    let color = match dictionary
+    let Some(Some(crate::OwnedObject::Name(color))) = dictionary
         .get(b"ColorSpace".as_slice())
-        .map(|v| document.resolve_owned_value(v))
+        .map(|value| document.resolve_owned_value(value))
         .transpose()?
-    {
-        Some(Some(crate::OwnedObject::Name(name))) => name,
-        _ => return Ok(false),
+    else {
+        return Ok(false);
     };
     Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
 }
@@ -1519,7 +1517,7 @@ pub(crate) fn plan_print_downsampling_hayro(
         for draw in scanner.draws {
             match cow_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, &mut placements, draw.target, draw.ctm)?
+                    cow_record_image(document, &mut placements, draw.target, draw.ctm)?;
                 }
                 Some(b"Form") => {
                     let mut state = CowPlacementWalkState {

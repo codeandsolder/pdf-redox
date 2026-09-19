@@ -49,9 +49,10 @@ pub struct PreservationConfig {
     pub output_intents: bool,
     /// Preserve viewer layout/mode/preferences.
     pub viewer_preferences: bool,
-    /// Preserve Catalog/page metadata-like auxiliary entries such as XMP,
-    /// `PieceInfo`, `LastModified`, and thumbnails. Privacy scrubbing is still a
-    /// separate policy and may remove these afterward.
+    /// Preserve authoring/document metadata attached throughout the known
+    /// object graph, including XMP `/Metadata`, Form `/PieceInfo` and `/LastModified`,
+    /// and page/catalog metadata-like auxiliary entries. Privacy scrubbing is a
+    /// separate policy and may remove metadata afterward.
     pub metadata: bool,
     /// Preserve embedded-font tables used for later text editing/reflow but not
     /// for rendering already-positioned PDF text. Visible-surface mode can drop
@@ -63,6 +64,10 @@ pub struct PreservationConfig {
     /// Keep unrecognized Catalog/page entries and everything reachable only
     /// from them. Turning this off is the main "known semantics only" switch.
     pub unknown_objects: bool,
+    /// Experimental: when an unknown Catalog/Page/PageTree wrapper is dropped, promote direct
+    /// child keys that are themselves valid for the wrapper's parent role.
+    #[serde(default)]
+    pub splice_unknown_wrappers: bool,
 }
 
 impl PreservationConfig {
@@ -79,6 +84,27 @@ impl PreservationConfig {
             font_editing_support: true,
             annotations: AnnotationPolicy::Preserve,
             unknown_objects: true,
+            splice_unknown_wrappers: false,
+        }
+    }
+
+    /// Preserve standardized interactive/document semantics while dropping
+    /// authoring-only metadata, editing support, and unclassified extensions.
+    /// This is the processing-oriented baseline for a known-semantics graph.
+    pub fn known_functional() -> Self {
+        Self {
+            links: true,
+            forms: true,
+            navigation: true,
+            optional_content: true,
+            structure: true,
+            output_intents: true,
+            viewer_preferences: true,
+            metadata: false,
+            font_editing_support: false,
+            annotations: AnnotationPolicy::Preserve,
+            unknown_objects: false,
+            splice_unknown_wrappers: false,
         }
     }
 
@@ -97,6 +123,7 @@ impl PreservationConfig {
             font_editing_support: false,
             annotations: AnnotationPolicy::AppearanceOnly,
             unknown_objects: false,
+            splice_unknown_wrappers: false,
         }
     }
 }
@@ -123,6 +150,91 @@ pub enum ImagePolicy {
         target_ppi: u16,
         min_savings_percent: u8,
     },
+}
+
+/// Structural raster-layout normalization independent of codec/downsampling policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RasterLayoutConfig {
+    /// Enable raster crop/reconstruction passes.
+    pub enabled: bool,
+    /// Remove fully transparent outer pixel margins when mask semantics can be preserved.
+    pub crop_transparent: bool,
+    /// Replace uniform opaque outer backgrounds with an equivalent compact background paint
+    /// plus the cropped foreground raster when doing so cannot reveal retained content.
+    pub crop_background: bool,
+    /// Remove paint conservatively classified as invisible in the default appearance: fully
+    /// transparent raster paints and high-confidence removable hidden text. This also permits
+    /// opaque-background cropping to discard such content instead of exposing it.
+    pub prune_hidden_paints: bool,
+    /// Additionally remove raster image paints inferred to be fully occluded by later opaque
+    /// paint. Disabled by default because geometric coverage is not a proof of renderer-exact
+    /// equivalence for all PDF transparency/antialiasing combinations.
+    pub prune_occluded_raster_paints: bool,
+    /// Materialize `/SMask`, explicit `/Mask`, and color-key masks into a normalized alpha
+    /// plane when rebuilding a raster. The emitted PDF still uses a standard soft-mask image.
+    pub bake_masks: bool,
+    /// Preserve renderer-exact color/alpha resampling for binary-alpha images. When false,
+    /// transparent color samples may be elided by replacing a constant visible color plus a
+    /// binary soft mask with a stencil. This is visually conservative but can change subpixel
+    /// antialiasing when a viewer downsamples color and alpha separately.
+    pub exact_raster_rendering: bool,
+    /// Maximum exact-sample distance from the detected border color when considering a pixel
+    /// background. Zero is byte-exact and is the lossless default.
+    pub background_tolerance: u8,
+    /// Reconstruct clusters of tiny images that are being used as scalar raster pixels/sprites.
+    pub reconstruct_pixel_clusters: bool,
+    /// Maximum page-space gap between tiny-image paint rectangles in one connected component.
+    /// Five millimetres is deliberately generous enough to bridge sparse plot/image pixels
+    /// while still keeping unrelated figures apart in ordinary datasheet layouts.
+    pub pixel_cluster_max_gap_mm: f32,
+    /// Maximum source-image width or height treated as a pixel/sprite primitive.
+    pub pixel_cluster_max_source_dimension: u8,
+    /// Minimum number of tiny-image paints required before a component is reconstructed.
+    pub pixel_cluster_min_paints: usize,
+    /// Maximum long-axis source dimension admitted as a thin native-resolution fragment.
+    /// These larger fragments are reconstructed only when a compatible continuous raster
+    /// anchor establishes the native pixel pitch for their spatial component.
+    pub native_fragment_max_long_dimension: u16,
+    /// Minimum long-axis source dimension considered a continuous native-resolution anchor.
+    pub native_anchor_min_long_dimension: u16,
+    /// Merge source rasters that were needlessly split into adjacent strips.
+    pub merge_stripes: bool,
+    /// Minimum number of compatible strips required before replacing them with one image.
+    pub stripe_min_paints: usize,
+    /// Maximum placement error, measured in source pixels along the strip-join axis.
+    pub stripe_max_gap_pixels: f32,
+    /// Inline images are first externalized only in scopes this fragmented, so normal PDFs do
+    /// not gain thousands of transient `XObjects` merely to discover there is nothing to merge.
+    pub fragmented_paint_threshold: usize,
+    /// Hard memory/size guard for a reconstructed raster.
+    pub max_reconstructed_pixels: u64,
+}
+
+impl Default for RasterLayoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            crop_transparent: true,
+            crop_background: true,
+            prune_hidden_paints: true,
+            prune_occluded_raster_paints: false,
+            bake_masks: false,
+            exact_raster_rendering: false,
+            background_tolerance: 0,
+            reconstruct_pixel_clusters: true,
+            pixel_cluster_max_gap_mm: 5.0,
+            pixel_cluster_max_source_dimension: 5,
+            pixel_cluster_min_paints: 16,
+            native_fragment_max_long_dimension: 32,
+            native_anchor_min_long_dimension: 64,
+            merge_stripes: true,
+            stripe_min_paints: 3,
+            stripe_max_gap_pixels: 0.35,
+            fragmented_paint_threshold: 64,
+            max_reconstructed_pixels: 32_000_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +323,18 @@ impl HiddenTextPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OptimizationGoal {
+    /// Prefer the smallest encoded PDF; candidate structural rewrites may be
+    /// rejected when they make the compressed representation larger.
+    #[default]
+    Size,
+    /// Prefer a simpler display list / fewer paint operations, even when that
+    /// costs some encoded bytes. Geometry and semantic-preservation gates still apply.
+    Processing,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -220,17 +344,38 @@ pub struct Config {
     #[serde(default)]
     pub max_image_ppi: Option<u16>,
     pub image_policy: ImagePolicy,
+    /// Optional structural raster-layout normalization (crop/join/fragment reconstruction).
+    #[serde(default)]
+    pub raster_layout: RasterLayoutConfig,
     pub privacy: PrivacyConfig,
     pub hidden_text: HiddenTextPolicy,
+    /// Remove self-contained diagonal watermark text. Text at least 24 pt is removed directly;
+    /// 20–24 pt text is removed only when the same payload repeats at least three times on a page.
+    #[serde(default)]
+    pub remove_large_diagonal_text: bool,
+    /// Remove exact repeated text/XObject paints that occur at roughly the same page position
+    /// on every page, or on every page after the first. Explicit semantic cleanup; off by default.
+    #[serde(default)]
+    pub remove_repeated_page_objects: bool,
     /// Repack eligible small indirect objects into `ObjStm` containers.
     pub generate_object_streams: bool,
+    /// Primary optimization objective used when size and display-list simplicity conflict.
+    #[serde(default)]
+    pub optimization_goal: OptimizationGoal,
     /// Normalize lexical representation of page content streams.
     pub normalize_content_streams: bool,
+    /// Batch semantically equivalent vector path paints while preserving vector geometry.
+    #[serde(default)]
+    pub compact_vector_paths: bool,
     /// Policy for preserving or recompressing existing Flate streams.
     pub flate_policy: FlatePolicy,
-    /// Remove unused `/Font` and `/XObject` resource entries using the
-    /// parse-gated Hayro/COW pruning pass. Experimental until corpus validation.
+    /// Remove unused `/Font` and `/XObject` entries plus typed `/ExtGState`, `/Pattern`,
+    /// `/Properties`, and `/Shading` entries using the parse-gated Hayro/COW pruning pass.
     pub prune_resources: bool,
+    /// Unused resource entries retained even when resource pruning is enabled. Selectors are
+    /// `*`, `<Category>:*`, `<Category>:<Name>`, or a bare resource name.
+    #[serde(default)]
+    pub keep_unused_resources: BTreeSet<String>,
     /// Canonicalize byte- and dictionary-identical `/Metadata` streams so a fresh rewrite
     /// can garbage-collect duplicate XMP objects.
     pub deduplicate_metadata_streams: bool,
@@ -274,12 +419,18 @@ impl Config {
             preservation: PreservationConfig::functional(),
             max_image_ppi: None,
             image_policy: ImagePolicy::Preserve,
+            raster_layout: RasterLayoutConfig::default(),
             privacy: PrivacyConfig::default(),
             hidden_text: HiddenTextPolicy::default(),
+            remove_large_diagonal_text: false,
+            remove_repeated_page_objects: false,
             generate_object_streams: true,
+            optimization_goal: OptimizationGoal::Size,
             normalize_content_streams: false,
+            compact_vector_paths: false,
             flate_policy: FlatePolicy::default(),
             prune_resources: false,
+            keep_unused_resources: BTreeSet::new(),
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
             deduplicate_to_unicode_cmaps: true,
@@ -315,10 +466,10 @@ impl Config {
 
     pub fn print() -> Self {
         Self {
-            max_image_ppi: Some(450),
+            max_image_ppi: Some(600),
             image_policy: ImagePolicy::Print {
                 jpeg_quality: 85,
-                target_ppi: 450,
+                target_ppi: 600,
                 min_savings_percent: 20,
             },
             ..Self::optimize_only()
@@ -395,6 +546,31 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn splice_unknown_wrappers(mut self, value: bool) -> Self {
+        self.config.preservation.splice_unknown_wrappers = value;
+        self
+    }
+
+    pub fn raster_layout(mut self, value: RasterLayoutConfig) -> Self {
+        self.config.raster_layout = value;
+        self
+    }
+
+    pub fn normalize_raster_layout(mut self, value: bool) -> Self {
+        self.config.raster_layout.enabled = value;
+        self
+    }
+
+    pub fn bake_image_masks(mut self, value: bool) -> Self {
+        self.config.raster_layout.bake_masks = value;
+        self
+    }
+
+    pub fn exact_raster_rendering(mut self, value: bool) -> Self {
+        self.config.raster_layout.exact_raster_rendering = value;
+        self
+    }
+
     pub fn max_image_ppi(mut self, value: Option<u16>) -> Self {
         self.config.max_image_ppi = value;
         self
@@ -415,13 +591,33 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn remove_large_diagonal_text(mut self, value: bool) -> Self {
+        self.config.remove_large_diagonal_text = value;
+        self
+    }
+
+    pub fn remove_repeated_page_objects(mut self, value: bool) -> Self {
+        self.config.remove_repeated_page_objects = value;
+        self
+    }
+
     pub fn generate_object_streams(mut self, value: bool) -> Self {
         self.config.generate_object_streams = value;
         self
     }
 
+    pub fn optimization_goal(mut self, value: OptimizationGoal) -> Self {
+        self.config.optimization_goal = value;
+        self
+    }
+
     pub fn normalize_content_streams(mut self, value: bool) -> Self {
         self.config.normalize_content_streams = value;
+        self
+    }
+
+    pub fn compact_vector_paths(mut self, value: bool) -> Self {
+        self.config.compact_vector_paths = value;
         self
     }
 
@@ -432,6 +628,14 @@ impl ConfigBuilder {
 
     pub fn prune_resources(mut self, value: bool) -> Self {
         self.config.prune_resources = value;
+        self
+    }
+
+    pub fn keep_unused_resources(
+        mut self,
+        selectors: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config.keep_unused_resources = selectors.into_iter().map(Into::into).collect();
         self
     }
 
@@ -522,6 +726,14 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raster_occlusion_pruning_is_explicit_opt_in() {
+        let raster = RasterLayoutConfig::default();
+        assert!(raster.prune_hidden_paints);
+        assert!(!raster.prune_occluded_raster_paints);
+        assert!(!raster.exact_raster_rendering);
+    }
 
     #[test]
     fn builder_starts_from_requested_profile() {

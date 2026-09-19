@@ -38,6 +38,8 @@ pub(crate) struct PreservationStats {
     pub dropped_page_keys: BTreeMap<String, usize>,
     pub dropped_page_tree_keys: BTreeMap<String, usize>,
     pub dropped_catalog_keys: BTreeMap<String, usize>,
+    pub dropped_authoring_metadata_keys: BTreeMap<String, usize>,
+    pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -292,9 +294,10 @@ fn annotation_subtypes_hayro(
             continue;
         }
         for annotation in annotations {
-            let label = annotation_subtype_hayro(document, &annotation)?
-                .map(|name| format!("/{}", String::from_utf8_lossy(&name)))
-                .unwrap_or_else(|| "(missing/non-name subtype)".to_owned());
+            let label = annotation_subtype_hayro(document, &annotation)?.map_or_else(
+                || "(missing/non-name subtype)".to_owned(),
+                |name| format!("/{}", String::from_utf8_lossy(&name)),
+            );
             *counts.entry(label).or_default() += 1;
         }
     }
@@ -467,11 +470,125 @@ fn keep_catalog_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     }
 }
 
+fn collect_direct_authoring_metadata_removals(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    path: &mut Vec<PreservationPathStep>,
+    removals: &mut BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
+) {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if dictionary.contains_key(b"Metadata".as_slice()) {
+                removals
+                    .entry(PreservationDictionaryTarget {
+                        root,
+                        path: path.clone(),
+                    })
+                    .or_default()
+                    .insert(b"Metadata".to_vec());
+            }
+            for (key, value) in dictionary {
+                if key.as_slice() == b"Metadata" || matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(PreservationPathStep::DictKey(key.clone()));
+                collect_direct_authoring_metadata_removals(root, value, path, removals);
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(PreservationPathStep::ArrayIndex(index));
+                collect_direct_authoring_metadata_removals(root, value, path, removals);
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+fn drop_authoring_metadata_hayro(
+    document: &mut EditDocument,
+    stats: &mut PreservationStats,
+) -> Result<()> {
+    // Discover every removable authoring-metadata key in one reachability walk.
+    // Recurse only through direct dictionaries/arrays; referenced objects are
+    // visited separately as roots, so discovery cannot follow graph cycles.
+    let mut removals = BTreeMap::<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>::new();
+    for root in document.reachable_output_objects()? {
+        let Some(snapshot) = document.current_owned_object(root)? else {
+            continue;
+        };
+        collect_direct_authoring_metadata_removals(root, &snapshot, &mut Vec::new(), &mut removals);
+
+        let Some(dictionary) = snapshot.as_dictionary() else {
+            continue;
+        };
+        let is_form = matches!(snapshot, OwnedObject::Stream { .. })
+            && match dictionary.get(b"Subtype".as_slice()) {
+                Some(value) => matches!(
+                    document.resolve_owned_value(value)?,
+                    Some(OwnedObject::Name(name)) if name == b"Form"
+                ),
+                None => false,
+            };
+        if is_form {
+            let target = PreservationDictionaryTarget {
+                root,
+                path: Vec::new(),
+            };
+            for key in [b"PieceInfo".as_slice(), b"LastModified".as_slice()] {
+                if dictionary.contains_key(key) {
+                    removals
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(key.to_vec());
+                }
+            }
+        }
+    }
+
+    for (target, keys) in removals {
+        let root = match target.root {
+            CowObjectHandle::Existing(id) => document.edit_object(id)?,
+            CowObjectHandle::New(id) => document
+                .overlay_mut()
+                .added_mut(id)
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        };
+        let Some(dictionary) = preservation_object_at_path_mut(root, &target.path)
+            .and_then(OwnedObject::as_dictionary_mut)
+        else {
+            continue;
+        };
+        for key in keys {
+            if dictionary.remove(key.as_slice()).is_some() {
+                *stats
+                    .dropped_authoring_metadata_keys
+                    .entry(format!("/{}", String::from_utf8_lossy(&key)))
+                    .or_default() += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prune_dictionary_target_hayro(
     document: &mut EditDocument,
     target: &PreservationDictionaryTarget,
     keep: impl Fn(&[u8]) -> bool,
+    splice_unknown_wrappers: bool,
     stats: &mut BTreeMap<String, usize>,
+    spliced: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
     let Some(snapshot) = preservation_target_snapshot(document, target)? else {
         return Ok(());
@@ -487,6 +604,39 @@ fn prune_dictionary_target_hayro(
     if remove.is_empty() {
         return Ok(());
     }
+
+    let mut promotions = Vec::new();
+    if splice_unknown_wrappers {
+        let existing = dictionary.keys().cloned().collect::<BTreeSet<_>>();
+        let mut planned = BTreeSet::new();
+        for wrapper_key in &remove {
+            let Some(wrapper) = dictionary.get(wrapper_key.as_slice()) else {
+                continue;
+            };
+            let Some(resolved) = document.resolve_owned_value(wrapper)? else {
+                continue;
+            };
+            let Some(wrapper_dict) = resolved.as_dictionary() else {
+                continue;
+            };
+            for (child_key, child_value) in wrapper_dict {
+                if keep(child_key)
+                    && !existing.contains(child_key)
+                    && planned.insert(child_key.clone())
+                {
+                    promotions.push((child_key.clone(), child_value.clone()));
+                    *spliced
+                        .entry(format!(
+                            "/{} -> /{}",
+                            String::from_utf8_lossy(wrapper_key),
+                            String::from_utf8_lossy(child_key)
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
     let Some(dictionary) = preservation_target_mut(document, target)? else {
         return Ok(());
     };
@@ -496,6 +646,9 @@ fn prune_dictionary_target_hayro(
                 .entry(format!("/{}", String::from_utf8_lossy(&key)))
                 .or_default() += 1;
         }
+    }
+    for (key, value) in promotions {
+        dictionary.entry(key).or_insert(value);
     }
     Ok(())
 }
@@ -931,7 +1084,7 @@ fn content_references_hayro(
 fn wrap_page_contents_hayro(
     document: &mut EditDocument,
     page: &PreservationDictionaryTarget,
-    append_bytes: Vec<u8>,
+    append_bytes: &[u8],
 ) -> Result<()> {
     let old = preservation_target_snapshot(document, page)?.and_then(|object| {
         object
@@ -940,7 +1093,7 @@ fn wrap_page_contents_hayro(
     });
     let before = new_content_stream(document, b"q\n".to_vec());
     let mut after_bytes = b"\nQ\n".to_vec();
-    after_bytes.extend_from_slice(&append_bytes);
+    after_bytes.extend_from_slice(append_bytes);
     let after = new_content_stream(document, after_bytes);
     let mut contents = vec![OwnedObject::Reference(before)];
     contents.extend(content_references_hayro(document, old)?);
@@ -1054,7 +1207,7 @@ fn flatten_annotations_hayro(
             page_dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
         }
         if changed_annotations {
-            wrap_page_contents_hayro(document, page, append_bytes)?;
+            wrap_page_contents_hayro(document, page, &append_bytes)?;
             replace_page_annotations_hayro(document, page, kept)?;
         }
     }
@@ -1115,12 +1268,17 @@ pub(crate) fn apply_preservation_policy_hayro(
         ..PreservationStats::default()
     };
     process_annotations_hayro(document, &pages, policy, &mut stats)?;
+    if !policy.metadata {
+        drop_authoring_metadata_hayro(document, &mut stats)?;
+    }
     for page in &pages {
         prune_dictionary_target_hayro(
             document,
             page,
             |key| keep_page_key_hayro(key, policy),
+            policy.splice_unknown_wrappers,
             &mut stats.dropped_page_keys,
+            &mut stats.spliced_unknown_wrapper_keys,
         )?;
     }
     for node in &page_tree_nodes {
@@ -1128,7 +1286,9 @@ pub(crate) fn apply_preservation_policy_hayro(
             document,
             node,
             |key| keep_page_tree_key_hayro(key, policy),
+            policy.splice_unknown_wrappers,
             &mut stats.dropped_page_tree_keys,
+            &mut stats.spliced_unknown_wrapper_keys,
         )?;
     }
     let catalog = PreservationDictionaryTarget {
@@ -1139,7 +1299,9 @@ pub(crate) fn apply_preservation_policy_hayro(
         document,
         &catalog,
         |key| keep_catalog_key_hayro(key, policy),
+        policy.splice_unknown_wrappers,
         &mut stats.dropped_catalog_keys,
+        &mut stats.spliced_unknown_wrapper_keys,
     )?;
     Ok(stats)
 }
@@ -1567,10 +1729,10 @@ fn annotation_subtypes(
             let subtype = if annotation.as_dictionary().is_some() {
                 let subtype = annotation.try_get_key(b"/Subtype")?;
                 pdf.resolve(&subtype)?;
-                subtype
-                    .as_name()
-                    .map(|name| format!("/{}", String::from_utf8_lossy(&name)))
-                    .unwrap_or_else(|| "(missing/non-name subtype)".to_owned())
+                subtype.as_name().map_or_else(
+                    || "(missing/non-name subtype)".to_owned(),
+                    |name| format!("/{}", String::from_utf8_lossy(&name)),
+                )
             } else {
                 "(non-dictionary annotation)".to_owned()
             };

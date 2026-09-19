@@ -148,7 +148,7 @@ fn write_hayro_object(
         Object::String(value) => write_pdf_string(output, value.as_bytes()),
         Object::Name(value) => write_pdf_name(output, value.as_ref()),
         Object::Dict(dictionary) => {
-            write_hayro_dictionary(output, dictionary, document, plan, false)?
+            write_hayro_dictionary(output, dictionary, document, plan, false)?;
         }
         Object::Array(array) => {
             output.push(b'[');
@@ -236,7 +236,7 @@ fn write_owned_object(
     match object {
         OwnedObject::Null => output.extend_from_slice(b"null"),
         OwnedObject::Boolean(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
+            output.extend_from_slice(if *value { b"true" } else { b"false" });
         }
         OwnedObject::Integer(value) => write!(&mut *output, "{value}")?,
         OwnedObject::Real(value) => write_pdf_real(output, *value)?,
@@ -732,10 +732,7 @@ mod tests {
         };
 
         assert_eq!(rewritten.object_count(), 6);
-        let trailer = match rewritten.preserved_trailer() {
-            Ok(trailer) => trailer,
-            Err(error) => panic!("rewritten trailer should parse: {error}"),
-        };
+        let trailer = rewritten.preserved_trailer();
         assert!(!trailer.contains_key(b"Size".as_slice()));
         assert!(!trailer.contains_key(b"Root".as_slice()));
 
@@ -814,10 +811,7 @@ mod tests {
             Err(error) => panic!("rewritten PDF should parse: {error}"),
         };
         assert_eq!(rewritten.object_count(), 4);
-        let trailer = match rewritten.preserved_trailer() {
-            Ok(trailer) => trailer,
-            Err(error) => panic!("rewritten trailer should parse: {error}"),
-        };
+        let trailer = rewritten.preserved_trailer();
         assert!(trailer.contains_key(b"Info".as_slice()));
         assert!(trailer.contains_key(b"ID".as_slice()));
         let custom = match trailer.get(b"Custom".as_slice()) {

@@ -475,7 +475,13 @@ impl TokenFilter for InlineImageExternalizer {
                 let dictionary =
                     self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
                 let fingerprint = match self.mode {
-                    InlineImageExternalizeMode::All => None,
+                    // All-mode rewriting is scoped to one content/resources pair, so even
+                    // a named color space that could not be expanded here has stable local
+                    // semantics. Fingerprinting lets pathological pages reuse identical
+                    // inline sprites instead of allocating one XObject per paint.
+                    InlineImageExternalizeMode::All => {
+                        Some(Self::semantic_fingerprint(&dictionary, &token.value)?)
+                    }
                     InlineImageExternalizeMode::Count | InlineImageExternalizeMode::Selected(_) => {
                         self.fingerprint_if_resolved(&dictionary, &token.value, unresolved_before)?
                     }
@@ -553,6 +559,44 @@ impl TokenFilter for InlineImageExternalizer {
 }
 
 /// Inspect decoded detached content and count semantic inline-image fingerprints.
+/// Rewrite every inline image in decoded detached content as a local Image
+/// XObject reference. Exact semantic duplicates within this one resource scope
+/// reuse the same generated name/image.
+pub fn rewrite_all_inline_images_detached(
+    content: &[u8],
+    min_size: usize,
+    color_spaces: Option<ObjectHandle>,
+    resource_names: BTreeSet<Vec<u8>>,
+) -> Result<DetachedInlineImageRewrite> {
+    let stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(Vec::new()),
+        Rc::new(content.to_vec()),
+    );
+    let mut filter = InlineImageExternalizer::new(min_size, color_spaces, resource_names);
+    let mut rewritten = Vec::new();
+    {
+        let mut sink = PlString::new("detached all-inline image content", None, &mut rewritten);
+        stream.filter_as_contents(&mut filter, Some(&mut sink))?;
+    }
+    let images = filter
+        .images
+        .into_iter()
+        .filter_map(|image| {
+            image.fingerprint.map(|fingerprint| DetachedInlineImage {
+                name: image.name,
+                dictionary: image.dictionary,
+                data: image.data,
+                fingerprint,
+            })
+        })
+        .collect();
+    Ok(DetachedInlineImageRewrite {
+        content: rewritten,
+        images,
+        externalized_occurrences: filter.externalized_occurrences,
+    })
+}
+
 pub fn inspect_duplicate_inline_images_detached(
     content: &[u8],
     min_size: usize,

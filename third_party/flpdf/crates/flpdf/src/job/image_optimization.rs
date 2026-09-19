@@ -71,6 +71,64 @@ impl Default for ImageOptimizationOptions {
     }
 }
 
+/// Encode an already-decoded 8-bit Gray/RGB/CMYK raster as JPEG using the
+/// same DCT backend as flpdf's image optimizer.
+pub fn encode_jpeg_raster(
+    width: u32,
+    height: u32,
+    components: usize,
+    data: &[u8],
+    jpeg_quality: u8,
+) -> Result<Vec<u8>> {
+    let pixel_format = match components {
+        1 => libjpeg_turbo_rs::PixelFormat::Grayscale,
+        3 => libjpeg_turbo_rs::PixelFormat::Rgb,
+        4 => libjpeg_turbo_rs::PixelFormat::Cmyk,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "JPEG raster encoding supports 1, 3, or 4 components, got {components}"
+            )));
+        }
+    };
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+        .and_then(|pixels| pixels.checked_mul(components))
+        .ok_or_else(|| Error::Unsupported("JPEG raster dimensions overflow".to_owned()))?;
+    if data.len() != expected {
+        return Err(Error::Unsupported(format!(
+            "JPEG raster buffer length {} does not match expected {expected}",
+            data.len()
+        )));
+    }
+    let quality = jpeg_quality.clamp(1, 100);
+    let mut encoded = Vec::new();
+    {
+        let mut sink = PlString::new("jpeg raster", None, &mut encoded);
+        let mut encoder = if quality == 75 {
+            PlDct::new_compressor(
+                "jpeg raster",
+                &mut sink,
+                width as usize,
+                height as usize,
+                pixel_format,
+            )
+        } else {
+            PlDct::new_compressor_with_quality(
+                "jpeg raster",
+                &mut sink,
+                width as usize,
+                height as usize,
+                pixel_format,
+                quality,
+            )
+        };
+        encoder.write(data)?;
+        encoder.finish()?;
+    }
+    Ok(encoded)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImageOptimizationStats {
     pub images_optimized: usize,
@@ -913,6 +971,23 @@ mod tests {
             min_savings_bytes: 1,
             min_savings_percent: 0,
         }
+    }
+
+    #[test]
+    fn encode_jpeg_raster_encodes_rgb_pixels() -> Result<()> {
+        let width = 32;
+        let height = 16;
+        let mut pixels = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[(x * 7) as u8, (y * 13) as u8, ((x + y) * 5) as u8]);
+            }
+        }
+        let encoded = encode_jpeg_raster(width as u32, height as u32, 3, &pixels, 85)?;
+        assert!(encoded.starts_with(&[0xff, 0xd8]));
+        assert!(encoded.ends_with(&[0xff, 0xd9]));
+        assert!(encoded.len() < pixels.len());
+        Ok(())
     }
 
     #[test]

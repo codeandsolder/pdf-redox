@@ -683,27 +683,27 @@ fn normalized_non_stream_resource_object<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
     redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<Option<ObjectHandle>> {
+) -> Option<ObjectHandle> {
     if object.as_stream_dict().is_some() || pdf.resolve(object).is_err() {
-        return Ok(None);
+        return None;
     }
     if let Some(entries) = object.as_dictionary() {
-        return Ok(Some(ObjectHandle::dictionary(
+        return Some(ObjectHandle::dictionary(
             entries
                 .into_iter()
                 .map(|(key, value)| (key, normalized_direct_resource_value(pdf, value, redirects)))
                 .collect(),
-        )));
+        ));
     }
     if let Some(items) = object.as_array() {
-        return Ok(Some(ObjectHandle::array(
+        return Some(ObjectHandle::array(
             items
                 .into_iter()
                 .map(|value| normalized_direct_resource_value(pdf, value, redirects))
                 .collect(),
-        )));
+        ));
     }
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
@@ -711,7 +711,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
     dependency_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects = HashMap::new();
 
@@ -720,7 +720,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
             continue;
         };
         let Some(normalized) =
-            normalized_non_stream_resource_object(pdf, object, dependency_redirects)?
+            normalized_non_stream_resource_object(pdf, object, dependency_redirects)
         else {
             continue;
         };
@@ -739,7 +739,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
         }
     }
 
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -817,7 +817,7 @@ fn form_resource_objects<R: Read + Seek + 'static>(
 fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     resource_objects: &[ObjectHandle],
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     // Exact resource containers can themselves refer to duplicated indirect
     // containers. Iterate until those identity-only differences stop exposing
     // new exact matches. Restrict the fixed point to objects reachable from
@@ -825,17 +825,14 @@ fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     // of magnitude more expensive and cannot affect a Form fingerprint.
     let mut redirects = HashMap::new();
     for _ in 0..=resource_objects.len() {
-        let next = exact_non_stream_resource_redirects_for_dependencies(
-            pdf,
-            resource_objects,
-            &redirects,
-        )?;
+        let next =
+            exact_non_stream_resource_redirects_for_dependencies(pdf, resource_objects, &redirects);
         if next == redirects {
-            return Ok(next);
+            return next;
         }
         redirects = next;
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -843,14 +840,10 @@ fn normalized_dictionary_with_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
     redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<Option<ObjectHandle>> {
-    let Some(normalized) = normalized_non_stream_resource_object(pdf, object, redirects)? else {
-        return Ok(None);
-    };
-    if normalized.as_dictionary().is_none() {
-        return Ok(None);
-    }
-    Ok(Some(normalized))
+) -> Option<ObjectHandle> {
+    let normalized = normalized_non_stream_resource_object(pdf, object, redirects)?;
+    normalized.as_dictionary()?;
+    Some(normalized)
 }
 
 #[cfg(test)]
@@ -875,7 +868,7 @@ fn exact_form_font_redirects<R: Read + Seek + 'static>(
         if !matches!(object_type.try_is_name_and_equals(b"Font"), Ok(true)) {
             continue;
         }
-        let Some(normalized) = normalized_dictionary_with_redirects(pdf, object, exact_redirects)?
+        let Some(normalized) = normalized_dictionary_with_redirects(pdf, object, exact_redirects)
         else {
             continue;
         };
@@ -1111,7 +1104,7 @@ fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     font_redirects: &HashMap<ObjectRef, ObjectRef>,
     image_redirects: &HashMap<ObjectRef, ObjectRef>,
     dependency_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects = HashMap::new();
     for object in objects {
@@ -1137,7 +1130,7 @@ fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
             canonical_by_fingerprint.insert(fingerprint, object_ref);
         }
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -1148,7 +1141,7 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
     exact_redirects: &HashMap<ObjectRef, ObjectRef>,
     font_redirects: &HashMap<ObjectRef, ObjectRef>,
     image_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let form_count = objects
         .iter()
         .filter(|object| {
@@ -1168,13 +1161,13 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
             font_redirects,
             image_redirects,
             &redirects,
-        )?;
+        );
         if next == redirects {
-            return Ok(next);
+            return next;
         }
         redirects = next;
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -1185,7 +1178,7 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     let holders = xobject_holders(&objects);
     let icon_holders = form_icon_holders(&objects);
     let resource_objects = form_resource_objects(pdf, &objects);
-    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects)?;
+    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects);
     let font_redirects = exact_form_font_redirects(pdf, &objects, &exact_redirects)?;
     let image_redirects = virtual_form_image_redirects(pdf, &objects, &exact_redirects)?;
 
@@ -1208,7 +1201,7 @@ pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
         &exact_redirects,
         &font_redirects,
         &image_redirects,
-    )?;
+    );
 
     let mut duplicate_refs = HashSet::new();
     let mut duplicate_raw_bytes = 0_usize;
@@ -1319,7 +1312,7 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     // Form dedup while retaining appearance's stricter dictionary semantics:
     // unlike general Form XObjects, /Name is not ignored here.
     let resource_objects = form_resource_objects(pdf, &objects);
-    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects)?;
+    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects);
     let font_redirects = exact_form_font_redirects(pdf, &objects, &exact_redirects)?;
     let image_redirects = virtual_form_image_redirects(pdf, &objects, &exact_redirects)?;
     let dependency_redirects = fixed_point_form_redirects(
@@ -1329,7 +1322,7 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
         &exact_redirects,
         &font_redirects,
         &image_redirects,
-    )?;
+    );
 
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -1855,67 +1848,11 @@ pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
 
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HayroFontProgramHolder {
-    holder: CowObjectHandle,
-    key: Vec<u8>,
-    program: CowObjectHandle,
-}
-
-fn inspect_hayro_font_program_holders(
-    holder: CowObjectHandle,
-    dictionary: &hayro_syntax::object::Dict<'_>,
-    holders: &mut Vec<HayroFontProgramHolder>,
-) {
-    for key in HAYRO_FONT_FILE_KEYS {
-        if let Some(program) = dictionary.get_ref(key) {
-            holders.push(HayroFontProgramHolder {
-                holder,
-                key: key.to_vec(),
-                program: CowObjectHandle::Existing(program.into()),
-            });
-        }
-    }
-}
-
-fn inspect_owned_font_program_holders(
-    holder: CowObjectHandle,
-    dictionary: &OwnedDictionary,
-    holders: &mut Vec<HayroFontProgramHolder>,
-) {
-    for key in HAYRO_FONT_FILE_KEYS {
-        let Some(OwnedObject::Reference(program)) = dictionary.get(key) else {
-            continue;
-        };
-        holders.push(HayroFontProgramHolder {
-            holder,
-            key: key.to_vec(),
-            program: *program,
-        });
-    }
-}
-
-fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<HayroFontProgramHolder>> {
+fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
     let mut holders = Vec::new();
-    document.walk_output_objects(|handle, object| {
-        match object {
-            CurrentObject::Source(object) => match &object {
-                HayroObject::Dict(dictionary) => {
-                    inspect_hayro_font_program_holders(handle, dictionary, &mut holders);
-                }
-                HayroObject::Stream(stream) => {
-                    inspect_hayro_font_program_holders(handle, stream.dict(), &mut holders);
-                }
-                _ => {}
-            },
-            CurrentObject::Owned(object) => {
-                if let Some(dictionary) = object.as_dictionary() {
-                    inspect_owned_font_program_holders(handle, dictionary, &mut holders);
-                }
-            }
-        }
-        Ok(())
-    })?;
+    for key in HAYRO_FONT_FILE_KEYS {
+        holders.extend(hayro_direct_reference_holders(document, key)?);
+    }
     Ok(holders)
 }
 
@@ -2065,31 +2002,6 @@ fn hayro_font_program_fingerprint(
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
-fn rewrite_font_program_holder(
-    document: &mut EditDocument,
-    holder: &HayroFontProgramHolder,
-    canonical: CowObjectHandle,
-) -> Result<bool> {
-    let object = match holder.holder {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
-    };
-    let Some(dictionary) = object.as_dictionary_mut() else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.key.as_slice()) else {
-        return Ok(false);
-    };
-    if *current != holder.program {
-        return Ok(false);
-    }
-    dictionary.insert(holder.key.clone(), OwnedObject::Reference(canonical));
-    Ok(true)
-}
-
 pub(crate) fn canonicalize_font_program_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
@@ -2101,31 +2013,28 @@ pub(crate) fn canonicalize_font_program_streams_hayro(
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_font_program_fingerprint(document, holder.program, &holder.key)?
+            hayro_font_program_fingerprint(document, holder.target, &holder.key)?
         else {
             continue;
         };
         if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.program {
-                redirects.insert((holder.key.clone(), holder.program), canonical);
-                if duplicate_refs.insert(holder.program) {
+            if canonical != holder.target {
+                redirects.insert((holder.key.clone(), holder.target), canonical);
+                if duplicate_refs.insert(holder.target) {
                     duplicate_raw_bytes += raw_bytes;
                 }
             }
         } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.program);
+            canonical_by_fingerprint.insert(fingerprint, holder.target);
         }
     }
 
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects
-            .get(&(holder.key.clone(), holder.program))
-            .copied()
-        else {
+        let Some(canonical) = redirects.get(&(holder.key.clone(), holder.target)).copied() else {
             continue;
         };
-        if rewrite_font_program_holder(document, holder, canonical)? {
+        if rewrite_direct_reference_holder(document, holder, canonical)? {
             references_canonicalized += 1;
         }
     }
@@ -3195,6 +3104,9 @@ pub(crate) fn canonicalize_image_xobjects_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let images = reachable_streams_with_subtype(document, b"Image")?;
+    if !stream_payloads_may_repeat(document, &images)? {
+        return Ok(TargetedDedupStats::default());
+    }
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
     } else {
@@ -3763,11 +3675,37 @@ struct FormDependencyRedirects {
     forms: HashMap<CowObjectHandle, CowObjectHandle>,
 }
 
+fn stream_payloads_may_repeat(document: &EditDocument, forms: &[CowObjectHandle]) -> Result<bool> {
+    let mut seen = HashSet::<[u8; 32]>::new();
+    for &form in forms {
+        let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(form)? else {
+            continue;
+        };
+        let raw = data.bytes(document.source())?;
+        let fingerprint: [u8; 32] = Sha256::digest(raw.as_ref()).into();
+        if !seen.insert(fingerprint) {
+            // Hash collisions only cause a conservative fallback to the exact
+            // dedup pass; they can never make this proof skip equal payloads.
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn form_dependency_redirects_hayro(
     document: &EditDocument,
     ignored_form_dictionary_keys: &[&[u8]],
 ) -> Result<FormDependencyRedirects> {
     let form_streams = reachable_streams_with_subtype(document, b"Form")?;
+    if !stream_payloads_may_repeat(document, &form_streams)? {
+        return Ok(FormDependencyRedirects {
+            form_streams,
+            exact: HashMap::new(),
+            fonts: HashMap::new(),
+            images: HashMap::new(),
+            forms: HashMap::new(),
+        });
+    }
     let images = reachable_streams_with_subtype(document, b"Image")?;
     let resources = form_resource_handles(document, &form_streams)?;
     let exact = exact_non_stream_resource_redirects_hayro(document, &resources)?;
@@ -3799,6 +3737,9 @@ pub(crate) fn canonicalize_form_xobjects_hayro(
         &[]
     };
     let dependencies = form_dependency_redirects_hayro(document, ignored)?;
+    if dependencies.forms.is_empty() {
+        return Ok(TargetedDedupStats::default());
+    }
     let mut duplicate_raw_bytes = 0_usize;
     for &form in &dependencies.form_streams {
         if dependencies.forms.contains_key(&form)
@@ -4000,7 +3941,7 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
                         path: Vec::new(),
                         key: b"Contents".to_vec(),
                         target: *target,
-                    }))
+                    }));
                 }
                 Some(OwnedObject::Array(values)) => {
                     for (index, value) in values.iter().enumerate() {
@@ -5954,6 +5895,56 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, different_key);
         assert_ne!(first, different_dict);
+        Ok(())
+    }
+
+    #[test]
+    fn hayro_font_program_dedup_finds_nested_direct_descriptors() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let first = font_program(&mut pdf, b"same-nested-font-program")?;
+        let second = font_program(&mut pdf, b"same-nested-font-program")?;
+        let root = pdf.root_handle()?;
+        root.replace_key(
+            b"/NestedFontA",
+            ObjectHandle::dictionary(vec![(
+                b"/Wrapper".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/FontFile2".to_vec(), first)]),
+            )]),
+        )?;
+        root.replace_key(
+            b"/NestedFontB",
+            ObjectHandle::dictionary(vec![(
+                b"/Wrapper".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/FontFile2".to_vec(), second)]),
+            )]),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.write()?;
+        let input = writer.get_buffer()?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let stats = canonicalize_font_program_streams_hayro(&mut document)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+
+        let output = document.write_compact()?;
+        let mut reparsed = Pdf::open(Cursor::new(output))?;
+        let root = reparsed.root_handle()?;
+        let first = root
+            .try_get_key(b"/NestedFontA")?
+            .try_get_key(b"/Wrapper")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        let second = root
+            .try_get_key(b"/NestedFontB")?
+            .try_get_key(b"/Wrapper")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        assert_eq!(first, second);
         Ok(())
     }
 
