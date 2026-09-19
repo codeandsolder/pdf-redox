@@ -719,7 +719,64 @@ Known lossless-stripe controls Alcor Micro and AP Memory are byte-for-byte ident
 
 Quality/idempotence: ST all-page 96-DPI incremental minimum PSNR versus candidate 33 is 44.08/46.12 dB; sampled 144-DPI PSNR is 46.7-47.7 dB. All three positives are exact SHA fixed points on second pass with zero further stripe work. OCXO is a visual outlier, but most of its source-vs-output difference already comes from the mandatory stripe reconstruction; JPEG q85 is not the dominant change.
 
-Candidate 35 active:
-1. Add a minimum useful crop threshold: do not apply transparent/background crop unless the four removed margins total at least 20 px, i.e. `(old_width-new_width)+(old_height-new_height) >= 20`.
-2. Add encoded-cost profitability gating for alpha-mask bake/crop so crops that make compressed color+mask payload larger are rejected.
-3. Refine reconstructed JPEG selection to start at q85 and lower quality only when necessary to fit the original stripe color-payload budget; this should leave the ST cases at q85 and move the OCXO case toward q80.
+### Candidate 35 — accepted crop economics + source-budgeted reconstructed JPEG
+
+Candidate 35 supersedes candidate 34.
+
+Artifacts:
+- frozen binary: `/srv/scratch/pdf-desht-build/candidate35-crop-economics-20260919/pdf-redox`
+- binary SHA-256: `e01464ff4a305f91a5aadd1eed995b17ca40d16546e46ced0e1d3e6214056145`
+- gate source snapshot: `/srv/scratch/pdf-desht-build/candidate35-gate-source-20260919/`
+- `raster_layout.rs` SHA-256: `8f2a32808a0d1edcf7947794be944a6e9af8c4408eb74040f02cca747e6b36aa`
+- acceptance manifest: `/srv/scratch/pdf-desht-build/candidate35-acceptance-20260919.json`
+- full gate log: `/srv/scratch/pdf-desht-build/candidate35_full_gate_20260919.log`, marker `CANDIDATE35_FULL_GATE_OK`
+
+Changes:
+1. Transparent/background cropping now requires at least **20 px total removed margin**, defined as `(old_width-new_width)+(old_height-new_height)`.
+2. Singleton alpha-crop rewrites are prepared without graph mutation and applied only when compressed candidate color+alpha(+background) payload is strictly smaller than the current encoded color+attached-mask payload. Rejected crops allocate no PDF objects and do not increment crop statistics.
+3. Reconstructed compact-color stripes carry the aggregate encoded source-color budget, deduplicated by source image object. JPEG still starts at q85; q82/80/78/75 are tried only when q85 already beats the lossless candidate but exceeds that source budget.
+
+Normal-document corpus replay:
+- **196/196** successful, zero failures.
+- **34** outputs changed versus candidate 34; **162** byte-identical.
+- net delta versus candidate 34: **-552,505 B**.
+- aggregate delta versus source inputs: **-97,348,923 B**.
+- **0/196 outputs larger than source**.
+
+Known crop-growth regressions are closed:
+- `2605.05242v1.pdf`: candidate 34 was 84,435 B larger than source; candidate 35 is **181,582 B smaller** and becomes 51/51-page source-exact at 24 DPI instead of differing on five pages.
+- `x-nucleo-drp1m1.pdf`: candidate 35 is **13,554 B smaller than source** and restores 6/6 source-exact pages at 24 DPI.
+- `2604.07012v1.pdf`: candidate 35 is **68,571 B smaller than source** and restores 16/16 source-exact pages at 24 DPI.
+- ESP32-P4 hardware guide: candidate 35 is **5,250 B smaller than source** and removes one of candidate 34's two source-render differences while retaining only profitable crops.
+
+Stripe/JPEG positives improve further without dropping any stripe reconstruction:
+- STM32G4 DMA/DMAMUX: **1,708,280 -> 1,653,435 B** versus candidate 34; 61 groups / 427 paints remain merged; source delta -100,053 B.
+- STM32G4 Analog Comparators: **1,091,117 -> 1,061,311 B**; 55 groups / 278 paints remain merged; source delta -80,172 B.
+- CTI OCXO: **226,068 -> 212,610 B**, now **10,128 B smaller than source**; 1 group / 23 paints remain merged.
+Candidate-34→35 sampled incremental PSNR is 47.33 dB minimum on DMA and 48.15 dB on Comparators. Source-relative ST quality is essentially unchanged; OCXO source-relative sampled quality improves slightly.
+
+All-changed validation:
+- **34/34** candidate-34→35 outputs have byte-identical default and `pdftotext -layout` extraction.
+- **31/31** crop/economics changed files have a source-render mismatch count no worse than candidate 34; many rejected crops restore exact source rendering.
+- **33/34** are exact SHA fixed points on pass two.
+- the sole exception, `x-nucleo-s2868a2.pdf`, has a pre-existing deferred repeated-page-object cleanup: candidate 34 itself changes by -941 B on its second pass; candidate 35 changes by -932 B. Candidate 35 does no second-pass raster work there.
+
+Full immutable-source gate passed: strict workspace/all-target/all-feature Clippy, root fmt/diff, workspace tests/docs, Rust 1.92 MSRV, wasm32, duplicate-dependency and fuzz checks, plus vendored flpdf **2709 tests** and **52 passing doctests / 1 ignored**, and focused borrowed-operator/inline-image-resynchronization tests.
+
+### Candidate 36 target — bounded pure-translation stroke-run batching
+
+DEFOND Rocker Switches remains a suspiciously large vector case. A naive rewrite that bakes each translation into absolute line coordinates removes **6.8 MB raw** but makes Flate output **1.11 MB larger**, because it destroys repeated local-coordinate structure.
+
+A better exact-structure transform batches consecutive blocks of the form:
+`q 1 0 0 1 tx ty cm x0 y0 m x1 y1 l S Q`
+into one saved graphics-state scope, retaining local path coordinates and expressing later placements as relative pure translations. Simulation on the current DEFOND processing output finds **606,459 strokes** in **293 runs** across 58 streams.
+
+Unbounded batching estimates **1,195,354 B** Flate-level-5 saving. To bound renderer floating-point CTM accumulation, restart from an absolute translation periodically:
+- 16-stroke reset: 831,701 B saved
+- 32: 987,964 B
+- **64: 1,080,779 B**
+- 128: 1,134,796 B
+- 256: 1,164,058 B
+- unbounded: 1,195,354 B
+
+Start candidate 36 conservatively at a **64-stroke reset interval**. Before production implementation, build a QDF/fix-qdf prototype and verify multi-DPI render equivalence; then implement structurally through the content parser rather than regex.

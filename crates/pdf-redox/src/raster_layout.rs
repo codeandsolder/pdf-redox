@@ -41,6 +41,7 @@ const ALPHA_OPAQUE: f64 = 0.995;
 const SHARED_IMAGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const SHARED_IMAGE_CACHE_MAX_ENTRIES: usize = 1024;
 const RECONSTRUCTED_JPEG_QUALITY: u8 = 85;
+const MIN_TOTAL_CROP_MARGIN_PIXELS: u32 = 20;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RasterLayoutStats {
@@ -1544,6 +1545,8 @@ struct SampleImage {
     /// Preserve compact source color coding (notably DCT/JPX) when a rewrite
     /// would otherwise decode the image and re-emit the color plane as Flate.
     preserve_encoded_color: bool,
+    encoded_color_bytes: usize,
+    encoded_mask_bytes: usize,
     data: Arc<[u8]>,
     alpha: Option<AlphaPlane>,
     mask_width: u32,
@@ -2026,6 +2029,19 @@ fn preserves_compact_color_encoding(
     )
 }
 
+fn encoded_stream_payload_len(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<usize>> {
+    let Some(object) = document.resolve_owned_value(value)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { data, .. } = &object else {
+        return Ok(None);
+    };
+    Ok(Some(data.bytes(document.source())?.len()))
+}
+
 fn image_info(
     document: &EditDocument,
     handle: ObjectHandle,
@@ -2034,9 +2050,10 @@ fn image_info(
     let Some(object) = document.current_owned_object(handle)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, .. } = &object else {
+    let OwnedObject::Stream { dictionary, data } = &object else {
         return Ok(None);
     };
+    let encoded_color_bytes = data.bytes(document.source())?.len();
     if current_bool(document, dictionary.get(b"ImageMask".as_slice()))?.unwrap_or(false)
         || current_bool(document, dictionary.get(b"IM".as_slice()))?.unwrap_or(false)
     {
@@ -2111,6 +2128,19 @@ fn image_info(
     let preserve_encoded_color = preserves_compact_color_encoding(document, dictionary)?;
     let has_smask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
     let has_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+    let encoded_mask_bytes = if has_smask {
+        match dictionary.get(b"SMask".as_slice()) {
+            Some(smask) => encoded_stream_payload_len(document, smask)?.unwrap_or(0),
+            None => 0,
+        }
+    } else if has_mask {
+        match dictionary.get(b"Mask".as_slice()) {
+            Some(mask) => encoded_stream_payload_len(document, mask)?.unwrap_or(0),
+            None => 0,
+        }
+    } else {
+        0
+    };
     if (has_smask || has_mask) && !bake_masks {
         return Ok(None);
     }
@@ -2209,6 +2239,8 @@ fn image_info(
         height,
         components,
         preserve_encoded_color,
+        encoded_color_bytes,
+        encoded_mask_bytes,
         data: decoded.into(),
         alpha,
         mask_width,
@@ -2887,20 +2919,43 @@ fn pack_binary_stencil_alpha(data: &[u8], width: u32, height: u32) -> Option<Vec
 struct ImageEncodingContext {
     flate_level: i32,
     exact_raster_rendering: bool,
+    source_color_budget: Option<usize>,
 }
 
-fn make_image(
-    document: &mut EditDocument,
+#[derive(Debug)]
+struct PreparedAlpha {
+    data: Vec<u8>,
+    bits_per_component: i64,
+}
+
+#[derive(Debug)]
+struct PreparedImage {
+    dictionary: OwnedDictionary,
+    data: Vec<u8>,
+    alpha: Option<PreparedAlpha>,
+    encoding: ImageEncodingStats,
+}
+
+impl PreparedImage {
+    fn payload_bytes(&self) -> usize {
+        self.data
+            .len()
+            .saturating_add(self.alpha.as_ref().map_or(0, |alpha| alpha.data.len()))
+    }
+}
+
+fn prepare_image(
     info: &SampleImage,
     width: u32,
     height: u32,
     data: &[u8],
     alpha: Option<Vec<u8>>,
     context: ImageEncodingContext,
-) -> Result<(ObjectHandle, ImageEncodingStats)> {
+) -> Result<PreparedImage> {
     let ImageEncodingContext {
         flate_level,
         exact_raster_rendering,
+        source_color_budget,
     } = context;
     let mut encoded_8bit = None;
     let mut encoding = ImageEncodingStats::default();
@@ -2956,11 +3011,12 @@ fn make_image(
             encoding.relaxed_stencil = relaxed_stencil;
             encoding.encoded_bytes_saved =
                 u64::try_from(normal_cost - stencil_cost).unwrap_or(u64::MAX);
-            let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+            return Ok(PreparedImage {
                 dictionary,
-                data: StreamData::Owned(stencil_encoded),
-            }));
-            return Ok((handle, encoding));
+                data: stencil_encoded,
+                alpha: None,
+                encoding,
+            });
         }
     }
 
@@ -2979,7 +3035,8 @@ fn make_image(
         OwnedObject::Name(b"FlateDecode".to_vec()),
     );
     dictionary.remove(b"DecodeParms".as_slice());
-    if let Some(alpha) = alpha {
+
+    let prepared_alpha = if let Some(alpha) = alpha {
         let alpha_8bit = compress_flate(&alpha, flate_level)?;
         let (alpha_data, alpha_bpc) =
             if let Some(packed) = pack_binary_gray_samples(&alpha, width, height) {
@@ -2996,29 +3053,14 @@ fn make_image(
             } else {
                 (alpha_8bit, 8)
             };
-        let alpha_stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
-            dictionary: BTreeMap::from([
-                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-                (
-                    b"ColorSpace".to_vec(),
-                    OwnedObject::Name(b"DeviceGray".to_vec()),
-                ),
-                (
-                    b"BitsPerComponent".to_vec(),
-                    OwnedObject::Integer(alpha_bpc),
-                ),
-                (
-                    b"Filter".to_vec(),
-                    OwnedObject::Name(b"FlateDecode".to_vec()),
-                ),
-            ]),
-            data: StreamData::Owned(alpha_data),
-        }));
-        dictionary.insert(b"SMask".to_vec(), OwnedObject::Reference(alpha_stream));
-    }
+        Some(PreparedAlpha {
+            data: alpha_data,
+            bits_per_component: alpha_bpc,
+        })
+    } else {
+        None
+    };
+
     let binary_components = if info.components == 1 && is_device_gray(&dictionary) {
         Some(1)
     } else if info.components == 3
@@ -3053,34 +3095,90 @@ fn make_image(
         encoded_8bit
     };
 
-    // Reconstructed DCT/JPX-backed color should stay compact. Stripe merging
-    // intentionally decodes the source fragments into one raster; emitting
-    // that raster as lossless Flate can be several times larger than the
-    // original JPEG strips. Re-encode the merged 8-bit color plane as JPEG
-    // and keep it when it beats the best lossless candidate. Binary-packed
-    // line art remains lossless because that representation is already tiny.
+    // Reconstructed DCT/JPX-backed color should stay compact. Start at q85.
+    // When a stripe plan knows the aggregate source color-stream budget, step
+    // quality down only as far as needed to fit that budget. This keeps already
+    // good q85 results unchanged while avoiding a merged JPEG that is larger
+    // than the compact strips it replaces.
     if info.preserve_encoded_color
         && !encoding.binary_packed
         && matches!(info.components, 1 | 3 | 4)
     {
-        let jpeg = flpdf::job::encode_jpeg_raster(
+        let jpeg_q85 = flpdf::job::encode_jpeg_raster(
             width,
             height,
             info.components,
             data,
             RECONSTRUCTED_JPEG_QUALITY,
         )?;
-        if jpeg.len() < encoded.len() {
+        let mut best_jpeg = (jpeg_q85.len() < encoded.len()).then_some(jpeg_q85);
+        if let (Some(budget), Some(q85)) = (source_color_budget, best_jpeg.as_ref())
+            && q85.len() > budget
+        {
+            for quality in [82, 80, 78, 75] {
+                let jpeg =
+                    flpdf::job::encode_jpeg_raster(width, height, info.components, data, quality)?;
+                if jpeg.len() < best_jpeg.as_ref().map_or(usize::MAX, Vec::len) {
+                    let fits_source = jpeg.len() <= budget;
+                    best_jpeg = Some(jpeg);
+                    if fits_source {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(jpeg) = best_jpeg {
             dictionary.insert(b"Filter".to_vec(), OwnedObject::Name(b"DCTDecode".to_vec()));
             dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(8));
             encoded = jpeg;
         }
     }
-    let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+
+    Ok(PreparedImage {
         dictionary,
-        data: StreamData::Owned(encoded),
+        data: encoded,
+        alpha: prepared_alpha,
+        encoding,
+    })
+}
+
+fn install_prepared_image(
+    document: &mut EditDocument,
+    mut prepared: PreparedImage,
+    width: u32,
+    height: u32,
+) -> (ObjectHandle, ImageEncodingStats) {
+    if let Some(alpha) = prepared.alpha.take() {
+        let alpha_stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+            dictionary: BTreeMap::from([
+                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+                (
+                    b"ColorSpace".to_vec(),
+                    OwnedObject::Name(b"DeviceGray".to_vec()),
+                ),
+                (
+                    b"BitsPerComponent".to_vec(),
+                    OwnedObject::Integer(alpha.bits_per_component),
+                ),
+                (
+                    b"Filter".to_vec(),
+                    OwnedObject::Name(b"FlateDecode".to_vec()),
+                ),
+            ]),
+            data: StreamData::Owned(alpha.data),
+        }));
+        prepared
+            .dictionary
+            .insert(b"SMask".to_vec(), OwnedObject::Reference(alpha_stream));
+    }
+    let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+        dictionary: prepared.dictionary,
+        data: StreamData::Owned(prepared.data),
     }));
-    Ok((handle, encoding))
+    (handle, prepared.encoding)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3194,6 +3292,7 @@ struct MergePlan {
     height: u32,
     data: Vec<u8>,
     alpha: Option<Vec<u8>>,
+    source_color_budget: Option<usize>,
     desired_ctm: Matrix,
     background: Option<BackgroundPaint>,
     alpha_crop_hint: Option<PixelCrop>,
@@ -3214,6 +3313,17 @@ struct PixelCrop {
     y: u32,
     width: u32,
     height: u32,
+}
+
+fn crop_total_margin_pixels(width: u32, height: u32, crop: PixelCrop) -> Option<u32> {
+    let removed_x = width.checked_sub(crop.width)?;
+    let removed_y = height.checked_sub(crop.height)?;
+    removed_x.checked_add(removed_y)
+}
+
+fn crop_is_worthwhile(width: u32, height: u32, crop: PixelCrop) -> bool {
+    crop_total_margin_pixels(width, height, crop)
+        .is_some_and(|removed| removed >= MIN_TOTAL_CROP_MARGIN_PIXELS)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3415,7 +3525,7 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
     });
     if config.crop_transparent
         && let Some(crop) = transparent_crop
-        && (crop.width != plan.width || crop.height != plan.height)
+        && crop_is_worthwhile(plan.width, plan.height, crop)
     {
         removed_pixels = removed_pixels.checked_add(crop_plan_to(plan, crop)?)?;
         transparent_cropped = true;
@@ -3436,7 +3546,17 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
             &background,
             config.background_tolerance,
         )? {
-            None => {
+            None if crop_is_worthwhile(
+                plan.width,
+                plan.height,
+                PixelCrop {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ) =>
+            {
                 let old_pixels = u64::from(plan.width).checked_mul(u64::from(plan.height))?;
                 plan.width = 1;
                 plan.height = 1;
@@ -3445,7 +3565,7 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
                 removed_pixels = removed_pixels.checked_add(old_pixels.saturating_sub(1))?;
                 background_cropped = old_pixels > 1;
             }
-            Some(crop) if crop.width != plan.width || crop.height != plan.height => {
+            Some(crop) if crop_is_worthwhile(plan.width, plan.height, crop) => {
                 let original_ctm = plan.desired_ctm;
                 let old_pixels = crop_plan_to(plan, crop)?;
                 plan.background = Some(BackgroundPaint {
@@ -3456,7 +3576,7 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
                 removed_pixels = removed_pixels.checked_add(old_pixels)?;
                 background_cropped = true;
             }
-            Some(_) => {}
+            None | Some(_) => {}
         }
     }
     Some((transparent_cropped, background_cropped, removed_pixels))
@@ -3598,6 +3718,15 @@ fn build_stripe_plan(
         origin.1,
     );
     let first_member = *members.iter().min()?;
+    let mut source_images = HashSet::new();
+    let source_color_budget = members.iter().try_fold(0usize, |total, index| {
+        let target = draws[*index].target;
+        if !source_images.insert(target) {
+            return Some(total);
+        }
+        let info = infos.get(&target)?;
+        total.checked_add(info.encoded_color_bytes)
+    })?;
     Some(MergePlan {
         members: members.to_vec(),
         first_member,
@@ -3606,6 +3735,9 @@ fn build_stripe_plan(
         height,
         data,
         alpha,
+        source_color_budget: first_info
+            .preserve_encoded_color
+            .then_some(source_color_budget),
         desired_ctm,
         background: None,
         alpha_crop_hint: None,
@@ -4037,6 +4169,7 @@ fn build_pixel_cluster_plan(
         height,
         data,
         alpha,
+        source_color_budget: None,
         desired_ctm,
         background: None,
         alpha_crop_hint: None,
@@ -4664,6 +4797,16 @@ struct ApplyPlansResult {
     added_resource_names: BTreeSet<Vec<u8>>,
 }
 
+fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEncodingStats) {
+    stats.binary_images_packed += usize::from(encoding.binary_packed);
+    stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
+    stats.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
+    stats.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
+    stats.binary_image_encoded_bytes_saved = stats
+        .binary_image_encoded_bytes_saved
+        .saturating_add(encoding.encoded_bytes_saved);
+}
+
 fn apply_plans(
     document: &mut EditDocument,
     context: ApplyPlansContext<'_>,
@@ -4707,21 +4850,22 @@ fn apply_plans(
         let Some((transparent_cropped, background_cropped, removed_pixels)) = crop_result else {
             continue;
         };
-        stats.transparent_margins_cropped += usize::from(transparent_cropped);
-        stats.background_margins_cropped += usize::from(background_cropped);
-        stats.cropped_pixels_removed = stats.cropped_pixels_removed.saturating_add(removed_pixels);
         let Some(relative) = relative_matrix(first_draw.replace_ctm, plan.desired_ctm) else {
             continue;
         };
         let mask_baked = plan.image.alpha.is_some() || plan.alpha.is_some();
-        let background = if let Some(background) = plan.background.take() {
+
+        // Prepare all prospective streams before mutating the graph. This lets
+        // singleton alpha-crop plans compare real compressed payload cost with
+        // the current source image+mask and disappear cleanly when the crop
+        // would make the PDF larger.
+        let prepared_background = if let Some(background) = plan.background.take() {
             let Some(background_relative) =
                 relative_matrix(first_draw.replace_ctm, background.desired_ctm)
             else {
                 continue;
             };
-            let (image, encoding) = make_image(
-                document,
+            let prepared = prepare_image(
                 &plan.image,
                 1,
                 1,
@@ -4730,30 +4874,16 @@ fn apply_plans(
                 ImageEncodingContext {
                     flate_level,
                     exact_raster_rendering: config.exact_raster_rendering,
+                    source_color_budget: None,
                 },
             )?;
-            stats.binary_images_packed += usize::from(encoding.binary_packed);
-            stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
-            stats.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
-            stats.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
-            stats.binary_image_encoded_bytes_saved = stats
-                .binary_image_encoded_bytes_saved
-                .saturating_add(encoding.encoded_bytes_saved);
-            let name = unique_xobject_name(&xobjects, &mut suffix);
-            xobjects.insert(name.clone(), OwnedObject::Reference(image));
-            result.added_resource_names.insert(name.clone());
-            Some((background_relative, name))
+            Some((background_relative, prepared))
         } else {
             None
         };
-        let (name, encoding, image_created) = if let Some(cached) = cached_crop {
-            let name = unique_xobject_name(&xobjects, &mut suffix);
-            xobjects.insert(name.clone(), OwnedObject::Reference(cached.image));
-            result.added_resource_names.insert(name.clone());
-            (name, cached.encoding, false)
-        } else {
-            let (image, encoding) = make_image(
-                document,
+
+        let mut prepared_main = if cached_crop.is_none() {
+            Some(prepare_image(
                 &plan.image,
                 plan.width,
                 plan.height,
@@ -4762,15 +4892,63 @@ fn apply_plans(
                 ImageEncodingContext {
                     flate_level,
                     exact_raster_rendering: config.exact_raster_rendering,
+                    source_color_budget: plan.source_color_budget,
                 },
-            )?;
-            stats.binary_images_packed += usize::from(encoding.binary_packed);
-            stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
-            stats.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
-            stats.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
-            stats.binary_image_encoded_bytes_saved = stats
-                .binary_image_encoded_bytes_saved
-                .saturating_add(encoding.encoded_bytes_saved);
+            )?)
+        } else {
+            None
+        };
+
+        if plan.kind == MergeKind::AlphaCrop
+            && cached_crop.is_none()
+            && let Some(prepared) = prepared_main.as_ref()
+        {
+            let source_payload = plan
+                .image
+                .encoded_color_bytes
+                .saturating_add(plan.image.encoded_mask_bytes);
+            let candidate_payload = prepared.payload_bytes().saturating_add(
+                prepared_background
+                    .as_ref()
+                    .map_or(0, |(_, background)| background.payload_bytes()),
+            );
+            if source_payload > 0 && candidate_payload >= source_payload {
+                for member in &plan.members {
+                    claimed.remove(member);
+                }
+                continue;
+            }
+        }
+
+        stats.transparent_margins_cropped += usize::from(transparent_cropped);
+        stats.background_margins_cropped += usize::from(background_cropped);
+        stats.cropped_pixels_removed = stats.cropped_pixels_removed.saturating_add(removed_pixels);
+
+        let background = if let Some((background_relative, prepared)) = prepared_background {
+            let (image, encoding) = install_prepared_image(document, prepared, 1, 1);
+            record_image_encoding_stats(stats, encoding);
+            let name = unique_xobject_name(&xobjects, &mut suffix);
+            xobjects.insert(name.clone(), OwnedObject::Reference(image));
+            result.added_resource_names.insert(name.clone());
+            Some((background_relative, name))
+        } else {
+            None
+        };
+
+        let (name, encoding, image_created) = if let Some(cached) = cached_crop {
+            let name = unique_xobject_name(&xobjects, &mut suffix);
+            xobjects.insert(name.clone(), OwnedObject::Reference(cached.image));
+            result.added_resource_names.insert(name.clone());
+            (name, cached.encoding, false)
+        } else {
+            let Some(prepared) = prepared_main.take() else {
+                return Err(Error::Invalid(
+                    "missing prepared image for uncached raster plan".to_owned(),
+                ));
+            };
+            let (image, encoding) =
+                install_prepared_image(document, prepared, plan.width, plan.height);
+            record_image_encoding_stats(stats, encoding);
             let name = unique_xobject_name(&xobjects, &mut suffix);
             xobjects.insert(name.clone(), OwnedObject::Reference(image));
             result.added_resource_names.insert(name.clone());
@@ -4906,7 +5084,7 @@ fn append_alpha_crop_plans(
         let Some(crop) = crop else {
             continue;
         };
-        if crop.x == 0 && crop.y == 0 && crop.width == info.width && crop.height == info.height {
+        if !crop_is_worthwhile(info.width, info.height, crop) {
             continue;
         }
         plans.push(MergePlan {
@@ -4917,6 +5095,7 @@ fn append_alpha_crop_plans(
             height: info.height,
             data: Vec::new(),
             alpha: None,
+            source_color_budget: None,
             desired_ctm: draw.ctm,
             background: None,
             alpha_crop_hint: Some(crop),
@@ -5843,6 +6022,8 @@ mod tests {
             height: 1,
             components: 3,
             preserve_encoded_color: false,
+            encoded_color_bytes: 0,
+            encoded_mask_bytes: 0,
             data: Vec::<u8>::new().into(),
             alpha: None,
             mask_width: 4,
@@ -5891,6 +6072,8 @@ mod tests {
             height,
             components: 1,
             preserve_encoded_color: false,
+            encoded_color_bytes: 0,
+            encoded_mask_bytes: 0,
             data: data.into(),
             alpha: None,
             mask_width: width,
@@ -6168,7 +6351,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_alpha_image_gets_singleton_crop_plan() {
+    fn standalone_alpha_image_skips_tiny_crop_plan() {
         let draw = test_draw(1, 0.0);
         let mut image = stripe_test_image(4, 4, (0..16).collect());
         image.alpha = Some(AlphaPlane {
@@ -6196,31 +6379,51 @@ mod tests {
                 height: 2,
             })
         );
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].kind, MergeKind::AlphaCrop);
-        assert_eq!(plans[0].members, vec![0]);
-        let mut plan = plans.remove(0);
-        assert!(plan.data.is_empty());
-        assert!(plan.alpha.is_none());
-        let crop = match plan.alpha_crop_hint {
-            Some(crop) => crop,
-            None => panic!("expected precomputed alpha crop"),
-        };
-        assert_eq!(
-            crop,
-            PixelCrop {
-                x: 1,
-                y: 1,
-                width: 2,
-                height: 2
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn standalone_alpha_image_accepts_twenty_pixel_total_crop() {
+        let draw = test_draw(1, 0.0);
+        let mut image = stripe_test_image(30, 20, vec![0; 30 * 20]);
+        let mut alpha = vec![0; 30 * 20];
+        for y in 5..15usize {
+            for x in 5..25usize {
+                alpha[y * 30 + x] = 255;
             }
+        }
+        image.alpha = Some(AlphaPlane {
+            data: alpha.into(),
+            width: 30,
+            height: 20,
+        });
+        let target = draw.target;
+        let infos = HashMap::from([(target, image)]);
+        let mut plans = Vec::new();
+        let mut alpha_crop_bounds_cache = HashMap::new();
+        append_alpha_crop_plans(
+            &[draw],
+            &infos,
+            &HashSet::new(),
+            &mut alpha_crop_bounds_cache,
+            &mut plans,
         );
-        plan.data = plan.image.data.to_vec();
-        plan.alpha = plan.image.alpha.as_ref().map(|alpha| alpha.data.to_vec());
-        assert_eq!(crop_plan_to(&mut plan, crop), Some(12));
-        assert_eq!(plan.width, 2);
-        assert_eq!(plan.height, 2);
-        assert_eq!(plan.data, vec![5, 6, 9, 10]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].alpha_crop_hint,
+            Some(PixelCrop {
+                x: 5,
+                y: 5,
+                width: 20,
+                height: 10,
+            })
+        );
+        assert_eq!(
+            plans[0]
+                .alpha_crop_hint
+                .and_then(|crop| crop_total_margin_pixels(30, 20, crop)),
+            Some(MIN_TOTAL_CROP_MARGIN_PIXELS)
+        );
     }
 
     #[test]
@@ -6281,6 +6484,8 @@ mod tests {
                 height: 4,
                 components: 1,
                 preserve_encoded_color: false,
+                encoded_color_bytes: 0,
+                encoded_mask_bytes: 0,
                 data: vec![0; 16].into(),
                 alpha: None,
                 mask_width: 4,
@@ -6293,6 +6498,7 @@ mod tests {
             height: 4,
             data: (0..16).collect(),
             alpha: None,
+            source_color_budget: None,
             desired_ctm: Matrix::new(40.0, 0.0, 0.0, 20.0, 10.0, 30.0),
             background: None,
             alpha_crop_hint: None,
