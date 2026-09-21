@@ -19,6 +19,7 @@ use crate::{
     },
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
     inline_images::externalize_duplicate_inline_images_hayro,
+    microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
     prune::{prune_resources_hayro, prune_resources_with_usage_hayro},
@@ -54,6 +55,23 @@ fn validate_config(cfg: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run the production pathological-microstroke detector and encoded-cost gate
+/// without serializing an output PDF. The temporary document may be rewritten
+/// internally, but the caller receives only the would-be rasterization stats.
+#[doc(hidden)]
+pub fn analyze_microstroke_rasterization(
+    input: &[u8],
+    flate_level: i32,
+) -> Result<MicrostrokeRasterStats> {
+    if !(0..=9).contains(&flate_level) {
+        return Err(crate::Error::Invalid(
+            "Flate level must be an integer from 0 through 9".to_owned(),
+        ));
+    }
+    let mut document = EditDocument::from_bytes(input.to_vec())?;
+    rasterize_pathological_microstrokes_hayro(&mut document, flate_level)
 }
 
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
@@ -416,6 +434,13 @@ fn optimize_pdf_with_document(
             prune_resources_hayro(&mut document, &cfg.keep_unused_resources)
         }
     })?;
+    let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
+        if cfg.rasterize_excessive_small_vectors {
+            rasterize_pathological_microstrokes_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(Default::default())
+        }
+    })?;
     let flate = timed(&mut timings, "flate-policy", || {
         apply_flate_policy_hayro(&mut document, cfg.flate_policy, cfg.flate_level)
     })?;
@@ -627,6 +652,15 @@ fn optimize_pdf_with_document(
             vector_compaction.transformed_form_estimated_flate_bytes_saved
         ));
     }
+    if microstroke_raster.runs_rasterized > 0 {
+        notes.push(format!(
+            "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
+            microstroke_raster.runs_rasterized,
+            microstroke_raster.pages_rewritten,
+            microstroke_raster.strokes_rasterized,
+            microstroke_raster.estimated_flate_bytes_saved
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -758,6 +792,11 @@ fn optimize_pdf_with_document(
         resource_pattern_entries_pruned: resource_prune.pattern_entries_removed,
         resource_properties_entries_pruned: resource_prune.properties_entries_removed,
         resource_shading_entries_pruned: resource_prune.shading_entries_removed,
+        microstroke_pages_rasterized: microstroke_raster.pages_rewritten,
+        microstroke_runs_rasterized: microstroke_raster.runs_rasterized,
+        microstroke_strokes_rasterized: microstroke_raster.strokes_rasterized,
+        microstroke_image_payload_bytes: microstroke_raster.image_payload_bytes,
+        microstroke_estimated_flate_bytes_saved: microstroke_raster.estimated_flate_bytes_saved,
         print_images_placed: print_plan.stats.images_placed,
         print_image_uses: print_plan.stats.image_uses,
         print_geometry_complete: print_plan.stats.geometry_complete,

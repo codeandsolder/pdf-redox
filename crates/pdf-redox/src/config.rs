@@ -367,6 +367,11 @@ pub struct Config {
     /// Batch semantically equivalent vector path paints while preserving vector geometry.
     #[serde(default)]
     pub compact_vector_paths: bool,
+    /// Rasterize only pathological fields of hundreds of tiny opaque vector strokes.
+    /// This is intentionally lossy at the vector/semantic level, so it is off for the
+    /// normal optimize/processing policies and enabled by default only for Print.
+    #[serde(default)]
+    pub rasterize_excessive_small_vectors: bool,
     /// Policy for preserving or recompressing existing Flate streams.
     pub flate_policy: FlatePolicy,
     /// Remove unused `/Font` and `/XObject` entries plus typed `/ExtGState`, `/Pattern`,
@@ -428,6 +433,7 @@ impl Config {
             optimization_goal: OptimizationGoal::Size,
             normalize_content_streams: false,
             compact_vector_paths: false,
+            rasterize_excessive_small_vectors: false,
             flate_policy: FlatePolicy::default(),
             prune_resources: false,
             keep_unused_resources: BTreeSet::new(),
@@ -472,6 +478,7 @@ impl Config {
                 target_ppi: 600,
                 min_savings_percent: 20,
             },
+            rasterize_excessive_small_vectors: true,
             ..Self::optimize_only()
         }
     }
@@ -621,6 +628,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn rasterize_excessive_small_vectors(mut self, value: bool) -> Self {
+        self.config.rasterize_excessive_small_vectors = value;
+        self
+    }
+
     pub fn flate_policy(mut self, value: FlatePolicy) -> Self {
         self.config.flate_policy = value;
         self
@@ -742,6 +754,19 @@ mod tests {
 
         let print = Config::builder(OutputProfile::Print).build();
         assert_eq!(print, Config::print());
+    }
+
+    #[test]
+    fn print_profile_controls_microstroke_rasterization_explicitly() {
+        assert!(!Config::optimize_only().rasterize_excessive_small_vectors);
+        assert!(!Config::perceptual().rasterize_excessive_small_vectors);
+        assert!(Config::print().rasterize_excessive_small_vectors);
+        assert!(
+            !Config::builder(OutputProfile::Print)
+                .rasterize_excessive_small_vectors(false)
+                .build()
+                .rasterize_excessive_small_vectors
+        );
     }
 
     #[test]

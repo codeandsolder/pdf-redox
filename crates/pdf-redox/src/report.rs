@@ -370,6 +370,16 @@ pub struct OptimizationReport {
     pub resource_properties_entries_pruned: usize,
     #[serde(default)]
     pub resource_shading_entries_pruned: usize,
+    #[serde(default)]
+    pub microstroke_pages_rasterized: usize,
+    #[serde(default)]
+    pub microstroke_runs_rasterized: usize,
+    #[serde(default)]
+    pub microstroke_strokes_rasterized: usize,
+    #[serde(default)]
+    pub microstroke_image_payload_bytes: usize,
+    #[serde(default)]
+    pub microstroke_estimated_flate_bytes_saved: usize,
     pub print_images_placed: usize,
     pub print_image_uses: usize,
     pub print_geometry_complete: bool,

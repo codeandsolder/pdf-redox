@@ -9,6 +9,7 @@ mod hidden_text;
 mod images;
 mod inline_images;
 mod jpeg;
+mod microstroke;
 mod optimize;
 mod preservation;
 mod print;
@@ -28,7 +29,8 @@ pub use config::{
     RasterLayoutConfig,
 };
 pub use error::{Error, Result, SourceLoadError};
-pub use optimize::{optimize_pdf, optimize_pdf_with_analysis};
+pub use microstroke::MicrostrokeRasterStats;
+pub use optimize::{analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis};
 pub use report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism,
     OptimizationReport, PageRect, PdfAnalysis, RiskFinding, RiskKind,

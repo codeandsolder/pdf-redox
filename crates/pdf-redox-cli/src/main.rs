@@ -2,8 +2,8 @@ mod corpus;
 
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
-    AnnotationPolicy, Config, FlatePolicy, OptimizationGoal, PrivacyLevel, analyze_pdf,
-    optimize_pdf,
+    AnnotationPolicy, Config, FlatePolicy, OptimizationGoal, PrivacyLevel,
+    analyze_microstroke_rasterization, analyze_pdf, optimize_pdf,
 };
 use std::{
     io::{self, Write},
@@ -124,6 +124,13 @@ struct Args {
     /// Compact compatible vector path paints without rasterizing them.
     #[arg(long)]
     compact_vector_paths: bool,
+    /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
+    /// Enabled automatically by the Print profile.
+    #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
+    rasterize_excessive_small_vectors: bool,
+    /// Preserve pathological tiny-vector fields even when the Print profile would rasterize them.
+    #[arg(long, conflicts_with = "rasterize_excessive_small_vectors")]
+    keep_excessive_small_vectors: bool,
     /// Reconstruct pathological fragmented raster layouts (pixel sprites and split stripes).
     /// Enabled automatically with `--optimize-for processing`.
     #[arg(long)]
@@ -214,6 +221,9 @@ struct Args {
     /// Number of per-file worst cases retained in each corpus ranking.
     #[arg(long, default_value_t = 20)]
     corpus_top: usize,
+    /// Run only the production pathological-microstroke detector/cost gate.
+    #[arg(long, hide = true)]
+    analyze_microstrokes: bool,
     #[arg(long)]
     analyze_only: bool,
     #[arg(long)]
@@ -289,6 +299,8 @@ fn config_from_args(args: &Args) -> Config {
     cfg.normalize_content_streams = args.normalize_content;
     cfg.compact_vector_paths =
         args.compact_vector_paths || matches!(args.optimize_for, OptimizeForArg::Processing);
+    cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
+        && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled =
         args.normalize_raster_layout || matches!(args.optimize_for, OptimizeForArg::Processing);
     cfg.raster_layout.bake_masks =
@@ -355,6 +367,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let input = std::fs::read(&a.input)?;
+    if a.analyze_microstrokes {
+        let cfg = config_from_args(&a);
+        let stats = analyze_microstroke_rasterization(&input, cfg.flate_level)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
     if a.analyze_only {
         let r = analyze_pdf(&input)?;
         println!("{}", serde_json::to_string_pretty(&r)?);
