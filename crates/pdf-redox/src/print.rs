@@ -31,6 +31,9 @@ impl ImagePlacement {
             }
             #[expect(
                 clippy::cast_possible_truncation,
+                reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
+            )]
+            #[expect(
                 clippy::cast_sign_loss,
                 reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
             )]
@@ -1310,6 +1313,9 @@ fn cow_image_dimensions(
     }
     #[expect(
         clippy::cast_possible_truncation,
+        reason = "finite positive image dimensions are range-checked against u32 before conversion"
+    )]
+    #[expect(
         clippy::cast_sign_loss,
         reason = "finite positive image dimensions are range-checked against u32 before conversion"
     )]
