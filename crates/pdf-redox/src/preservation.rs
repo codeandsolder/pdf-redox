@@ -27,7 +27,7 @@ const PAGE_SURFACE_KEYS: &[&[u8]] = &[
 ];
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PreservationStats {
+pub struct PreservationStats {
     pub pages: usize,
     pub annotation_entries_seen: usize,
     pub annotation_entries_flattened: usize,
@@ -292,9 +292,10 @@ fn annotation_subtypes_hayro(
             continue;
         }
         for annotation in annotations {
-            let label = annotation_subtype_hayro(document, &annotation)?
-                .map(|name| format!("/{}", String::from_utf8_lossy(&name)))
-                .unwrap_or_else(|| "(missing/non-name subtype)".to_owned());
+            let label = annotation_subtype_hayro(document, &annotation)?.map_or_else(
+                || "(missing/non-name subtype)".to_owned(),
+                |name| format!("/{}", String::from_utf8_lossy(&name)),
+            );
             *counts.entry(label).or_default() += 1;
         }
     }
@@ -409,7 +410,7 @@ fn retain_link_visual_shells_hayro(
     Ok(retained)
 }
 
-fn keep_page_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_page_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     if matches!(
         key,
         b"Type"
@@ -438,7 +439,7 @@ fn keep_page_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     }
 }
 
-fn keep_page_tree_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_page_tree_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"Type" | b"Parent" | b"Kids" | b"Count" | b"Resources" | b"MediaBox" | b"CropBox"
         | b"Rotate" => true,
@@ -451,7 +452,7 @@ fn keep_page_tree_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     }
 }
 
-fn keep_catalog_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_catalog_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"Type" | b"Pages" | b"Version" | b"Extensions" => true,
         b"AcroForm" => policy.forms,
@@ -502,7 +503,7 @@ fn prune_dictionary_target_hayro(
 
 fn resolved_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -931,7 +932,7 @@ fn content_references_hayro(
 fn wrap_page_contents_hayro(
     document: &mut EditDocument,
     page: &PreservationDictionaryTarget,
-    append_bytes: Vec<u8>,
+    append_bytes: &[u8],
 ) -> Result<()> {
     let old = preservation_target_snapshot(document, page)?.and_then(|object| {
         object
@@ -940,7 +941,7 @@ fn wrap_page_contents_hayro(
     });
     let before = new_content_stream(document, b"q\n".to_vec());
     let mut after_bytes = b"\nQ\n".to_vec();
-    after_bytes.extend_from_slice(&append_bytes);
+    after_bytes.extend_from_slice(append_bytes);
     let after = new_content_stream(document, after_bytes);
     let mut contents = vec![OwnedObject::Reference(before)];
     contents.extend(content_references_hayro(document, old)?);
@@ -1054,7 +1055,7 @@ fn flatten_annotations_hayro(
             page_dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
         }
         if changed_annotations {
-            wrap_page_contents_hayro(document, page, append_bytes)?;
+            wrap_page_contents_hayro(document, page, &append_bytes)?;
             replace_page_annotations_hayro(document, page, kept)?;
         }
     }
@@ -1105,7 +1106,7 @@ fn process_annotations_hayro(
     Ok(())
 }
 
-pub(crate) fn apply_preservation_policy_hayro(
+pub fn apply_preservation_policy_hayro(
     document: &mut EditDocument,
     policy: &PreservationConfig,
 ) -> Result<PreservationStats> {
@@ -1147,7 +1148,7 @@ pub(crate) fn apply_preservation_policy_hayro(
 /// Apply semantic-preservation policy while keeping the source Catalog/page tree.
 /// The final writer still emits a fresh full PDF rewrite.
 #[cfg(test)]
-pub(crate) fn apply_preservation_policy(
+pub fn apply_preservation_policy(
     pdf: &mut Pdf<Cursor<Vec<u8>>>,
     policy: &PreservationConfig,
 ) -> Result<PreservationStats> {
@@ -1434,7 +1435,7 @@ fn prune_page_tree_nodes(
 }
 
 #[cfg(test)]
-fn keep_page_tree_key(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_page_tree_key(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         // Page-tree structure and the four inheritable page attributes.
         b"/Type" | b"/Parent" | b"/Kids" | b"/Count" | b"/Resources" | b"/MediaBox"
@@ -1469,7 +1470,7 @@ fn prune_catalog(
 }
 
 #[cfg(test)]
-fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"/Type" | b"/Pages" | b"/Version" | b"/Extensions" => true,
         b"/AcroForm" => policy.forms,
@@ -1567,10 +1568,10 @@ fn annotation_subtypes(
             let subtype = if annotation.as_dictionary().is_some() {
                 let subtype = annotation.try_get_key(b"/Subtype")?;
                 pdf.resolve(&subtype)?;
-                subtype
-                    .as_name()
-                    .map(|name| format!("/{}", String::from_utf8_lossy(&name)))
-                    .unwrap_or_else(|| "(missing/non-name subtype)".to_owned())
+                subtype.as_name().map_or_else(
+                    || "(missing/non-name subtype)".to_owned(),
+                    |name| format!("/{}", String::from_utf8_lossy(&name)),
+                )
             } else {
                 "(non-dictionary annotation)".to_owned()
             };

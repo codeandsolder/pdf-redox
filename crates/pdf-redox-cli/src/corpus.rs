@@ -8,7 +8,7 @@ use std::time::Instant;
 const FAILURE_EXAMPLE_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct CorpusFileSummary {
+pub struct CorpusFileSummary {
     path: String,
     input_bytes: usize,
     producer: Option<String>,
@@ -138,7 +138,7 @@ struct CorpusTotals {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct CorpusReport {
+pub struct CorpusReport {
     root: String,
     elapsed_ms: u128,
     pdf_candidates: usize,
@@ -174,10 +174,11 @@ pub(crate) struct CorpusReport {
     failure_examples: Vec<CorpusFailure>,
 }
 
-pub(crate) fn analyze_corpus(
-    root: &Path,
-    top: usize,
-) -> Result<CorpusReport, Box<dyn std::error::Error>> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "corpus analysis is a single streaming aggregation whose counters and ranking inputs are updated together"
+)]
+pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn std::error::Error>> {
     if !root.is_dir() {
         return Err(format!("corpus input is not a directory: {}", root.display()).into());
     }
@@ -454,7 +455,10 @@ fn accumulate_stream_role_counts(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the accumulator updates one coherent set of corpus-wide counters in a single pass"
+)]
 fn accumulate_counts(
     analysis: &PdfAnalysis,
     filter_counts: &mut BTreeMap<String, u64>,

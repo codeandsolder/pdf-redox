@@ -55,7 +55,7 @@ fn replace_page_content(
     Ok(())
 }
 
-pub(crate) fn normalize_page_contents_hayro(document: &mut EditDocument) -> Result<()> {
+pub fn normalize_page_contents_hayro(document: &mut EditDocument) -> Result<()> {
     for page in document.page_handles()? {
         let Some(object) = document.current_owned_object(page)? else {
             continue;

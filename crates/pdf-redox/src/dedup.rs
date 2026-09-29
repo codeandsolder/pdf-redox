@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TargetedDedupStats {
+pub struct TargetedDedupStats {
     pub duplicate_streams_detected: usize,
     pub duplicate_raw_bytes: usize,
     pub references_canonicalized: usize,
@@ -70,7 +70,7 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
+pub fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -243,7 +243,7 @@ fn icc_arrays(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
+pub fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -447,11 +447,10 @@ fn collect_direct_form_icon_holders(
         return;
     }
 
-    let dictionary = if let Some(dict) = value.as_stream_dict() {
-        dict
-    } else if value.as_dictionary().is_some() {
-        value.clone()
-    } else {
+    let dictionary = value
+        .as_stream_dict()
+        .or_else(|| value.as_dictionary().map(|_| value.clone()));
+    let Some(dictionary) = dictionary else {
         if let Some(items) = value.as_array() {
             for item in items {
                 collect_direct_form_icon_holders(&item, false, holders);
@@ -464,14 +463,15 @@ fn collect_direct_form_icon_holders(
         dictionary.try_get_key(b"/Subtype"),
         Ok(subtype) if matches!(subtype.try_is_name_and_equals(b"Widget"), Ok(true))
     );
-    let mut collected_mk = false;
-    if is_widget
+    let collected_mk = if is_widget
         && let Ok(mk) = dictionary.try_get_key(b"/MK")
         && !mk.is_null()
     {
         holders.push(mk);
-        collected_mk = true;
-    }
+        true
+    } else {
+        false
+    };
 
     if let Some(entries) = dictionary.as_dictionary() {
         for (key, child) in entries {
@@ -532,7 +532,7 @@ fn xobject_name_is_ignorable(version: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
+pub fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     // Image /Name is required only in PDF 1.0 and obsolescent afterwards.
@@ -679,6 +679,10 @@ fn normalized_direct_resource_value<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the helper signature aligned with sibling fallible normalization helpers"
+)]
 fn normalized_non_stream_resource_object<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
@@ -762,10 +766,8 @@ fn collect_form_resource_objects<R: Read + Seek + 'static>(
         value.clone()
     };
 
-    if value.as_stream_dict().is_none()
-        && value.object_ref().is_some()
-        && (value.as_dictionary().is_some() || value.as_array().is_some())
-    {
+    let is_indirect_non_stream = value.as_stream_dict().is_none() && value.object_ref().is_some();
+    if is_indirect_non_stream && (value.as_dictionary().is_some() || value.as_array().is_some()) {
         resource_objects.push(value.clone());
     }
 
@@ -1103,6 +1105,10 @@ fn form_fingerprint<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the fixed-point helper interface aligned with fallible redirect builders"
+)]
 fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -1178,7 +1184,7 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
+pub fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1305,7 +1311,7 @@ fn appearance_holders<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
+pub fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1397,7 +1403,7 @@ pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
+pub fn canonicalize_page_contents<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     #[derive(Clone)]
@@ -1558,7 +1564,7 @@ fn collect_direct_type3_charprocs(
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
+pub fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1685,7 +1691,7 @@ fn to_unicode_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
+pub fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1784,7 +1790,7 @@ fn font_program_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Opti
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
+pub fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -2090,7 +2096,7 @@ fn rewrite_font_program_holder(
     Ok(true)
 }
 
-pub(crate) fn canonicalize_font_program_streams_hayro(
+pub fn canonicalize_font_program_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_font_program_holders(document)?;
@@ -2368,7 +2374,7 @@ fn canonicalize_named_stream_references_hayro(
     })
 }
 
-pub(crate) fn canonicalize_metadata_streams_hayro(
+pub fn canonicalize_metadata_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     canonicalize_named_stream_references_hayro(document, b"Metadata", b"metadata")
@@ -2530,9 +2536,7 @@ fn rewrite_direct_array_reference_holder(
     Ok(true)
 }
 
-pub(crate) fn canonicalize_icc_profiles_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_icc_profiles_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = hayro_icc_array_holders(document)?;
     let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
     let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
@@ -2593,7 +2597,7 @@ fn object_at_direct_path_mut<'a>(
 /// flpdf `get_all_objects()` coverage. On damaged or oddly indexed PDFs Hayro
 /// can therefore find additional real `/ToUnicode` holders that the legacy
 /// pass skipped; every rewrite still requires an exact stream fingerprint.
-pub(crate) fn canonicalize_to_unicode_cmaps_hayro(
+pub fn canonicalize_to_unicode_cmaps_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     canonicalize_named_stream_references_hayro(document, b"ToUnicode", b"to-unicode")
@@ -2841,7 +2845,7 @@ fn rewrite_type3_glyph_holder(
     Ok(true)
 }
 
-pub(crate) fn canonicalize_type3_charprocs_hayro(
+pub fn canonicalize_type3_charprocs_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_type3_glyph_holders(document)?;
@@ -3191,7 +3195,7 @@ fn rewrite_dictionary_target_entries(
     Ok(rewritten)
 }
 
-pub(crate) fn canonicalize_image_xobjects_hayro(
+pub fn canonicalize_image_xobjects_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let images = reachable_streams_with_subtype(document, b"Image")?;
@@ -3472,8 +3476,9 @@ fn resolved_dictionary_clone(
     Ok(document
         .resolve_owned_value(value)?
         .and_then(|object| match object {
-            OwnedObject::Dictionary(dictionary) => Some(dictionary),
-            OwnedObject::Stream { dictionary, .. } => Some(dictionary),
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+                Some(dictionary)
+            }
             _ => None,
         }))
 }
@@ -3790,9 +3795,7 @@ fn form_dependency_redirects_hayro(
     })
 }
 
-pub(crate) fn canonicalize_form_xobjects_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_form_xobjects_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
     } else {
@@ -3869,7 +3872,7 @@ fn appearance_dictionary_targets(
     Ok(targets)
 }
 
-pub(crate) fn canonicalize_appearance_streams_hayro(
+pub fn canonicalize_appearance_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = appearance_dictionary_targets(document)?;
@@ -3934,7 +3937,7 @@ enum PageContentHolder {
 }
 
 impl PageContentHolder {
-    fn target(&self) -> CowObjectHandle {
+    const fn target(&self) -> CowObjectHandle {
         match self {
             Self::Dictionary(holder) => holder.target,
             Self::Array(holder) => holder.target,
@@ -4000,7 +4003,7 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
                         path: Vec::new(),
                         key: b"Contents".to_vec(),
                         target: *target,
-                    }))
+                    }));
                 }
                 Some(OwnedObject::Array(values)) => {
                     for (index, value) in values.iter().enumerate() {
@@ -4046,9 +4049,7 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
     Ok(holders)
 }
 
-pub(crate) fn canonicalize_page_contents_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = page_content_holders_hayro(document)?;
     let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
     let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
@@ -4111,7 +4112,7 @@ mod tests {
     }
 
     fn untyped_metadata_stream(
-        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        pdf: &Pdf<std::io::Cursor<Vec<u8>>>,
         data: &[u8],
     ) -> Result<ObjectHandle> {
         pdf.new_stream_with_data(Rc::new(data.to_vec()))
@@ -4169,10 +4170,12 @@ mod tests {
         let payload = b"<x:xmpmeta>same payload, separate indirect lengths</x:xmpmeta>";
         let first = metadata_stream(&mut pdf, payload)?;
         let second = metadata_stream(&mut pdf, payload)?;
-        let first_length =
-            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
-        let second_length =
-            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+        let first_length = pdf.make_indirect_object_handle(ObjectHandle::integer(
+            i64::try_from(payload.len()).expect("test fixture length fits i64"),
+        ))?;
+        let second_length = pdf.make_indirect_object_handle(ObjectHandle::integer(
+            i64::try_from(payload.len()).expect("test fixture length fits i64"),
+        ))?;
         let first_dict = first
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("first metadata stream has no dictionary".to_owned()))?;
@@ -4252,8 +4255,8 @@ mod tests {
     fn canonicalizes_metadata_references_even_when_type_is_missing() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let payload = b"<x:xmpmeta>producer forgot Type</x:xmpmeta>";
-        let first = untyped_metadata_stream(&mut pdf, payload)?;
-        let second = untyped_metadata_stream(&mut pdf, payload)?;
+        let first = untyped_metadata_stream(&pdf, payload)?;
+        let second = untyped_metadata_stream(&pdf, payload)?;
         let first_holder = holder(&mut pdf, first)?;
         let second_holder = holder(&mut pdf, second)?;
         let root = pdf.root_handle()?;
@@ -4701,6 +4704,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test intentionally constructs one complete nested resource graph fixture inline"
+    )]
     fn canonicalizes_nested_exact_form_resource_graphs() -> Result<()> {
         let mut pdf = Pdf::empty()?;
 
@@ -5399,7 +5406,12 @@ mod tests {
         };
         page_handles.push(page.clone());
         pages.replace_key(b"/Kids", ObjectHandle::array(page_handles.clone()))?;
-        pages.replace_key(b"/Count", ObjectHandle::integer(page_handles.len() as i64))?;
+        pages.replace_key(
+            b"/Count",
+            ObjectHandle::integer(
+                i64::try_from(page_handles.len()).expect("test fixture length fits i64"),
+            ),
+        )?;
         pdf.mark_object_handle_dirty(&pages)?;
         Ok(page)
     }
@@ -5788,7 +5800,10 @@ mod tests {
         let dict = stream
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("new font stream has no dictionary".to_owned()))?;
-        dict.replace_key(b"/Length1", ObjectHandle::integer(data.len() as i64))?;
+        dict.replace_key(
+            b"/Length1",
+            ObjectHandle::integer(i64::try_from(data.len()).expect("test fixture length fits i64")),
+        )?;
         pdf.mark_object_handle_dirty(&dict)?;
         Ok(stream)
     }
@@ -5887,8 +5902,9 @@ mod tests {
         let different_dict = font_program(&mut pdf, payload)?;
 
         for stream in [&first, &second] {
-            let length =
-                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+            let length = pdf.make_indirect_object_handle(ObjectHandle::integer(
+                i64::try_from(payload.len()).expect("test fixture length fits i64"),
+            ))?;
             let dict = stream
                 .as_stream_dict()
                 .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
@@ -6008,16 +6024,18 @@ mod tests {
         let different_length = font_program(&mut pdf, payload)?;
 
         for stream in [&first, &second] {
-            let length =
-                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+            let length = pdf.make_indirect_object_handle(ObjectHandle::integer(
+                i64::try_from(payload.len()).expect("test fixture length fits i64"),
+            ))?;
             let dict = stream
                 .as_stream_dict()
                 .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
             dict.replace_key(b"/Length1", length)?;
             pdf.mark_object_handle_dirty(&dict)?;
         }
-        let different_length_ref =
-            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64 + 1))?;
+        let different_length_ref = pdf.make_indirect_object_handle(ObjectHandle::integer(
+            i64::try_from(payload.len()).expect("test fixture length fits i64") + 1,
+        ))?;
         let different_length_dict = different_length
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;

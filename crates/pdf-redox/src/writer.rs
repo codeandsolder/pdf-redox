@@ -42,7 +42,9 @@ impl OutputPlan {
 
         let mut ids = BTreeMap::new();
         for (index, handle) in order.iter().copied().enumerate() {
-            ids.insert(handle, OutputObjectId(index as u32 + 1));
+            let id = u32::try_from(index + 1)
+                .map_err(|_| Error::TooManyOutputObjects { count: order.len() })?;
+            ids.insert(handle, OutputObjectId(id));
         }
         let catalog = ids[&catalog_handle];
 
@@ -61,7 +63,7 @@ impl OutputPlan {
     }
 }
 
-pub(crate) fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
+pub fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
     let plan = OutputPlan::new(document)?;
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
@@ -148,7 +150,7 @@ fn write_hayro_object(
         Object::String(value) => write_pdf_string(output, value.as_bytes()),
         Object::Name(value) => write_pdf_name(output, value.as_ref()),
         Object::Dict(dictionary) => {
-            write_hayro_dictionary(output, dictionary, document, plan, false)?
+            write_hayro_dictionary(output, dictionary, document, plan, false)?;
         }
         Object::Array(array) => {
             output.push(b'[');
@@ -236,7 +238,7 @@ fn write_owned_object(
     match object {
         OwnedObject::Null => output.extend_from_slice(b"null"),
         OwnedObject::Boolean(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
+            output.extend_from_slice(if *value { b"true" } else { b"false" });
         }
         OwnedObject::Integer(value) => write!(&mut *output, "{value}")?,
         OwnedObject::Real(value) => write_pdf_real(output, *value)?,
@@ -341,29 +343,40 @@ fn expand_scientific(value: &str) -> Result<String> {
     let exponent = exponent.parse::<i32>().map_err(|_| Error::InvalidReal)?;
     let negative = mantissa.starts_with('-');
     let unsigned = mantissa.strip_prefix('-').unwrap_or(mantissa);
-    let decimal_position = unsigned.find('.').unwrap_or(unsigned.len()) as i32;
+    let decimal_position = i32::try_from(unsigned.find('.').unwrap_or(unsigned.len()))
+        .map_err(|_| Error::InvalidReal)?;
     let digits = unsigned.replace('.', "");
-    let new_position = decimal_position + exponent;
+    let new_position = decimal_position
+        .checked_add(exponent)
+        .ok_or(Error::InvalidReal)?;
+    let exponent_padding =
+        usize::try_from(exponent.unsigned_abs()).map_err(|_| Error::InvalidReal)?;
 
-    let mut expanded = String::with_capacity(digits.len() + exponent.unsigned_abs() as usize + 3);
+    let mut expanded = String::with_capacity(
+        digits
+            .len()
+            .saturating_add(exponent_padding)
+            .saturating_add(3),
+    );
     if negative {
         expanded.push('-');
     }
     if new_position <= 0 {
+        let zero_count =
+            usize::try_from(new_position.unsigned_abs()).map_err(|_| Error::InvalidReal)?;
         expanded.push_str("0.");
-        expanded.extend(std::iter::repeat_n('0', (-new_position) as usize));
+        expanded.extend(std::iter::repeat_n('0', zero_count));
         expanded.push_str(&digits);
-    } else if new_position as usize >= digits.len() {
-        expanded.push_str(&digits);
-        expanded.extend(std::iter::repeat_n(
-            '0',
-            new_position as usize - digits.len(),
-        ));
     } else {
-        let split = new_position as usize;
-        expanded.push_str(&digits[..split]);
-        expanded.push('.');
-        expanded.push_str(&digits[split..]);
+        let position = usize::try_from(new_position).map_err(|_| Error::InvalidReal)?;
+        if position >= digits.len() {
+            expanded.push_str(&digits);
+            expanded.extend(std::iter::repeat_n('0', position - digits.len()));
+        } else {
+            expanded.push_str(&digits[..position]);
+            expanded.push('.');
+            expanded.push_str(&digits[position..]);
+        }
     }
     Ok(expanded)
 }
@@ -380,7 +393,7 @@ fn write_pdf_name(output: &mut Vec<u8>, name: &[u8]) {
     }
 }
 
-fn is_direct_name_byte(byte: u8) -> bool {
+const fn is_direct_name_byte(byte: u8) -> bool {
     matches!(byte, b'!'..=b'~')
         && !matches!(
             byte,
@@ -413,7 +426,7 @@ fn push_hex_byte(output: &mut Vec<u8>, byte: u8) {
     output.push(HEX[(byte & 0x0f) as usize]);
 }
 
-fn missing_mapping_error(handle: ObjectHandle) -> Error {
+const fn missing_mapping_error(handle: ObjectHandle) -> Error {
     match handle {
         ObjectHandle::Existing(id) => Error::MissingOutputSourceMapping {
             number: id.number(),
@@ -424,10 +437,8 @@ fn missing_mapping_error(handle: ObjectHandle) -> Error {
 }
 
 fn check_xref_offset(offset: usize) -> Result<()> {
-    let exceeds_limit = match u64::try_from(offset) {
-        Ok(offset) => offset > MAX_CLASSIC_XREF_OFFSET,
-        Err(_) => true,
-    };
+    let exceeds_limit =
+        u64::try_from(offset).map_or(true, |offset| offset > MAX_CLASSIC_XREF_OFFSET);
     if exceeds_limit {
         Err(Error::OutputOffsetTooLarge { offset })
     } else {
@@ -478,7 +489,7 @@ fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Re
 fn zlib_encode(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
     use flate2::{Compression, write::ZlibEncoder};
     let compression = if (0..=9).contains(&level) {
-        Compression::new(level as u32)
+        Compression::new(level.cast_unsigned())
     } else {
         Compression::default()
     };
@@ -523,6 +534,10 @@ fn push_xref_stream_entry(output: &mut Vec<u8>, kind: u8, field2: u64, field3: u
     output.extend_from_slice(&field3.to_be_bytes());
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "object-stream output keeps ID planning, offset capture, and xref construction in one stateful writer"
+)]
 fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<Vec<u8>> {
     let plan = OutputPlan::new(document)?;
     let mut compressed = BTreeMap::<ObjectHandle, (u32, u16)>::new();
@@ -542,15 +557,44 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
         objstm_groups.push(current);
     }
 
-    let base_count = plan.order.len() as u32;
+    let output_object_count = plan
+        .order
+        .len()
+        .saturating_add(objstm_groups.len())
+        .saturating_add(1);
+    let base_count = u32::try_from(plan.order.len()).map_err(|_| Error::TooManyOutputObjects {
+        count: output_object_count,
+    })?;
     for (group_index, group) in objstm_groups.iter().enumerate() {
-        let objstm_id = base_count + group_index as u32 + 1;
+        let group_index = u32::try_from(group_index).map_err(|_| Error::TooManyOutputObjects {
+            count: output_object_count,
+        })?;
+        let objstm_id = base_count
+            .checked_add(group_index)
+            .and_then(|id| id.checked_add(1))
+            .ok_or(Error::TooManyOutputObjects {
+                count: output_object_count,
+            })?;
         for (index, handle) in group.iter().copied().enumerate() {
-            compressed.insert(handle, (objstm_id, index as u16));
+            let index = u16::try_from(index).map_err(|_| Error::TooManyOutputObjects {
+                count: output_object_count,
+            })?;
+            compressed.insert(handle, (objstm_id, index));
         }
     }
-    let xref_id = base_count + objstm_groups.len() as u32 + 1;
-    let size = xref_id + 1;
+    let group_count =
+        u32::try_from(objstm_groups.len()).map_err(|_| Error::TooManyOutputObjects {
+            count: output_object_count,
+        })?;
+    let xref_id = base_count
+        .checked_add(group_count)
+        .and_then(|id| id.checked_add(1))
+        .ok_or(Error::TooManyOutputObjects {
+            count: output_object_count,
+        })?;
+    let size = xref_id.checked_add(1).ok_or(Error::TooManyOutputObjects {
+        count: output_object_count,
+    })?;
 
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
@@ -571,9 +615,17 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
     }
 
     for (group_index, group) in objstm_groups.iter().enumerate() {
-        let id = base_count + group_index as u32 + 1;
+        let group_index = u32::try_from(group_index).map_err(|_| Error::TooManyOutputObjects {
+            count: output_object_count,
+        })?;
+        let id = base_count
+            .checked_add(group_index)
+            .and_then(|id| id.checked_add(1))
+            .ok_or(Error::TooManyOutputObjects {
+                count: output_object_count,
+            })?;
         normal_offsets.insert(id, output.len());
-        writeln!(&mut output, "{} 0 obj", id)?;
+        writeln!(&mut output, "{id} 0 obj")?;
         write_objstm(&mut output, document, &plan, group, level)?;
         output.extend_from_slice(b"\nendobj\n");
     }
@@ -598,9 +650,9 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
     }
     let encoded_xref = zlib_encode(&xref_data, level)?;
 
-    writeln!(&mut output, "{} 0 obj", xref_id)?;
+    writeln!(&mut output, "{xref_id} 0 obj")?;
     output.extend_from_slice(b"<< /Type /XRef /Size ");
-    write!(&mut output, "{}", size)?;
+    write!(&mut output, "{size}")?;
     output.extend_from_slice(b" /W [1 8 2] /Root ");
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
     for (name, value) in document.trailer() {
@@ -619,7 +671,7 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
     Ok(output)
 }
 
-pub(crate) fn write_pdf_with_options(
+pub fn write_pdf_with_options(
     document: &EditDocument,
     generate_object_streams: bool,
     compression_level: i32,
@@ -671,9 +723,8 @@ mod tests {
             Ok(catalog) => catalog,
             Err(error) => panic!("catalog should materialize: {error}"),
         };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            panic!("catalog should be a dictionary");
         };
         dictionary.insert(b"Lang".to_vec(), OwnedObject::String(b"en-GB".to_vec()));
 
@@ -684,9 +735,8 @@ mod tests {
             Ok(catalog) => catalog,
             Err(error) => panic!("catalog should remain editable: {error}"),
         };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            panic!("catalog should be a dictionary");
         };
         dictionary.insert(
             b"PieceInfo".to_vec(),
@@ -732,10 +782,7 @@ mod tests {
         };
 
         assert_eq!(rewritten.object_count(), 6);
-        let trailer = match rewritten.preserved_trailer() {
-            Ok(trailer) => trailer,
-            Err(error) => panic!("rewritten trailer should parse: {error}"),
-        };
+        let trailer = rewritten.preserved_trailer();
         assert!(!trailer.contains_key(b"Size".as_slice()));
         assert!(!trailer.contains_key(b"Root".as_slice()));
 
@@ -814,10 +861,7 @@ mod tests {
             Err(error) => panic!("rewritten PDF should parse: {error}"),
         };
         assert_eq!(rewritten.object_count(), 4);
-        let trailer = match rewritten.preserved_trailer() {
-            Ok(trailer) => trailer,
-            Err(error) => panic!("rewritten trailer should parse: {error}"),
-        };
+        let trailer = rewritten.preserved_trailer();
         assert!(trailer.contains_key(b"Info".as_slice()));
         assert!(trailer.contains_key(b"ID".as_slice()));
         let custom = match trailer.get(b"Custom".as_slice()) {
@@ -846,9 +890,8 @@ mod tests {
             Ok(catalog) => catalog,
             Err(error) => panic!("catalog should materialize: {error}"),
         };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            panic!("catalog should be a dictionary");
         };
         dictionary.insert(
             b"Missing".to_vec(),
@@ -894,9 +937,8 @@ mod tests {
     fn large_source_integer_does_not_round_through_f64() {
         use hayro_syntax::object::FromBytes;
 
-        let number = match hayro_syntax::object::Number::from_bytes(b"9007199254740993") {
-            Some(number) => number,
-            None => panic!("integer should parse"),
+        let Some(number) = hayro_syntax::object::Number::from_bytes(b"9007199254740993") else {
+            panic!("integer should parse");
         };
         let mut output = Vec::new();
         if let Err(error) = write_hayro_number(&mut output, &number) {
@@ -938,9 +980,19 @@ mod tests {
         let mut entries = Vec::new();
         push_xref_entry(&mut entries, 0, 0, 65535);
         for &offset in &offsets {
-            push_xref_entry(&mut entries, 1, offset as u32, 0);
+            push_xref_entry(
+                &mut entries,
+                1,
+                u32::try_from(offset).expect("test xref offset fits u32"),
+                0,
+            );
         }
-        push_xref_entry(&mut entries, 1, xref_offset as u32, 0);
+        push_xref_entry(
+            &mut entries,
+            1,
+            u32::try_from(xref_offset).expect("test xref offset fits u32"),
+            0,
+        );
 
         pdf.extend_from_slice(
             format!(

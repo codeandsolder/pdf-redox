@@ -11,6 +11,18 @@ use std::{
     sync::Arc,
 };
 
+pub const fn exact_i64_to_f64(value: i64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
+    if value.unsigned_abs() > MAX_EXACT_INTEGER {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the range check guarantees this integer is exactly representable as f64"
+    )]
+    Some(value as f64)
+}
+
 /// Immutable, lazily parsed source PDF backed by Hayro.
 ///
 /// Hayro keeps the original bytes alive and parses objects on demand. Mutations
@@ -22,22 +34,32 @@ pub struct SourcePdf {
 
 impl SourcePdf {
     /// Parse owned PDF bytes without making another full-document copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Hayro cannot parse the input as a PDF.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_shared(Arc::new(bytes))
     }
 
     /// Parse PDF bytes already held in shared storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Hayro cannot parse the input as a PDF.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
         let pdf = Pdf::new(bytes.clone()).map_err(SourceLoadError::from)?;
         Ok(Self { pdf, bytes })
     }
 
     /// Original source bytes, unchanged.
+    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
     /// Number of objects indexed by the source cross-reference graph.
+    #[must_use]
     pub fn object_count(&self) -> usize {
         self.pdf.len()
     }
@@ -53,11 +75,13 @@ impl SourcePdf {
     }
 
     /// Number of pages in the source page tree.
+    #[must_use]
     pub fn page_count(&self) -> usize {
         self.pdf.pages().len()
     }
 
     /// Object identifiers of pages resolved from the source page tree.
+    #[must_use]
     pub fn page_ids(&self) -> Vec<ObjectId> {
         self.pdf
             .pages()
@@ -67,11 +91,13 @@ impl SourcePdf {
     }
 
     /// Effective PDF version reported by Hayro.
+    #[must_use]
     pub fn version(&self) -> PdfVersion {
         self.pdf.version()
     }
 
     /// Object identifier of the document catalog.
+    #[must_use]
     pub fn catalog_id(&self) -> ObjectId {
         self.pdf.xref().root_id().into()
     }
@@ -81,6 +107,10 @@ impl SourcePdf {
     /// Indirect references stay as references and source stream payloads stay
     /// source-backed, so materializing a dictionary does not recursively clone
     /// the object graph or duplicate large encoded streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` is not present in the source object graph.
     pub fn materialize(&self, id: ObjectId) -> Result<OwnedObject> {
         Ok(owned_from_hayro(self.object(id)?, Some(id)))
     }
@@ -114,6 +144,10 @@ impl SourcePdf {
     /// This walks only the borrowed COS structure of that object. Referenced
     /// objects are not resolved or materialized, and stream payload bytes are
     /// never touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` is not present in the source object graph.
     pub fn references(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
         Ok(self.object_with_references(id)?.1)
     }
@@ -122,6 +156,10 @@ impl SourcePdf {
     ///
     /// For ordinary unencrypted files this remains a borrowed view into the
     /// source PDF. Hayro may allocate when decryption is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` does not resolve to a source stream.
     pub fn stream_data(&self, id: ObjectId) -> Result<Cow<'_, [u8]>> {
         let stream =
             self.pdf
@@ -135,6 +173,10 @@ impl SourcePdf {
     }
 
     /// Return fully decoded bytes of a source stream on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` is not a stream or its filter chain cannot be decoded.
     pub fn decoded_stream_data(&self, id: ObjectId) -> Result<Cow<'_, [u8]>> {
         let stream =
             self.pdf
@@ -155,9 +197,9 @@ impl SourcePdf {
     /// The vendored Hayro accessor exposes the final already-parsed trailer
     /// dictionary, so document construction no longer reparses the PDF through
     /// a second parser merely to preserve `/Info`, `/ID`, or custom roots.
-    pub(crate) fn preserved_trailer(&self) -> Result<OwnedDictionary> {
+    pub(crate) fn preserved_trailer(&self) -> OwnedDictionary {
         let Some(trailer) = self.pdf.xref().trailer() else {
-            return Ok(OwnedDictionary::new());
+            return OwnedDictionary::new();
         };
         let xref_stream = trailer.entries().any(|(name, value)| {
             name.as_ref() == b"Type"
@@ -172,13 +214,13 @@ impl SourcePdf {
             }
             preserved.insert(name.to_vec(), owned_from_maybe_ref(value));
         }
-        Ok(preserved)
+        preserved
     }
 }
 
 const MAX_TRAILER_NESTING: usize = 256;
 
-fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
+const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
     matches!(name, b"Size" | b"Root" | b"Encrypt" | b"Prev" | b"XRefStm")
         || xref_stream
             && matches!(
@@ -196,7 +238,12 @@ fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
             )
 }
 
-pub(crate) fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
+/// Convert a detached flpdf object into the owned COW representation.
+///
+/// # Errors
+///
+/// Returns an error for excessive nesting, unsupported reference ranges, or failed lazy materialization.
+pub fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
     if depth > MAX_TRAILER_NESTING {
         return Err(Error::Invalid(
             "trailer direct-object nesting exceeds the supported limit".to_owned(),
@@ -278,14 +325,17 @@ pub struct ObjectId {
 }
 
 impl ObjectId {
+    #[must_use]
     pub const fn new(number: i32, generation: i32) -> Self {
         Self { number, generation }
     }
 
+    #[must_use]
     pub const fn number(self) -> i32 {
         self.number
     }
 
+    #[must_use]
     pub const fn generation(self) -> i32 {
         self.generation
     }
@@ -315,6 +365,7 @@ impl From<ObjectId> for ObjectIdentifier {
 pub struct NewObjectId(usize);
 
 impl NewObjectId {
+    #[must_use]
     pub const fn index(self) -> usize {
         self.0
     }
@@ -342,6 +393,11 @@ pub enum StreamData {
 }
 
 impl StreamData {
+    /// Borrow or load the encoded stream bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a source-backed stream no longer resolves to a source stream.
     pub fn bytes<'a>(&'a self, source: &'a SourcePdf) -> Result<Cow<'a, [u8]>> {
         match self {
             Self::Source(id) => source.stream_data(*id),
@@ -349,6 +405,7 @@ impl StreamData {
         }
     }
 
+    #[must_use]
     pub const fn is_source_backed(&self) -> bool {
         matches!(self, Self::Source(_))
     }
@@ -376,14 +433,15 @@ pub enum OwnedObject {
 }
 
 impl OwnedObject {
-    pub fn as_dictionary(&self) -> Option<&OwnedDictionary> {
+    #[must_use]
+    pub const fn as_dictionary(&self) -> Option<&OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
             _ => None,
         }
     }
 
-    pub fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
+    pub const fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
             _ => None,
@@ -391,6 +449,7 @@ impl OwnedObject {
     }
 
     /// Collect indirect references contained in this owned COS value.
+    #[must_use]
     pub fn references(&self) -> Vec<ObjectHandle> {
         let mut references = BTreeSet::new();
         collect_owned_references(self, &mut references);
@@ -423,6 +482,10 @@ impl ObjectOverlay {
     }
 
     /// Materialize an existing source object only when it is first edited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source object is missing or has already been deleted from the overlay.
     pub fn edit<'a>(&'a mut self, source: &SourcePdf, id: ObjectId) -> Result<&'a mut OwnedObject> {
         let change = match self.existing.entry(id) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -445,6 +508,7 @@ impl ObjectOverlay {
         self.existing.remove(&id)
     }
 
+    #[must_use]
     pub fn change(&self, id: ObjectId) -> Option<&ExistingObjectChange> {
         self.existing.get(&id)
     }
@@ -459,6 +523,7 @@ impl ObjectOverlay {
         id
     }
 
+    #[must_use]
     pub fn added(&self, id: NewObjectId) -> Option<&OwnedObject> {
         self.added.get(id.index())
     }
@@ -467,17 +532,19 @@ impl ObjectOverlay {
         self.added.get_mut(id.index())
     }
 
+    #[must_use]
     pub fn added_objects(&self) -> &[OwnedObject] {
         &self.added
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.existing.is_empty() && self.added.is_empty()
     }
 }
 
 /// Borrowed view of one object encountered while walking the current COW graph.
-pub(crate) enum CurrentObject<'a> {
+pub enum CurrentObject<'a> {
     /// Object parsed lazily from the immutable Hayro source.
     Source(Object<'a>),
     /// Object already materialized in the overlay.
@@ -493,9 +560,14 @@ pub struct EditDocument {
 }
 
 impl EditDocument {
+    /// Parse bytes into an immutable source plus an initially empty COW overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input cannot be parsed as a PDF.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let source = SourcePdf::from_bytes(bytes)?;
-        let trailer = source.preserved_trailer()?;
+        let trailer = source.preserved_trailer();
         Ok(Self {
             source,
             trailer,
@@ -503,26 +575,34 @@ impl EditDocument {
         })
     }
 
-    pub fn source(&self) -> &SourcePdf {
+    #[must_use]
+    pub const fn source(&self) -> &SourcePdf {
         &self.source
     }
 
-    pub fn trailer(&self) -> &OwnedDictionary {
+    #[must_use]
+    pub const fn trailer(&self) -> &OwnedDictionary {
         &self.trailer
     }
 
-    pub fn trailer_mut(&mut self) -> &mut OwnedDictionary {
+    pub const fn trailer_mut(&mut self) -> &mut OwnedDictionary {
         &mut self.trailer
     }
 
-    pub fn overlay(&self) -> &ObjectOverlay {
+    #[must_use]
+    pub const fn overlay(&self) -> &ObjectOverlay {
         &self.overlay
     }
 
-    pub fn overlay_mut(&mut self) -> &mut ObjectOverlay {
+    pub const fn overlay_mut(&mut self) -> &mut ObjectOverlay {
         &mut self.overlay
     }
 
+    /// Materialize and return an editable source object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source object is missing or deleted.
     pub fn edit_object(&mut self, id: ObjectId) -> Result<&mut OwnedObject> {
         self.overlay.edit(&self.source, id)
     }
@@ -583,7 +663,11 @@ impl EditDocument {
                     .collect::<Result<Vec<_>>>()?;
                 entries.push((
                     b"/Length".to_vec(),
-                    FlObjectHandle::integer(bytes.len() as i64),
+                    FlObjectHandle::integer(i64::try_from(bytes.len()).map_err(|_| {
+                        Error::Invalid(
+                            "stream length exceeds signed 64-bit PDF integer range".to_owned(),
+                        )
+                    })?),
                 ));
                 let dictionary = FlObjectHandle::dictionary(entries);
                 Ok(FlObjectHandle::stream(dictionary, Rc::new(bytes)))
@@ -624,7 +708,9 @@ impl EditDocument {
         }
         entries.push((
             b"/Length".to_vec(),
-            FlObjectHandle::integer(bytes.len() as i64),
+            FlObjectHandle::integer(i64::try_from(bytes.len()).map_err(|_| {
+                Error::Invalid("stream length exceeds signed 64-bit PDF integer range".to_owned())
+            })?),
         ));
         let handle = FlObjectHandle::stream(FlObjectHandle::dictionary(entries), Rc::new(bytes));
         Ok(handle.get_stream_data(level)?.as_ref().clone())
@@ -689,6 +775,10 @@ impl EditDocument {
 
     /// Write the current COW graph as a compact fresh PDF using classic xref output.
     /// Production optimization normally selects writer options through `Config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid reachable objects, unsupported output sizes, or writer I/O failures.
     pub fn write_compact(&self) -> Result<Vec<u8>> {
         crate::writer::write_pdf(self)
     }
@@ -808,6 +898,10 @@ impl EditDocument {
 
     /// Collect all objects reachable from the document catalog after applying
     /// overlay replacements/deletions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reachable graph contains missing or deleted referenced objects.
     pub fn reachable_objects(&self) -> Result<Vec<ObjectHandle>> {
         self.reachable_from([ObjectHandle::Existing(self.source.catalog_id())])
     }
@@ -884,6 +978,10 @@ impl EditDocument {
     }
 
     /// Collect all objects reachable from an explicit root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a reachable reference points to a missing or deleted object.
     pub fn reachable_from(
         &self,
         roots: impl IntoIterator<Item = ObjectHandle>,
@@ -1009,6 +1107,11 @@ fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<Obje
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::float_cmp,
+    reason = "Hayro exposes Number only through paired f64/i64 views; comparing them preserves its integer representation"
+)]
 fn owned_from_hayro(object: Object<'_>, stream_id: Option<ObjectId>) -> OwnedObject {
     match object {
         Object::Null(_) => OwnedObject::Null,
@@ -1136,9 +1239,8 @@ mod tests {
             Ok(object) => object,
             Err(error) => panic!("catalog should materialize: {error}"),
         };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            panic!("catalog should be a dictionary");
         };
         dictionary.insert(b"Lang".to_vec(), OwnedObject::String(b"en".to_vec()));
 
@@ -1182,9 +1284,8 @@ mod tests {
             Ok(object) => object,
             Err(error) => panic!("catalog should materialize: {error}"),
         };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            panic!("catalog should be a dictionary");
         };
         dictionary.insert(
             b"PieceInfo".to_vec(),

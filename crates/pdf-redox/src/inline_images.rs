@@ -183,13 +183,12 @@ fn summary_for_target(
 }
 
 fn image_stream(document: &mut EditDocument, image: DetachedInlineImage) -> Result<ObjectHandle> {
-    let mut dictionary = match crate::source::owned_from_flpdf(&image.dictionary, 0)? {
-        OwnedObject::Dictionary(dictionary) => dictionary,
-        _ => {
-            return Err(Error::Invalid(
-                "detached inline image dictionary is not a dictionary".to_owned(),
-            ));
-        }
+    let OwnedObject::Dictionary(mut dictionary) =
+        crate::source::owned_from_flpdf(&image.dictionary, 0)?
+    else {
+        return Err(Error::Invalid(
+            "detached inline image dictionary is not a dictionary".to_owned(),
+        ));
     };
     dictionary.remove(b"Length".as_slice());
     Ok(ObjectHandle::New(document.overlay_mut().add(
@@ -276,7 +275,7 @@ fn install_rewrite(
     Ok(())
 }
 
-pub(crate) fn externalize_duplicate_inline_images_hayro(
+pub fn externalize_duplicate_inline_images_hayro(
     document: &mut EditDocument,
     min_size: usize,
     min_duplicate_payload_bytes: usize,

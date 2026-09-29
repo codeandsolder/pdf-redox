@@ -227,7 +227,7 @@ fn install_form_resources(
     Ok(())
 }
 
-pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
+pub fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = document.current_owned_object(catalog)? else {
         return Ok(false);
@@ -309,7 +309,7 @@ pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bo
     Ok(false)
 }
 
-pub(crate) fn prune_resources_hayro(document: &mut EditDocument) -> Result<()> {
+pub fn prune_resources_hayro(document: &mut EditDocument) -> Result<()> {
     // Prune forms with local resource scopes first. Resource-less forms are
     // intentionally accounted against their caller's scope below.
     let mut forms = BTreeSet::new();

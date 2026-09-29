@@ -11,7 +11,7 @@ const MIN_PLACEMENT_POINTS: f64 = 1.0e-9;
 const MIN_DOWNSAMPLE_PIXEL_REDUCTION_PERCENT: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ImagePlacement {
+pub struct ImagePlacement {
     pub width_px: u32,
     pub height_px: u32,
     pub max_width_points: f64,
@@ -26,7 +26,17 @@ impl ImagePlacement {
             if !desired.is_finite() || desired <= 1.0 {
                 return 1.min(pixels);
             }
-            (desired as u64).min(u64::from(pixels)) as u32
+            if desired >= f64::from(pixels) {
+                return pixels;
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
+            )]
+            {
+                desired as u32
+            }
         }
 
         (
@@ -39,7 +49,7 @@ impl ImagePlacement {
 fn parsed_number(object: &ObjectHandle) -> Option<f64> {
     object
         .as_integer()
-        .map(|value| value as f64)
+        .and_then(crate::source::exact_i64_to_f64)
         .or_else(|| object.as_real())
 }
 
@@ -282,6 +292,10 @@ struct PlacementWalkState<'a> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the test traversal mirrors the production form-walk call shape"
+)]
 fn scan_form<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     form: ObjectHandle,
@@ -440,7 +454,7 @@ fn collect_image_placements<R: Read + Seek + 'static>(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PrintPlacementStats {
+pub struct PrintPlacementStats {
     pub images_placed: usize,
     pub image_uses: usize,
     pub downsample_candidates: usize,
@@ -453,7 +467,7 @@ pub(crate) struct PrintPlacementStats {
 
 #[derive(Debug, Default)]
 #[cfg(test)]
-pub(crate) struct PrintPlan {
+pub struct PrintPlan {
     pub stats: PrintPlacementStats,
     pub resize_targets: HashMap<(ObjectRef, ObjectRef), ImageResizeTarget>,
 }
@@ -553,7 +567,7 @@ fn is_resize_safe_flate<R: Read + Seek + 'static>(pdf: &mut Pdf<R>, object_ref: 
 }
 
 #[cfg(test)]
-pub(crate) fn plan_print_downsampling<R: Read + Seek + 'static>(
+pub fn plan_print_downsampling<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     target_ppi: u32,
 ) -> Result<PrintPlan> {
@@ -625,7 +639,7 @@ mod tests {
     use flpdf::ObjectHandle;
     use std::{io::Cursor, rc::Rc};
 
-    fn stream(pdf: &mut Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
+    fn stream(pdf: &Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
         pdf.new_stream_with_data(Rc::new(bytes.to_vec()))
             .map_err(Into::into)
     }
@@ -703,7 +717,7 @@ mod tests {
             Vec::new()
         };
         page_handles.push(page);
-        let count = page_handles.len() as i64;
+        let count = i64::try_from(page_handles.len()).expect("test page count fits i64");
         pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
         pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
         pdf.mark_object_handle_dirty(&pages)?;
@@ -767,6 +781,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test asserts exact deterministic PDF geometry values"
+    )]
     fn shared_image_uses_largest_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -795,6 +813,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test asserts exact deterministic PDF geometry values"
+    )]
     fn resource_less_form_inherits_page_xobjects_for_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -802,7 +824,7 @@ mod tests {
             .object_ref()
             .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
 
-        let form = stream(&mut pdf, b"q 300 0 0 150 0 0 cm /Im Do Q\n")?;
+        let form = stream(&pdf, b"q 300 0 0 150 0 0 cm /Im Do Q\n")?;
         let form_dict = form
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
@@ -874,7 +896,7 @@ mod tests {
         dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
         pdf.mark_object_handle_dirty(&dict)?;
 
-        let form = stream(&mut pdf, b"q 72 0 0 36 0 0 cm /Im Do Q\n")?;
+        let form = stream(&pdf, b"q 72 0 0 36 0 0 cm /Im Do Q\n")?;
         let form_dict = form
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
@@ -924,6 +946,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test asserts exact deterministic PDF geometry values"
+    )]
     fn nested_form_matrix_contributes_to_image_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 500)?;
@@ -931,7 +957,7 @@ mod tests {
             .object_ref()
             .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
 
-        let form = stream(&mut pdf, b"q 2 0 0 1 0 0 cm /Im Do Q\n")?;
+        let form = stream(&pdf, b"q 2 0 0 1 0 0 cm /Im Do Q\n")?;
         let form_dict = form
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
@@ -982,6 +1008,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test asserts exact deterministic PDF geometry values"
+    )]
     fn page_user_unit_scales_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 1000)?;
@@ -1026,7 +1056,7 @@ struct CowPlacementScanner {
 }
 
 impl CowPlacementScanner {
-    fn new(
+    const fn new(
         xobjects: BTreeMap<Vec<u8>, crate::ObjectHandle>,
         base_ctm: Matrix,
         complete: bool,
@@ -1217,7 +1247,7 @@ fn cow_number(
         return Ok(None);
     };
     Ok(match document.resolve_owned_value(value)? {
-        Some(crate::OwnedObject::Integer(value)) => Some(value as f64),
+        Some(crate::OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(crate::OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -1269,9 +1299,20 @@ fn cow_image_dimensions(
     let Some(height) = cow_number(document, dictionary.get(b"Height".as_slice()))? else {
         return Ok(None);
     };
-    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || width > f64::from(u32::MAX)
+        || height > f64::from(u32::MAX)
+    {
         return Ok(None);
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite positive image dimensions are range-checked against u32 before conversion"
+    )]
     Ok(Some((width as u32, height as u32)))
 }
 
@@ -1385,10 +1426,10 @@ fn cow_scan_form(
         for draw in scanner.draws {
             match cow_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, state.placements, draw.target, draw.ctm)?
+                    cow_record_image(document, state.placements, draw.target, draw.ctm)?;
                 }
                 Some(b"Form") => {
-                    cow_scan_form(document, draw.target, draw.ctm, &current, state, depth + 1)?
+                    cow_scan_form(document, draw.target, draw.ctm, &current, state, depth + 1)?;
                 }
                 _ => *state.complete = false,
             }
@@ -1400,7 +1441,7 @@ fn cow_scan_form(
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PrintPlanHayro {
+pub struct PrintPlanHayro {
     pub stats: PrintPlacementStats,
     pub resize_targets: HashMap<(crate::ObjectHandle, crate::ObjectHandle), ImageResizeTarget>,
 }
@@ -1450,13 +1491,12 @@ fn cow_image_resize_safe(
     ) {
         return Ok(false);
     }
-    let filter = match dictionary
+    let Some(Some(crate::OwnedObject::Name(filter))) = dictionary
         .get(b"Filter".as_slice())
-        .map(|v| document.resolve_owned_value(v))
+        .map(|value| document.resolve_owned_value(value))
         .transpose()?
-    {
-        Some(Some(crate::OwnedObject::Name(name))) => name,
-        _ => return Ok(false),
+    else {
+        return Ok(false);
     };
     if jpeg && !matches!(filter.as_slice(), b"DCTDecode" | b"DCT") {
         return Ok(false);
@@ -1464,18 +1504,17 @@ fn cow_image_resize_safe(
     if !jpeg && !matches!(filter.as_slice(), b"FlateDecode" | b"Fl") {
         return Ok(false);
     }
-    let color = match dictionary
+    let Some(Some(crate::OwnedObject::Name(color))) = dictionary
         .get(b"ColorSpace".as_slice())
-        .map(|v| document.resolve_owned_value(v))
+        .map(|value| document.resolve_owned_value(value))
         .transpose()?
-    {
-        Some(Some(crate::OwnedObject::Name(name))) => name,
-        _ => return Ok(false),
+    else {
+        return Ok(false);
     };
     Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
 }
 
-pub(crate) fn plan_print_downsampling_hayro(
+pub fn plan_print_downsampling_hayro(
     document: &crate::EditDocument,
     target_ppi: u32,
 ) -> Result<PrintPlanHayro> {
@@ -1519,7 +1558,7 @@ pub(crate) fn plan_print_downsampling_hayro(
         for draw in scanner.draws {
             match cow_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, &mut placements, draw.target, draw.ctm)?
+                    cow_record_image(document, &mut placements, draw.target, draw.ctm)?;
                 }
                 Some(b"Form") => {
                     let mut state = CowPlacementWalkState {
