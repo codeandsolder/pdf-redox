@@ -116,10 +116,6 @@ impl<'a> SliceLiveInput<'a> {
     pub(crate) fn position(&self) -> usize {
         self.position
     }
-
-    pub(crate) fn seek_to(&mut self, position: usize) -> Result<()> {
-        self.seek(position as u64)
-    }
 }
 
 impl LiveInput for SliceLiveInput<'_> {
@@ -211,11 +207,19 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
         self.last_offset
     }
 
-    fn seek(&mut self, offset: u64) -> Result<()> {
+    pub(crate) fn seek(&mut self, offset: u64) -> Result<()> {
         self.input.seek(offset)
     }
 
     pub(crate) fn next_token(&mut self) -> Result<Token> {
+        self.next_token_with(false)
+    }
+
+    pub(crate) fn next_scalar_token(&mut self) -> Result<Token> {
+        self.next_token_with(true)
+    }
+
+    fn next_token_with(&mut self, scalar_only: bool) -> Result<Token> {
         loop {
             match self.input.read_byte()? {
                 // cov:ignore-start: each loop drains a ready token before the next input byte.
@@ -228,7 +232,12 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 // cov:ignore-end
             }
 
-            let Some(pushed) = self.tokenizer.get_token() else {
+            let pushed = if scalar_only {
+                self.tokenizer.get_scalar_token()
+            } else {
+                self.tokenizer.get_token()
+            };
+            let Some(pushed) = pushed else {
                 continue;
             };
 
@@ -236,7 +245,7 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 self.input.unread_byte()?;
             }
             let end = self.input.tell()?;
-            let start = end.saturating_sub(pushed.token.raw.len() as u64);
+            let start = end.saturating_sub(pushed.raw_len as u64);
             let start = usize::try_from(start).unwrap_or(usize::MAX);
             let end = usize::try_from(end).unwrap_or(usize::MAX);
             let mut token = pushed.token;
@@ -384,11 +393,24 @@ fn parse_live_file_object_with_context<I: LiveInput>(
 /// `parseContentStream_data` never passes a null `context` for that reason),
 /// so `has_context` is unconditionally `true` here regardless of whether the
 /// caller-supplied [`HandleResolver`] carries a real document.
-pub(crate) fn parse_live_content_stream_object<I: LiveInput>(
-    input: &mut I,
+
+pub(crate) fn parse_live_content_stream_object_from_tokens<I: LiveInput>(
+    tokens: &mut LiveTokenSource<'_, I>,
     resolver: &mut dyn HandleResolver,
 ) -> Result<LiveParsedObject> {
-    parse_live_object_with_context(input, resolver, true, None, true)
+    let mut parser = LiveFileParser {
+        tokens,
+        resolver,
+        buffered: VecDeque::new(),
+        diagnostics: Vec::new(),
+        good_count: 0,
+        bad_count: 0,
+        give_up: false,
+        has_context: true,
+        decrypter: None,
+        content_stream: true,
+    };
+    parser.parse()
 }
 
 fn parse_live_object_with_context<I: LiveInput>(
@@ -573,14 +595,14 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                             continue;
                         }
                     }
-                    let value =
-                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    let token_start = token.start as i64;
+                    let value = self.parse_scalar_token(token, token_start, false)?;
                     self.add_to_top_frame(frames, value)?;
                 }
                 _ => {
                     self.capture_raw_signature_contents(frames, &token);
-                    let value =
-                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    let token_start = token.start as i64;
+                    let value = self.parse_scalar_token(token, token_start, false)?;
                     self.add_to_top_frame(frames, value)?;
                 }
             }
@@ -2056,7 +2078,7 @@ impl HandleResolver for ContentHandleResolver {
     }
 }
 
-enum RealClassification {
+pub(crate) enum RealClassification {
     Canonical(f64),
     Literal { value: f64, literal: Vec<u8> },
 }
@@ -2066,12 +2088,15 @@ enum RealClassification {
 // byte-identical unparse. Both the legacy `Object`-producing path
 // (`real_object`) and the canonical live parser call this instead of
 // recomputing the comparison themselves.
-fn classify_real(token: Token) -> Result<RealClassification> {
+pub(crate) fn parse_real_token_value(token: &Token) -> Result<f64> {
     let text = std::str::from_utf8(&token.value)
         .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
-    let value = text
-        .parse::<f64>()
-        .map_err(|_| Error::parse(token.start, "invalid real"))?;
+    text.parse::<f64>()
+        .map_err(|_| Error::parse(token.start, "invalid real"))
+}
+
+pub(crate) fn classify_real(token: Token) -> Result<RealClassification> {
+    let value = parse_real_token_value(&token)?;
     // Preserve the source literal when `value.to_string()` cannot reproduce
     // it byte-for-byte (e.g. `.4`, `0.400`, `1.0`) — required for
     // byte-identical parity with qpdf's QPDF_Real (which re-emits the parsed
@@ -2087,7 +2112,7 @@ fn classify_real(token: Token) -> Result<RealClassification> {
     }
 }
 
-fn parse_integer_token(token: &Token) -> Result<i64> {
+pub(crate) fn parse_integer_token(token: &Token) -> Result<i64> {
     std::str::from_utf8(&token.value)
         .ok()
         .and_then(|text| text.parse::<i64>().ok())

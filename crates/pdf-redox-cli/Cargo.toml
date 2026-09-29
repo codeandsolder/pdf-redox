@@ -13,6 +13,7 @@ workspace = true
 [[bin]]
 name = "pdf-redox"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 pdf-redox = { path = "../pdf-redox" }

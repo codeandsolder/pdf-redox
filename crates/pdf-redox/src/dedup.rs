@@ -1,5 +1,5 @@
 use crate::{
-    EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
+    EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData, source::CurrentObject,
 };
 #[cfg(test)]
@@ -14,9 +14,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TargetedDedupStats {
+pub(crate) struct TargetedDedupStats {
     pub duplicate_streams_detected: usize,
     pub duplicate_raw_bytes: usize,
+    pub references_canonicalized: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ExactObjectDedupStats {
+    pub duplicate_objects_detected: usize,
     pub references_canonicalized: usize,
 }
 
@@ -70,7 +76,7 @@ fn stream_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Option<[u8
 }
 
 #[cfg(test)]
-pub fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_metadata_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -243,7 +249,7 @@ fn icc_arrays(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
 }
 
 #[cfg(test)]
-pub fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_icc_profiles<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -447,10 +453,11 @@ fn collect_direct_form_icon_holders(
         return;
     }
 
-    let dictionary = value
-        .as_stream_dict()
-        .or_else(|| value.as_dictionary().map(|_| value.clone()));
-    let Some(dictionary) = dictionary else {
+    let dictionary = if let Some(dict) = value.as_stream_dict() {
+        dict
+    } else if value.as_dictionary().is_some() {
+        value.clone()
+    } else {
         if let Some(items) = value.as_array() {
             for item in items {
                 collect_direct_form_icon_holders(&item, false, holders);
@@ -463,15 +470,14 @@ fn collect_direct_form_icon_holders(
         dictionary.try_get_key(b"/Subtype"),
         Ok(subtype) if matches!(subtype.try_is_name_and_equals(b"Widget"), Ok(true))
     );
-    let collected_mk = if is_widget
+    let mut collected_mk = false;
+    if is_widget
         && let Ok(mk) = dictionary.try_get_key(b"/MK")
         && !mk.is_null()
     {
         holders.push(mk);
-        true
-    } else {
-        false
-    };
+        collected_mk = true;
+    }
 
     if let Some(entries) = dictionary.as_dictionary() {
         for (key, child) in entries {
@@ -532,7 +538,7 @@ fn xobject_name_is_ignorable(version: &str) -> bool {
 }
 
 #[cfg(test)]
-pub fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_image_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     // Image /Name is required only in PDF 1.0 and obsolescent afterwards.
@@ -679,35 +685,31 @@ fn normalized_direct_resource_value<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "keeps the helper signature aligned with sibling fallible normalization helpers"
-)]
 fn normalized_non_stream_resource_object<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
     redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<Option<ObjectHandle>> {
+) -> Option<ObjectHandle> {
     if object.as_stream_dict().is_some() || pdf.resolve(object).is_err() {
-        return Ok(None);
+        return None;
     }
     if let Some(entries) = object.as_dictionary() {
-        return Ok(Some(ObjectHandle::dictionary(
+        return Some(ObjectHandle::dictionary(
             entries
                 .into_iter()
                 .map(|(key, value)| (key, normalized_direct_resource_value(pdf, value, redirects)))
                 .collect(),
-        )));
+        ));
     }
     if let Some(items) = object.as_array() {
-        return Ok(Some(ObjectHandle::array(
+        return Some(ObjectHandle::array(
             items
                 .into_iter()
                 .map(|value| normalized_direct_resource_value(pdf, value, redirects))
                 .collect(),
-        )));
+        ));
     }
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
@@ -715,7 +717,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
     dependency_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects = HashMap::new();
 
@@ -724,7 +726,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
             continue;
         };
         let Some(normalized) =
-            normalized_non_stream_resource_object(pdf, object, dependency_redirects)?
+            normalized_non_stream_resource_object(pdf, object, dependency_redirects)
         else {
             continue;
         };
@@ -743,7 +745,7 @@ fn exact_non_stream_resource_redirects_for_dependencies<R: Read + Seek + 'static
         }
     }
 
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -766,8 +768,10 @@ fn collect_form_resource_objects<R: Read + Seek + 'static>(
         value.clone()
     };
 
-    let is_indirect_non_stream = value.as_stream_dict().is_none() && value.object_ref().is_some();
-    if is_indirect_non_stream && (value.as_dictionary().is_some() || value.as_array().is_some()) {
+    if value.as_stream_dict().is_none()
+        && value.object_ref().is_some()
+        && (value.as_dictionary().is_some() || value.as_array().is_some())
+    {
         resource_objects.push(value.clone());
     }
 
@@ -819,7 +823,7 @@ fn form_resource_objects<R: Read + Seek + 'static>(
 fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     resource_objects: &[ObjectHandle],
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     // Exact resource containers can themselves refer to duplicated indirect
     // containers. Iterate until those identity-only differences stop exposing
     // new exact matches. Restrict the fixed point to objects reachable from
@@ -827,17 +831,14 @@ fn exact_non_stream_resource_redirects<R: Read + Seek + 'static>(
     // of magnitude more expensive and cannot affect a Form fingerprint.
     let mut redirects = HashMap::new();
     for _ in 0..=resource_objects.len() {
-        let next = exact_non_stream_resource_redirects_for_dependencies(
-            pdf,
-            resource_objects,
-            &redirects,
-        )?;
+        let next =
+            exact_non_stream_resource_redirects_for_dependencies(pdf, resource_objects, &redirects);
         if next == redirects {
-            return Ok(next);
+            return next;
         }
         redirects = next;
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -845,14 +846,10 @@ fn normalized_dictionary_with_redirects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: &ObjectHandle,
     redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<Option<ObjectHandle>> {
-    let Some(normalized) = normalized_non_stream_resource_object(pdf, object, redirects)? else {
-        return Ok(None);
-    };
-    if normalized.as_dictionary().is_none() {
-        return Ok(None);
-    }
-    Ok(Some(normalized))
+) -> Option<ObjectHandle> {
+    let normalized = normalized_non_stream_resource_object(pdf, object, redirects)?;
+    normalized.as_dictionary()?;
+    Some(normalized)
 }
 
 #[cfg(test)]
@@ -877,7 +874,7 @@ fn exact_form_font_redirects<R: Read + Seek + 'static>(
         if !matches!(object_type.try_is_name_and_equals(b"Font"), Ok(true)) {
             continue;
         }
-        let Some(normalized) = normalized_dictionary_with_redirects(pdf, object, exact_redirects)?
+        let Some(normalized) = normalized_dictionary_with_redirects(pdf, object, exact_redirects)
         else {
             continue;
         };
@@ -1105,10 +1102,6 @@ fn form_fingerprint<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "keeps the fixed-point helper interface aligned with fallible redirect builders"
-)]
 fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     objects: &[ObjectHandle],
@@ -1117,7 +1110,7 @@ fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
     font_redirects: &HashMap<ObjectRef, ObjectRef>,
     image_redirects: &HashMap<ObjectRef, ObjectRef>,
     dependency_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects = HashMap::new();
     for object in objects {
@@ -1143,7 +1136,7 @@ fn form_redirects_for_dependencies<R: Read + Seek + 'static>(
             canonical_by_fingerprint.insert(fingerprint, object_ref);
         }
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
@@ -1154,7 +1147,7 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
     exact_redirects: &HashMap<ObjectRef, ObjectRef>,
     font_redirects: &HashMap<ObjectRef, ObjectRef>,
     image_redirects: &HashMap<ObjectRef, ObjectRef>,
-) -> Result<HashMap<ObjectRef, ObjectRef>> {
+) -> HashMap<ObjectRef, ObjectRef> {
     let form_count = objects
         .iter()
         .filter(|object| {
@@ -1174,24 +1167,24 @@ fn fixed_point_form_redirects<R: Read + Seek + 'static>(
             font_redirects,
             image_redirects,
             &redirects,
-        )?;
+        );
         if next == redirects {
-            return Ok(next);
+            return next;
         }
         redirects = next;
     }
-    Ok(redirects)
+    redirects
 }
 
 #[cfg(test)]
-pub fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
     let holders = xobject_holders(&objects);
     let icon_holders = form_icon_holders(&objects);
     let resource_objects = form_resource_objects(pdf, &objects);
-    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects)?;
+    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects);
     let font_redirects = exact_form_font_redirects(pdf, &objects, &exact_redirects)?;
     let image_redirects = virtual_form_image_redirects(pdf, &objects, &exact_redirects)?;
 
@@ -1214,7 +1207,7 @@ pub fn canonicalize_form_xobjects<R: Read + Seek + 'static>(
         &exact_redirects,
         &font_redirects,
         &image_redirects,
-    )?;
+    );
 
     let mut duplicate_refs = HashSet::new();
     let mut duplicate_raw_bytes = 0_usize;
@@ -1311,7 +1304,7 @@ fn appearance_holders<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-pub fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1325,7 +1318,7 @@ pub fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
     // Form dedup while retaining appearance's stricter dictionary semantics:
     // unlike general Form XObjects, /Name is not ignored here.
     let resource_objects = form_resource_objects(pdf, &objects);
-    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects)?;
+    let exact_redirects = exact_non_stream_resource_redirects(pdf, &resource_objects);
     let font_redirects = exact_form_font_redirects(pdf, &objects, &exact_redirects)?;
     let image_redirects = virtual_form_image_redirects(pdf, &objects, &exact_redirects)?;
     let dependency_redirects = fixed_point_form_redirects(
@@ -1335,7 +1328,7 @@ pub fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
         &exact_redirects,
         &font_redirects,
         &image_redirects,
-    )?;
+    );
 
     let mut canonical_by_fingerprint: HashMap<[u8; 32], ObjectRef> = HashMap::new();
     let mut redirects: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -1403,7 +1396,7 @@ pub fn canonicalize_appearance_streams<R: Read + Seek + 'static>(
 }
 
 #[cfg(test)]
-pub fn canonicalize_page_contents<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_page_contents<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     #[derive(Clone)]
@@ -1564,7 +1557,7 @@ fn collect_direct_type3_charprocs(
 }
 
 #[cfg(test)]
-pub fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_type3_charprocs<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1691,7 +1684,7 @@ fn to_unicode_holders(objects: &[ObjectHandle]) -> Vec<ObjectHandle> {
 }
 
 #[cfg(test)]
-pub fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_to_unicode_cmaps<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1790,7 +1783,7 @@ fn font_program_fingerprint(object: &ObjectHandle, domain: &[u8]) -> Result<Opti
 }
 
 #[cfg(test)]
-pub fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
+pub(crate) fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> Result<TargetedDedupStats> {
     let objects = pdf.get_all_objects()?;
@@ -1861,67 +1854,11 @@ pub fn canonicalize_font_program_streams<R: Read + Seek + 'static>(
 
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HayroFontProgramHolder {
-    holder: CowObjectHandle,
-    key: Vec<u8>,
-    program: CowObjectHandle,
-}
-
-fn inspect_hayro_font_program_holders(
-    holder: CowObjectHandle,
-    dictionary: &hayro_syntax::object::Dict<'_>,
-    holders: &mut Vec<HayroFontProgramHolder>,
-) {
-    for key in HAYRO_FONT_FILE_KEYS {
-        if let Some(program) = dictionary.get_ref(key) {
-            holders.push(HayroFontProgramHolder {
-                holder,
-                key: key.to_vec(),
-                program: CowObjectHandle::Existing(program.into()),
-            });
-        }
-    }
-}
-
-fn inspect_owned_font_program_holders(
-    holder: CowObjectHandle,
-    dictionary: &OwnedDictionary,
-    holders: &mut Vec<HayroFontProgramHolder>,
-) {
-    for key in HAYRO_FONT_FILE_KEYS {
-        let Some(OwnedObject::Reference(program)) = dictionary.get(key) else {
-            continue;
-        };
-        holders.push(HayroFontProgramHolder {
-            holder,
-            key: key.to_vec(),
-            program: *program,
-        });
-    }
-}
-
-fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<HayroFontProgramHolder>> {
+fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
     let mut holders = Vec::new();
-    document.walk_output_objects(|handle, object| {
-        match object {
-            CurrentObject::Source(object) => match &object {
-                HayroObject::Dict(dictionary) => {
-                    inspect_hayro_font_program_holders(handle, dictionary, &mut holders);
-                }
-                HayroObject::Stream(stream) => {
-                    inspect_hayro_font_program_holders(handle, stream.dict(), &mut holders);
-                }
-                _ => {}
-            },
-            CurrentObject::Owned(object) => {
-                if let Some(dictionary) = object.as_dictionary() {
-                    inspect_owned_font_program_holders(handle, dictionary, &mut holders);
-                }
-            }
-        }
-        Ok(())
-    })?;
+    for key in HAYRO_FONT_FILE_KEYS {
+        holders.extend(hayro_direct_reference_holders(document, key)?);
+    }
     Ok(holders)
 }
 
@@ -2071,32 +2008,7 @@ fn hayro_font_program_fingerprint(
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
-fn rewrite_font_program_holder(
-    document: &mut EditDocument,
-    holder: &HayroFontProgramHolder,
-    canonical: CowObjectHandle,
-) -> Result<bool> {
-    let object = match holder.holder {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
-    };
-    let Some(dictionary) = object.as_dictionary_mut() else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.key.as_slice()) else {
-        return Ok(false);
-    };
-    if *current != holder.program {
-        return Ok(false);
-    }
-    dictionary.insert(holder.key.clone(), OwnedObject::Reference(canonical));
-    Ok(true)
-}
-
-pub fn canonicalize_font_program_streams_hayro(
+pub(crate) fn canonicalize_font_program_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_font_program_holders(document)?;
@@ -2107,31 +2019,28 @@ pub fn canonicalize_font_program_streams_hayro(
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_font_program_fingerprint(document, holder.program, &holder.key)?
+            hayro_font_program_fingerprint(document, holder.target, &holder.key)?
         else {
             continue;
         };
         if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.program {
-                redirects.insert((holder.key.clone(), holder.program), canonical);
-                if duplicate_refs.insert(holder.program) {
+            if canonical != holder.target {
+                redirects.insert((holder.key.clone(), holder.target), canonical);
+                if duplicate_refs.insert(holder.target) {
                     duplicate_raw_bytes += raw_bytes;
                 }
             }
         } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.program);
+            canonical_by_fingerprint.insert(fingerprint, holder.target);
         }
     }
 
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects
-            .get(&(holder.key.clone(), holder.program))
-            .copied()
-        else {
+        let Some(canonical) = redirects.get(&(holder.key.clone(), holder.target)).copied() else {
             continue;
         };
-        if rewrite_font_program_holder(document, holder, canonical)? {
+        if rewrite_direct_reference_holder(document, holder, canonical)? {
             references_canonicalized += 1;
         }
     }
@@ -2310,10 +2219,7 @@ fn rewrite_direct_reference_holder(
 ) -> Result<bool> {
     let root = match holder.root {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let Some(holder_object) = object_at_direct_path_mut(root, &holder.path) else {
         return Ok(false);
@@ -2374,7 +2280,7 @@ fn canonicalize_named_stream_references_hayro(
     })
 }
 
-pub fn canonicalize_metadata_streams_hayro(
+pub(crate) fn canonicalize_metadata_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     canonicalize_named_stream_references_hayro(document, b"Metadata", b"metadata")
@@ -2515,10 +2421,7 @@ fn rewrite_direct_array_reference_holder(
 ) -> Result<bool> {
     let root = match holder.root {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let Some(array_object) = object_at_direct_path_mut(root, &holder.path) else {
         return Ok(false);
@@ -2536,7 +2439,9 @@ fn rewrite_direct_array_reference_holder(
     Ok(true)
 }
 
-pub fn canonicalize_icc_profiles_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+pub(crate) fn canonicalize_icc_profiles_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
     let holders = hayro_icc_array_holders(document)?;
     let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
     let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
@@ -2597,7 +2502,7 @@ fn object_at_direct_path_mut<'a>(
 /// flpdf `get_all_objects()` coverage. On damaged or oddly indexed PDFs Hayro
 /// can therefore find additional real `/ToUnicode` holders that the legacy
 /// pass skipped; every rewrite still requires an exact stream fingerprint.
-pub fn canonicalize_to_unicode_cmaps_hayro(
+pub(crate) fn canonicalize_to_unicode_cmaps_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     canonicalize_named_stream_references_hayro(document, b"ToUnicode", b"to-unicode")
@@ -2824,10 +2729,7 @@ fn rewrite_type3_glyph_holder(
 ) -> Result<bool> {
     let root = match holder.target.root {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let Some(charprocs) = object_at_direct_path_mut(root, &holder.target.path) else {
         return Ok(false);
@@ -2845,7 +2747,7 @@ fn rewrite_type3_glyph_holder(
     Ok(true)
 }
 
-pub fn canonicalize_type3_charprocs_hayro(
+pub(crate) fn canonicalize_type3_charprocs_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_type3_glyph_holders(document)?;
@@ -2987,21 +2889,7 @@ fn reachable_streams_with_subtype(
     document: &EditDocument,
     subtype: &[u8],
 ) -> Result<Vec<CowObjectHandle>> {
-    let mut streams = Vec::new();
-    for handle in document.reachable_output_objects()? {
-        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
-        else {
-            continue;
-        };
-        let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
-            continue;
-        };
-        if matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == subtype)
-        {
-            streams.push(handle);
-        }
-    }
-    Ok(streams)
+    document.reachable_streams_with_subtype(subtype)
 }
 
 fn exact_stream_redirects_hayro(
@@ -3067,10 +2955,7 @@ fn rewrite_dictionary_reference_keys(
     }
     let object = match handle {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let Some(dictionary) = object.as_dictionary_mut() else {
         return Ok(0);
@@ -3080,6 +2965,75 @@ fn rewrite_dictionary_reference_keys(
         dictionary.insert(key, OwnedObject::Reference(target));
     }
     Ok(count)
+}
+
+fn inspect_hayro_dictionary_target_dictionary(
+    root: CowObjectHandle,
+    dictionary: &hayro_syntax::object::Dict<'_>,
+    key: &[u8],
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) {
+    if let Some(target) = dictionary.get_ref(key) {
+        targets.insert(DirectDictionaryTarget {
+            root: CowObjectHandle::Existing(target.into()),
+            path: Vec::new(),
+        });
+    } else if matches!(
+        dictionary.get_raw::<HayroObject<'_>>(key),
+        Some(HayroMaybeRef::NotRef(HayroObject::Dict(_)))
+    ) {
+        let mut target_path = path.clone();
+        target_path.push(DirectPathStep::DictKey(key.to_vec()));
+        targets.insert(DirectDictionaryTarget {
+            root,
+            path: target_path,
+        });
+    }
+
+    for (name, value) in dictionary.entries() {
+        if name.as_ref() == key {
+            continue;
+        }
+        let HayroMaybeRef::NotRef(value) = value else {
+            continue;
+        };
+        path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+        inspect_hayro_dictionary_target(root, &value, key, path, targets);
+        path.pop();
+    }
+}
+
+fn inspect_hayro_dictionary_target(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    key: &[u8],
+    path: &mut Vec<DirectPathStep>,
+    targets: &mut BTreeSet<DirectDictionaryTarget>,
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            inspect_hayro_dictionary_target_dictionary(root, dictionary, key, path, targets);
+        }
+        HayroObject::Stream(stream) => {
+            inspect_hayro_dictionary_target_dictionary(root, stream.dict(), key, path, targets);
+        }
+        HayroObject::Array(values) => {
+            for (index, value) in values.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_hayro_dictionary_target(root, &value, key, path, targets);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
 }
 
 fn inspect_owned_dictionary_target(
@@ -3138,12 +3092,17 @@ fn hayro_dictionary_targets(
     key: &[u8],
 ) -> Result<BTreeSet<DirectDictionaryTarget>> {
     let mut targets = BTreeSet::new();
-    for root in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(root)? else {
-            continue;
-        };
-        inspect_owned_dictionary_target(root, &object, key, &mut Vec::new(), &mut targets);
-    }
+    document.walk_output_objects(|root, object| {
+        match object {
+            CurrentObject::Source(object) => {
+                inspect_hayro_dictionary_target(root, &object, key, &mut Vec::new(), &mut targets);
+            }
+            CurrentObject::Owned(object) => {
+                inspect_owned_dictionary_target(root, object, key, &mut Vec::new(), &mut targets);
+            }
+        }
+        Ok(())
+    })?;
     Ok(targets)
 }
 
@@ -3177,10 +3136,7 @@ fn rewrite_dictionary_target_entries(
         }
         let root = match target.root {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         let Some(dictionary) =
             object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
@@ -3195,10 +3151,13 @@ fn rewrite_dictionary_target_entries(
     Ok(rewritten)
 }
 
-pub fn canonicalize_image_xobjects_hayro(
+pub(crate) fn canonicalize_image_xobjects_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let images = reachable_streams_with_subtype(document, b"Image")?;
+    if !stream_payloads_may_repeat(document, &images)? {
+        return Ok(TargetedDedupStats::default());
+    }
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
     } else {
@@ -3352,24 +3311,417 @@ fn exact_non_stream_resource_redirects_hayro(
     Ok(redirects)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectReferenceHolder {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+    target: CowObjectHandle,
+}
+
+fn inspect_hayro_redirect_reference_holders(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<RedirectReferenceHolder>,
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            for (name, value) in dictionary.entries() {
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                match value {
+                    HayroMaybeRef::Ref(target) => {
+                        let target = CowObjectHandle::Existing(target.into());
+                        if redirects.contains_key(&target) {
+                            holders.push(RedirectReferenceHolder {
+                                root,
+                                path: path.clone(),
+                                target,
+                            });
+                        }
+                    }
+                    HayroMaybeRef::NotRef(value) => {
+                        inspect_hayro_redirect_reference_holders(
+                            root, &value, redirects, path, holders,
+                        );
+                    }
+                }
+                path.pop();
+            }
+        }
+        HayroObject::Stream(stream) => {
+            for (name, value) in stream.dict().entries() {
+                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+                match value {
+                    HayroMaybeRef::Ref(target) => {
+                        let target = CowObjectHandle::Existing(target.into());
+                        if redirects.contains_key(&target) {
+                            holders.push(RedirectReferenceHolder {
+                                root,
+                                path: path.clone(),
+                                target,
+                            });
+                        }
+                    }
+                    HayroMaybeRef::NotRef(value) => {
+                        inspect_hayro_redirect_reference_holders(
+                            root, &value, redirects, path, holders,
+                        );
+                    }
+                }
+                path.pop();
+            }
+        }
+        HayroObject::Array(array) => {
+            for (index, value) in array.raw_iter().enumerate() {
+                path.push(DirectPathStep::ArrayIndex(index));
+                match value {
+                    HayroMaybeRef::Ref(target) => {
+                        let target = CowObjectHandle::Existing(target.into());
+                        if redirects.contains_key(&target) {
+                            holders.push(RedirectReferenceHolder {
+                                root,
+                                path: path.clone(),
+                                target,
+                            });
+                        }
+                    }
+                    HayroMaybeRef::NotRef(value) => {
+                        inspect_hayro_redirect_reference_holders(
+                            root, &value, redirects, path, holders,
+                        );
+                    }
+                }
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn inspect_owned_redirect_reference_holders(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<RedirectReferenceHolder>,
+) {
+    match object {
+        OwnedObject::Reference(target) => {
+            if redirects.contains_key(target) {
+                holders.push(RedirectReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    target: *target,
+                });
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(DirectPathStep::ArrayIndex(index));
+                inspect_owned_redirect_reference_holders(root, value, redirects, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for (name, value) in dictionary {
+                path.push(DirectPathStep::DictKey(name.clone()));
+                inspect_owned_redirect_reference_holders(root, value, redirects, path, holders);
+                path.pop();
+            }
+        }
+        OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+fn rewrite_all_references_hayro(
+    document: &mut EditDocument,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<usize> {
+    if redirects.is_empty() {
+        return Ok(0);
+    }
+
+    let mut holders = Vec::new();
+    document.walk_output_objects(|root, object| {
+        match object {
+            CurrentObject::Source(object) => inspect_hayro_redirect_reference_holders(
+                root,
+                &object,
+                redirects,
+                &mut Vec::new(),
+                &mut holders,
+            ),
+            CurrentObject::Owned(object) => inspect_owned_redirect_reference_holders(
+                root,
+                object,
+                redirects,
+                &mut Vec::new(),
+                &mut holders,
+            ),
+        }
+        Ok(())
+    })?;
+
+    let mut rewritten = 0usize;
+    for holder in holders {
+        let canonical = canonical_cow_redirect(holder.target, redirects);
+        if canonical == holder.target {
+            continue;
+        }
+        let root = match holder.root {
+            CowObjectHandle::Existing(id) => document.edit_object(id)?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
+        };
+        let Some(value) = object_at_direct_path_mut(root, &holder.path) else {
+            continue;
+        };
+        let OwnedObject::Reference(current) = value else {
+            continue;
+        };
+        if *current != holder.target {
+            continue;
+        }
+        *current = canonical;
+        rewritten = rewritten.saturating_add(1);
+    }
+    Ok(rewritten)
+}
+
+fn exact_dictionary_redirects_hayro(
+    document: &EditDocument,
+    handles: &BTreeSet<CowObjectHandle>,
+    domain: &[u8],
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut canonical_by_fingerprint =
+        HashMap::<[u8; 32], Vec<(CowObjectHandle, OwnedObject)>>::new();
+    let mut redirects = HashMap::new();
+
+    for &handle in handles {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        if !matches!(object, OwnedObject::Dictionary(_)) {
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, domain);
+        hash_owned_object(&mut hasher, &object)?;
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+
+        let candidates = canonical_by_fingerprint.entry(fingerprint).or_default();
+        if let Some((canonical, _)) = candidates
+            .iter()
+            .find(|(_, candidate)| *candidate == object)
+        {
+            if *canonical != handle {
+                redirects.insert(handle, *canonical);
+            }
+        } else {
+            candidates.push((handle, object));
+        }
+    }
+
+    Ok(redirects)
+}
+
+pub(crate) fn canonicalize_exact_extgstate_dictionaries_hayro(
+    document: &mut EditDocument,
+) -> Result<ExactObjectDedupStats> {
+    let targets = hayro_dictionary_targets(document, b"ExtGState")?;
+    let mut handles = BTreeSet::new();
+    for target in &targets {
+        let Some(snapshot) = document.current_owned_object(target.root)? else {
+            continue;
+        };
+        let Some(dictionary) =
+            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
+        else {
+            continue;
+        };
+        for value in dictionary.values() {
+            if let OwnedObject::Reference(handle) = value {
+                handles.insert(*handle);
+            }
+        }
+    }
+
+    let redirects =
+        exact_dictionary_redirects_hayro(document, &handles, b"exact-extgstate-dictionary")?;
+    let references_canonicalized =
+        rewrite_dictionary_target_entries(document, &targets, &redirects)?;
+    Ok(ExactObjectDedupStats {
+        duplicate_objects_detected: redirects.len(),
+        references_canonicalized,
+    })
+}
+
+pub(crate) fn canonicalize_exact_structure_attribute_dictionaries_hayro(
+    document: &mut EditDocument,
+) -> Result<ExactObjectDedupStats> {
+    let mut holders = Vec::new();
+    let mut handles = BTreeSet::new();
+    document.walk_output_objects(|root, object| {
+        let target = match object {
+            CurrentObject::Source(HayroObject::Dict(dictionary)) => {
+                let is_struct_elem = dictionary
+                    .get::<HayroName<'_>>(b"Type")
+                    .is_some_and(|name| name.as_ref() == b"StructElem");
+                is_struct_elem
+                    .then(|| dictionary.get_ref(b"A"))
+                    .flatten()
+                    .map(|target| CowObjectHandle::Existing(target.into()))
+            }
+            CurrentObject::Source(HayroObject::Stream(stream)) => {
+                let dictionary = stream.dict();
+                let is_struct_elem = dictionary
+                    .get::<HayroName<'_>>(b"Type")
+                    .is_some_and(|name| name.as_ref() == b"StructElem");
+                is_struct_elem
+                    .then(|| dictionary.get_ref(b"A"))
+                    .flatten()
+                    .map(|target| CowObjectHandle::Existing(target.into()))
+            }
+            CurrentObject::Owned(object) => {
+                let Some(dictionary) = object.as_dictionary() else {
+                    return Ok(());
+                };
+                let Some(object_type) = dictionary.get(b"Type".as_slice()) else {
+                    return Ok(());
+                };
+                if !matches!(
+                    document.resolve_owned_value(object_type)?,
+                    Some(OwnedObject::Name(name)) if name == b"StructElem"
+                ) {
+                    return Ok(());
+                }
+                match dictionary.get(b"A".as_slice()) {
+                    Some(OwnedObject::Reference(target)) => Some(*target),
+                    _ => None,
+                }
+            }
+            CurrentObject::Source(_) => None,
+        };
+
+        let Some(target) = target else {
+            return Ok(());
+        };
+        holders.push(DirectReferenceHolder {
+            root,
+            path: Vec::new(),
+            key: b"A".to_vec(),
+            target,
+        });
+        handles.insert(target);
+        Ok(())
+    })?;
+
+    let redirects = exact_dictionary_redirects_hayro(
+        document,
+        &handles,
+        b"exact-structure-attribute-dictionary",
+    )?;
+    let mut references_canonicalized = 0usize;
+    for holder in &holders {
+        let Some(canonical) = redirects.get(&holder.target).copied() else {
+            continue;
+        };
+        if rewrite_direct_reference_holder(document, holder, canonical)? {
+            references_canonicalized = references_canonicalized.saturating_add(1);
+        }
+    }
+    Ok(ExactObjectDedupStats {
+        duplicate_objects_detected: redirects.len(),
+        references_canonicalized,
+    })
+}
+
+fn reachable_dictionaries_with_type(
+    document: &EditDocument,
+    object_type: &[u8],
+) -> Result<Vec<CowObjectHandle>> {
+    let mut handles = Vec::new();
+    document.walk_output_objects(|handle, object| {
+        let matches_type = match object {
+            CurrentObject::Source(HayroObject::Dict(dictionary)) => dictionary
+                .get::<HayroName<'_>>(b"Type")
+                .is_some_and(|name| name.as_ref() == object_type),
+            CurrentObject::Owned(OwnedObject::Dictionary(dictionary)) => {
+                let Some(value) = dictionary.get(b"Type".as_slice()) else {
+                    return Ok(());
+                };
+                matches!(
+                    document.resolve_owned_value(value)?,
+                    Some(OwnedObject::Name(name)) if name == object_type
+                )
+            }
+            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
+        };
+        if matches_type {
+            handles.push(handle);
+        }
+        Ok(())
+    })?;
+    Ok(handles)
+}
+
+pub(crate) fn canonicalize_exact_font_dictionaries_hayro(
+    document: &mut EditDocument,
+) -> Result<ExactObjectDedupStats> {
+    let handles = reachable_dictionaries_with_type(document, b"Font")?;
+    let mut canonical_by_fingerprint =
+        HashMap::<[u8; 32], Vec<(CowObjectHandle, OwnedObject)>>::new();
+    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
+
+    for handle in handles {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let OwnedObject::Dictionary(_) = &object else {
+            continue;
+        };
+
+        let mut hasher = Sha256::new();
+        hash_len_prefixed(&mut hasher, b"exact-font-dictionary");
+        hash_owned_object(&mut hasher, &object)?;
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+
+        let candidates = canonical_by_fingerprint.entry(fingerprint).or_default();
+        if let Some((canonical, _)) = candidates
+            .iter()
+            .find(|(_, candidate)| *candidate == object)
+        {
+            if *canonical != handle {
+                redirects.insert(handle, *canonical);
+            }
+        } else {
+            candidates.push((handle, object));
+        }
+    }
+
+    let references_canonicalized = rewrite_all_references_hayro(document, &redirects)?;
+    Ok(ExactObjectDedupStats {
+        duplicate_objects_detected: redirects.len(),
+        references_canonicalized,
+    })
+}
+
 fn exact_form_font_redirects_hayro(
     document: &EditDocument,
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
     let mut redirects = HashMap::new();
-    for handle in document.reachable_output_objects()? {
-        let Some(OwnedObject::Dictionary(dictionary)) = document.current_owned_object(handle)?
-        else {
-            continue;
-        };
-        let Some(value) = dictionary.get(b"Type".as_slice()) else {
-            continue;
-        };
-        if !matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == b"Font")
-        {
-            continue;
-        }
+    for handle in reachable_dictionaries_with_type(document, b"Font")? {
         let Some(fingerprint) = hash_non_stream_object_with_redirects(
             document,
             handle,
@@ -3476,9 +3828,8 @@ fn resolved_dictionary_clone(
     Ok(document
         .resolve_owned_value(value)?
         .and_then(|object| match object {
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-                Some(dictionary)
-            }
+            OwnedObject::Dictionary(dictionary) => Some(dictionary),
+            OwnedObject::Stream { dictionary, .. } => Some(dictionary),
             _ => None,
         }))
 }
@@ -3742,10 +4093,7 @@ fn rewrite_selected_dictionary_entries(
         }
         let root = match target.root {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         let Some(dictionary) =
             object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
@@ -3768,11 +4116,37 @@ struct FormDependencyRedirects {
     forms: HashMap<CowObjectHandle, CowObjectHandle>,
 }
 
+fn stream_payloads_may_repeat(document: &EditDocument, forms: &[CowObjectHandle]) -> Result<bool> {
+    let mut seen = HashSet::<[u8; 32]>::new();
+    for &form in forms {
+        let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(form)? else {
+            continue;
+        };
+        let raw = data.bytes(document.source())?;
+        let fingerprint: [u8; 32] = Sha256::digest(raw.as_ref()).into();
+        if !seen.insert(fingerprint) {
+            // Hash collisions only cause a conservative fallback to the exact
+            // dedup pass; they can never make this proof skip equal payloads.
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn form_dependency_redirects_hayro(
     document: &EditDocument,
     ignored_form_dictionary_keys: &[&[u8]],
 ) -> Result<FormDependencyRedirects> {
     let form_streams = reachable_streams_with_subtype(document, b"Form")?;
+    if !stream_payloads_may_repeat(document, &form_streams)? {
+        return Ok(FormDependencyRedirects {
+            form_streams,
+            exact: HashMap::new(),
+            fonts: HashMap::new(),
+            images: HashMap::new(),
+            forms: HashMap::new(),
+        });
+    }
     let images = reachable_streams_with_subtype(document, b"Image")?;
     let resources = form_resource_handles(document, &form_streams)?;
     let exact = exact_non_stream_resource_redirects_hayro(document, &resources)?;
@@ -3795,13 +4169,18 @@ fn form_dependency_redirects_hayro(
     })
 }
 
-pub fn canonicalize_form_xobjects_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+pub(crate) fn canonicalize_form_xobjects_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
     } else {
         &[]
     };
     let dependencies = form_dependency_redirects_hayro(document, ignored)?;
+    if dependencies.forms.is_empty() {
+        return Ok(TargetedDedupStats::default());
+    }
     let mut duplicate_raw_bytes = 0_usize;
     for &form in &dependencies.form_streams {
         if dependencies.forms.contains_key(&form)
@@ -3872,7 +4251,7 @@ fn appearance_dictionary_targets(
     Ok(targets)
 }
 
-pub fn canonicalize_appearance_streams_hayro(
+pub(crate) fn canonicalize_appearance_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = appearance_dictionary_targets(document)?;
@@ -3937,7 +4316,7 @@ enum PageContentHolder {
 }
 
 impl PageContentHolder {
-    const fn target(&self) -> CowObjectHandle {
+    fn target(&self) -> CowObjectHandle {
         match self {
             Self::Dictionary(holder) => holder.target,
             Self::Array(holder) => holder.target,
@@ -3957,30 +4336,7 @@ impl PageContentHolder {
 }
 
 fn page_handles_hayro(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
-    let mut pages = BTreeSet::new();
-    pages.extend(
-        document
-            .source()
-            .page_ids()
-            .into_iter()
-            .map(CowObjectHandle::Existing),
-    );
-    for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(value) = dictionary.get(b"Type".as_slice()) else {
-            continue;
-        };
-        if matches!(document.resolve_owned_value(value)?, Some(OwnedObject::Name(name)) if name == b"Page")
-        {
-            pages.insert(handle);
-        }
-    }
-    Ok(pages.into_iter().collect())
+    document.page_handles()
 }
 
 fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
@@ -4049,7 +4405,9 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
     Ok(holders)
 }
 
-pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+pub(crate) fn canonicalize_page_contents_hayro(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
     let holders = page_content_holders_hayro(document)?;
     let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
     let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
@@ -4112,7 +4470,7 @@ mod tests {
     }
 
     fn untyped_metadata_stream(
-        pdf: &Pdf<std::io::Cursor<Vec<u8>>>,
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
         data: &[u8],
     ) -> Result<ObjectHandle> {
         pdf.new_stream_with_data(Rc::new(data.to_vec()))
@@ -4170,12 +4528,10 @@ mod tests {
         let payload = b"<x:xmpmeta>same payload, separate indirect lengths</x:xmpmeta>";
         let first = metadata_stream(&mut pdf, payload)?;
         let second = metadata_stream(&mut pdf, payload)?;
-        let first_length = pdf.make_indirect_object_handle(ObjectHandle::integer(
-            i64::try_from(payload.len()).expect("test fixture length fits i64"),
-        ))?;
-        let second_length = pdf.make_indirect_object_handle(ObjectHandle::integer(
-            i64::try_from(payload.len()).expect("test fixture length fits i64"),
-        ))?;
+        let first_length =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
+        let second_length =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
         let first_dict = first
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("first metadata stream has no dictionary".to_owned()))?;
@@ -4255,8 +4611,8 @@ mod tests {
     fn canonicalizes_metadata_references_even_when_type_is_missing() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let payload = b"<x:xmpmeta>producer forgot Type</x:xmpmeta>";
-        let first = untyped_metadata_stream(&pdf, payload)?;
-        let second = untyped_metadata_stream(&pdf, payload)?;
+        let first = untyped_metadata_stream(&mut pdf, payload)?;
+        let second = untyped_metadata_stream(&mut pdf, payload)?;
         let first_holder = holder(&mut pdf, first)?;
         let second_holder = holder(&mut pdf, second)?;
         let root = pdf.root_handle()?;
@@ -4704,10 +5060,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the test intentionally constructs one complete nested resource graph fixture inline"
-    )]
     fn canonicalizes_nested_exact_form_resource_graphs() -> Result<()> {
         let mut pdf = Pdf::empty()?;
 
@@ -5406,12 +5758,7 @@ mod tests {
         };
         page_handles.push(page.clone());
         pages.replace_key(b"/Kids", ObjectHandle::array(page_handles.clone()))?;
-        pages.replace_key(
-            b"/Count",
-            ObjectHandle::integer(
-                i64::try_from(page_handles.len()).expect("test fixture length fits i64"),
-            ),
-        )?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(page_handles.len() as i64))?;
         pdf.mark_object_handle_dirty(&pages)?;
         Ok(page)
     }
@@ -5800,10 +6147,7 @@ mod tests {
         let dict = stream
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("new font stream has no dictionary".to_owned()))?;
-        dict.replace_key(
-            b"/Length1",
-            ObjectHandle::integer(i64::try_from(data.len()).expect("test fixture length fits i64")),
-        )?;
+        dict.replace_key(b"/Length1", ObjectHandle::integer(data.len() as i64))?;
         pdf.mark_object_handle_dirty(&dict)?;
         Ok(stream)
     }
@@ -5902,9 +6246,8 @@ mod tests {
         let different_dict = font_program(&mut pdf, payload)?;
 
         for stream in [&first, &second] {
-            let length = pdf.make_indirect_object_handle(ObjectHandle::integer(
-                i64::try_from(payload.len()).expect("test fixture length fits i64"),
-            ))?;
+            let length =
+                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
             let dict = stream
                 .as_stream_dict()
                 .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
@@ -5974,6 +6317,56 @@ mod tests {
     }
 
     #[test]
+    fn hayro_font_program_dedup_finds_nested_direct_descriptors() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let first = font_program(&mut pdf, b"same-nested-font-program")?;
+        let second = font_program(&mut pdf, b"same-nested-font-program")?;
+        let root = pdf.root_handle()?;
+        root.replace_key(
+            b"/NestedFontA",
+            ObjectHandle::dictionary(vec![(
+                b"/Wrapper".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/FontFile2".to_vec(), first)]),
+            )]),
+        )?;
+        root.replace_key(
+            b"/NestedFontB",
+            ObjectHandle::dictionary(vec![(
+                b"/Wrapper".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/FontFile2".to_vec(), second)]),
+            )]),
+        )?;
+        pdf.mark_object_handle_dirty(&root)?;
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory()?;
+        writer.set_preserve_unreferenced_objects(false);
+        writer.write()?;
+        let input = writer.get_buffer()?;
+
+        let mut document = EditDocument::from_bytes(input)?;
+        let stats = canonicalize_font_program_streams_hayro(&mut document)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+
+        let output = document.write_compact()?;
+        let mut reparsed = Pdf::open(Cursor::new(output))?;
+        let root = reparsed.root_handle()?;
+        let first = root
+            .try_get_key(b"/NestedFontA")?
+            .try_get_key(b"/Wrapper")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        let second = root
+            .try_get_key(b"/NestedFontB")?
+            .try_get_key(b"/Wrapper")?
+            .try_get_key(b"/FontFile2")?
+            .object_ref();
+        assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
     fn canonicalizes_font_programs_only_with_same_fontfile_kind_and_dictionary() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let first = font_program(&mut pdf, b"same-font-program")?;
@@ -6024,18 +6417,16 @@ mod tests {
         let different_length = font_program(&mut pdf, payload)?;
 
         for stream in [&first, &second] {
-            let length = pdf.make_indirect_object_handle(ObjectHandle::integer(
-                i64::try_from(payload.len()).expect("test fixture length fits i64"),
-            ))?;
+            let length =
+                pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64))?;
             let dict = stream
                 .as_stream_dict()
                 .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;
             dict.replace_key(b"/Length1", length)?;
             pdf.mark_object_handle_dirty(&dict)?;
         }
-        let different_length_ref = pdf.make_indirect_object_handle(ObjectHandle::integer(
-            i64::try_from(payload.len()).expect("test fixture length fits i64") + 1,
-        ))?;
+        let different_length_ref =
+            pdf.make_indirect_object_handle(ObjectHandle::integer(payload.len() as i64 + 1))?;
         let different_length_dict = different_length
             .as_stream_dict()
             .ok_or_else(|| Error::Invalid("font stream has no dictionary".to_owned()))?;

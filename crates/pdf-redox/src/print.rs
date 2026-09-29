@@ -298,7 +298,7 @@ struct PlacementWalkState<'a> {
 )]
 fn scan_form<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
-    form: ObjectHandle,
+    form: &ObjectHandle,
     outer_ctm: Matrix,
     inherited_xobjects: &BTreeMap<Vec<u8>, ObjectHandle>,
     state: &mut PlacementWalkState<'_>,
@@ -308,7 +308,7 @@ fn scan_form<R: Read + Seek + 'static>(
         *state.complete = false;
         return Ok(());
     }
-    pdf.resolve(&form)?;
+    pdf.resolve(form)?;
     let Some(dict) = form.as_stream_dict() else {
         *state.complete = false;
         return Ok(());
@@ -378,7 +378,7 @@ fn process_draws<R: Read + Seek + 'static>(
                 *state.complete = false;
             }
         } else if subtype.try_is_name_and_equals(b"Form")? {
-            scan_form(pdf, draw.target, draw.ctm, current_xobjects, state, depth)?;
+            scan_form(pdf, &draw.target, draw.ctm, current_xobjects, state, depth)?;
         }
     }
     Ok(())
@@ -1457,6 +1457,17 @@ fn cow_image_resize_safe(
     let Some(dictionary) = object.as_dictionary() else {
         return Ok(false);
     };
+    // Recovered 1-bit ImageMasks are geometry-like bilevel fields, not
+    // continuous-tone images. Their native grid is intentionally preserved:
+    // generic PPI downsampling either drops subpixel features or fattens them.
+    if let Some(value) = dictionary.get(b"ImageMask".as_slice())
+        && matches!(
+            document.resolve_owned_value(value)?,
+            Some(crate::OwnedObject::Boolean(true))
+        )
+    {
+        return Ok(false);
+    }
     for key in [
         b"SMask".as_slice(),
         b"Mask".as_slice(),

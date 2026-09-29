@@ -18,7 +18,10 @@ version = "0.1.0"
 flpdf = { version = "0.5.1", path = "third_party/flpdf/crates/flpdf" }
 hayro-syntax = { path = "third_party/hayro-syntax", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+libjpeg-turbo-rs = "=0.8.0"
+fax = "=0.3.0"
 sha2 = "0.11"
+smallvec = "1.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -47,3 +50,18 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
+
+# Fast optimized profile for corpus A/Bs and performance work. Keep production
+# release settings untouched, but avoid paying ThinLTO + single-CGU link cost
+# on every experimental candidate.
+[profile.validation]
+inherits = "release"
+codegen-units = 16
+incremental = true
+lto = false
+strip = "none"

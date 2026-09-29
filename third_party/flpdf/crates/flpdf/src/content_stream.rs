@@ -16,13 +16,95 @@
 //! warning sink, so the first recoverable diagnostic is returned as the
 //! corresponding `QPDFExc` error.
 
-use crate::parser::{parse_live_content_stream_object, ContentHandleResolver, SliceLiveInput};
-use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
+use crate::parser::{
+    parse_integer_token, parse_live_content_stream_object_from_tokens, parse_real_token_value,
+    ContentHandleResolver, LiveTokenSource, SliceLiveInput,
+};
+use crate::tokenizer::{Token, TokenType, Tokenizer, TokenizerStateError};
 use crate::{
     object_handle::{DocumentResolver, ObjectHandle},
     Error, QpdfErrorCode, QpdfExc, Result,
 };
 use std::{cell::RefCell, rc::Rc};
+
+/// Lightweight top-level scalar from a PDF content stream.
+///
+/// This is deliberately value-only: content-stream operands have no persistent
+/// PDF object identity, so hot analysis callbacks can consume ordinary
+/// numbers, names, strings, and operators without allocating a full handle.
+/// Containers and malformed/recovery cases still use the canonical parser.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentScalar {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(f64),
+    Name(Vec<u8>),
+    String(Vec<u8>),
+    Operator(Vec<u8>),
+}
+
+impl ContentScalar {
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_real(&self) -> Option<f64> {
+        match self {
+            Self::Real(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(&self) -> Option<&[u8]> {
+        match self {
+            Self::Name(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_operator(&self) -> Option<&[u8]> {
+        match self {
+            Self::Operator(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+fn content_scalar_from_token(token: Token) -> Option<ContentScalar> {
+    if token.error_message.is_some() {
+        return None;
+    }
+    match token.token_type {
+        TokenType::Null => Some(ContentScalar::Null),
+        TokenType::Bool => Some(ContentScalar::Boolean(token.value == b"true")),
+        TokenType::Integer => parse_integer_token(&token).ok().map(ContentScalar::Integer),
+        TokenType::Real => parse_real_token_value(&token).ok().map(ContentScalar::Real),
+        TokenType::Name => {
+            let mut value = token.value;
+            if value.first().copied() != Some(b'/') {
+                return None;
+            }
+            value.remove(0);
+            Some(ContentScalar::Name(value))
+        }
+        TokenType::String => Some(ContentScalar::String(token.value)),
+        TokenType::Word => Some(ContentScalar::Operator(token.value)),
+        _ => None,
+    }
+}
 
 /// Whether content-stream parsing should continue after an object callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,9 +122,45 @@ pub enum ParseControl {
 /// can inspect identity and parsed offsets without introducing an
 /// ObjectHandle-to-Object consumer bridge.
 pub trait ObjectHandleParserCallbacks {
+    /// Whether this callback consumes lightweight top-level content scalars.
+    ///
+    /// Implementations that set this to true must override handle_scalar.
+    /// The parser then moves each scalar directly into the callback instead of
+    /// constructing a heavyweight ObjectHandle.
+    #[doc(hidden)]
+    const HANDLES_CONTENT_SCALARS: bool = false;
+
     /// Receive the full decoded content size before the first object.
     fn content_size(&mut self, _size: usize) -> Result<()> {
         Ok(())
+    }
+
+    /// Consume one lightweight scalar when HANDLES_CONTENT_SCALARS is enabled.
+    #[doc(hidden)]
+    fn handle_scalar(
+        &mut self,
+        _scalar: ContentScalar,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        Err(Error::Internal(
+            "content scalar callback invoked without HANDLES_CONTENT_SCALARS".into(),
+        ))
+    }
+
+    /// Consume an operator without transferring ownership of its token bytes.
+    ///
+    /// The default preserves the old scalar callback contract. Hot callbacks
+    /// can override this to fan out the borrowed operator without allocating
+    /// or cloning the short operator token at every callback layer.
+    #[doc(hidden)]
+    fn handle_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl> {
+        self.handle_scalar(ContentScalar::Operator(operator.to_vec()), offset, length)
     }
 
     /// Receive one parsed ObjectHandle and its qpdf content span.
@@ -141,6 +259,22 @@ pub fn parse_detached_content_stream<C: ObjectHandleParserCallbacks>(
     parse_content_stream_handles(input, None, source_description, callbacks)
 }
 
+fn skip_content_ignorable(input: &[u8], mut position: usize) -> usize {
+    while position < input.len() {
+        match input[position] {
+            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => position += 1,
+            b'%' => {
+                position += 1;
+                while position < input.len() && !matches!(input[position], b'\n' | b'\r') {
+                    position += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    position
+}
+
 fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
     input: &[u8],
     context: Option<Rc<dyn DocumentResolver>>,
@@ -151,47 +285,75 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
 
     let mut tokenizer = Tokenizer::new(input);
     tokenizer.allow_eof();
-    // A parallel, canonical `LiveInput` over the same bytes: content-stream
-    // objects share `LiveFileParser`'s parser (`QPDFParser`'s own
-    // `content_stream=true` mode, `parse_live_content_stream_object`), which
-    // is driven by `LiveInput` rather than this module's own pull tokenizer.
-    // The pull tokenizer above stays only for the probe/inline-image steps
-    // below, which have no `LiveInput` equivalent; the two positions are
-    // resynchronized at each loop boundary.
+    // Ordinary content objects use the canonical live-input parser.
+    // The pull tokenizer remains only for inline-image payload framing.
     let mut live_input = SliceLiveInput::new(input);
+    let mut live_tokens = LiveTokenSource::new(&mut live_input);
+    let mut resolver = ContentHandleResolver::new(context.clone());
     let mut stopped_on_container_eof = false;
 
-    while tokenizer.position() < input.len() {
-        let probe = tokenizer.read_token(true, 0)?;
-        let offset = probe.start;
-        tokenizer.set_position(offset)?;
-        live_input.seek_to(offset)?;
-
-        let (object, length, diagnostics) = {
-            let mut resolver = ContentHandleResolver::new(context.clone());
-            let parsed = parse_live_content_stream_object(&mut live_input, &mut resolver)?;
-            let length = live_input.position() - offset;
-            (parsed.value, length, parsed.diagnostics)
-        };
-        tokenizer.set_position(live_input.position())?;
-        for diagnostic in diagnostics {
-            if diagnostic.message == "parse error while reading object" {
-                stopped_on_container_eof = true;
-            }
-            deliver_diagnostic(
-                context.as_ref(),
-                source_description,
-                "content",
-                diagnostic.relative_offset,
-                &diagnostic.message,
-            )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
-        }
-        if !object.is_initialized() {
+    while usize::try_from(live_tokens.tell()?).unwrap_or(usize::MAX) < input.len() {
+        let position = usize::try_from(live_tokens.tell()?).unwrap_or(usize::MAX);
+        let offset = skip_content_ignorable(input, position);
+        if offset >= input.len() {
             break;
         }
-        let is_id = object.as_operator().as_deref() == Some(b"ID");
+        live_tokens.seek(offset as u64)?;
 
-        if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
+        let mut scalar_result = None;
+        if C::HANDLES_CONTENT_SCALARS {
+            let token = live_tokens.next_scalar_token()?;
+            let token_start = token.start;
+            let token_end = token.end;
+            if token.error_message.is_none() && token.token_type == TokenType::Word {
+                let length = token_end.saturating_sub(token_start);
+                let is_id = token.value == b"ID";
+                let control = callbacks.handle_operator(&token.value, token_start, length)?;
+                scalar_result = Some((is_id, control));
+            } else if let Some(scalar) = content_scalar_from_token(token) {
+                let length = token_end.saturating_sub(token_start);
+                let control = callbacks.handle_scalar(scalar, token_start, length)?;
+                scalar_result = Some((false, control));
+            } else {
+                // Containers and recovery cases retain the canonical
+                // qpdf-shaped parser.
+                live_tokens.seek(offset as u64)?;
+            }
+        }
+
+        let (is_id, control) = if let Some(result) = scalar_result {
+            result
+        } else {
+            let (object, length, diagnostics) = {
+                let parsed =
+                    parse_live_content_stream_object_from_tokens(&mut live_tokens, &mut resolver)?;
+                let next = usize::try_from(live_tokens.tell()?).unwrap_or(usize::MAX);
+                let length = next.saturating_sub(offset);
+                (parsed.value, length, parsed.diagnostics)
+            };
+            for diagnostic in diagnostics {
+                if diagnostic.message == "parse error while reading object" {
+                    stopped_on_container_eof = true;
+                }
+                deliver_diagnostic(
+                    context.as_ref(),
+                    source_description,
+                    "content",
+                    diagnostic.relative_offset,
+                    &diagnostic.message,
+                )?;
+            }
+            if !object.is_initialized() {
+                break;
+            }
+            let is_id = object.as_operator().as_deref() == Some(b"ID");
+            let control = callbacks.handle_object(object, offset, length)?;
+            (is_id, control)
+        };
+
+        let live_position = usize::try_from(live_tokens.tell()?).unwrap_or(usize::MAX);
+        tokenizer.set_position(live_position)?;
+        if control == ParseControl::Stop {
             return Ok(false);
         }
 
@@ -251,6 +413,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
             {
                 return Ok(false);
             }
+            live_tokens.seek(tokenizer.position() as u64)?;
         }
     }
 
@@ -401,6 +564,217 @@ mod tests {
             self.eof = true;
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct SpanCallbacks {
+        spans: Vec<(usize, usize)>,
+        inline_images: usize,
+        eof: bool,
+    }
+
+    impl ObjectHandleParserCallbacks for SpanCallbacks {
+        fn handle_object(
+            &mut self,
+            object: ObjectHandle,
+            offset: usize,
+            length: usize,
+        ) -> Result<ParseControl> {
+            if object.as_inline_image().is_some() {
+                self.inline_images += 1;
+            }
+            self.spans.push((offset, length));
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            self.eof = true;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ScalarNameCallbacks {
+        names: Vec<Vec<u8>>,
+    }
+
+    impl ObjectHandleParserCallbacks for ScalarNameCallbacks {
+        const HANDLES_CONTENT_SCALARS: bool = true;
+
+        fn handle_scalar(
+            &mut self,
+            scalar: ContentScalar,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            if let Some(name) = scalar.as_name() {
+                self.names.push(name.to_vec());
+            }
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_object(
+            &mut self,
+            _object: ObjectHandle,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ScalarFallbackCallbacks {
+        scalar_count: usize,
+        arrays: Vec<Vec<i64>>,
+    }
+
+    impl ObjectHandleParserCallbacks for ScalarFallbackCallbacks {
+        const HANDLES_CONTENT_SCALARS: bool = true;
+
+        fn handle_scalar(
+            &mut self,
+            _scalar: ContentScalar,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            self.scalar_count += 1;
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_object(
+            &mut self,
+            object: ObjectHandle,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            if let Some(items) = object.as_array() {
+                self.arrays.push(
+                    items
+                        .into_iter()
+                        .filter_map(|item| item.as_integer())
+                        .collect(),
+                );
+            }
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scalar_fast_path_falls_back_to_canonical_array_parser() {
+        let mut callbacks = ScalarFallbackCallbacks::default();
+        parse_detached_content_stream(b"[1 2 3] TJ 4 Tc", "scalar fallback", &mut callbacks)
+            .expect("content parses");
+        assert_eq!(callbacks.arrays, vec![vec![1, 2, 3]]);
+        assert_eq!(callbacks.scalar_count, 4);
+    }
+
+    #[test]
+    fn lightweight_name_scalar_matches_object_handle_name_semantics() {
+        let mut callbacks = ScalarNameCallbacks::default();
+        parse_detached_content_stream(b"/Im1 Do", "name scalar", &mut callbacks)
+            .expect("content parses");
+        assert_eq!(callbacks.names, vec![b"Im1".to_vec()]);
+    }
+
+    #[test]
+    fn detached_content_skips_ignorable_bytes_without_probe_tokenization() {
+        let input = b" \n% hi\r\n12% after number\n0 0 1 3 4 cm";
+        let mut callbacks = SpanCallbacks::default();
+        parse_detached_content_stream(input, "span test", &mut callbacks).expect("content parses");
+        let slices = callbacks
+            .spans
+            .iter()
+            .map(|&(offset, length)| &input[offset..offset + length])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slices,
+            vec![
+                b"12".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+                b"1".as_slice(),
+                b"3".as_slice(),
+                b"4".as_slice(),
+                b"cm".as_slice(),
+            ]
+        );
+        assert!(callbacks.eof);
+    }
+
+    #[test]
+    fn detached_content_resynchronizes_after_inline_image_payload() {
+        let input = b"BI /W 1 /H 1 /BPC 8 /CS /G ID \x7f EI Q";
+        let mut callbacks = SpanCallbacks::default();
+        parse_detached_content_stream(input, "inline span test", &mut callbacks)
+            .expect("inline image and following operator parse");
+        assert_eq!(callbacks.inline_images, 1);
+        let &(offset, length) = callbacks.spans.last().expect("Q callback");
+        assert_eq!(&input[offset..offset + length], b"Q");
+        assert!(callbacks.eof);
+    }
+
+    #[derive(Default)]
+    struct BorrowedOperatorCallbacks {
+        operators: Vec<Vec<u8>>,
+        scalars: usize,
+    }
+
+    impl ObjectHandleParserCallbacks for BorrowedOperatorCallbacks {
+        const HANDLES_CONTENT_SCALARS: bool = true;
+
+        fn handle_scalar(
+            &mut self,
+            _scalar: ContentScalar,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            self.scalars += 1;
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_operator(
+            &mut self,
+            operator: &[u8],
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            self.operators.push(operator.to_vec());
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_object(
+            &mut self,
+            _object: ObjectHandle,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lightweight_operators_use_borrowed_callback() {
+        let mut callbacks = BorrowedOperatorCallbacks::default();
+        parse_detached_content_stream(b"q 1 0 0 1 2 3 cm Q", "borrowed operators", &mut callbacks)
+            .expect("content parses");
+        assert_eq!(
+            callbacks.operators,
+            vec![b"q".to_vec(), b"cm".to_vec(), b"Q".to_vec()]
+        );
+        assert_eq!(callbacks.scalars, 6);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 #[derive(Debug, Default)]
-pub struct ScrubStats {
+pub(crate) struct ScrubStats {
     pub removed: BTreeMap<String, usize>,
     pub jpeg_metadata_bytes_removed: usize,
 }
@@ -26,9 +26,13 @@ impl ScrubStats {
 
 #[cfg(test)]
 fn dict_view(handle: &ObjectHandle) -> Option<ObjectHandle> {
-    handle
-        .as_stream_dict()
-        .or_else(|| handle.as_dictionary().map(|_| handle.clone()))
+    if let Some(d) = handle.as_stream_dict() {
+        Some(d)
+    } else if handle.as_dictionary().is_some() {
+        Some(handle.clone())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -221,23 +225,16 @@ fn scrub_owned_cos_privacy_dictionary(
     }
 }
 
-const fn validate_hayro_cos_privacy_config(_cfg: &PrivacyConfig) {}
-
 /// Apply COS-level privacy cleanup directly to the Hayro/COW graph without
 /// materializing unaffected source objects.
 ///
 /// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
 /// `/LastModified`. `BestEffort` can additionally remove thumbnails and form
 /// values, active content, attachment roots, signature values, and JPEG metadata.
-#[expect(
-    clippy::too_many_lines,
-    reason = "privacy cleanup is an ordered policy application over one mutable document graph"
-)]
-pub fn scrub_edit_document_cos_privacy(
+pub(crate) fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
 ) -> Result<ScrubStats> {
-    validate_hayro_cos_privacy_config(cfg);
     let mut stats = ScrubStats::default();
     if cfg.level == PrivacyLevel::None {
         return Ok(stats);
@@ -335,7 +332,7 @@ pub fn scrub_edit_document_cos_privacy(
                 }
             }
             CowObjectHandle::New(id) => {
-                if let Some(object) = document.overlay_mut().added_mut(id)
+                if let Ok(object) = document.edit_added_object(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                 {
                     scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
@@ -440,7 +437,7 @@ fn scrub_catalog_attachments(document: &mut EditDocument, stats: &mut ScrubStats
                     }
                 }
                 CowObjectHandle::New(id) => {
-                    if let Some(object) = document.overlay_mut().added_mut(id)
+                    if let Ok(object) = document.edit_added_object(id)
                         && let Some(dictionary) = object.as_dictionary_mut()
                         && dictionary.remove(b"EmbeddedFiles".as_slice()).is_some()
                     {
@@ -545,7 +542,7 @@ fn strip_signature_field_hayro(
                 }
             }
             CowObjectHandle::New(id) => {
-                if let Some(object) = document.overlay_mut().added_mut(id)
+                if let Ok(object) = document.edit_added_object(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                     && dictionary.remove(b"V".as_slice()).is_some()
                 {
@@ -647,10 +644,7 @@ fn scrub_jpeg_metadata_hayro(
         };
         let object = match handle {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(clean);
@@ -696,7 +690,7 @@ fn scrub_catalog_javascript_name_tree(
                     }
                 }
                 CowObjectHandle::New(id) => {
-                    if let Some(object) = document.overlay_mut().added_mut(id)
+                    if let Ok(object) = document.edit_added_object(id)
                         && let Some(dictionary) = object.as_dictionary_mut()
                         && dictionary.remove(b"JavaScript".as_slice()).is_some()
                     {
@@ -721,7 +715,7 @@ fn scrub_catalog_javascript_name_tree(
 }
 
 #[cfg(test)]
-pub fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
+pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
     scrub_edit_document_cos_privacy(
         document,
         &PrivacyConfig {
@@ -753,11 +747,7 @@ fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "this test-only flpdf reference implementation intentionally mirrors the full scrub policy"
-)]
-pub fn scrub_pdf<R: Read + Seek + 'static>(
+pub(crate) fn scrub_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     cfg: &PrivacyConfig,
 ) -> Result<ScrubStats> {
@@ -949,16 +939,18 @@ mod tests {
             }
         }
 
-        let Some(custom) = rewritten.trailer().get(b"Custom".as_slice()) else {
-            panic!("custom trailer root should survive");
+        let custom = match rewritten.trailer().get(b"Custom".as_slice()) {
+            Some(custom) => custom,
+            None => panic!("custom trailer root should survive"),
         };
         let custom_id = match custom {
             OwnedObject::Reference(CowObjectHandle::Existing(id)) => *id,
             other => panic!("expected custom trailer reference, got {other:?}"),
         };
         let custom = rewritten.source().materialize(custom_id)?;
-        let Some(custom) = custom.as_dictionary() else {
-            panic!("custom trailer object should remain a dictionary");
+        let custom = match custom.as_dictionary() {
+            Some(dictionary) => dictionary,
+            None => panic!("custom trailer object should remain a dictionary"),
         };
         assert_eq!(
             custom.get(b"Keep".as_slice()),
@@ -1043,8 +1035,9 @@ mod tests {
         let rewritten = EditDocument::from_bytes(output)?;
         let catalog_id = rewritten.source().catalog_id();
         let catalog = rewritten.source().materialize(catalog_id)?;
-        let Some(catalog) = catalog.as_dictionary() else {
-            panic!("catalog should remain a dictionary");
+        let catalog = match catalog.as_dictionary() {
+            Some(dictionary) => dictionary,
+            None => panic!("catalog should remain a dictionary"),
         };
         assert!(!catalog.contains_key(b"AA".as_slice()));
         assert!(!catalog.contains_key(b"OpenAction".as_slice()));
