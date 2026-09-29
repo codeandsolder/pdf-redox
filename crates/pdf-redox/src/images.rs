@@ -192,7 +192,7 @@ fn transform_one(
     Ok(true)
 }
 
-pub(crate) fn optimize_images_hayro(
+pub fn optimize_images_hayro(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
 ) -> Result<ImageOptimizationStats> {
@@ -216,7 +216,7 @@ pub(crate) fn optimize_images_hayro(
     Ok(stats)
 }
 
-pub(crate) fn optimize_images_with_resize_targets_hayro(
+pub fn optimize_images_with_resize_targets_hayro(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
     targets: &HashMap<(ObjectHandle, ObjectHandle), ImageResizeTarget>,

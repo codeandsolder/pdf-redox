@@ -90,14 +90,17 @@ pub struct PageRect {
 }
 
 impl PageRect {
+    #[must_use]
     pub fn width(self) -> f64 {
         (self.x1 - self.x0).max(0.0)
     }
 
+    #[must_use]
     pub fn height(self) -> f64 {
         (self.y1 - self.y0).max(0.0)
     }
 
+    #[must_use]
     pub fn area(self) -> f64 {
         self.width() * self.height()
     }

@@ -9,7 +9,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FlateOptimizationStats {
+pub struct FlateOptimizationStats {
     pub streams_selected: usize,
     pub estimated_savings_bytes: usize,
 }
@@ -55,7 +55,7 @@ fn is_safe_lone_flate_hayro(
     Ok(true)
 }
 
-pub(crate) fn apply_flate_policy_hayro(
+pub fn apply_flate_policy_hayro(
     document: &mut crate::EditDocument,
     policy: FlatePolicy,
     level: i32,
@@ -120,7 +120,7 @@ pub(crate) fn apply_flate_policy_hayro(
     Ok(stats)
 }
 
-pub(crate) fn compress_unfiltered_streams_hayro(
+pub fn compress_unfiltered_streams_hayro(
     document: &mut crate::EditDocument,
     level: i32,
 ) -> Result<()> {
@@ -187,7 +187,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
 }
 
 #[cfg(test)]
-pub(crate) fn apply_flate_policy<R: Read + Seek + 'static>(
+pub fn apply_flate_policy<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     policy: FlatePolicy,
     level: i32,
@@ -320,16 +320,19 @@ mod tests {
     #[test]
     fn selective_policy_recompresses_predictor_streams_without_changing_decoded_bytes() -> Result<()>
     {
-        let columns = 256_i64;
-        let mut source = Vec::with_capacity(columns as usize * 128);
+        let columns = 256_u16;
+        let mut source = Vec::with_capacity(usize::from(columns) * 128);
         for row in 0..128_u8 {
-            for column in 0..columns as u16 {
+            for column in 0..columns {
                 source.push(row.wrapping_add((column % 17) as u8));
             }
         }
         let parms = ObjectHandle::dictionary(vec![
             (b"/Predictor".to_vec(), ObjectHandle::integer(12)),
-            (b"/Columns".to_vec(), ObjectHandle::integer(columns)),
+            (
+                b"/Columns".to_vec(),
+                ObjectHandle::integer(i64::from(columns)),
+            ),
             (b"/Colors".to_vec(), ObjectHandle::integer(1)),
             (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
         ]);

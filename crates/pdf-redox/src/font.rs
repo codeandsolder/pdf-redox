@@ -31,13 +31,13 @@ struct FontProgramUsage {
 }
 
 impl FontProgramUsage {
-    fn cidfont_type2_only(self) -> bool {
+    const fn cidfont_type2_only(self) -> bool {
         self.cidfont_type2 && !self.simple_truetype
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FontOptimizationStats {
+pub struct FontOptimizationStats {
     pub programs_optimized: usize,
     pub original_encoded_bytes: usize,
     pub optimized_encoded_bytes: usize,
@@ -68,7 +68,7 @@ fn checksum32(data: &[u8]) -> u32 {
     })
 }
 
-fn is_sfnt_magic(magic: &[u8]) -> bool {
+const fn is_sfnt_magic(magic: &[u8]) -> bool {
     matches!(magic, [0, 1, 0, 0] | b"OTTO" | b"true" | b"typ1")
 }
 
@@ -174,7 +174,7 @@ fn is_lone_flate(stream_dict: &flpdf::ObjectHandle) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(crate) fn strip_font_editing_tables<R: Read + Seek + 'static>(
+pub fn strip_font_editing_tables<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     flate_level: i32,
 ) -> Result<FontOptimizationStats> {
@@ -257,9 +257,8 @@ pub(crate) fn strip_font_editing_tables<R: Read + Seek + 'static>(
             if !is_lone_flate(&stream_dict)? {
                 continue;
             }
-            let decoded = match program.get_stream_data(DecodeLevel::Generalized) {
-                Ok(data) => data,
-                Err(_) => continue,
+            let Ok(decoded) = program.get_stream_data(DecodeLevel::Generalized) else {
+                continue;
             };
             let usage = program_usage.get(&program_ref).copied().unwrap_or_default();
             let Some((trimmed, removed_decoded_bytes)) =
@@ -267,11 +266,11 @@ pub(crate) fn strip_font_editing_tables<R: Read + Seek + 'static>(
             else {
                 continue;
             };
-            let encoded =
-                match encode_stream_data_with_flate_level(&stream_dict, &trimmed, flate_level) {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                };
+            let Ok(encoded) =
+                encode_stream_data_with_flate_level(&stream_dict, &trimmed, flate_level)
+            else {
+                continue;
+            };
             let original = program.get_raw_stream_data()?;
             if encoded.len() >= original.len() {
                 continue;
@@ -304,7 +303,7 @@ fn owned_name_value(
     })
 }
 
-fn direct_owned_reference(value: Option<&OwnedObject>) -> Option<CowObjectHandle> {
+const fn direct_owned_reference(value: Option<&OwnedObject>) -> Option<CowObjectHandle> {
     match value {
         Some(OwnedObject::Reference(handle)) => Some(*handle),
         _ => None,
@@ -476,7 +475,7 @@ fn replace_current_stream_data(
 /// The graph walk and mutation are Hayro-native. flpdf is used only for the
 /// already-tested stream filter codec semantics so `/DecodeParms` behavior
 /// remains identical during the migration.
-pub(crate) fn strip_font_editing_tables_hayro(
+pub fn strip_font_editing_tables_hayro(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<FontOptimizationStats> {
@@ -544,18 +543,17 @@ pub(crate) fn strip_font_editing_tables_hayro(
             continue;
         };
         let raw = data.bytes(document.source())?;
-        let decoded = match decode_stream_data(&filter_dictionary, raw.as_ref()) {
-            Ok(decoded) => decoded,
-            Err(_) => continue,
+        let Ok(decoded) = decode_stream_data(&filter_dictionary, raw.as_ref()) else {
+            continue;
         };
         let Some((trimmed, removed_decoded_bytes)) = sfnt_for_pdf_rendering(&decoded, usage) else {
             continue;
         };
-        let encoded =
-            match encode_stream_data_with_flate_level(&filter_dictionary, &trimmed, flate_level) {
-                Ok(encoded) => encoded,
-                Err(_) => continue,
-            };
+        let Ok(encoded) =
+            encode_stream_data_with_flate_level(&filter_dictionary, &trimmed, flate_level)
+        else {
+            continue;
+        };
         if encoded.len() >= raw.len() {
             continue;
         }
@@ -594,7 +592,7 @@ mod tests {
         ]);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(&source_font)?;
-        let encoded = encoder.finish()?;
+        let compressed_font = encoder.finish()?;
 
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
@@ -630,10 +628,10 @@ mod tests {
         );
         let header = format!(
             "7 0 obj\n<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 1 >> >>\nstream\n",
-            encoded.len()
+            compressed_font.len()
         );
         let mut stream_object = header.into_bytes();
-        stream_object.extend_from_slice(&encoded);
+        stream_object.extend_from_slice(&compressed_font);
         stream_object.extend_from_slice(b"\nendstream\nendobj\n");
         append_pdf_object(&mut pdf, &mut offsets, &stream_object);
 
@@ -677,13 +675,21 @@ mod tests {
         owned.sort_unstable_by_key(|(tag, _)| *tag);
         let count = owned.len();
         let max_power = 1_usize << (usize::BITS - 1 - count.leading_zeros());
-        let search_range = (max_power * 16) as u16;
+        let search_range = u16::try_from(max_power * 16).expect("test sfnt search range fits u16");
         let mut out = Vec::new();
         out.extend_from_slice(&[0, 1, 0, 0]);
-        out.extend_from_slice(&(count as u16).to_be_bytes());
+        out.extend_from_slice(
+            &(u16::try_from(count).expect("test sfnt table count fits u16")).to_be_bytes(),
+        );
         out.extend_from_slice(&search_range.to_be_bytes());
-        out.extend_from_slice(&(max_power.trailing_zeros() as u16).to_be_bytes());
-        out.extend_from_slice(&((count * 16) as u16 - search_range).to_be_bytes());
+        out.extend_from_slice(
+            &(u16::try_from(max_power.trailing_zeros()).expect("test sfnt selector fits u16"))
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(
+            &(u16::try_from(count * 16).expect("test sfnt range fits u16") - search_range)
+                .to_be_bytes(),
+        );
         let directory = out.len();
         out.resize(directory + count * 16, 0);
         for (index, (tag, data)) in owned.iter().enumerate() {
@@ -698,8 +704,13 @@ mod tests {
             let record = directory + index * 16;
             out[record..record + 4].copy_from_slice(tag);
             out[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
-            out[record + 8..record + 12].copy_from_slice(&(offset as u32).to_be_bytes());
-            out[record + 12..record + 16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            out[record + 8..record + 12].copy_from_slice(
+                &(u32::try_from(offset).expect("test sfnt offset fits u32")).to_be_bytes(),
+            );
+            out[record + 12..record + 16].copy_from_slice(
+                &(u32::try_from(data.len()).expect("test sfnt table length fits u32"))
+                    .to_be_bytes(),
+            );
         }
         out
     }

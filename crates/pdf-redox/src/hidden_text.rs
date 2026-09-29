@@ -28,7 +28,7 @@ fn flpdf_object_key(reference: ObjectRef) -> ObjectKey {
     )
 }
 
-fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
+const fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
     match handle {
         CowObjectHandle::Existing(id) => Some((id.number(), id.generation())),
         CowObjectHandle::New(_) => None,
@@ -44,7 +44,7 @@ struct Rect {
 }
 
 impl Rect {
-    fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+    const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
         Self {
             x0: x0.min(x1),
             y0: y0.min(y1),
@@ -53,7 +53,7 @@ impl Rect {
         }
     }
 
-    fn from_rectangle(rect: Rectangle) -> Self {
+    const fn from_rectangle(rect: Rectangle) -> Self {
         Self::new(rect.llx, rect.lly, rect.urx, rect.ury)
     }
 
@@ -77,7 +77,7 @@ impl Rect {
         self.intersect(target).map_or(0.0, |r| r.area() / area)
     }
 
-    fn to_public(self) -> PageRect {
+    const fn to_public(self) -> PageRect {
         PageRect {
             x0: self.x0,
             y0: self.y0,
@@ -111,13 +111,15 @@ enum Color {
 impl Color {
     fn is_dark(self) -> bool {
         let luminance = match self {
-            Self::Gray(g) => g,
-            Self::Rgb(r, g, b) => (0.2126 * r) + (0.7152 * g) + (0.0722 * b),
-            Self::Cmyk(c, m, y, k) => {
-                let r = 1.0 - (c * (1.0 - k) + k);
-                let g = 1.0 - (m * (1.0 - k) + k);
-                let b = 1.0 - (y * (1.0 - k) + k);
-                (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+            Self::Gray(gray) => gray,
+            Self::Rgb(red, green, blue) => {
+                0.0722f64.mul_add(blue, 0.7152f64.mul_add(green, 0.2126 * red))
+            }
+            Self::Cmyk(cyan, magenta, yellow, black) => {
+                let red = 1.0 - cyan.mul_add(1.0 - black, black);
+                let green = 1.0 - magenta.mul_add(1.0 - black, black);
+                let blue = 1.0 - yellow.mul_add(1.0 - black, black);
+                0.0722f64.mul_add(blue, 0.7152f64.mul_add(green, 0.2126 * red))
             }
             Self::Unknown => return false,
         };
@@ -314,7 +316,7 @@ impl PathState {
         *self = Self::default();
     }
 
-    fn set_rect(&mut self, rect: Rect) {
+    const fn set_rect(&mut self, rect: Rect) {
         if self.single_rect.is_none() {
             self.single_rect = Some(rect);
             self.only_single_rect = true;
@@ -323,7 +325,7 @@ impl PathState {
         }
     }
 
-    fn mark_complex(&mut self) {
+    const fn mark_complex(&mut self) {
         self.only_single_rect = false;
     }
 }
@@ -384,8 +386,8 @@ impl<'a> PageScanner<'a> {
     }
 
     fn number(object: &ObjectHandle) -> Option<f64> {
-        if object.as_integer().is_some() {
-            return object.as_integer().map(|v| v as f64);
+        if let Some(integer) = object.as_integer() {
+            return crate::source::exact_i64_to_f64(integer);
         }
         object.as_real()
     }
@@ -440,19 +442,19 @@ impl<'a> PageScanner<'a> {
         }
         let local = Rectangle::new(
             0.0_f64.min(advance),
-            self.text.rise - (0.25 * size),
+            0.25f64.mul_add(-size, self.text.rise),
             0.0_f64.max(advance),
-            self.text.rise + (0.9 * size),
+            0.9f64.mul_add(size, self.text.rise),
         );
         let transformed = self.combined_text_matrix().transform_rectangle(local);
         let rect = Rect::from_rectangle(transformed);
         (rect.area().is_finite() && rect.area() > 1e-12).then_some(rect)
     }
 
-    fn show_text(
+    fn show_text<T: AsRef<[u8]>>(
         &mut self,
-        strings: Vec<Vec<u8>>,
-        tj_adjustments: Vec<f64>,
+        strings: &[T],
+        tj_adjustments: &[f64],
         span_start: usize,
         span_end: usize,
     ) {
@@ -461,6 +463,7 @@ impl<'a> PageScanner<'a> {
         let mut decoded = String::new();
         let mut advance = 0.0;
         for (index, bytes) in strings.iter().enumerate() {
+            let bytes = bytes.as_ref();
             raw.extend_from_slice(bytes);
             decoded.push_str(&font.decode(bytes));
             advance += font.advance(bytes, &self.text);
@@ -513,8 +516,8 @@ impl<'a> PageScanner<'a> {
         self.text.matrix.translate(advance, 0.0);
     }
 
-    fn show_single(&mut self, bytes: Vec<u8>, span_start: usize, span_end: usize) {
-        self.show_text(vec![bytes], Vec::new(), span_start, span_end);
+    fn show_single(&mut self, bytes: &[u8], span_start: usize, span_end: usize) {
+        self.show_text(std::slice::from_ref(&bytes), &[], span_start, span_end);
     }
 
     fn show_tj_array(&mut self, array: &[ObjectHandle], span_start: usize, span_end: usize) {
@@ -530,12 +533,13 @@ impl<'a> PageScanner<'a> {
                 pending_adjustment = 0.0;
                 strings.push(bytes);
             } else if let Some(value) = Self::number(item) {
-                pending_adjustment += (-value / 1000.0) * self.text.font_size * hscale;
+                pending_adjustment =
+                    ((-value / 1000.0) * self.text.font_size).mul_add(hscale, pending_adjustment);
             }
         }
         if !strings.is_empty() {
             adjustments.push(pending_adjustment);
-            self.show_text(strings, adjustments, span_start, span_end);
+            self.show_text(&strings, &adjustments, span_start, span_end);
         }
     }
 
@@ -620,6 +624,10 @@ impl<'a> PageScanner<'a> {
         self.path.reset();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "PDF content operators are intentionally dispatched in one exhaustive table"
+    )]
     fn apply_operator(&mut self, operator: &[u8], span_start: usize, span_end: usize) {
         match operator {
             b"q" => self.graphics_stack.push((self.graphics, self.text.clone())),
@@ -654,38 +662,38 @@ impl<'a> PageScanner<'a> {
                 self.text.char_spacing = self
                     .numbers()
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(self.text.char_spacing)
+                    .unwrap_or(self.text.char_spacing);
             }
             b"Tw" => {
                 self.text.word_spacing = self
                     .numbers()
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(self.text.word_spacing)
+                    .unwrap_or(self.text.word_spacing);
             }
             b"Tz" => {
                 self.text.horizontal_scale = self
                     .numbers()
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(self.text.horizontal_scale)
+                    .unwrap_or(self.text.horizontal_scale);
             }
             b"TL" => {
                 self.text.leading = self
                     .numbers()
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(self.text.leading)
+                    .unwrap_or(self.text.leading);
             }
             b"Tr" => {
                 self.text.render_mode = self
                     .operands
                     .first()
                     .and_then(|o| o.object.as_integer())
-                    .unwrap_or(self.text.render_mode)
+                    .unwrap_or(self.text.render_mode);
             }
             b"Ts" => {
                 self.text.rise = self
                     .numbers()
                     .and_then(|v| v.first().copied())
-                    .unwrap_or(self.text.rise)
+                    .unwrap_or(self.text.rise);
             }
             b"Tm" => {
                 if let Some(v) = self.numbers().filter(|v| v.len() >= 6) {
@@ -710,7 +718,7 @@ impl<'a> PageScanner<'a> {
             b"T*" => self.new_line(),
             b"Tj" => {
                 if let Some(bytes) = self.operands.first().and_then(|o| o.object.as_string()) {
-                    self.show_single(bytes, span_start, span_end);
+                    self.show_single(&bytes, span_start, span_end);
                 }
             }
             b"TJ" => {
@@ -721,7 +729,7 @@ impl<'a> PageScanner<'a> {
             b"'" => {
                 self.new_line();
                 if let Some(bytes) = self.operands.first().and_then(|o| o.object.as_string()) {
-                    self.show_single(bytes, span_start, span_end);
+                    self.show_single(&bytes, span_start, span_end);
                 }
             }
             b"\"" => {
@@ -734,7 +742,7 @@ impl<'a> PageScanner<'a> {
                     }
                     self.new_line();
                     if let Some(bytes) = self.operands[2].object.as_string() {
-                        self.show_single(bytes, span_start, span_end);
+                        self.show_single(&bytes, span_start, span_end);
                     }
                 }
             }
@@ -806,6 +814,10 @@ impl<'a> PageScanner<'a> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "final classification keeps the page-level evidence and ordering rules together"
+    )]
     fn finish(self) -> PageScan {
         let page_area = self.crop.area();
         let page_images: Vec<Rect> = self
@@ -981,7 +993,7 @@ struct PageScan {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct HiddenTextApplyStats {
+pub struct HiddenTextApplyStats {
     pub removed: usize,
 }
 
@@ -996,7 +1008,7 @@ struct OptionalContentState {
     dead_code,
     reason = "retained only until final flpdf/Hayro hidden-text parity sweep"
 )]
-pub(crate) fn apply_hidden_text_policy<R: Read + Seek + 'static>(
+pub fn apply_hidden_text_policy<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
@@ -1073,7 +1085,7 @@ fn replace_page_content_hayro(
     Ok(())
 }
 
-pub(crate) fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
+pub fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
     let ocg = optional_content_state_hayro(document)?;
     let pages = document.page_handles()?;
     let mut findings = Vec::new();
@@ -1084,7 +1096,7 @@ pub(crate) fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<H
     Ok(findings)
 }
 
-pub(crate) fn apply_hidden_text_policy_hayro(
+pub fn apply_hidden_text_policy_hayro(
     document: &mut EditDocument,
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
@@ -1291,10 +1303,8 @@ fn parse_cid_widths_hayro(
                     out.insert(code, width);
                 }
             }
-            index += 1;
-        } else {
-            index += 1;
         }
+        index += 1;
     }
     Ok(())
 }
@@ -1517,7 +1527,7 @@ fn page_content_bytes_hayro(document: &EditDocument, page: CowObjectHandle) -> R
 
 fn owned_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -1691,7 +1701,7 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
     } else {
         let first = font.try_get_key(b"/FirstChar")?;
         let first = if first.try_is_integer()? {
-            first.try_get_int_value()?.max(0) as u32
+            u32::try_from(first.try_get_int_value()?.max(0)).unwrap_or(u32::MAX)
         } else {
             0
         };
@@ -1747,10 +1757,8 @@ fn parse_cid_widths(widths: &ObjectHandle, out: &mut HashMap<u32, f64>) -> Resul
                     out.insert(code, value);
                 }
             }
-            i += 1;
-        } else {
-            i += 1;
         }
+        i += 1;
     }
     Ok(())
 }
@@ -1992,7 +2000,7 @@ fn hex_token(token: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -2063,7 +2071,7 @@ mod tests {
 
     #[test]
     fn parses_basic_to_unicode_bfchar_and_bfrange() {
-        let cmap = br#"
+        let cmap = br"
             2 beginbfchar
             <01> <0041>
             <02> <03A9>
@@ -2071,7 +2079,7 @@ mod tests {
             1 beginbfrange
             <10> <12> <0061>
             endbfrange
-        "#;
+        ";
         let map = parse_to_unicode(cmap);
         assert_eq!(map.get(&vec![0x01]).map(String::as_str), Some("A"));
         assert_eq!(map.get(&vec![0x02]).map(String::as_str), Some("Ω"));

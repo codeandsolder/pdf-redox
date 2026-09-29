@@ -3,14 +3,14 @@ use crate::{
     analyze::{analyze_pdf, input_sha256},
     content::normalize_page_contents_hayro,
     dedup::{
-        canonicalize_appearance_streams_hayro, canonicalize_font_program_streams_hayro,
-        canonicalize_form_xobjects_hayro, canonicalize_icc_profiles_hayro,
-        canonicalize_image_xobjects_hayro, canonicalize_metadata_streams_hayro,
-        canonicalize_page_contents_hayro, canonicalize_to_unicode_cmaps_hayro,
-        canonicalize_type3_charprocs_hayro,
+        TargetedDedupStats, canonicalize_appearance_streams_hayro,
+        canonicalize_font_program_streams_hayro, canonicalize_form_xobjects_hayro,
+        canonicalize_icc_profiles_hayro, canonicalize_image_xobjects_hayro,
+        canonicalize_metadata_streams_hayro, canonicalize_page_contents_hayro,
+        canonicalize_to_unicode_cmaps_hayro, canonicalize_type3_charprocs_hayro,
     },
     flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
-    font::strip_font_editing_tables_hayro,
+    font::{FontOptimizationStats, strip_font_editing_tables_hayro},
     hidden_text::apply_hidden_text_policy_hayro,
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
     inline_images::externalize_duplicate_inline_images_hayro,
@@ -19,7 +19,7 @@ use crate::{
     prune::prune_resources_hayro,
     scrub::scrub_edit_document_cos_privacy,
 };
-use flpdf::{ImageOptimizationOptions, ImageOptimizationStats};
+use flpdf::{DuplicateInlineImageStats, ImageOptimizationOptions, ImageOptimizationStats};
 #[cfg(test)]
 use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
 
@@ -35,6 +35,11 @@ fn validate_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Optimize a PDF according to `cfg`.
+///
+/// # Errors
+///
+/// Returns an error when the input is invalid, a configured transform fails, or the result cannot be written.
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
     let before = analyze_pdf(input)?;
@@ -49,6 +54,10 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
 /// its input identity matches. Callers that accept analysis objects from an
 /// untrusted boundary should keep their own trusted cached copy rather than
 /// round-tripping mutable user data into this function.
+///
+/// # Errors
+///
+/// Returns an error when the input is invalid, a configured transform fails, or the result cannot be written.
 pub fn optimize_pdf_with_analysis(
     input: &[u8],
     cfg: &Config,
@@ -66,6 +75,10 @@ pub fn optimize_pdf_with_analysis(
     optimize_pdf_with_before(input, cfg, before)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "this is the ordered optimization pipeline; splitting it would obscure pass ordering and shared statistics"
+)]
 fn optimize_pdf_with_before(
     input: &[u8],
     cfg: &Config,
@@ -83,29 +96,29 @@ fn optimize_pdf_with_before(
     // Strip rendering-irrelevant editing/layout state before font-program
     // dedup so producer subsets can converge to the same program.
     let font_rendering = if cfg.preservation.font_editing_support {
-        Default::default()
+        FontOptimizationStats::default()
     } else {
         strip_font_editing_tables_hayro(&mut document, cfg.flate_level)?
     };
     let metadata_dedup = if cfg.deduplicate_metadata_streams {
         canonicalize_metadata_streams_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let font_dedup = if cfg.deduplicate_font_programs {
         canonicalize_font_program_streams_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let to_unicode_dedup = if cfg.deduplicate_to_unicode_cmaps {
         canonicalize_to_unicode_cmaps_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let icc_dedup = if cfg.deduplicate_icc_profiles {
         canonicalize_icc_profiles_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let inline_image_dedup = if cfg.deduplicate_inline_images
         && before.duplicate_inline_image_payload_wasted_bytes
@@ -117,7 +130,7 @@ fn optimize_pdf_with_before(
             cfg.inline_image_min_duplicate_payload_bytes,
         )?
     } else {
-        Default::default()
+        DuplicateInlineImageStats::default()
     };
 
     // Exact image canonicalization follows inline-image externalization so the
@@ -125,22 +138,22 @@ fn optimize_pdf_with_before(
     let image_dedup = if cfg.deduplicate_image_xobjects {
         canonicalize_image_xobjects_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let form_dedup = if cfg.deduplicate_form_xobjects {
         canonicalize_form_xobjects_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let appearance_dedup = if cfg.deduplicate_appearance_streams {
         canonicalize_appearance_streams_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
     let type3_charproc_dedup = if cfg.deduplicate_type3_charprocs {
         canonicalize_type3_charprocs_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
 
     let (print_plan, print_plan_error) = match &cfg.image_policy {
@@ -208,7 +221,7 @@ fn optimize_pdf_with_before(
     let page_content_dedup = if cfg.deduplicate_page_contents {
         canonicalize_page_contents_hayro(&mut document)?
     } else {
-        Default::default()
+        TargetedDedupStats::default()
     };
 
     // Match the historical writer's StreamDataMode::Compress policy explicitly
@@ -369,11 +382,23 @@ fn optimize_pdf_with_before(
         ));
     }
 
-    let saved_bytes = input.len() as isize - output.len() as isize;
+    let input_len = isize::try_from(input.len()).map_err(|_| {
+        crate::Error::Invalid("input length exceeds signed pointer range".to_owned())
+    })?;
+    let output_len = isize::try_from(output.len()).map_err(|_| {
+        crate::Error::Invalid("output length exceeds signed pointer range".to_owned())
+    })?;
+    let saved_bytes = input_len - output_len;
     let saved_percent = if input.is_empty() {
         0.0
     } else {
-        saved_bytes as f64 * 100.0 / input.len() as f64
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the percentage is informational and sub-byte precision is irrelevant"
+        )]
+        {
+            saved_bytes as f64 * 100.0 / input.len() as f64
+        }
     };
     let report = OptimizationReport {
         before,
@@ -491,8 +516,14 @@ mod tests {
                 b"/Subtype".as_slice(),
                 ObjectHandle::name(b"Image".to_vec()),
             ),
-            (b"/Width".as_slice(), ObjectHandle::integer(width as i64)),
-            (b"/Height".as_slice(), ObjectHandle::integer(height as i64)),
+            (
+                b"/Width".as_slice(),
+                ObjectHandle::integer(i64::try_from(width).expect("test image width fits i64")),
+            ),
+            (
+                b"/Height".as_slice(),
+                ObjectHandle::integer(i64::try_from(height).expect("test image height fits i64")),
+            ),
             (
                 b"/ColorSpace".as_slice(),
                 ObjectHandle::name(b"DeviceGray".to_vec()),
@@ -523,8 +554,12 @@ mod tests {
                     ObjectHandle::array(vec![
                         ObjectHandle::integer(0),
                         ObjectHandle::integer(0),
-                        ObjectHandle::integer(width as i64),
-                        ObjectHandle::integer(height as i64),
+                        ObjectHandle::integer(
+                            i64::try_from(width).expect("test image width fits i64"),
+                        ),
+                        ObjectHandle::integer(
+                            i64::try_from(height).expect("test image height fits i64"),
+                        ),
                     ]),
                 ),
                 (b"/Resources".to_vec(), resources),
@@ -859,9 +894,8 @@ mod tests {
         let input = perceptual_image_fixture()?;
         let mut config = Config::print();
         config.max_image_ppi = Some(0);
-        let error = match optimize_pdf(&input, &config) {
-            Ok(_) => return Err(Error::Invalid("zero PPI was not rejected".to_owned())),
-            Err(error) => error,
+        let Err(error) = optimize_pdf(&input, &config) else {
+            return Err(Error::Invalid("zero PPI was not rejected".to_owned()));
         };
         assert!(matches!(error, Error::Invalid(message) if message.contains("greater than zero")));
         Ok(())

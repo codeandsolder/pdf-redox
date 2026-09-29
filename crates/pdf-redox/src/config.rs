@@ -31,6 +31,10 @@ pub enum AnnotationPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are independent serialized preservation policy switches"
+)]
 pub struct PreservationConfig {
     /// Preserve Link annotation navigation/actions. Independent of whether
     /// other annotations are preserved, flattened, or discarded.
@@ -66,7 +70,8 @@ pub struct PreservationConfig {
 }
 
 impl PreservationConfig {
-    pub fn functional() -> Self {
+    #[must_use]
+    pub const fn functional() -> Self {
         Self {
             links: true,
             forms: true,
@@ -82,7 +87,8 @@ impl PreservationConfig {
         }
     }
 
-    pub fn visible_surface() -> Self {
+    #[must_use]
+    pub const fn visible_surface() -> Self {
         Self {
             links: false,
             forms: false,
@@ -107,7 +113,7 @@ impl Default for PreservationConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "mode")]
 #[derive(Default)]
 pub enum ImagePolicy {
@@ -157,6 +163,10 @@ pub enum PrivacyLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are independent serialized privacy policy switches"
+)]
 pub struct PrivacyConfig {
     pub level: PrivacyLevel,
     /// Remove JPEG APP1/APP13/COM payloads without touching entropy-coded data.
@@ -211,7 +221,11 @@ impl HiddenTextPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the optimizer exposes independent feature switches in its serialized config"
+)]
 pub struct Config {
     #[serde(default)]
     pub preservation: PreservationConfig,
@@ -269,6 +283,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
     pub fn optimize_only() -> Self {
         Self {
             preservation: PreservationConfig::functional(),
@@ -295,6 +310,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn visible_surface() -> Self {
         Self {
             preservation: PreservationConfig::visible_surface(),
@@ -302,6 +318,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn perceptual() -> Self {
         Self {
             image_policy: ImagePolicy::Perceptual {
@@ -313,6 +330,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn print() -> Self {
         Self {
             max_image_ppi: Some(450),
@@ -328,84 +346,84 @@ impl Config {
 
 /// Fluent construction for [`Config`] when callers need to override several
 /// independent policy knobs without mutating public fields piecemeal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "config builders do nothing unless build() is called"]
 pub struct ConfigBuilder {
     config: Config,
 }
 
 impl ConfigBuilder {
-    pub fn preservation(mut self, value: PreservationConfig) -> Self {
+    pub const fn preservation(mut self, value: PreservationConfig) -> Self {
         self.config.preservation = value;
         self
     }
 
-    pub fn preserve_links(mut self, value: bool) -> Self {
+    pub const fn preserve_links(mut self, value: bool) -> Self {
         self.config.preservation.links = value;
         self
     }
 
-    pub fn preserve_forms(mut self, value: bool) -> Self {
+    pub const fn preserve_forms(mut self, value: bool) -> Self {
         self.config.preservation.forms = value;
         self
     }
 
-    pub fn preserve_navigation(mut self, value: bool) -> Self {
+    pub const fn preserve_navigation(mut self, value: bool) -> Self {
         self.config.preservation.navigation = value;
         self
     }
 
-    pub fn preserve_optional_content(mut self, value: bool) -> Self {
+    pub const fn preserve_optional_content(mut self, value: bool) -> Self {
         self.config.preservation.optional_content = value;
         self
     }
 
-    pub fn preserve_structure(mut self, value: bool) -> Self {
+    pub const fn preserve_structure(mut self, value: bool) -> Self {
         self.config.preservation.structure = value;
         self
     }
 
-    pub fn preserve_output_intents(mut self, value: bool) -> Self {
+    pub const fn preserve_output_intents(mut self, value: bool) -> Self {
         self.config.preservation.output_intents = value;
         self
     }
 
-    pub fn preserve_viewer_preferences(mut self, value: bool) -> Self {
+    pub const fn preserve_viewer_preferences(mut self, value: bool) -> Self {
         self.config.preservation.viewer_preferences = value;
         self
     }
 
-    pub fn preserve_metadata(mut self, value: bool) -> Self {
+    pub const fn preserve_metadata(mut self, value: bool) -> Self {
         self.config.preservation.metadata = value;
         self
     }
 
-    pub fn preserve_font_editing_support(mut self, value: bool) -> Self {
+    pub const fn preserve_font_editing_support(mut self, value: bool) -> Self {
         self.config.preservation.font_editing_support = value;
         self
     }
 
-    pub fn annotation_policy(mut self, value: AnnotationPolicy) -> Self {
+    pub const fn annotation_policy(mut self, value: AnnotationPolicy) -> Self {
         self.config.preservation.annotations = value;
         self
     }
 
-    pub fn preserve_unknown_objects(mut self, value: bool) -> Self {
+    pub const fn preserve_unknown_objects(mut self, value: bool) -> Self {
         self.config.preservation.unknown_objects = value;
         self
     }
 
-    pub fn max_image_ppi(mut self, value: Option<u16>) -> Self {
+    pub const fn max_image_ppi(mut self, value: Option<u16>) -> Self {
         self.config.max_image_ppi = value;
         self
     }
 
-    pub fn image_policy(mut self, value: ImagePolicy) -> Self {
+    pub const fn image_policy(mut self, value: ImagePolicy) -> Self {
         self.config.image_policy = value;
         self
     }
 
-    pub fn privacy(mut self, value: PrivacyConfig) -> Self {
+    pub const fn privacy(mut self, value: PrivacyConfig) -> Self {
         self.config.privacy = value;
         self
     }
@@ -415,86 +433,87 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn generate_object_streams(mut self, value: bool) -> Self {
+    pub const fn generate_object_streams(mut self, value: bool) -> Self {
         self.config.generate_object_streams = value;
         self
     }
 
-    pub fn normalize_content_streams(mut self, value: bool) -> Self {
+    pub const fn normalize_content_streams(mut self, value: bool) -> Self {
         self.config.normalize_content_streams = value;
         self
     }
 
-    pub fn flate_policy(mut self, value: FlatePolicy) -> Self {
+    pub const fn flate_policy(mut self, value: FlatePolicy) -> Self {
         self.config.flate_policy = value;
         self
     }
 
-    pub fn prune_resources(mut self, value: bool) -> Self {
+    pub const fn prune_resources(mut self, value: bool) -> Self {
         self.config.prune_resources = value;
         self
     }
 
-    pub fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
+    pub const fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
         self.config.deduplicate_metadata_streams = value;
         self
     }
 
-    pub fn deduplicate_font_programs(mut self, value: bool) -> Self {
+    pub const fn deduplicate_font_programs(mut self, value: bool) -> Self {
         self.config.deduplicate_font_programs = value;
         self
     }
 
-    pub fn deduplicate_to_unicode_cmaps(mut self, value: bool) -> Self {
+    pub const fn deduplicate_to_unicode_cmaps(mut self, value: bool) -> Self {
         self.config.deduplicate_to_unicode_cmaps = value;
         self
     }
 
-    pub fn deduplicate_inline_images(mut self, value: bool) -> Self {
+    pub const fn deduplicate_inline_images(mut self, value: bool) -> Self {
         self.config.deduplicate_inline_images = value;
         self
     }
 
-    pub fn inline_image_min_duplicate_payload_bytes(mut self, value: usize) -> Self {
+    pub const fn inline_image_min_duplicate_payload_bytes(mut self, value: usize) -> Self {
         self.config.inline_image_min_duplicate_payload_bytes = value;
         self
     }
 
-    pub fn deduplicate_image_xobjects(mut self, value: bool) -> Self {
+    pub const fn deduplicate_image_xobjects(mut self, value: bool) -> Self {
         self.config.deduplicate_image_xobjects = value;
         self
     }
 
-    pub fn deduplicate_form_xobjects(mut self, value: bool) -> Self {
+    pub const fn deduplicate_form_xobjects(mut self, value: bool) -> Self {
         self.config.deduplicate_form_xobjects = value;
         self
     }
 
-    pub fn deduplicate_appearance_streams(mut self, value: bool) -> Self {
+    pub const fn deduplicate_appearance_streams(mut self, value: bool) -> Self {
         self.config.deduplicate_appearance_streams = value;
         self
     }
 
-    pub fn deduplicate_page_contents(mut self, value: bool) -> Self {
+    pub const fn deduplicate_page_contents(mut self, value: bool) -> Self {
         self.config.deduplicate_page_contents = value;
         self
     }
 
-    pub fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
+    pub const fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
         self.config.deduplicate_type3_charprocs = value;
         self
     }
 
-    pub fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
+    pub const fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
         self.config.deduplicate_icc_profiles = value;
         self
     }
 
-    pub fn flate_level(mut self, value: i32) -> Self {
+    pub const fn flate_level(mut self, value: i32) -> Self {
         self.config.flate_level = value;
         self
     }
 
+    #[must_use]
     pub fn build(self) -> Config {
         self.config
     }

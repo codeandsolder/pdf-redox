@@ -1,7 +1,7 @@
 /// Strip metadata-only JPEG marker segments without touching quantized DCT
 /// coefficients or entropy-coded scan data. Returns None when the input is not
 /// a structurally recognizable JPEG or no bytes would be removed.
-pub(crate) fn strip_jpeg_metadata(data: &[u8], aggressive: bool) -> Option<(Vec<u8>, usize)> {
+pub fn strip_jpeg_metadata(data: &[u8], aggressive: bool) -> Option<(Vec<u8>, usize)> {
     if data.len() < 4 || data[0..2] != [0xff, 0xd8] {
         return None;
     }

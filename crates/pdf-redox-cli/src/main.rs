@@ -39,6 +39,10 @@ enum AnnotationPolicyArg {
     name = "pdf-redox",
     about = "Pure-Rust PDF normalization, optimization, and cleanup"
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flags are independent switches and map directly to the public configuration"
+)]
 struct Args {
     input: PathBuf,
     #[arg(short, long)]
@@ -145,6 +149,10 @@ struct Args {
     json: bool,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the CLI entry point is linear argument-to-configuration plumbing"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = Args::parse();
     if a.corpus {

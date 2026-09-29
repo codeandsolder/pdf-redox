@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 
-pub(crate) fn input_sha256(input: &[u8]) -> String {
+pub fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(input);
     let mut output = String::with_capacity(digest.len() * 2);
@@ -143,7 +143,7 @@ fn collect_page_content_refs(document: &EditDocument) -> Result<HashSet<CowObjec
     Ok(refs)
 }
 
-fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
+const fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
     match key {
         b"Metadata" => Some("metadata"),
         b"ToUnicode" => Some("to-unicode"),
@@ -506,6 +506,15 @@ fn filter_name(
     Ok(String::from_utf8_lossy(&detached.unparse_resolved()).into_owned())
 }
 
+/// Analyze a PDF without modifying it.
+///
+/// # Errors
+///
+/// Returns an error when the input cannot be parsed or a referenced stream cannot be decoded.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the analysis is a single ordered aggregation pass over related document metrics"
+)]
 pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
     let objects = all_source_objects(&document)?;
