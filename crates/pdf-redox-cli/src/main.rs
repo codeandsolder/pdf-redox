@@ -46,6 +46,16 @@ fn parse_flate_level(value: &str) -> Result<i32, String> {
         .ok_or_else(|| "Flate level must be an integer from 0 through 9".to_owned())
 }
 
+fn parse_jpeg_quality(value: &str) -> Result<u8, String> {
+    let quality = value
+        .parse::<u8>()
+        .map_err(|_| "JPEG quality must be an integer from 1 through 100".to_owned())?;
+    (1..=100)
+        .contains(&quality)
+        .then_some(quality)
+        .ok_or_else(|| "JPEG quality must be an integer from 1 through 100".to_owned())
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AnnotationPolicyArg {
     Preserve,
@@ -104,7 +114,12 @@ struct Args {
     /// Override handling of non-Link/non-Widget annotations.
     #[arg(long, value_enum)]
     annotations: Option<AnnotationPolicyArg>,
-    /// Override the effective-PPI target used by the print image policy.
+    /// Override JPEG quality (1-100) for Perceptual/Print image re-encoding.
+    /// The lossless JPEG entropy pass does not use this value.
+    #[arg(long, value_parser = parse_jpeg_quality)]
+    jpeg_quality: Option<u8>,
+    /// Override the maximum effective image PPI used by the Print profile.
+    /// Perceptual preserves source pixel dimensions instead.
     #[arg(long)]
     max_image_ppi: Option<u16>,
     #[arg(long, value_enum, default_value = "none")]
@@ -277,6 +292,19 @@ fn config_from_args(args: &Args) -> Config {
             AnnotationPolicyArg::Discard => AnnotationPolicy::Discard,
         };
     }
+    if let Some(jpeg_quality) = args.jpeg_quality {
+        match &mut cfg.image_policy {
+            pdf_redox::ImagePolicy::Perceptual {
+                jpeg_quality: quality,
+                ..
+            }
+            | pdf_redox::ImagePolicy::Print {
+                jpeg_quality: quality,
+                ..
+            } => *quality = jpeg_quality,
+            pdf_redox::ImagePolicy::Preserve => {}
+        }
+    }
     if let Some(max_image_ppi) = args.max_image_ppi {
         cfg.max_image_ppi = Some(max_image_ppi);
     }
@@ -447,5 +475,49 @@ mod tests {
     fn flate_level_rejects_out_of_range_values() {
         assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "10"]).is_err());
         assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "-1"]).is_err());
+    }
+
+    #[test]
+    fn jpeg_quality_overrides_perceptual_and_print_profiles() -> Result<(), clap::Error> {
+        for profile in ["perceptual", "print"] {
+            let args = Args::try_parse_from([
+                "pdf-redox",
+                "input.pdf",
+                "--profile",
+                profile,
+                "--jpeg-quality",
+                "73",
+            ])?;
+            let cfg = config_from_args(&args);
+            let quality = match cfg.image_policy {
+                pdf_redox::ImagePolicy::Perceptual { jpeg_quality, .. }
+                | pdf_redox::ImagePolicy::Print { jpeg_quality, .. } => jpeg_quality,
+                pdf_redox::ImagePolicy::Preserve => {
+                    panic!("{profile} unexpectedly preserves images")
+                }
+            };
+            assert_eq!(quality, 73);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn jpeg_quality_rejects_out_of_range_values() {
+        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--jpeg-quality", "0"]).is_err());
+        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--jpeg-quality", "101"]).is_err());
+    }
+
+    #[test]
+    fn max_image_ppi_overrides_print_cap() -> Result<(), clap::Error> {
+        let args = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--profile",
+            "print",
+            "--max-image-ppi",
+            "300",
+        ])?;
+        assert_eq!(config_from_args(&args).max_image_ppi, Some(300));
+        Ok(())
     }
 }

@@ -69,7 +69,7 @@ pub(crate) fn apply_flate_policy_hayro(
         FlatePolicy::RecompressAll => (0, 0, true),
     };
     let mut stats = FlateOptimizationStats::default();
-    for handle in document.reachable_output_objects()? {
+    for handle in document.reachable_streams()? {
         let Some(crate::OwnedObject::Stream { dictionary, data }) =
             document.current_owned_object(handle)?
         else {
@@ -106,10 +106,7 @@ pub(crate) fn apply_flate_policy_hayro(
         }
         let object = match handle {
             crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-            crate::ObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+            crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         if let crate::OwnedObject::Stream { data, .. } = object {
             *data = crate::StreamData::Owned(repacked);
@@ -124,7 +121,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
     document: &mut crate::EditDocument,
     level: i32,
 ) -> Result<()> {
-    let handles = document.reachable_output_objects()?;
+    let handles = document.reachable_streams()?;
     for handle in handles {
         let Some(crate::OwnedObject::Stream { dictionary, data }) =
             document.current_owned_object(handle)?
@@ -142,10 +139,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
             if has_filter {
                 let object = match handle {
                     crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    crate::ObjectHandle::New(id) => document
-                        .overlay_mut()
-                        .added_mut(id)
-                        .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+                    crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
                 };
                 if let crate::OwnedObject::Stream { dictionary, data } = object {
                     dictionary.remove(b"Filter".as_slice());
@@ -168,10 +162,7 @@ pub(crate) fn compress_unfiltered_streams_hayro(
         let encoded = encode_stream_data_with_flate_level(&encoding_dictionary, &raw, level)?;
         let object = match handle {
             crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-            crate::ObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+            crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         if let crate::OwnedObject::Stream { dictionary, data } = object {
             dictionary.insert(

@@ -1,4 +1,5 @@
 mod analyze;
+mod bilevel;
 mod config;
 mod content;
 mod dedup;
@@ -9,6 +10,7 @@ mod hidden_text;
 mod images;
 mod inline_images;
 mod jpeg;
+mod jpeg_optimize;
 mod microstroke;
 mod optimize;
 mod preservation;
@@ -19,6 +21,7 @@ mod repeated_page_objects;
 mod report;
 mod scrub;
 mod source;
+mod structure_compact;
 mod vector_compact;
 mod writer;
 

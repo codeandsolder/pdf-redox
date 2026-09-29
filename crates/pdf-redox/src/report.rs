@@ -207,8 +207,26 @@ pub struct OptimizationReport {
     /// Wall-clock milliseconds spent in major optimizer stages. Intended for profiling, not stable API ordering.
     #[serde(default)]
     pub stage_timings_ms: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub reachability_queries: u64,
+    #[serde(default)]
+    pub reachability_rebuilds: u64,
+    #[serde(default)]
+    pub reachability_cache_hits: u64,
+    #[serde(default)]
+    pub reachability_edge_checks: u64,
+    #[serde(default)]
+    pub reachability_edge_stable_reuses: u64,
     pub privacy_items_removed: BTreeMap<String, usize>,
     pub jpeg_metadata_bytes_removed: usize,
+    #[serde(default)]
+    pub jpeg_entropy_streams_considered: usize,
+    #[serde(default)]
+    pub jpeg_entropy_streams_optimized: usize,
+    #[serde(default)]
+    pub jpeg_entropy_original_encoded_bytes: usize,
+    #[serde(default)]
+    pub jpeg_entropy_optimized_encoded_bytes: usize,
     pub hidden_text_items_removed: usize,
     /// Self-contained large diagonal `BT..ET` text objects removed by the explicit watermark-like cleanup.
     #[serde(default)]
@@ -263,6 +281,18 @@ pub struct OptimizationReport {
     pub font_duplicate_streams_detected: usize,
     pub font_duplicate_raw_bytes: usize,
     pub font_references_canonicalized: usize,
+    #[serde(default)]
+    pub font_duplicate_dictionaries_detected: usize,
+    #[serde(default)]
+    pub font_dictionary_references_canonicalized: usize,
+    #[serde(default)]
+    pub extgstate_duplicate_dictionaries_detected: usize,
+    #[serde(default)]
+    pub extgstate_dictionary_references_canonicalized: usize,
+    #[serde(default)]
+    pub structure_attribute_duplicate_dictionaries_detected: usize,
+    #[serde(default)]
+    pub structure_attribute_references_canonicalized: usize,
     #[serde(default)]
     pub font_programs_rendering_optimized: usize,
     #[serde(default)]
@@ -345,7 +375,13 @@ pub struct OptimizationReport {
     #[serde(default)]
     pub raster_stencil_images_emitted: usize,
     #[serde(default)]
+    pub raster_constant_color_mask_stencils_emitted: usize,
+    #[serde(default)]
     pub raster_relaxed_stencil_images_emitted: usize,
+    #[serde(default)]
+    pub raster_bilevel_ccitt_images_emitted: usize,
+    #[serde(default)]
+    pub raster_bilevel_flate_images_emitted: usize,
     #[serde(default)]
     pub exact_raster_rendering: bool,
     #[serde(default)]
@@ -356,6 +392,8 @@ pub struct OptimizationReport {
     pub raster_deferred_tile_paints_consumed: usize,
     #[serde(default)]
     pub raster_staging_xobject_entries_removed: usize,
+    #[serde(default)]
+    pub raster_rewritten_xobject_entries_removed: usize,
     #[serde(default)]
     pub resource_entries_pruned: usize,
     #[serde(default)]
@@ -371,6 +409,24 @@ pub struct OptimizationReport {
     #[serde(default)]
     pub resource_shading_entries_pruned: usize,
     #[serde(default)]
+    pub page_tree_nodes_before: usize,
+    #[serde(default)]
+    pub page_tree_nodes_after: usize,
+    #[serde(default)]
+    pub page_tree_nodes_removed: usize,
+    #[serde(default)]
+    pub page_tree_pages_reparented: usize,
+    #[serde(default)]
+    pub name_trees_repacked: usize,
+    #[serde(default)]
+    pub name_tree_nodes_before: usize,
+    #[serde(default)]
+    pub name_tree_nodes_after: usize,
+    #[serde(default)]
+    pub name_tree_nodes_removed: usize,
+    #[serde(default)]
+    pub named_destination_wrappers_inlined: usize,
+    #[serde(default)]
     pub microstroke_pages_rasterized: usize,
     #[serde(default)]
     pub microstroke_runs_rasterized: usize,
@@ -378,6 +434,10 @@ pub struct OptimizationReport {
     pub microstroke_strokes_rasterized: usize,
     #[serde(default)]
     pub microstroke_image_payload_bytes: usize,
+    #[serde(default)]
+    pub microstroke_ccitt_images: usize,
+    #[serde(default)]
+    pub microstroke_flate_images: usize,
     #[serde(default)]
     pub microstroke_estimated_flate_bytes_saved: usize,
     pub print_images_placed: usize,

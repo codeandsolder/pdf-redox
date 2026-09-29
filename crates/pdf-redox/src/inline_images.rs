@@ -69,21 +69,8 @@ fn collect_targets(document: &EditDocument) -> Result<Vec<ContentTarget>> {
     for page in document.page_handles()? {
         targets.insert(ContentTarget::Page(page));
     }
-    for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
-            continue;
-        };
-        if matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Form")
-            && matches!(object, OwnedObject::Stream { .. })
-        {
-            targets.insert(ContentTarget::Form(handle));
-        }
+    for handle in document.reachable_streams_with_subtype(b"Form")? {
+        targets.insert(ContentTarget::Form(handle));
     }
     Ok(targets.into_iter().collect())
 }
@@ -123,7 +110,7 @@ fn image_stream(document: &mut EditDocument, image: DetachedInlineImage) -> Resu
         ));
     };
     dictionary.remove(b"Length".as_slice());
-    Ok(ObjectHandle::New(document.overlay_mut().add(
+    Ok(ObjectHandle::New(document.add_object(
         OwnedObject::Stream {
             dictionary,
             data: StreamData::Owned(image.data),
@@ -171,16 +158,13 @@ fn install_rewrite(
 
     match target {
         ContentTarget::Page(page) => {
-            let stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+            let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
                 data: StreamData::Owned(rewrite.content),
             }));
             let object = match page {
                 ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document
-                    .overlay_mut()
-                    .added_mut(id)
-                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                ObjectHandle::New(id) => document.edit_added_object(id)?,
             };
             if let Some(dictionary) = object.as_dictionary_mut() {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -190,10 +174,7 @@ fn install_rewrite(
         ContentTarget::Form(form) => {
             let object = match form {
                 ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document
-                    .overlay_mut()
-                    .added_mut(id)
-                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                ObjectHandle::New(id) => document.edit_added_object(id)?,
             };
             if let OwnedObject::Stream { dictionary, data } = object {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -410,10 +391,7 @@ pub(crate) fn cleanup_fragmented_inline_staging_hayro(
             ContentTarget::Page(page) => {
                 let object = match page {
                     ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    ObjectHandle::New(id) => document
-                        .overlay_mut()
-                        .added_mut(id)
-                        .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                    ObjectHandle::New(id) => document.edit_added_object(id)?,
                 };
                 if let Some(dictionary) = object.as_dictionary_mut() {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -422,10 +400,7 @@ pub(crate) fn cleanup_fragmented_inline_staging_hayro(
             ContentTarget::Form(form) => {
                 let object = match form {
                     ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    ObjectHandle::New(id) => document
-                        .overlay_mut()
-                        .added_mut(id)
-                        .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                    ObjectHandle::New(id) => document.edit_added_object(id)?,
                 };
                 if let Some(dictionary) = object.as_dictionary_mut() {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));

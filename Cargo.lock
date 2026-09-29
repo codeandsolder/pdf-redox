@@ -271,6 +271,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fax"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70ed8646f3993cad0585c6669ffba6f7e5440a0bfb0a1f16600cae33ce7cf307"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,9 +518,11 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "pdf-redox"
 version = "0.1.0"
 dependencies = [
+ "fax",
  "flate2",
  "flpdf",
  "hayro-syntax",
+ "libjpeg-turbo-rs",
  "serde",
  "sha2",
  "smallvec",

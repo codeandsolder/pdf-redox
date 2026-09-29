@@ -104,10 +104,7 @@ fn preservation_target_mut<'a>(
 ) -> Result<Option<&'a mut OwnedDictionary>> {
     let root = match target.root {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     Ok(
         preservation_object_at_path_mut(root, &target.path)
@@ -560,10 +557,7 @@ fn drop_authoring_metadata_hayro(
     for (target, keys) in removals {
         let root = match target.root {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         let Some(dictionary) = preservation_object_at_path_mut(root, &target.path)
             .and_then(OwnedObject::as_dictionary_mut)
@@ -714,12 +708,12 @@ fn inherited_page_value_hayro(
 fn ensure_indirect_owned(document: &mut EditDocument, object: OwnedObject) -> CowObjectHandle {
     match object {
         OwnedObject::Reference(handle) => handle,
-        object => CowObjectHandle::New(document.overlay_mut().add(object)),
+        object => CowObjectHandle::New(document.add_object(object)),
     }
 }
 
 fn new_content_stream(document: &mut EditDocument, data: Vec<u8>) -> CowObjectHandle {
-    CowObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+    CowObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
         data: StreamData::Owned(data),
     }))
@@ -823,10 +817,7 @@ fn appearance_as_form_hayro(
         AppearanceSource::Handle(handle) => {
             let object = match handle {
                 CowObjectHandle::Existing(id) => document.edit_object(id)?,
-                CowObjectHandle::New(id) => document
-                    .overlay_mut()
-                    .added_mut(id)
-                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                CowObjectHandle::New(id) => document.edit_added_object(id)?,
             };
             let Some(dictionary) = object.as_dictionary_mut() else {
                 return Err(Error::Invalid(
@@ -843,7 +834,7 @@ fn appearance_as_form_hayro(
                 ));
             };
             dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
-            Ok(CowObjectHandle::New(document.overlay_mut().add(object)))
+            Ok(CowObjectHandle::New(document.add_object(object)))
         }
     }
 }

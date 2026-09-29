@@ -2,12 +2,12 @@ use crate::{Error, Result, SourceLoadError};
 use flpdf::{DecodeLevel, ObjectHandle as FlObjectHandle};
 use hayro_syntax::{
     Pdf, PdfVersion,
-    object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
+    object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream},
 };
 use std::{
     borrow::Cow,
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
     rc::Rc,
     sync::Arc,
 };
@@ -16,9 +16,17 @@ use std::{
 ///
 /// Hayro keeps the original bytes alive and parses objects on demand. Mutations
 /// belong in [`ObjectOverlay`] rather than in this source representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceStreamKind {
+    NotStream,
+    Stream(Option<Vec<u8>>),
+}
+
 pub struct SourcePdf {
     pdf: Pdf,
     bytes: Arc<Vec<u8>>,
+    direct_reference_cache: RefCell<HashMap<ObjectId, Vec<ObjectId>>>,
+    stream_kind_cache: RefCell<HashMap<ObjectId, SourceStreamKind>>,
 }
 
 impl SourcePdf {
@@ -30,7 +38,12 @@ impl SourcePdf {
     /// Parse PDF bytes already held in shared storage.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
         let pdf = Pdf::new(Arc::clone(&bytes)).map_err(SourceLoadError::from)?;
-        Ok(Self { pdf, bytes })
+        Ok(Self {
+            pdf,
+            bytes,
+            direct_reference_cache: RefCell::new(HashMap::new()),
+            stream_kind_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Original source bytes, unchanged.
@@ -96,14 +109,55 @@ impl SourcePdf {
             })
     }
 
+    fn source_stream_kind_from_object(object: &Object<'_>) -> SourceStreamKind {
+        match object {
+            Object::Stream(stream) => SourceStreamKind::Stream(
+                stream
+                    .dict()
+                    .get::<Name<'_>>(b"Subtype")
+                    .map(|name| name.as_ref().to_vec()),
+            ),
+            _ => SourceStreamKind::NotStream,
+        }
+    }
+
+    fn cache_source_stream_kind(&self, id: ObjectId, object: &Object<'_>) {
+        if self.stream_kind_cache.borrow().contains_key(&id) {
+            return;
+        }
+        self.stream_kind_cache
+            .borrow_mut()
+            .insert(id, Self::source_stream_kind_from_object(object));
+    }
+
+    fn source_stream_kind(&self, id: ObjectId) -> Result<SourceStreamKind> {
+        if let Some(kind) = self.stream_kind_cache.borrow().get(&id) {
+            return Ok(kind.clone());
+        }
+        let object = self.object(id)?;
+        let kind = Self::source_stream_kind_from_object(&object);
+        self.stream_kind_cache.borrow_mut().insert(id, kind.clone());
+        Ok(kind)
+    }
+
     pub(crate) fn object_with_references(
         &self,
         id: ObjectId,
     ) -> Result<(Object<'_>, Vec<ObjectId>)> {
         let object = self.object(id)?;
-        let mut references = BTreeSet::new();
-        collect_hayro_references(&object, &mut references);
-        Ok((object, references.into_iter().collect()))
+        self.cache_source_stream_kind(id, &object);
+        let references = if let Some(references) = self.direct_reference_cache.borrow().get(&id) {
+            references.clone()
+        } else {
+            let mut references = BTreeSet::new();
+            collect_hayro_references(&object, &mut references);
+            let references = references.into_iter().collect::<Vec<_>>();
+            self.direct_reference_cache
+                .borrow_mut()
+                .insert(id, references.clone());
+            references
+        };
+        Ok((object, references))
     }
 
     pub(crate) fn contains_object(&self, id: ObjectId) -> bool {
@@ -116,7 +170,19 @@ impl SourcePdf {
     /// objects are not resolved or materialized, and stream payload bytes are
     /// never touched.
     pub fn references(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
-        Ok(self.object_with_references(id)?.1)
+        if let Some(references) = self.direct_reference_cache.borrow().get(&id) {
+            return Ok(references.clone());
+        }
+
+        let object = self.object(id)?;
+        self.cache_source_stream_kind(id, &object);
+        let mut references = BTreeSet::new();
+        collect_hayro_references(&object, &mut references);
+        let references = references.into_iter().collect::<Vec<_>>();
+        self.direct_reference_cache
+            .borrow_mut()
+            .insert(id, references.clone());
+        Ok(references)
     }
 
     /// Return the encoded/decrypted bytes of a source stream on demand.
@@ -521,6 +587,23 @@ struct DecodedContentCache {
     streams: BTreeMap<ObjectId, Vec<u8>>,
 }
 
+struct ReachableOutputCache {
+    generation: u64,
+    traversal: Vec<ObjectHandle>,
+    sorted: Vec<ObjectHandle>,
+    streams: Option<Vec<ObjectHandle>>,
+    streams_by_subtype: HashMap<Vec<u8>, Vec<ObjectHandle>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReachabilityCacheStats {
+    pub queries: u64,
+    pub rebuilds: u64,
+    pub cache_hits: u64,
+    pub edge_checks: u64,
+    pub edge_stable_reuses: u64,
+}
+
 /// A lazily parsed source document plus the objects changed by optimization
 /// passes. This is the target architecture for the Hayro migration.
 pub struct EditDocument {
@@ -528,6 +611,10 @@ pub struct EditDocument {
     trailer: OwnedDictionary,
     overlay: ObjectOverlay,
     decoded_content_stream_cache: RefCell<DecodedContentCache>,
+    mutation_generation: Cell<u64>,
+    reachable_output_cache: RefCell<Option<ReachableOutputCache>>,
+    pending_reference_baselines: RefCell<HashMap<ObjectHandle, Vec<ObjectHandle>>>,
+    reachability_cache_stats: Cell<ReachabilityCacheStats>,
 }
 
 impl EditDocument {
@@ -539,6 +626,10 @@ impl EditDocument {
             trailer,
             overlay: ObjectOverlay::default(),
             decoded_content_stream_cache: RefCell::new(DecodedContentCache::default()),
+            mutation_generation: Cell::new(0),
+            reachable_output_cache: RefCell::new(None),
+            pending_reference_baselines: RefCell::new(HashMap::new()),
+            reachability_cache_stats: Cell::new(ReachabilityCacheStats::default()),
         })
     }
 
@@ -550,7 +641,85 @@ impl EditDocument {
         &self.trailer
     }
 
+    fn invalidate_reachable_metadata_cache(&self) {
+        if let Some(cache) = self.reachable_output_cache.borrow_mut().as_mut() {
+            cache.streams = None;
+            cache.streams_by_subtype.clear();
+        }
+    }
+
+    fn mark_graph_maybe_mutated(&self) {
+        self.pending_reference_baselines.borrow_mut().clear();
+        self.invalidate_reachable_metadata_cache();
+        self.mutation_generation
+            .set(self.mutation_generation.get().wrapping_add(1));
+    }
+
+    fn mark_object_maybe_mutated(&self, handle: ObjectHandle) -> Result<()> {
+        self.invalidate_reachable_metadata_cache();
+        if self
+            .pending_reference_baselines
+            .borrow()
+            .contains_key(&handle)
+        {
+            return Ok(());
+        }
+
+        let generation = self.mutation_generation.get();
+        let reachable = self
+            .reachable_output_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.generation == generation && cache.sorted.binary_search(&handle).is_ok()
+            });
+        if !reachable {
+            return Ok(());
+        }
+
+        let baseline = self.references_for_handle(handle)?;
+        self.pending_reference_baselines
+            .borrow_mut()
+            .insert(handle, baseline);
+        Ok(())
+    }
+
+    fn validate_pending_reference_changes(&self) -> Result<()> {
+        let pending = std::mem::take(&mut *self.pending_reference_baselines.borrow_mut());
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut stats = self.reachability_cache_stats.get();
+        let mut graph_changed = false;
+        for (handle, baseline) in pending {
+            stats.edge_checks = stats.edge_checks.saturating_add(1);
+            match self.references_for_handle(handle) {
+                Ok(current) if current == baseline => {}
+                Ok(_) | Err(Error::DeletedReferencedObject { .. }) => {
+                    graph_changed = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if graph_changed {
+            self.mutation_generation
+                .set(self.mutation_generation.get().wrapping_add(1));
+        } else {
+            stats.edge_stable_reuses = stats.edge_stable_reuses.saturating_add(1);
+        }
+        self.reachability_cache_stats.set(stats);
+        Ok(())
+    }
+
+    pub(crate) fn reachability_cache_stats(&self) -> ReachabilityCacheStats {
+        self.reachability_cache_stats.get()
+    }
+
     pub fn trailer_mut(&mut self) -> &mut OwnedDictionary {
+        self.mark_graph_maybe_mutated();
         &mut self.trailer
     }
 
@@ -558,11 +727,30 @@ impl EditDocument {
         &self.overlay
     }
 
+    // Escape hatch for bulk/opaque overlay mutation. Callers that only need
+    // to allocate or edit one known object should prefer add_object,
+    // edit_object, or edit_added_object so reachability can reuse a cached
+    // graph when indirect-reference edges stay unchanged.
     pub fn overlay_mut(&mut self) -> &mut ObjectOverlay {
+        self.mark_graph_maybe_mutated();
         &mut self.overlay
     }
 
+    // Allocation alone cannot change output reachability; the reachable object
+    // that eventually points at this handle will trigger edge validation.
+    pub fn add_object(&mut self, object: OwnedObject) -> NewObjectId {
+        self.overlay.add(object)
+    }
+
+    pub fn edit_added_object(&mut self, id: NewObjectId) -> Result<&mut OwnedObject> {
+        self.mark_object_maybe_mutated(ObjectHandle::New(id))?;
+        self.overlay
+            .added_mut(id)
+            .ok_or_else(|| Error::MissingNewObject { index: id.index() })
+    }
+
     pub fn edit_object(&mut self, id: ObjectId) -> Result<&mut OwnedObject> {
+        self.mark_object_maybe_mutated(ObjectHandle::Existing(id))?;
         self.overlay.edit(&self.source, id)
     }
 
@@ -893,8 +1081,188 @@ impl EditDocument {
         roots
     }
 
+    fn ensure_reachable_output_cache(&self) -> Result<bool> {
+        self.validate_pending_reference_changes()?;
+        let generation = self.mutation_generation.get();
+        if self
+            .reachable_output_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.generation == generation)
+        {
+            return Ok(false);
+        }
+
+        let mut stats = self.reachability_cache_stats.get();
+        stats.rebuilds = stats.rebuilds.saturating_add(1);
+        self.reachability_cache_stats.set(stats);
+
+        let mut seen = HashSet::new();
+        let mut traversal = Vec::new();
+        let mut pending = self.output_roots();
+        while let Some(handle) = pending.pop() {
+            if !seen.insert(handle) {
+                continue;
+            }
+            let references = match self.references_for_handle(handle) {
+                Ok(references) => references,
+                Err(Error::MissingSourceObject { .. })
+                    if matches!(handle, ObjectHandle::Existing(_)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            traversal.push(handle);
+            pending.extend(
+                references
+                    .into_iter()
+                    .filter(|reference| !seen.contains(reference)),
+            );
+        }
+
+        let mut sorted = traversal.clone();
+        sorted.sort_unstable();
+        *self.reachable_output_cache.borrow_mut() = Some(ReachableOutputCache {
+            generation,
+            traversal,
+            sorted,
+            streams: None,
+            streams_by_subtype: HashMap::new(),
+        });
+        Ok(true)
+    }
+
+    fn record_reachability_query(&self, rebuilt: bool) {
+        let mut stats = self.reachability_cache_stats.get();
+        stats.queries = stats.queries.saturating_add(1);
+        if !rebuilt {
+            stats.cache_hits = stats.cache_hits.saturating_add(1);
+        }
+        self.reachability_cache_stats.set(stats);
+    }
+
+    fn reachable_output_traversal(&self) -> Result<Vec<ObjectHandle>> {
+        let rebuilt = self.ensure_reachable_output_cache()?;
+        self.record_reachability_query(rebuilt);
+        self.reachable_output_cache
+            .borrow()
+            .as_ref()
+            .map(|cache| cache.traversal.clone())
+            .ok_or_else(|| Error::Invalid("reachable-output cache was not populated".to_owned()))
+    }
+
     pub(crate) fn reachable_output_objects(&self) -> Result<Vec<ObjectHandle>> {
-        self.reachable_from(self.output_roots())
+        let rebuilt = self.ensure_reachable_output_cache()?;
+        self.record_reachability_query(rebuilt);
+        self.reachable_output_cache
+            .borrow()
+            .as_ref()
+            .map(|cache| cache.sorted.clone())
+            .ok_or_else(|| Error::Invalid("reachable-output cache was not populated".to_owned()))
+    }
+
+    pub(crate) fn stream_subtype_is(&self, handle: ObjectHandle, subtype: &[u8]) -> Result<bool> {
+        match handle {
+            ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                Some(ExistingObjectChange::Replace(OwnedObject::Stream { dictionary, .. })) => {
+                    let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
+                        return Ok(false);
+                    };
+                    Ok(matches!(
+                        self.resolve_owned_value(value)?,
+                        Some(OwnedObject::Name(name)) if name == subtype
+                    ))
+                }
+                Some(ExistingObjectChange::Replace(_)) => Ok(false),
+                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
+                    number: id.number,
+                    generation: id.generation,
+                }),
+                None => Ok(matches!(
+                    self.source.source_stream_kind(id)?,
+                    SourceStreamKind::Stream(Some(name)) if name.as_slice() == subtype
+                )),
+            },
+            ObjectHandle::New(id) => {
+                let Some(OwnedObject::Stream { dictionary, .. }) = self.overlay.added(id) else {
+                    return Ok(false);
+                };
+                let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
+                    return Ok(false);
+                };
+                Ok(matches!(
+                    self.resolve_owned_value(value)?,
+                    Some(OwnedObject::Name(name)) if name == subtype
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn reachable_streams(&self) -> Result<Vec<ObjectHandle>> {
+        let generation = self.mutation_generation.get();
+        if let Some(cache) = self.reachable_output_cache.borrow().as_ref()
+            && cache.generation == generation
+            && let Some(streams) = cache.streams.as_ref()
+        {
+            return Ok(streams.clone());
+        }
+
+        let mut streams = Vec::new();
+        for handle in self.reachable_output_objects()? {
+            let is_stream = match handle {
+                ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                    Some(ExistingObjectChange::Replace(OwnedObject::Stream { .. })) => true,
+                    Some(ExistingObjectChange::Replace(_) | ExistingObjectChange::Delete) => false,
+                    None => matches!(
+                        self.source.source_stream_kind(id)?,
+                        SourceStreamKind::Stream(_)
+                    ),
+                },
+                ObjectHandle::New(id) => {
+                    matches!(self.overlay.added(id), Some(OwnedObject::Stream { .. }))
+                }
+            };
+            if is_stream {
+                streams.push(handle);
+            }
+        }
+
+        if let Some(cache) = self.reachable_output_cache.borrow_mut().as_mut()
+            && cache.generation == generation
+        {
+            cache.streams = Some(streams.clone());
+        }
+        Ok(streams)
+    }
+
+    pub(crate) fn reachable_streams_with_subtype(
+        &self,
+        subtype: &[u8],
+    ) -> Result<Vec<ObjectHandle>> {
+        let generation = self.mutation_generation.get();
+        if let Some(cache) = self.reachable_output_cache.borrow().as_ref()
+            && cache.generation == generation
+            && let Some(streams) = cache.streams_by_subtype.get(subtype)
+        {
+            return Ok(streams.clone());
+        }
+
+        let mut streams = Vec::new();
+        for handle in self.reachable_output_objects()? {
+            if self.stream_subtype_is(handle, subtype)? {
+                streams.push(handle);
+            }
+        }
+
+        if let Some(cache) = self.reachable_output_cache.borrow_mut().as_mut()
+            && cache.generation == generation
+        {
+            cache
+                .streams_by_subtype
+                .insert(subtype.to_vec(), streams.clone());
+        }
+        Ok(streams)
     }
 
     /// Visit every object reachable from the current output roots exactly once.
@@ -907,19 +1275,11 @@ impl EditDocument {
     where
         F: for<'a> FnMut(ObjectHandle, CurrentObject<'a>) -> Result<()>,
     {
-        let mut seen = BTreeSet::new();
-        let mut pending = self.output_roots();
-
-        while let Some(handle) = pending.pop() {
-            if !seen.insert(handle) {
-                continue;
-            }
-
-            let references = match handle {
+        for handle in self.reachable_output_traversal()? {
+            match handle {
                 ObjectHandle::Existing(id) => match self.overlay.change(id) {
                     Some(ExistingObjectChange::Replace(object)) => {
                         visit(handle, CurrentObject::Owned(object))?;
-                        object.references()
                     }
                     Some(ExistingObjectChange::Delete) => {
                         return Err(Error::DeletedReferencedObject {
@@ -927,15 +1287,11 @@ impl EditDocument {
                             generation: id.generation,
                         });
                     }
-                    None => {
-                        let (object, references) = match self.source.object_with_references(id) {
-                            Ok(value) => value,
-                            Err(Error::MissingSourceObject { .. }) => continue,
-                            Err(error) => return Err(error),
-                        };
-                        visit(handle, CurrentObject::Source(object))?;
-                        references.into_iter().map(ObjectHandle::Existing).collect()
-                    }
+                    None => match self.source.object(id) {
+                        Ok(object) => visit(handle, CurrentObject::Source(object))?,
+                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(error) => return Err(error),
+                    },
                 },
                 ObjectHandle::New(id) => {
                     let object = self
@@ -943,15 +1299,8 @@ impl EditDocument {
                         .added(id)
                         .ok_or_else(|| Error::MissingNewObject { index: id.index() })?;
                     visit(handle, CurrentObject::Owned(object))?;
-                    object.references()
                 }
-            };
-
-            pending.extend(
-                references
-                    .into_iter()
-                    .filter(|reference| !seen.contains(reference)),
-            );
+            }
         }
         Ok(())
     }
@@ -961,11 +1310,12 @@ impl EditDocument {
         &self,
         roots: impl IntoIterator<Item = ObjectHandle>,
     ) -> Result<Vec<ObjectHandle>> {
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
+        let mut reachable = Vec::new();
         let mut pending = roots.into_iter().collect::<Vec<_>>();
 
         while let Some(handle) = pending.pop() {
-            if seen.contains(&handle) {
+            if !seen.insert(handle) {
                 continue;
             }
 
@@ -979,7 +1329,7 @@ impl EditDocument {
                 Err(error) => return Err(error),
             };
 
-            seen.insert(handle);
+            reachable.push(handle);
             for reference in references {
                 if !seen.contains(&reference) {
                     pending.push(reference);
@@ -987,7 +1337,8 @@ impl EditDocument {
             }
         }
 
-        Ok(seen.into_iter().collect())
+        reachable.sort_unstable();
+        Ok(reachable)
     }
 
     fn references_for_handle(&self, handle: ObjectHandle) -> Result<Vec<ObjectHandle>> {
@@ -1270,14 +1621,57 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_allocation_does_not_invalidate_output_reachability() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let before = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("initial output graph should be reachable: {error}"),
+        };
+        assert_eq!(document.reachability_cache_stats().rebuilds, 1);
+
+        let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
+        let after_allocation = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("cached output graph should remain reachable: {error}"),
+        };
+        assert_eq!(after_allocation, before);
+        assert!(!after_allocation.contains(&ObjectHandle::New(added)));
+        let stats = document.reachability_cache_stats();
+        assert_eq!(stats.rebuilds, 1);
+        assert!(stats.cache_hits >= 1);
+
+        let catalog_id = document.source().catalog_id();
+        let catalog = match document.edit_object(catalog_id) {
+            Ok(object) => object,
+            Err(error) => panic!("catalog should materialize: {error}"),
+        };
+        let dictionary = match catalog.as_dictionary_mut() {
+            Some(dictionary) => dictionary,
+            None => panic!("catalog should be a dictionary"),
+        };
+        dictionary.insert(
+            b"PieceInfo".to_vec(),
+            OwnedObject::Reference(ObjectHandle::New(added)),
+        );
+
+        let linked = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("linked output graph should be reachable: {error}"),
+        };
+        assert!(linked.contains(&ObjectHandle::New(added)));
+        assert_eq!(document.reachability_cache_stats().rebuilds, 2);
+    }
+
+    #[test]
     fn reachability_follows_new_overlay_references() {
         let mut document = match EditDocument::from_bytes(sample_pdf()) {
             Ok(document) => document,
             Err(error) => panic!("sample PDF should parse: {error}"),
         };
-        let added = document
-            .overlay_mut()
-            .add(OwnedObject::Dictionary(OwnedDictionary::new()));
+        let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
         let catalog_id = document.source().catalog_id();
         let catalog = match document.edit_object(catalog_id) {
             Ok(object) => object,
@@ -1297,6 +1691,99 @@ mod tests {
             Err(error) => panic!("overlay graph should be reachable: {error}"),
         };
         assert!(reachable.contains(&ObjectHandle::New(added)));
+    }
+
+    #[test]
+    fn reachable_output_cache_reuses_after_edge_stable_edit() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let before = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("initial output graph should be reachable: {error}"),
+        };
+        let initial_stats = document.reachability_cache_stats();
+        assert_eq!(initial_stats.rebuilds, 1);
+
+        let stream = match document.edit_object(ObjectId::new(4, 0)) {
+            Ok(stream) => stream,
+            Err(error) => panic!("stream should be editable: {error}"),
+        };
+        let OwnedObject::Stream { data, .. } = stream else {
+            panic!("fixture object should be a stream");
+        };
+        *data = StreamData::Owned(b"BT ET".to_vec());
+
+        let after = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("edge-stable output graph should be reachable: {error}"),
+        };
+        assert_eq!(after, before);
+
+        let stats = document.reachability_cache_stats();
+        assert_eq!(stats.rebuilds, 1);
+        assert_eq!(stats.edge_checks, 1);
+        assert_eq!(stats.edge_stable_reuses, 1);
+        assert!(stats.cache_hits >= 1);
+    }
+
+    #[test]
+    fn reachable_output_cache_invalidates_after_object_edit() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let before = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("initial output graph should be reachable: {error}"),
+        };
+        assert!(before.contains(&ObjectHandle::Existing(ObjectId::new(4, 0))));
+        // Hit the cache before changing the graph.
+        let cached = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("cached output graph should be reachable: {error}"),
+        };
+        assert_eq!(cached, before);
+
+        let page = match document.edit_object(ObjectId::new(3, 0)) {
+            Ok(page) => page,
+            Err(error) => panic!("page should be editable: {error}"),
+        };
+        let Some(dictionary) = page.as_dictionary_mut() else {
+            panic!("page should be a dictionary");
+        };
+        dictionary.remove(b"Contents".as_slice());
+
+        let after = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("edited output graph should be reachable: {error}"),
+        };
+        assert!(!after.contains(&ObjectHandle::Existing(ObjectId::new(4, 0))));
+    }
+
+    #[test]
+    fn reachable_output_cache_invalidates_after_trailer_edit() {
+        let mut document = match EditDocument::from_bytes(sample_pdf()) {
+            Ok(document) => document,
+            Err(error) => panic!("sample PDF should parse: {error}"),
+        };
+        let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
+        let before = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("initial output graph should be reachable: {error}"),
+        };
+        assert!(!before.contains(&ObjectHandle::New(added)));
+
+        document.trailer_mut().insert(
+            b"Info".to_vec(),
+            OwnedObject::Reference(ObjectHandle::New(added)),
+        );
+        let after = match document.reachable_output_objects() {
+            Ok(handles) => handles,
+            Err(error) => panic!("trailer-edited output graph should be reachable: {error}"),
+        };
+        assert!(after.contains(&ObjectHandle::New(added)));
     }
 
     #[test]

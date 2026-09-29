@@ -861,10 +861,7 @@ fn redirect_font_descriptor_program(
 ) -> Result<bool> {
     let object = match descriptor {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let Some(dictionary) = object.as_dictionary_mut() else {
         return Ok(false);
@@ -1118,10 +1115,7 @@ fn union_sparse_cid_font_programs_hayro(
         // behavior; this only applies to the union stream.
         let object = match canonical.program {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         if let Some(dictionary) = object.as_dictionary_mut() {
             dictionary.insert(
@@ -2166,10 +2160,7 @@ fn replace_current_stream_data(
 ) -> Result<()> {
     let object = match handle {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     match object {
         OwnedObject::Stream { data, .. } => {

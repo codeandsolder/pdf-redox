@@ -332,7 +332,7 @@ pub(crate) fn scrub_edit_document_cos_privacy(
                 }
             }
             CowObjectHandle::New(id) => {
-                if let Some(object) = document.overlay_mut().added_mut(id)
+                if let Ok(object) = document.edit_added_object(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                 {
                     scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
@@ -437,7 +437,7 @@ fn scrub_catalog_attachments(document: &mut EditDocument, stats: &mut ScrubStats
                     }
                 }
                 CowObjectHandle::New(id) => {
-                    if let Some(object) = document.overlay_mut().added_mut(id)
+                    if let Ok(object) = document.edit_added_object(id)
                         && let Some(dictionary) = object.as_dictionary_mut()
                         && dictionary.remove(b"EmbeddedFiles".as_slice()).is_some()
                     {
@@ -542,7 +542,7 @@ fn strip_signature_field_hayro(
                 }
             }
             CowObjectHandle::New(id) => {
-                if let Some(object) = document.overlay_mut().added_mut(id)
+                if let Ok(object) = document.edit_added_object(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                     && dictionary.remove(b"V".as_slice()).is_some()
                 {
@@ -644,10 +644,7 @@ fn scrub_jpeg_metadata_hayro(
         };
         let object = match handle {
             CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document
-                .overlay_mut()
-                .added_mut(id)
-                .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+            CowObjectHandle::New(id) => document.edit_added_object(id)?,
         };
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(clean);
@@ -693,7 +690,7 @@ fn scrub_catalog_javascript_name_tree(
                     }
                 }
                 CowObjectHandle::New(id) => {
-                    if let Some(object) = document.overlay_mut().added_mut(id)
+                    if let Ok(object) = document.edit_added_object(id)
                         && let Some(dictionary) = object.as_dictionary_mut()
                         && dictionary.remove(b"JavaScript".as_slice()).is_some()
                     {

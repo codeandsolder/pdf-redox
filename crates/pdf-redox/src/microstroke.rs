@@ -1,14 +1,13 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
+    bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
 };
-use flate2::{Compression, write::ZlibEncoder};
 use flpdf::content_stream::ContentScalar;
 use flpdf::{Matrix, ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    io::Write as _,
 };
 
 const MIN_MICROSTROKE_RUN: usize = 500;
@@ -28,6 +27,8 @@ pub struct MicrostrokeRasterStats {
     pub runs_rasterized: usize,
     pub strokes_rasterized: usize,
     pub image_payload_bytes: usize,
+    pub ccitt_images: usize,
+    pub flate_images: usize,
     pub estimated_flate_bytes_saved: usize,
 }
 
@@ -654,16 +655,7 @@ struct RasterizedRun {
     y0: f64,
     width_user: f64,
     height_user: f64,
-    width: u32,
-    height: u32,
-    packed: Vec<u8>,
-}
-
-fn paint_bit(packed: &mut [u8], row_bytes: usize, x: usize, y: usize) {
-    let Some(byte) = packed.get_mut(y.saturating_mul(row_bytes).saturating_add(x / 8)) else {
-        return;
-    };
-    *byte &= !(0x80 >> (x % 8));
+    mask: BilevelRaster,
 }
 
 fn max_linear_scale(matrix: Matrix) -> Option<f64> {
@@ -787,8 +779,9 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
     {
         return None;
     }
-    let row_bytes = width.div_ceil(8);
-    let mut packed = vec![0xff; row_bytes.checked_mul(height)?];
+    let width_u32 = u32::try_from(width).ok()?;
+    let height_u32 = u32::try_from(height).ok()?;
+    let mut mask = BilevelRaster::transparent(width_u32, height_u32)?;
     let radius = run.state.width * scale * 0.5;
 
     for &((ux0, uy0), (ux1, uy1)) in &run.lines {
@@ -855,7 +848,7 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
                     _ => false,
                 };
                 if paints {
-                    paint_bit(&mut packed, row_bytes, x, y);
+                    mask.paint(x, y);
                 }
             }
         }
@@ -866,40 +859,12 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
         y0: ymin,
         width_user: width as f64 / scale,
         height_user: height as f64 / scale,
-        width: u32::try_from(width).ok()?,
-        height: u32::try_from(height).ok()?,
-        packed,
+        mask,
     })
 }
 
-fn compress_flate(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    let level = u32::try_from(level.clamp(0, 9)).unwrap_or(9);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data)?;
-    Ok(encoder.finish()?)
-}
-
-fn image_payload(raster: &RasterizedRun, flate_level: i32) -> Result<(Vec<u8>, OwnedDictionary)> {
-    let data = compress_flate(&raster.packed, flate_level)?;
-    let dictionary = BTreeMap::from([
-        (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-        (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-        (
-            b"Width".to_vec(),
-            OwnedObject::Integer(i64::from(raster.width)),
-        ),
-        (
-            b"Height".to_vec(),
-            OwnedObject::Integer(i64::from(raster.height)),
-        ),
-        (b"ImageMask".to_vec(), OwnedObject::Boolean(true)),
-        (b"BitsPerComponent".to_vec(), OwnedObject::Integer(1)),
-        (
-            b"Filter".to_vec(),
-            OwnedObject::Name(b"FlateDecode".to_vec()),
-        ),
-    ]);
-    Ok((data, dictionary))
+fn image_payload(raster: &RasterizedRun, flate_level: i32) -> Result<BilevelImagePayload> {
+    raster.mask.encode_image_mask(flate_level)
 }
 
 fn compact_real(value: f64) -> String {
@@ -987,10 +952,7 @@ fn install_page_xobject(
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
     let object = match page {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -1106,6 +1068,7 @@ struct Candidate {
     replacement: Vec<u8>,
     dictionary: OwnedDictionary,
     data: Vec<u8>,
+    codec: BilevelCodec,
     strokes: usize,
 }
 
@@ -1168,11 +1131,12 @@ pub(crate) fn rasterize_pathological_microstrokes_hayro(
             let Some(raster) = rasterize_run(&run, pitch, user_unit) else {
                 continue;
             };
-            let (data, dictionary) = image_payload(&raster, flate_level)?;
+            let payload = image_payload(&raster, flate_level)?;
             let name = next_image_name(&mut name_index, &mut occupied);
             let replacement = replacement_bytes(&name, &run, &raster);
             let local_before = compressed_len(&decoded[run.start..run.end], flate_level)?;
-            let local_after = data
+            let local_after = payload
+                .data
                 .len()
                 .saturating_add(replacement.len())
                 .saturating_add(192);
@@ -1184,8 +1148,9 @@ pub(crate) fn rasterize_pathological_microstrokes_hayro(
                 end: run.end,
                 name,
                 replacement,
-                dictionary,
-                data,
+                dictionary: payload.dictionary,
+                data: payload.data,
+                codec: payload.codec,
                 strokes: run.lines.len(),
             });
         }
@@ -1218,7 +1183,7 @@ pub(crate) fn rasterize_pathological_microstrokes_hayro(
 
         let mut installed = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
-            let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+            let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: candidate.dictionary.clone(),
                 data: StreamData::Owned(candidate.data.clone()),
             }));
@@ -1242,6 +1207,18 @@ pub(crate) fn rasterize_pathological_microstrokes_hayro(
                 .iter()
                 .map(|candidate| candidate.data.len())
                 .sum::<usize>(),
+        );
+        stats.ccitt_images = stats.ccitt_images.saturating_add(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.codec == BilevelCodec::CcittGroup4)
+                .count(),
+        );
+        stats.flate_images = stats.flate_images.saturating_add(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.codec == BilevelCodec::Flate)
+                .count(),
         );
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
@@ -1403,6 +1380,6 @@ mod tests {
             lines: vec![((0.0, 0.0), (1.0, 0.0)); MIN_MICROSTROKE_RUN],
         };
         let raster = rasterize_run(&run, 0.12, 1.0).unwrap_or_else(|| panic!("raster"));
-        assert!(raster.packed.iter().any(|byte| *byte != 0xff));
+        assert!(raster.mask.packed().iter().any(|byte| *byte != 0xff));
     }
 }

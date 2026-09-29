@@ -1,4 +1,4 @@
-use crate::{EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
+use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
 
 pub(crate) fn decoded_content_value(
     document: &EditDocument,
@@ -100,16 +100,13 @@ pub(crate) fn replace_page_content(
     page: ObjectHandle,
     bytes: Vec<u8>,
 ) -> Result<()> {
-    let stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+    let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
         data: StreamData::Owned(bytes),
     }));
     let object = match page {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));

@@ -1,4 +1,4 @@
-use crate::{EditDocument, Error, ObjectHandle, OwnedObject, Result, StreamData};
+use crate::{EditDocument, ObjectHandle, OwnedObject, Result, StreamData};
 use flpdf::{
     DetachedImageTransform, ImageOptimizationOptions, ImageOptimizationStats, ImageResizeTarget,
     optimize_image_detached,
@@ -128,10 +128,7 @@ fn install_transform(
     };
     let object = match handle {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     let OwnedObject::Stream { dictionary, data } = object else {
         return Ok(());
@@ -198,12 +195,10 @@ pub(crate) fn optimize_images_hayro(
 ) -> Result<ImageOptimizationStats> {
     let binding_counts = image_binding_counts(document)?;
     let mut stats = ImageOptimizationStats::default();
-    let mut images = BTreeSet::new();
-    for handle in document.reachable_output_objects()? {
-        if is_image(document, handle)? {
-            images.insert(handle);
-        }
-    }
+    let images = document
+        .reachable_streams_with_subtype(b"Image")?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     for image in images {
         if transform_one(document, image, options, None, &mut stats)? {
             stats.references_reused += binding_counts

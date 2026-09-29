@@ -1687,10 +1687,7 @@ fn install_page_xobject(
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
     let object = match page {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -2064,7 +2061,7 @@ fn factor_repeated_path_forms_hayro(
     }
     let mut form_handles = Vec::with_capacity(selected.len());
     for (bytes, _, bounds, _) in &selected {
-        let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: path_form_dictionary(*bounds),
             data: StreamData::Owned(bytes.clone()),
         }));
@@ -2296,7 +2293,7 @@ fn factor_repeated_transformed_blocks_hayro(
     }
     let mut form_handles = Vec::with_capacity(selected.len());
     for (bytes, _, bounds, _, _) in &selected {
-        let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: path_form_dictionary(*bounds),
             data: StreamData::Owned(bytes.clone()),
         }));

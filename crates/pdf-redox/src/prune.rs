@@ -1,5 +1,5 @@
 use crate::{
-    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+    EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
 };
 use flpdf::{DetachedResourceUsage, find_resources_detached};
@@ -235,10 +235,7 @@ fn install_page_resources(
 ) -> Result<()> {
     let object = match page {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -253,10 +250,7 @@ fn install_form_resources(
 ) -> Result<()> {
     let object = match form {
         ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -346,6 +340,45 @@ pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bo
     Ok(false)
 }
 
+pub(crate) fn prune_xobject_candidates_for_content_hayro(
+    document: &EditDocument,
+    mut resources: OwnedDictionary,
+    content: &[u8],
+    candidates: &BTreeSet<Vec<u8>>,
+) -> Result<(OwnedDictionary, usize)> {
+    if candidates.is_empty() {
+        return Ok((resources, 0));
+    }
+    let Some(usage) = scan(content) else {
+        return Ok((resources, 0));
+    };
+    let mut names = usage.names.clone();
+    let mut names_by_type = usage.names_by_resource_type.clone();
+    names.extend(borrowed_form_names(
+        document,
+        &resources,
+        &usage,
+        &mut names_by_type,
+    )?);
+
+    let Some(value) = resources.get(b"XObject".as_slice()).cloned() else {
+        return Ok((resources, 0));
+    };
+    let Some(mut xobjects) = resolved_dictionary(document, Some(&value))? else {
+        return Ok((resources, 0));
+    };
+    let before = xobjects.len();
+    xobjects.retain(|name, _| {
+        !candidates.contains(name)
+            || resource_entry_used(b"XObject", name, &names, None, Some(&names_by_type))
+    });
+    let removed = before.saturating_sub(xobjects.len());
+    if removed != 0 {
+        resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
+    }
+    Ok((resources, removed))
+}
+
 pub(crate) fn prune_resources_with_usage_hayro(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
@@ -403,8 +436,8 @@ pub(crate) fn prune_resources_hayro(
     // Prune forms with local resource scopes first. Resource-less forms are
     // intentionally accounted against their caller's scope below.
     let mut forms = BTreeSet::new();
-    for handle in document.reachable_output_objects()? {
-        if is_form(document, handle)? && form_resources(document, handle)?.is_some() {
+    for handle in document.reachable_streams_with_subtype(b"Form")? {
+        if form_resources(document, handle)?.is_some() {
             forms.insert(handle);
         }
     }

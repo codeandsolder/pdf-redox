@@ -1477,16 +1477,13 @@ fn replace_page_content_hayro(
     page: CowObjectHandle,
     decoded: Vec<u8>,
 ) -> Result<()> {
-    let stream = CowObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+    let stream = CowObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
         data: crate::StreamData::Owned(decoded),
     }));
     let object = match page {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document
-            .overlay_mut()
-            .added_mut(id)
-            .ok_or_else(|| crate::Error::MissingNewObject { index: id.index() })?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));

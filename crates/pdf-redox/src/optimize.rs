@@ -5,11 +5,13 @@ use crate::{
     analyze::{analyze_document_for_optimization, input_sha256},
     content::normalize_page_contents_hayro,
     dedup::{
-        canonicalize_appearance_streams_hayro, canonicalize_font_program_streams_hayro,
-        canonicalize_form_xobjects_hayro, canonicalize_icc_profiles_hayro,
-        canonicalize_image_xobjects_hayro, canonicalize_metadata_streams_hayro,
-        canonicalize_page_contents_hayro, canonicalize_to_unicode_cmaps_hayro,
-        canonicalize_type3_charprocs_hayro,
+        canonicalize_appearance_streams_hayro, canonicalize_exact_extgstate_dictionaries_hayro,
+        canonicalize_exact_font_dictionaries_hayro,
+        canonicalize_exact_structure_attribute_dictionaries_hayro,
+        canonicalize_font_program_streams_hayro, canonicalize_form_xobjects_hayro,
+        canonicalize_icc_profiles_hayro, canonicalize_image_xobjects_hayro,
+        canonicalize_metadata_streams_hayro, canonicalize_page_contents_hayro,
+        canonicalize_to_unicode_cmaps_hayro, canonicalize_type3_charprocs_hayro,
     },
     flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
     font::{strip_font_editing_tables_hayro, union_sparse_cid_font_programs_after_dedup_hayro},
@@ -19,6 +21,7 @@ use crate::{
     },
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
     inline_images::externalize_duplicate_inline_images_hayro,
+    jpeg_optimize::optimize_jpeg_entropy_hayro,
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
@@ -28,6 +31,7 @@ use crate::{
         remove_repeated_page_objects_hayro, repeated_page_objects_prefix_possible_hayro,
     },
     scrub::scrub_edit_document_cos_privacy,
+    structure_compact::compact_structure_hayro,
     vector_compact::{compact_vector_paths_hayro, processing_factor_candidate},
 };
 use flpdf::{ImageOptimizationOptions, ImageOptimizationStats};
@@ -187,6 +191,15 @@ fn optimize_pdf_with_document(
             Ok(Default::default())
         }
     })?;
+    let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
+        canonicalize_exact_font_dictionaries_hayro(&mut document)
+    })?;
+    let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
+        canonicalize_exact_extgstate_dictionaries_hayro(&mut document)
+    })?;
+    let structure_attribute_dedup = timed(&mut timings, "structure-attribute-dedup", || {
+        canonicalize_exact_structure_attribute_dictionaries_hayro(&mut document)
+    })?;
     let icc_dedup = timed(&mut timings, "icc-dedup", || {
         if cfg.deduplicate_icc_profiles {
             canonicalize_icc_profiles_hayro(&mut document)
@@ -265,8 +278,15 @@ fn optimize_pdf_with_document(
         }
     })?;
 
-    // Exact image canonicalization follows inline-image externalization so the
-    // latter can converge with already-existing Image XObjects.
+    // Entropy-optimize surviving/reconstructed JPEGs before exact image
+    // canonicalization. This preserves quantized DCT coefficients while allowing
+    // images that differed only in Huffman coding to converge.
+    let jpeg_entropy = timed(&mut timings, "jpeg-entropy", || {
+        optimize_jpeg_entropy_hayro(&mut document, 128, 1)
+    })?;
+
+    // Exact image canonicalization follows inline-image externalization and JPEG
+    // entropy normalization so both can converge with existing Image XObjects.
     let image_dedup = timed(&mut timings, "image-dedup", || {
         if cfg.deduplicate_image_xobjects {
             canonicalize_image_xobjects_hayro(&mut document)
@@ -459,6 +479,9 @@ fn optimize_pdf_with_document(
             Ok(Default::default())
         }
     })?;
+    let structure_compaction = timed(&mut timings, "structure-compaction", || {
+        compact_structure_hayro(&mut document)
+    })?;
 
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
@@ -535,6 +558,15 @@ fn optimize_pdf_with_document(
             raster_transform.saved_bytes()
         ));
     }
+    if jpeg_entropy.streams_optimized > 0 {
+        notes.push(format!(
+            "Entropy-optimized {} JPEG stream(s) without changing quantized DCT coefficients: {} -> {} encoded bytes ({} bytes saved).",
+            jpeg_entropy.streams_optimized,
+            jpeg_entropy.original_encoded_bytes,
+            jpeg_entropy.optimized_encoded_bytes,
+            jpeg_entropy.saved_bytes()
+        ));
+    }
     if repeated_page_objects.objects_removed > 0 {
         notes.push(format!(
             "Removed {} persistent page object(s) from {} repeated group(s) across {} page(s): {} text object(s), {} Image/Form paint(s).",
@@ -570,6 +602,27 @@ fn optimize_pdf_with_document(
         notes.push(format!(
             "Canonicalized {} duplicate embedded-font reference(s) across {} duplicate font-program stream object(s).",
             font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
+        ));
+    }
+    if font_object_dedup.duplicate_objects_detected > 0 {
+        notes.push(format!(
+            "Interned {} exact duplicate Font dictionary object(s), canonicalizing {} reference(s) without changing font semantics.",
+            font_object_dedup.duplicate_objects_detected,
+            font_object_dedup.references_canonicalized
+        ));
+    }
+    if extgstate_object_dedup.duplicate_objects_detected > 0 {
+        notes.push(format!(
+            "Interned {} exact duplicate ExtGState dictionary object(s), canonicalizing {} resource reference(s).",
+            extgstate_object_dedup.duplicate_objects_detected,
+            extgstate_object_dedup.references_canonicalized
+        ));
+    }
+    if structure_attribute_dedup.duplicate_objects_detected > 0 {
+        notes.push(format!(
+            "Interned {} exact duplicate structure-attribute dictionary object(s), canonicalizing {} StructElem /A reference(s).",
+            structure_attribute_dedup.duplicate_objects_detected,
+            structure_attribute_dedup.references_canonicalized
         ));
     }
     if to_unicode_dedup.references_canonicalized > 0 {
@@ -661,6 +714,25 @@ fn optimize_pdf_with_document(
             microstroke_raster.estimated_flate_bytes_saved
         ));
     }
+    if raster_layout.constant_color_mask_stencils_emitted > 0 {
+        notes.push(format!(
+            "Collapsed {} constant-color Image+binary-SMask pair(s) into single native-resolution stencil image(s).",
+            raster_layout.constant_color_mask_stencils_emitted
+        ));
+    }
+    if structure_compaction.page_tree_nodes_removed > 0
+        || structure_compaction.name_tree_nodes_removed > 0
+        || structure_compaction.named_destination_wrappers_inlined > 0
+    {
+        notes.push(format!(
+            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, and inlined {} trivial named-destination wrapper object(s).",
+            structure_compaction.page_tree_nodes_before,
+            structure_compaction.page_tree_nodes_after,
+            structure_compaction.name_tree_nodes_before,
+            structure_compaction.name_tree_nodes_after,
+            structure_compaction.named_destination_wrappers_inlined
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -675,14 +747,24 @@ fn optimize_pdf_with_document(
     } else {
         saved_bytes as f64 * 100.0 / input_bytes as f64
     };
+    let reachability_cache = document.reachability_cache_stats();
     let report = OptimizationReport {
         before,
         after_bytes: output.len(),
         saved_bytes,
         saved_percent,
         stage_timings_ms: timings,
+        reachability_queries: reachability_cache.queries,
+        reachability_rebuilds: reachability_cache.rebuilds,
+        reachability_cache_hits: reachability_cache.cache_hits,
+        reachability_edge_checks: reachability_cache.edge_checks,
+        reachability_edge_stable_reuses: reachability_cache.edge_stable_reuses,
         privacy_items_removed: scrub.removed,
         jpeg_metadata_bytes_removed: scrub.jpeg_metadata_bytes_removed,
+        jpeg_entropy_streams_considered: jpeg_entropy.streams_considered,
+        jpeg_entropy_streams_optimized: jpeg_entropy.streams_optimized,
+        jpeg_entropy_original_encoded_bytes: jpeg_entropy.original_encoded_bytes,
+        jpeg_entropy_optimized_encoded_bytes: jpeg_entropy.optimized_encoded_bytes,
         hidden_text_items_removed: hidden_text.removed,
         large_diagonal_text_objects_removed: large_diagonal_text.removed,
         repeated_page_object_groups_removed: repeated_page_objects.groups_removed,
@@ -719,6 +801,16 @@ fn optimize_pdf_with_document(
         font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
         font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
         font_references_canonicalized: font_dedup.references_canonicalized,
+        font_duplicate_dictionaries_detected: font_object_dedup.duplicate_objects_detected,
+        font_dictionary_references_canonicalized: font_object_dedup.references_canonicalized,
+        extgstate_duplicate_dictionaries_detected: extgstate_object_dedup
+            .duplicate_objects_detected,
+        extgstate_dictionary_references_canonicalized: extgstate_object_dedup
+            .references_canonicalized,
+        structure_attribute_duplicate_dictionaries_detected: structure_attribute_dedup
+            .duplicate_objects_detected,
+        structure_attribute_references_canonicalized: structure_attribute_dedup
+            .references_canonicalized,
         font_programs_rendering_optimized: font_rendering.programs_optimized,
         font_rendering_original_encoded_bytes: font_rendering.original_encoded_bytes,
         font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
@@ -779,12 +871,17 @@ fn optimize_pdf_with_document(
         raster_binary_images_packed: raster_layout.binary_images_packed,
         raster_binary_masks_packed: raster_layout.binary_masks_packed,
         raster_stencil_images_emitted: raster_layout.stencil_images_emitted,
+        raster_constant_color_mask_stencils_emitted: raster_layout
+            .constant_color_mask_stencils_emitted,
         raster_relaxed_stencil_images_emitted: raster_layout.relaxed_stencil_images_emitted,
+        raster_bilevel_ccitt_images_emitted: raster_layout.bilevel_ccitt_images_emitted,
+        raster_bilevel_flate_images_emitted: raster_layout.bilevel_flate_images_emitted,
         exact_raster_rendering: cfg.raster_layout.exact_raster_rendering,
         raster_binary_image_encoded_bytes_saved: raster_layout.binary_image_encoded_bytes_saved,
         raster_deferred_tile_candidates: raster_layout.deferred_tile_candidates,
         raster_deferred_tile_paints_consumed: raster_layout.deferred_tile_paints_consumed,
         raster_staging_xobject_entries_removed: raster_layout.staging_xobject_entries_removed,
+        raster_rewritten_xobject_entries_removed: raster_layout.rewritten_xobject_entries_removed,
         resource_entries_pruned: resource_prune.entries_removed,
         resource_font_entries_pruned: resource_prune.font_entries_removed,
         resource_xobject_entries_pruned: resource_prune.xobject_entries_removed,
@@ -792,10 +889,21 @@ fn optimize_pdf_with_document(
         resource_pattern_entries_pruned: resource_prune.pattern_entries_removed,
         resource_properties_entries_pruned: resource_prune.properties_entries_removed,
         resource_shading_entries_pruned: resource_prune.shading_entries_removed,
+        page_tree_nodes_before: structure_compaction.page_tree_nodes_before,
+        page_tree_nodes_after: structure_compaction.page_tree_nodes_after,
+        page_tree_nodes_removed: structure_compaction.page_tree_nodes_removed,
+        page_tree_pages_reparented: structure_compaction.page_tree_pages_reparented,
+        name_trees_repacked: structure_compaction.name_trees_repacked,
+        name_tree_nodes_before: structure_compaction.name_tree_nodes_before,
+        name_tree_nodes_after: structure_compaction.name_tree_nodes_after,
+        name_tree_nodes_removed: structure_compaction.name_tree_nodes_removed,
+        named_destination_wrappers_inlined: structure_compaction.named_destination_wrappers_inlined,
         microstroke_pages_rasterized: microstroke_raster.pages_rewritten,
         microstroke_runs_rasterized: microstroke_raster.runs_rasterized,
         microstroke_strokes_rasterized: microstroke_raster.strokes_rasterized,
         microstroke_image_payload_bytes: microstroke_raster.image_payload_bytes,
+        microstroke_ccitt_images: microstroke_raster.ccitt_images,
+        microstroke_flate_images: microstroke_raster.flate_images,
         microstroke_estimated_flate_bytes_saved: microstroke_raster.estimated_flate_bytes_saved,
         print_images_placed: print_plan.stats.images_placed,
         print_image_uses: print_plan.stats.image_uses,

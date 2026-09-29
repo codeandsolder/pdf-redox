@@ -1,6 +1,7 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
     StreamData,
+    bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
     hidden_text::{
         HiddenTextSharedContext, hidden_text_shared_context_hayro,
@@ -10,6 +11,7 @@ use crate::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
         cleanup_fragmented_inline_staging_hayro, externalize_fragmented_inline_target_hayro,
     },
+    prune::prune_xobject_candidates_for_content_hayro,
     vector_compact::{
         ProcessingPageScanner, ProcessingVectorAnalysis, compacted_rect_fill_len,
         merge_rect_fill_pair, rect_contains_rect,
@@ -61,11 +63,15 @@ pub(crate) struct RasterLayoutStats {
     pub binary_images_packed: usize,
     pub binary_masks_packed: usize,
     pub stencil_images_emitted: usize,
+    pub constant_color_mask_stencils_emitted: usize,
     pub relaxed_stencil_images_emitted: usize,
+    pub bilevel_ccitt_images_emitted: usize,
+    pub bilevel_flate_images_emitted: usize,
     pub binary_image_encoded_bytes_saved: u64,
     pub deferred_tile_candidates: usize,
     pub deferred_tile_paints_consumed: usize,
     pub staging_xobject_entries_removed: usize,
+    pub rewritten_xobject_entries_removed: usize,
     pub inline_occurrences_remaining: usize,
     pub inline_inventory_complete: bool,
     pub page_rect_fill_paints_seen: usize,
@@ -1235,22 +1241,8 @@ fn collect_targets(document: &EditDocument, pages: &[ObjectHandle]) -> Result<Ve
     for &page in pages {
         targets.insert(ContentTarget::Page(page));
     }
-    for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let subtype = dictionary
-            .get(b"Subtype".as_slice())
-            .map(|value| document.resolve_owned_value(value))
-            .transpose()?;
-        if matches!(subtype, Some(Some(OwnedObject::Name(name))) if name == b"Form")
-            && matches!(object, OwnedObject::Stream { .. })
-        {
-            targets.insert(ContentTarget::Form(handle));
-        }
+    for handle in document.reachable_streams_with_subtype(b"Form")? {
+        targets.insert(ContentTarget::Form(handle));
     }
     Ok(targets.into_iter().collect())
 }
@@ -1272,22 +1264,6 @@ fn xobjects(
     Ok(out)
 }
 
-fn subtype(document: &EditDocument, handle: ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let Some(object) = document.current_owned_object(handle)? else {
-        return Ok(None);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
-}
-
 fn new_raster_scanner(
     document: &EditDocument,
     resources: &OwnedDictionary,
@@ -1295,7 +1271,7 @@ fn new_raster_scanner(
     let xobjects = xobjects(document, resources)?;
     let mut image_names = HashSet::new();
     for (name, handle) in &xobjects {
-        if subtype(document, *handle)?.as_deref() == Some(b"Image") {
+        if document.stream_subtype_is(*handle, b"Image")? {
             image_names.insert(name.clone());
         }
     }
@@ -1688,6 +1664,25 @@ fn unpack_packed_samples(data: &[u8], width: u32, height: u32, bpc: u8) -> Optio
     Some(out)
 }
 
+fn expand_low_bit_device_gray(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    samples: &[u8],
+    bpc: u8,
+) -> Result<Option<Vec<u8>>> {
+    if !matches!(bpc, 1 | 2 | 4) {
+        return Ok(None);
+    }
+    let max_sample = f64::from((1_u16 << bpc) - 1);
+    let (decode_min, decode_max) = decode_pair(document, dictionary)?.unwrap_or((0.0, 1.0));
+    let mut out = Vec::with_capacity(samples.len());
+    for &sample in samples {
+        let value = decode_min + (f64::from(sample) / max_sample) * (decode_max - decode_min);
+        out.push((value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+    }
+    Ok(Some(out))
+}
+
 fn decode_pair(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
@@ -2042,6 +2037,121 @@ fn encoded_stream_payload_len(
     Ok(Some(data.bytes(document.source())?.len()))
 }
 
+fn simple_binary_soft_mask_candidate(
+    document: &EditDocument,
+    handle: ObjectHandle,
+) -> Result<bool> {
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+    else {
+        return Ok(false);
+    };
+    const SAFE_PARENT_KEYS: &[&[u8]] = &[
+        b"Type",
+        b"Subtype",
+        b"Width",
+        b"W",
+        b"Height",
+        b"H",
+        b"BitsPerComponent",
+        b"BPC",
+        b"ColorSpace",
+        b"CS",
+        b"Filter",
+        b"F",
+        b"DecodeParms",
+        b"DP",
+        b"Decode",
+        b"D",
+        b"Interpolate",
+        b"I",
+        b"Length",
+        b"SMask",
+        b"SMaskInData",
+        b"Name",
+    ];
+    if dictionary
+        .keys()
+        .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
+        || dictionary.contains_key(b"Mask".as_slice())
+        || current_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+            .is_some_and(|value| value != 0.0)
+    {
+        return Ok(false);
+    }
+    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Stream {
+        dictionary: mask_dictionary,
+        ..
+    }) = document.resolve_owned_value(smask)?
+    else {
+        return Ok(false);
+    };
+    const SAFE_MASK_KEYS: &[&[u8]] = &[
+        b"Type",
+        b"Subtype",
+        b"Width",
+        b"W",
+        b"Height",
+        b"H",
+        b"BitsPerComponent",
+        b"BPC",
+        b"ColorSpace",
+        b"CS",
+        b"Filter",
+        b"F",
+        b"DecodeParms",
+        b"DP",
+        b"Decode",
+        b"D",
+        b"Interpolate",
+        b"I",
+        b"Length",
+        b"Name",
+    ];
+    if mask_dictionary
+        .keys()
+        .any(|key| !SAFE_MASK_KEYS.contains(&key.as_slice()))
+        || mask_dictionary.contains_key(b"Matte".as_slice())
+        || mask_dictionary.contains_key(b"SMask".as_slice())
+        || mask_dictionary.contains_key(b"Mask".as_slice())
+    {
+        return Ok(false);
+    }
+    if current_bool(document, mask_dictionary.get(b"Interpolate".as_slice()))?
+        .or(current_bool(
+            document,
+            mask_dictionary.get(b"I".as_slice()),
+        )?)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let Some(bpc) = current_number(
+        document,
+        mask_dictionary
+            .get(b"BitsPerComponent".as_slice())
+            .or_else(|| mask_dictionary.get(b"BPC".as_slice())),
+    )?
+    else {
+        return Ok(false);
+    };
+    if (bpc - 1.0).abs() > f64::EPSILON {
+        return Ok(false);
+    }
+    let Some(color_space) = mask_dictionary
+        .get(b"ColorSpace".as_slice())
+        .or_else(|| mask_dictionary.get(b"CS".as_slice()))
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        document.resolve_owned_value(color_space)?,
+        Some(OwnedObject::Name(name)) if matches!(name.as_slice(), b"DeviceGray" | b"G")
+    ))
+}
+
 fn image_info(
     document: &EditDocument,
     handle: ObjectHandle,
@@ -2085,8 +2195,13 @@ fn image_info(
     let Some(mut components) = color_components(document, color_space)? else {
         return Ok(None);
     };
+    let resolved_color_space = document.resolve_owned_value(color_space)?;
+    let device_gray = matches!(
+        resolved_color_space.as_ref(),
+        Some(OwnedObject::Name(name)) if matches!(name.as_slice(), b"DeviceGray" | b"G")
+    );
     let indexed = indexed_palette(document, color_space)?.is_some();
-    if bpc != 8 && !indexed {
+    if bpc != 8 && !indexed && !device_gray {
         return Ok(None);
     }
     let raw_decoded = match document.decoded_owned_stream_data(&object, flpdf::DecodeLevel::All) {
@@ -2098,7 +2213,7 @@ fn image_info(
             return Ok(None);
         }
     };
-    let mut decoded = if indexed && bpc != 8 {
+    let mut decoded = if (indexed || device_gray) && bpc != 8 {
         let Some(samples) = unpack_packed_samples(&raw_decoded, width, height, bpc) else {
             return Ok(None);
         };
@@ -2185,6 +2300,12 @@ fn image_info(
         };
         decoded = expanded;
         components = expanded_components;
+    } else if device_gray && bpc != 8 {
+        let Some(expanded) = expand_low_bit_device_gray(document, dictionary, &decoded, bpc)?
+        else {
+            return Ok(None);
+        };
+        decoded = expanded;
     }
 
     let interpolate = current_bool(document, dictionary.get(b"Interpolate".as_slice()))?
@@ -2224,11 +2345,21 @@ fn image_info(
         };
         template.insert(b"ColorSpace".to_vec(), OwnedObject::Name(color_space));
         template.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(8));
+    } else if device_gray && bpc != 8 {
+        // Packed DeviceGray samples were normalized through the source Decode
+        // array above, so re-emit canonical 8-bit gray with the default decode.
+        template.remove(b"Decode".as_slice());
+        template.remove(b"D".as_slice());
+        template.insert(
+            b"ColorSpace".to_vec(),
+            OwnedObject::Name(b"DeviceGray".to_vec()),
+        );
+        template.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(8));
     } else {
         // Resource dictionaries often wrap the same ICCBased/Cal/etc. color space
         // in thousands of distinct indirect objects. The wrapper identity has no
         // rendering semantics; compare and re-emit the resolved color-space value.
-        let Some(resolved_color_space) = document.resolve_owned_value(color_space)? else {
+        let Some(resolved_color_space) = resolved_color_space else {
             return Ok(None);
         };
         template.insert(b"ColorSpace".to_vec(), resolved_color_space);
@@ -2767,6 +2898,7 @@ fn pack_binary_samples(data: &[u8], width: u32, height: u32, components: usize) 
     Some(out)
 }
 
+#[cfg(test)]
 fn pack_binary_gray_samples(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     pack_binary_samples(data, width, height, 1)
 }
@@ -2832,6 +2964,8 @@ struct ImageEncodingStats {
     binary_mask_packed: bool,
     stencil_color: Option<StencilColor>,
     relaxed_stencil: bool,
+    bilevel_ccitt_images: u8,
+    bilevel_flate_images: u8,
     encoded_bytes_saved: u64,
 }
 
@@ -2896,25 +3030,6 @@ fn constant_visible_device_color(
     }
 }
 
-fn pack_binary_stencil_alpha(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    if data.len() != width.checked_mul(height)? || !data.iter().all(|&v| matches!(v, 0 | 255)) {
-        return None;
-    }
-    let row_bytes = width.div_ceil(8);
-    let mut out = vec![0u8; row_bytes.checked_mul(height)?];
-    for y in 0..height {
-        for x in 0..width {
-            // PDF ImageMask with default /Decode [0 1]: 0 paints, 1 is transparent.
-            if data[y * width + x] == 0 {
-                out[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
-            }
-        }
-    }
-    Some(out)
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ImageEncodingContext {
     flate_level: i32,
@@ -2926,6 +3041,7 @@ struct ImageEncodingContext {
 struct PreparedAlpha {
     data: Vec<u8>,
     bits_per_component: i64,
+    bilevel_codec: Option<BilevelCodec>,
 }
 
 #[derive(Debug)]
@@ -2942,6 +3058,37 @@ impl PreparedImage {
             .len()
             .saturating_add(self.alpha.as_ref().map_or(0, |alpha| alpha.data.len()))
     }
+}
+
+fn prepare_constant_color_mask_stencil(
+    info: &SampleImage,
+    width: u32,
+    height: u32,
+    alpha: &[u8],
+    flate_level: i32,
+) -> Result<Option<PreparedImage>> {
+    let Some(color) = constant_device_color(info, &info.data) else {
+        return Ok(None);
+    };
+    let Some(stencil) = BilevelRaster::from_image_mask_alpha(alpha, width, height) else {
+        return Ok(None);
+    };
+    let stencil_payload = stencil.encode_image_mask(flate_level)?;
+    let mut encoding = ImageEncodingStats {
+        stencil_color: Some(color),
+        binary_packed: true,
+        ..ImageEncodingStats::default()
+    };
+    match stencil_payload.codec {
+        BilevelCodec::CcittGroup4 => encoding.bilevel_ccitt_images = 1,
+        BilevelCodec::Flate => encoding.bilevel_flate_images = 1,
+    }
+    Ok(Some(PreparedImage {
+        dictionary: stencil_payload.dictionary,
+        data: stencil_payload.data,
+        alpha: None,
+        encoding,
+    }))
 }
 
 fn prepare_image(
@@ -2965,7 +3112,7 @@ fn prepare_image(
     // to differ: that can change only resampled antialiasing, and avoids an
     // otherwise redundant color plane. Exact mode keeps those samples.
     if let Some(alpha) = alpha.as_deref()
-        && let Some(stencil) = pack_binary_stencil_alpha(alpha, width, height)
+        && let Some(stencil) = BilevelRaster::from_image_mask_alpha(alpha, width, height)
         && let Some((color, relaxed_stencil)) = constant_device_color(info, data)
             .map(|color| (color, false))
             .or_else(|| {
@@ -2975,11 +3122,12 @@ fn prepare_image(
                     .map(|color| (color, true))
             })
     {
-        let stencil_encoded = compress_flate(&stencil, flate_level)?;
+        let stencil_payload = stencil.encode_image_mask(flate_level)?;
         let alpha_8bit_encoded = compress_flate(alpha, flate_level)?;
         // Include the tiny color operator in the comparison. Object/dictionary
         // overhead further favors the stencil because it replaces two streams.
-        let stencil_cost = stencil_encoded
+        let stencil_cost = stencil_payload
+            .data
             .len()
             .saturating_add(color.content_operator().len());
         // If the stencil already beats the compressed alpha plane by itself,
@@ -2994,26 +3142,19 @@ fn prepare_image(
             cost
         };
         if stencil_cost < normal_cost {
-            let dictionary = BTreeMap::from([
-                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-                (b"ImageMask".to_vec(), OwnedObject::Boolean(true)),
-                (b"BitsPerComponent".to_vec(), OwnedObject::Integer(1)),
-                (
-                    b"Filter".to_vec(),
-                    OwnedObject::Name(b"FlateDecode".to_vec()),
-                ),
-            ]);
+            let dictionary = stencil_payload.dictionary;
             encoding.stencil_color = Some(color);
             encoding.binary_packed = true;
             encoding.relaxed_stencil = relaxed_stencil;
+            match stencil_payload.codec {
+                BilevelCodec::CcittGroup4 => encoding.bilevel_ccitt_images = 1,
+                BilevelCodec::Flate => encoding.bilevel_flate_images = 1,
+            }
             encoding.encoded_bytes_saved =
                 u64::try_from(normal_cost - stencil_cost).unwrap_or(u64::MAX);
             return Ok(PreparedImage {
                 dictionary,
-                data: stencil_encoded,
+                data: stencil_payload.data,
                 alpha: None,
                 encoding,
             });
@@ -3038,24 +3179,36 @@ fn prepare_image(
 
     let prepared_alpha = if let Some(alpha) = alpha {
         let alpha_8bit = compress_flate(&alpha, flate_level)?;
-        let (alpha_data, alpha_bpc) =
-            if let Some(packed) = pack_binary_gray_samples(&alpha, width, height) {
-                let encoded = compress_flate(&packed, flate_level)?;
-                if encoded.len() < alpha_8bit.len() {
+        let (alpha_data, alpha_bpc, alpha_codec) =
+            if let Some(raster) = BilevelRaster::from_binary_gray_samples(&alpha, width, height) {
+                let encoded = raster.encode(flate_level)?;
+                let encoded_cost = estimated_bilevel_stream_cost(encoded.data.len(), encoded.codec);
+                if encoded_cost < alpha_8bit.len() {
                     encoding.binary_mask_packed = true;
+                    match encoded.codec {
+                        BilevelCodec::CcittGroup4 => {
+                            encoding.bilevel_ccitt_images =
+                                encoding.bilevel_ccitt_images.saturating_add(1);
+                        }
+                        BilevelCodec::Flate => {
+                            encoding.bilevel_flate_images =
+                                encoding.bilevel_flate_images.saturating_add(1);
+                        }
+                    }
                     encoding.encoded_bytes_saved = encoding.encoded_bytes_saved.saturating_add(
-                        u64::try_from(alpha_8bit.len() - encoded.len()).unwrap_or(u64::MAX),
+                        u64::try_from(alpha_8bit.len() - encoded_cost).unwrap_or(u64::MAX),
                     );
-                    (encoded, 1)
+                    (encoded.data, 1, Some(encoded.codec))
                 } else {
-                    (alpha_8bit, 8)
+                    (alpha_8bit, 8, None)
                 }
             } else {
-                (alpha_8bit, 8)
+                (alpha_8bit, 8, None)
             };
         Some(PreparedAlpha {
             data: alpha_data,
             bits_per_component: alpha_bpc,
+            bilevel_codec: alpha_codec,
         })
     } else {
         None
@@ -3075,8 +3228,39 @@ fn prepare_image(
     } else {
         None
     };
-    let mut encoded = if let Some(components) = binary_components
-        && let Some(packed) = pack_binary_samples(data, width, height, components)
+    let mut encoded = if binary_components == Some(1) {
+        if let Some(raster) = BilevelRaster::from_binary_gray_samples(data, width, height) {
+            let encoded_1bit = raster.encode(flate_level)?;
+            let encoded_cost =
+                estimated_bilevel_stream_cost(encoded_1bit.data.len(), encoded_1bit.codec);
+            if encoded_cost < encoded_8bit.len() {
+                dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(1));
+                set_bilevel_filter(&mut dictionary, width, height, encoded_1bit.codec);
+                encoding.binary_packed = true;
+                match encoded_1bit.codec {
+                    BilevelCodec::CcittGroup4 => {
+                        encoding.bilevel_ccitt_images =
+                            encoding.bilevel_ccitt_images.saturating_add(1);
+                    }
+                    BilevelCodec::Flate => {
+                        encoding.bilevel_flate_images =
+                            encoding.bilevel_flate_images.saturating_add(1);
+                    }
+                }
+                encoding.encoded_bytes_saved = encoding.encoded_bytes_saved.saturating_add(
+                    u64::try_from(encoded_8bit.len() - encoded_cost).unwrap_or(u64::MAX),
+                );
+                encoded_1bit.data
+            } else {
+                dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(8));
+                encoded_8bit
+            }
+        } else {
+            dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(8));
+            encoded_8bit
+        }
+    } else if binary_components == Some(3)
+        && let Some(packed) = pack_binary_samples(data, width, height, 3)
     {
         let encoded_1bit = compress_flate(&packed, flate_level)?;
         if encoded_1bit.len() < encoded_8bit.len() {
@@ -3149,32 +3333,36 @@ fn install_prepared_image(
     height: u32,
 ) -> (ObjectHandle, ImageEncodingStats) {
     if let Some(alpha) = prepared.alpha.take() {
-        let alpha_stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
-            dictionary: BTreeMap::from([
-                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-                (
-                    b"ColorSpace".to_vec(),
-                    OwnedObject::Name(b"DeviceGray".to_vec()),
-                ),
-                (
-                    b"BitsPerComponent".to_vec(),
-                    OwnedObject::Integer(alpha.bits_per_component),
-                ),
-                (
-                    b"Filter".to_vec(),
-                    OwnedObject::Name(b"FlateDecode".to_vec()),
-                ),
-            ]),
+        let mut alpha_dictionary = BTreeMap::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+            (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+            (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+            (
+                b"ColorSpace".to_vec(),
+                OwnedObject::Name(b"DeviceGray".to_vec()),
+            ),
+            (
+                b"BitsPerComponent".to_vec(),
+                OwnedObject::Integer(alpha.bits_per_component),
+            ),
+            (
+                b"Filter".to_vec(),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        if let Some(codec) = alpha.bilevel_codec {
+            set_bilevel_filter(&mut alpha_dictionary, width, height, codec);
+        }
+        let alpha_stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary: alpha_dictionary,
             data: StreamData::Owned(alpha.data),
         }));
         prepared
             .dictionary
             .insert(b"SMask".to_vec(), OwnedObject::Reference(alpha_stream));
     }
-    let handle = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+    let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: prepared.dictionary,
         data: StreamData::Owned(prepared.data),
     }));
@@ -3304,6 +3492,7 @@ enum MergeKind {
     Stripe,
     PixelCluster,
     NativeFragment,
+    ConstantColorMaskStencil,
     AlphaCrop,
 }
 
@@ -4719,6 +4908,25 @@ fn unique_xobject_name(xobjects: &OwnedDictionary, suffix: &mut usize) -> Vec<u8
     }
 }
 
+fn install_target_resources(
+    document: &mut EditDocument,
+    target: ContentTarget,
+    resources: OwnedDictionary,
+) -> Result<()> {
+    let handle = match target {
+        ContentTarget::Page(page) => page,
+        ContentTarget::Form(form) => form,
+    };
+    let object = match handle {
+        ObjectHandle::Existing(id) => document.edit_object(id)?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
+    };
+    if let Some(dictionary) = object.as_dictionary_mut() {
+        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+    }
+    Ok(())
+}
+
 fn install_target(
     document: &mut EditDocument,
     target: ContentTarget,
@@ -4727,16 +4935,13 @@ fn install_target(
 ) -> Result<()> {
     match target {
         ContentTarget::Page(page) => {
-            let stream = ObjectHandle::New(document.overlay_mut().add(OwnedObject::Stream {
+            let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
                 data: StreamData::Owned(content),
             }));
             let object = match page {
                 ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document
-                    .overlay_mut()
-                    .added_mut(id)
-                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                ObjectHandle::New(id) => document.edit_added_object(id)?,
             };
             if let Some(dictionary) = object.as_dictionary_mut() {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -4746,10 +4951,7 @@ fn install_target(
         ContentTarget::Form(form) => {
             let object = match form {
                 ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document
-                    .overlay_mut()
-                    .added_mut(id)
-                    .ok_or_else(|| Error::MissingNewObject { index: id.index() })?,
+                ObjectHandle::New(id) => document.edit_added_object(id)?,
             };
             if let OwnedObject::Stream { dictionary, data } = object {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -4795,6 +4997,7 @@ struct ApplyPlansResult {
     changed: bool,
     consumed_draws: HashSet<usize>,
     added_resource_names: BTreeSet<Vec<u8>>,
+    obsolete_resource_names: BTreeSet<Vec<u8>>,
 }
 
 fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEncodingStats) {
@@ -4802,6 +5005,12 @@ fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEnc
     stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
     stats.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
     stats.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
+    stats.bilevel_ccitt_images_emitted = stats
+        .bilevel_ccitt_images_emitted
+        .saturating_add(usize::from(encoding.bilevel_ccitt_images));
+    stats.bilevel_flate_images_emitted = stats
+        .bilevel_flate_images_emitted
+        .saturating_add(usize::from(encoding.bilevel_flate_images));
     stats.binary_image_encoded_bytes_saved = stats
         .binary_image_encoded_bytes_saved
         .saturating_add(encoding.encoded_bytes_saved);
@@ -4841,7 +5050,9 @@ fn apply_plans(
         } else {
             None
         };
-        let crop_result = if let Some(cached) = cached_crop.filter(|cached| cached.fast_reuse) {
+        let crop_result = if plan.kind == MergeKind::ConstantColorMaskStencil {
+            Some((false, false, 0))
+        } else if let Some(cached) = cached_crop.filter(|cached| cached.fast_reuse) {
             crop_plan_geometry_to(&mut plan, cached.source_crop)
                 .map(|removed_pixels| (true, false, removed_pixels))
         } else {
@@ -4883,21 +5094,66 @@ fn apply_plans(
         };
 
         let mut prepared_main = if cached_crop.is_none() {
-            Some(prepare_image(
-                &plan.image,
-                plan.width,
-                plan.height,
-                &plan.data,
-                plan.alpha,
-                ImageEncodingContext {
+            if plan.kind == MergeKind::ConstantColorMaskStencil {
+                let Some(alpha) = plan.alpha.as_deref() else {
+                    for member in &plan.members {
+                        claimed.remove(member);
+                    }
+                    continue;
+                };
+                let Some(prepared) = prepare_constant_color_mask_stencil(
+                    &plan.image,
+                    plan.width,
+                    plan.height,
+                    alpha,
                     flate_level,
-                    exact_raster_rendering: config.exact_raster_rendering,
-                    source_color_budget: plan.source_color_budget,
-                },
-            )?)
+                )?
+                else {
+                    for member in &plan.members {
+                        claimed.remove(member);
+                    }
+                    continue;
+                };
+                Some(prepared)
+            } else {
+                Some(prepare_image(
+                    &plan.image,
+                    plan.width,
+                    plan.height,
+                    &plan.data,
+                    plan.alpha.take(),
+                    ImageEncodingContext {
+                        flate_level,
+                        exact_raster_rendering: config.exact_raster_rendering,
+                        source_color_budget: plan.source_color_budget,
+                    },
+                )?)
+            }
         } else {
             None
         };
+
+        if plan.kind == MergeKind::ConstantColorMaskStencil
+            && let Some(prepared) = prepared_main.as_ref()
+        {
+            let source_payload = plan
+                .image
+                .encoded_color_bytes
+                .saturating_add(plan.image.encoded_mask_bytes);
+            let color_operator_bytes = prepared
+                .encoding
+                .stencil_color
+                .map_or(0, |color| color.content_operator().len());
+            let candidate_payload = prepared
+                .payload_bytes()
+                .saturating_add(color_operator_bytes);
+            if source_payload > 0 && candidate_payload >= source_payload {
+                for member in &plan.members {
+                    claimed.remove(member);
+                }
+                continue;
+            }
+        }
 
         if plan.kind == MergeKind::AlphaCrop
             && cached_crop.is_none()
@@ -4999,6 +5255,11 @@ fn apply_plans(
             let draw = &input.draws[member];
             replacements.push((draw.range_start, draw.range_end, Vec::new()));
         }
+        for &member in &plan.members {
+            result
+                .obsolete_resource_names
+                .insert(input.draws[member].resource_name.clone());
+        }
         result.consumed_draws.extend(plan.members.iter().copied());
         if plan.kind == MergeKind::PixelCluster {
             stats.deferred_tile_paints_consumed = stats
@@ -5017,6 +5278,9 @@ fn apply_plans(
             MergeKind::NativeFragment => {
                 stats.native_fragment_groups_reconstructed += 1;
                 stats.native_fragment_paints_reconstructed += plan.members.len();
+            }
+            MergeKind::ConstantColorMaskStencil => {
+                stats.constant_color_mask_stencils_emitted += 1;
             }
             MergeKind::AlphaCrop => {}
         }
@@ -5104,6 +5368,57 @@ fn append_alpha_crop_plans(
     }
 }
 
+fn find_constant_color_mask_stencil_plans(
+    document: &EditDocument,
+    draws: &[RasterDraw],
+    infos: &HashMap<ObjectHandle, SampleImage>,
+    used: &HashSet<usize>,
+) -> Result<Vec<MergePlan>> {
+    let mut plans = Vec::new();
+    for (index, draw) in draws.iter().enumerate() {
+        if used.contains(&index) {
+            continue;
+        }
+        let Some(info) = infos.get(&draw.target) else {
+            continue;
+        };
+        if !simple_binary_soft_mask_candidate(document, draw.target)? {
+            continue;
+        }
+        let Some(alpha) = info.alpha.as_ref() else {
+            continue;
+        };
+        // Same-grid color+alpha already participates in the ordinary raster
+        // reconstruction path. This pass is for the pathological producer
+        // pattern where a tiny constant-color carrier drives a much larger
+        // binary soft mask.
+        if alpha.width == info.width && alpha.height == info.height {
+            continue;
+        }
+        if constant_device_color(info, &info.data).is_none()
+            || BilevelRaster::from_image_mask_alpha(&alpha.data, alpha.width, alpha.height)
+                .is_none()
+        {
+            continue;
+        }
+        plans.push(MergePlan {
+            members: vec![index],
+            first_member: index,
+            image: info.clone(),
+            width: alpha.width,
+            height: alpha.height,
+            data: Vec::new(),
+            alpha: Some(alpha.data.to_vec()),
+            source_color_budget: None,
+            desired_ctm: draw.ctm,
+            background: None,
+            alpha_crop_hint: None,
+            kind: MergeKind::ConstantColorMaskStencil,
+        });
+    }
+    Ok(plans)
+}
+
 #[derive(Clone, Copy)]
 struct MergePlanContext<'a> {
     target: ContentTarget,
@@ -5132,8 +5447,19 @@ fn build_merge_plans_for_scanner(
         >= config
             .stripe_min_paints
             .min(config.pixel_cluster_min_paints);
+    let mut has_structural_mask_candidate = false;
     if !enough_for_merge && !config.crop_transparent {
-        return Ok(Vec::new());
+        for (index, draw) in scanner.draws.iter().enumerate() {
+            if !initial_used.contains(&index)
+                && simple_binary_soft_mask_candidate(document, draw.target)?
+            {
+                has_structural_mask_candidate = true;
+                break;
+            }
+        }
+        if !has_structural_mask_candidate {
+            return Ok(Vec::new());
+        }
     }
 
     let image_materialize_started = Instant::now();
@@ -5155,19 +5481,18 @@ fn build_merge_plans_for_scanner(
                 continue;
             }
         }
-        if let Some(cached) = predecoded_images.and_then(|cache| cache.get(&draw.target)) {
-            match cached {
-                Some(info) if config.bake_masks || info.alpha.is_none() => {
-                    infos.insert(draw.target, info.clone());
-                }
-                // Hidden-visibility analysis always requests baked masks. If it
-                // produced alpha, the non-baking planner would reject this image
-                // before decoding; if it produced None, both modes reject it.
-                Some(_) | None => {}
-            }
+        let structural_mask =
+            !config.bake_masks && simple_binary_soft_mask_candidate(document, draw.target)?;
+        if let Some(cached) = predecoded_images.and_then(|cache| cache.get(&draw.target))
+            && let Some(info) = cached
+            && (config.bake_masks || info.alpha.is_none() || structural_mask)
+        {
+            infos.insert(draw.target, info.clone());
             continue;
         }
         if let Some(info) = image_info(document, draw.target, config.bake_masks)? {
+            infos.insert(draw.target, info);
+        } else if structural_mask && let Some(info) = image_info(document, draw.target, true)? {
             infos.insert(draw.target, info);
         }
     }
@@ -5260,6 +5585,11 @@ fn build_merge_plans_for_scanner(
     }
 
     let mut used = initial_used.clone();
+    let mask_stencil_plans =
+        find_constant_color_mask_stencil_plans(document, &scanner.draws, &infos, &used)?;
+    for plan in &mask_stencil_plans {
+        used.extend(plan.members.iter().copied());
+    }
     let native_plan_started = Instant::now();
     let native_fragment_plans = if enough_for_merge {
         find_native_fragment_plans(target, &scanner.draws, &infos, &used, config, user_unit)
@@ -5284,7 +5614,8 @@ fn build_merge_plans_for_scanner(
     for plan in &stripe_plans {
         used.extend(plan.members.iter().copied());
     }
-    let mut plans = native_fragment_plans;
+    let mut plans = mask_stencil_plans;
+    plans.extend(native_fragment_plans);
     plans.extend(stripe_plans);
     let pixel_plan_started = Instant::now();
     if enough_for_merge {
@@ -5326,13 +5657,40 @@ pub(crate) fn normalize_raster_layout_hayro(
 ) -> Result<RasterLayoutStats> {
     if *DEBUG_RASTER {
         eprintln!(
-            "raster-layout entry enabled={} fragment_threshold={} pixel_gap_mm={}",
-            config.enabled, config.fragmented_paint_threshold, config.pixel_cluster_max_gap_mm
+            "raster-layout entry enabled={} reconstruct_pixels={} fragment_threshold={} pixel_gap_mm={}",
+            config.enabled,
+            config.reconstruct_pixel_clusters,
+            config.fragmented_paint_threshold,
+            config.pixel_cluster_max_gap_mm
         );
     }
-    if !config.enabled {
+
+    // Tiny Image XObjects used as individual raster pixels/fragments are a
+    // structural pathology, not a quality policy. Reconstruct those in every
+    // profile, but when full raster-layout normalization is disabled keep this
+    // mode deliberately exact/conservative: no cropping, visibility pruning,
+    // relaxed stencil conversion, or general stripe merging. Masks are decoded
+    // only so pathological constant-color carrier + binary-mask pairs can be
+    // reconstructed exactly as a single stencil.
+    let structural_config;
+    let config = if config.enabled {
+        config
+    } else if config.reconstruct_pixel_clusters {
+        structural_config = {
+            let mut value = config.clone();
+            value.crop_transparent = false;
+            value.crop_background = false;
+            value.prune_hidden_paints = false;
+            value.prune_occluded_raster_paints = false;
+            value.bake_masks = false;
+            value.exact_raster_rendering = true;
+            value.merge_stripes = false;
+            value
+        };
+        &structural_config
+    } else {
         return Ok(RasterLayoutStats::default());
-    }
+    };
     let mut stats = RasterLayoutStats {
         inline_inventory_complete: true,
         page_vector_inventory_complete: true,
@@ -5731,6 +6089,23 @@ pub(crate) fn normalize_raster_layout_hayro(
         {
             cache.remove(&page);
         }
+        if applied.changed && !applied.obsolete_resource_names.is_empty() {
+            let current_content = target_content(document, target)?;
+            if let Some(current_resources) = target_resources(document, target)? {
+                let (resources, removed) = prune_xobject_candidates_for_content_hayro(
+                    document,
+                    current_resources,
+                    &current_content,
+                    &applied.obsolete_resource_names,
+                )?;
+                if removed != 0 {
+                    install_target_resources(document, target, resources)?;
+                    stats.rewritten_xobject_entries_removed = stats
+                        .rewritten_xobject_entries_removed
+                        .saturating_add(removed);
+                }
+            }
+        }
 
         if !scanner.resource_pending_operands {
             let mut consumed = pruned_draws.clone();
@@ -6059,11 +6434,10 @@ mod tests {
     fn stencil_alpha_pack_uses_zero_bits_for_painted_pixels() {
         let alpha = [255, 0, 255, 0, 0, 255, 0, 255, 255, 255];
         // Default PDF ImageMask /Decode [0 1]: zero paints, one is transparent.
-        assert_eq!(
-            pack_binary_stencil_alpha(&alpha, 5, 2),
-            Some(vec![0b0101_1000, 0b0100_0000])
-        );
-        assert_eq!(pack_binary_stencil_alpha(&[0, 127], 2, 1), None);
+        let raster =
+            BilevelRaster::from_image_mask_alpha(&alpha, 5, 2).unwrap_or_else(|| panic!("raster"));
+        assert_eq!(raster.packed(), &[0b0101_1000, 0b0100_0000]);
+        assert!(BilevelRaster::from_image_mask_alpha(&[0, 127], 2, 1).is_none());
     }
 
     fn stripe_test_image(width: u32, height: u32, data: Vec<u8>) -> SampleImage {
