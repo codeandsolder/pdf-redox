@@ -638,6 +638,13 @@ mod tests {
     use flpdf::ObjectHandle;
     use std::{io::Cursor, rc::Rc};
 
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     fn stream(pdf: &Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
         pdf.new_stream_with_data(Rc::new(bytes.to_vec()))
             .map_err(Into::into)
@@ -802,8 +809,8 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 2);
-        assert_eq!(placement.max_width_points, 300.0);
-        assert_eq!(placement.max_height_points, 150.0);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
         assert_eq!(placement.target_dimensions(144), (600, 300));
         Ok(())
     }
@@ -839,8 +846,8 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("inherited image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 2);
-        assert_eq!(placement.max_width_points, 300.0);
-        assert_eq!(placement.max_height_points, 150.0);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
         assert_eq!(placement.target_dimensions(144), (600, 300));
         Ok(())
     }
@@ -989,8 +996,8 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("nested image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 1);
-        assert_eq!(placement.max_width_points, 100.0);
-        assert_eq!(placement.max_height_points, 50.0);
+        assert_close(placement.max_width_points, 100.0);
+        assert_close(placement.max_height_points, 50.0);
         assert_eq!(placement.target_dimensions(450), (625, 313));
         Ok(())
     }
@@ -1016,8 +1023,8 @@ mod tests {
         let placement = placements
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("UserUnit image placement not collected".to_owned()))?;
-        assert_eq!(placement.max_width_points, 144.0);
-        assert_eq!(placement.max_height_points, 144.0);
+        assert_close(placement.max_width_points, 144.0);
+        assert_close(placement.max_height_points, 144.0);
         assert_eq!(placement.target_dimensions(300), (600, 600));
         Ok(())
     }

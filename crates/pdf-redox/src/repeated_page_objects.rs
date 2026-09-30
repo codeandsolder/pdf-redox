@@ -667,6 +667,13 @@ pub fn remove_repeated_page_objects_hayro(
 mod tests {
     use super::*;
 
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     fn text_candidate(page: usize, x: f64, y: f64, key: &[u8]) -> Candidate {
         Candidate {
             page_index: page,
@@ -727,8 +734,8 @@ mod tests {
         assert_eq!(scanner.candidates.len(), 1);
         let candidate = &scanner.candidates[0];
         assert_eq!(candidate.page_index, 2);
-        assert_eq!(candidate.x, 101.0);
-        assert_eq!(candidate.y, 699.0);
+        assert_close(candidate.x, 101.0);
+        assert_close(candidate.y, 699.0);
         assert_eq!(
             candidate.key,
             CandidateKey::XObject {

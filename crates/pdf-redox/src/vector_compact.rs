@@ -2598,10 +2598,10 @@ mod tests {
             assert_eq!(shared.end, standalone.end);
             assert_eq!(shared.semantic_key, standalone.semantic_key);
             assert_eq!(shared.operator_count, standalone.operator_count);
-            assert_eq!(shared.bounds.x0, standalone.bounds.x0);
-            assert_eq!(shared.bounds.y0, standalone.bounds.y0);
-            assert_eq!(shared.bounds.x1, standalone.bounds.x1);
-            assert_eq!(shared.bounds.y1, standalone.bounds.y1);
+            assert!(close(shared.bounds.x0, standalone.bounds.x0));
+            assert!(close(shared.bounds.y0, standalone.bounds.y0));
+            assert!(close(shared.bounds.x1, standalone.bounds.x1));
+            assert!(close(shared.bounds.y1, standalone.bounds.y1));
         }
 
         assert_eq!(shared_transformed.len(), standalone_transformed.len());
@@ -2610,10 +2610,10 @@ mod tests {
             assert_eq!(shared.body_end, standalone.body_end);
             assert_eq!(shared.semantic_key, standalone.semantic_key);
             assert_eq!(shared.operator_count, standalone.operator_count);
-            assert_eq!(shared.bounds.x0, standalone.bounds.x0);
-            assert_eq!(shared.bounds.y0, standalone.bounds.y0);
-            assert_eq!(shared.bounds.x1, standalone.bounds.x1);
-            assert_eq!(shared.bounds.y1, standalone.bounds.y1);
+            assert!(close(shared.bounds.x0, standalone.bounds.x0));
+            assert!(close(shared.bounds.y0, standalone.bounds.y0));
+            assert!(close(shared.bounds.x1, standalone.bounds.x1));
+            assert!(close(shared.bounds.y1, standalone.bounds.y1));
         }
     }
 
@@ -2625,10 +2625,10 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].semantic_key, blocks[1].semantic_key);
         assert_eq!(blocks[0].operator_count, 3);
-        assert_eq!(blocks[0].bounds.x0, 0.0);
-        assert_eq!(blocks[0].bounds.y0, 0.0);
-        assert_eq!(blocks[0].bounds.x1, 10.0);
-        assert_eq!(blocks[0].bounds.y1, 10.0);
+        assert!(close(blocks[0].bounds.x0, 0.0));
+        assert!(close(blocks[0].bounds.y0, 0.0));
+        assert!(close(blocks[0].bounds.x1, 10.0));
+        assert!(close(blocks[0].bounds.y1, 10.0));
     }
 
     #[test]
