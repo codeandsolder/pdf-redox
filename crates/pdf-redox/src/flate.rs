@@ -24,13 +24,9 @@ fn is_safe_lone_flate(dict: &ObjectHandle) -> Result<bool> {
         return Ok(false);
     }
     let type_object = dict.try_get_key(b"/Type")?;
-    if type_object.try_is_name_and_equals(b"Metadata")?
+    Ok(!(type_object.try_is_name_and_equals(b"Metadata")?
         || type_object.try_is_name_and_equals(b"ObjStm")?
-        || type_object.try_is_name_and_equals(b"XRef")?
-    {
-        return Ok(false);
-    }
-    Ok(true)
+        || type_object.try_is_name_and_equals(b"XRef")?))
 }
 
 fn is_safe_lone_flate_hayro(

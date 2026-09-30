@@ -68,6 +68,10 @@ enum AnnotationPolicyArg {
     name = "pdf-redox",
     about = "Pure-Rust PDF normalization, optimization, and cleanup"
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI switch fields are intentionally independent boolean flags generated directly by clap"
+)]
 struct Args {
     input: PathBuf,
     #[arg(short, long)]
@@ -245,6 +249,10 @@ struct Args {
     json: bool,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeping the one-to-one CLI flag-to-config mapping linear makes omissions and precedence easier to audit"
+)]
 fn config_from_args(args: &Args) -> Config {
     let mut cfg = match args.profile {
         ProfileArg::Optimize => Config::optimize_only(),
@@ -478,7 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_quality_overrides_perceptual_and_print_profiles() -> Result<(), clap::Error> {
+    fn jpeg_quality_overrides_perceptual_and_print_profiles()
+    -> Result<(), Box<dyn std::error::Error>> {
         for profile in ["perceptual", "print"] {
             let args = Args::try_parse_from([
                 "pdf-redox",
@@ -493,7 +502,10 @@ mod tests {
                 pdf_redox::ImagePolicy::Perceptual { jpeg_quality, .. }
                 | pdf_redox::ImagePolicy::Print { jpeg_quality, .. } => jpeg_quality,
                 pdf_redox::ImagePolicy::Preserve => {
-                    panic!("{profile} unexpectedly preserves images")
+                    return Err(std::io::Error::other(format!(
+                        "{profile} unexpectedly preserves images"
+                    ))
+                    .into());
                 }
             };
             assert_eq!(quality, 73);

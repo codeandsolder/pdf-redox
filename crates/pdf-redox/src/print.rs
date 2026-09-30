@@ -31,6 +31,9 @@ impl ImagePlacement {
             }
             #[expect(
                 clippy::cast_possible_truncation,
+                reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
+            )]
+            #[expect(
                 clippy::cast_sign_loss,
                 reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
             )]
@@ -292,10 +295,6 @@ struct PlacementWalkState<'a> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the test traversal mirrors the production form-walk call shape"
-)]
 fn scan_form<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     form: &ObjectHandle,
@@ -639,6 +638,13 @@ mod tests {
     use flpdf::ObjectHandle;
     use std::{io::Cursor, rc::Rc};
 
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     fn stream(pdf: &Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
         pdf.new_stream_with_data(Rc::new(bytes.to_vec()))
             .map_err(Into::into)
@@ -717,7 +723,8 @@ mod tests {
             Vec::new()
         };
         page_handles.push(page);
-        let count = i64::try_from(page_handles.len()).expect("test page count fits i64");
+        let count = i64::try_from(page_handles.len())
+            .map_err(|_| Error::Invalid("test page count exceeds i64".to_owned()))?;
         pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
         pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
         pdf.mark_object_handle_dirty(&pages)?;
@@ -781,10 +788,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn shared_image_uses_largest_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -806,17 +809,13 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 2);
-        assert_eq!(placement.max_width_points, 300.0);
-        assert_eq!(placement.max_height_points, 150.0);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
         assert_eq!(placement.target_dimensions(144), (600, 300));
         Ok(())
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn resource_less_form_inherits_page_xobjects_for_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -847,8 +846,8 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("inherited image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 2);
-        assert_eq!(placement.max_width_points, 300.0);
-        assert_eq!(placement.max_height_points, 150.0);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
         assert_eq!(placement.target_dimensions(144), (600, 300));
         Ok(())
     }
@@ -946,10 +945,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn nested_form_matrix_contributes_to_image_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 500)?;
@@ -1001,17 +996,13 @@ mod tests {
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("nested image placement not collected".to_owned()))?;
         assert_eq!(placement.uses, 1);
-        assert_eq!(placement.max_width_points, 100.0);
-        assert_eq!(placement.max_height_points, 50.0);
+        assert_close(placement.max_width_points, 100.0);
+        assert_close(placement.max_height_points, 50.0);
         assert_eq!(placement.target_dimensions(450), (625, 313));
         Ok(())
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn page_user_unit_scales_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 1000)?;
@@ -1032,8 +1023,8 @@ mod tests {
         let placement = placements
             .get(&image_ref)
             .ok_or_else(|| Error::Invalid("UserUnit image placement not collected".to_owned()))?;
-        assert_eq!(placement.max_width_points, 144.0);
-        assert_eq!(placement.max_height_points, 144.0);
+        assert_close(placement.max_width_points, 144.0);
+        assert_close(placement.max_height_points, 144.0);
         assert_eq!(placement.target_dimensions(300), (600, 600));
         Ok(())
     }
@@ -1310,6 +1301,9 @@ fn cow_image_dimensions(
     }
     #[expect(
         clippy::cast_possible_truncation,
+        reason = "finite positive image dimensions are range-checked against u32 before conversion"
+    )]
+    #[expect(
         clippy::cast_sign_loss,
         reason = "finite positive image dimensions are range-checked against u32 before conversion"
     )]

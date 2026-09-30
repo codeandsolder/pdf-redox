@@ -28,6 +28,7 @@ jobs:
         run: cargo check --locked --workspace --all-targets --all-features
 
   rust:
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
@@ -49,6 +50,25 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --all-features --no-deps
+
+
+  rust-shared-cache:
+    name: Rust 1.98.1 (shared sccache)
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
+    with:
+      command: |
+        cargo +1.98.1 fmt --all -- --check
+        git diff --check
+        cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +1.98.1 test --locked --workspace --all-features
+        RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --locked --workspace --all-features --no-deps
+      rust-toolchain: "1.98.1"
+      rust-components: "rustfmt clippy"
+      rustflags: "-C target-cpu=x86-64-v2"
 
   wasm:
     name: WASM compatibility

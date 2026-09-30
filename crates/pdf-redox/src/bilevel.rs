@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, convert::Infallible, io::Write as _};
 
 const CCITT_EXTRA_DICTIONARY_BYTES: usize = 96;
 
-pub(crate) fn estimated_bilevel_stream_cost(data_len: usize, codec: BilevelCodec) -> usize {
+pub const fn estimated_bilevel_stream_cost(data_len: usize, codec: BilevelCodec) -> usize {
     data_len.saturating_add(match codec {
         BilevelCodec::Flate => 0,
         BilevelCodec::CcittGroup4 => CCITT_EXTRA_DICTIONARY_BYTES,
@@ -13,26 +13,26 @@ pub(crate) fn estimated_bilevel_stream_cost(data_len: usize, codec: BilevelCodec
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BilevelCodec {
+pub enum BilevelCodec {
     Flate,
     CcittGroup4,
 }
 
 #[derive(Debug)]
-pub(crate) struct BilevelEncodedData {
+pub struct BilevelEncodedData {
     pub data: Vec<u8>,
     pub codec: BilevelCodec,
 }
 
 #[derive(Debug)]
-pub(crate) struct BilevelImagePayload {
+pub struct BilevelImagePayload {
     pub data: Vec<u8>,
     pub dictionary: OwnedDictionary,
     pub codec: BilevelCodec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BilevelRaster {
+pub struct BilevelRaster {
     width: u32,
     height: u32,
     // PDF ImageMask sample semantics used throughout pdf-redox:
@@ -145,7 +145,7 @@ fn infallible<T>(value: std::result::Result<T, Infallible>) -> T {
     }
 }
 
-pub(crate) fn compress_flate(data: &[u8], level: i32) -> Result<Vec<u8>> {
+pub fn compress_flate(data: &[u8], level: i32) -> Result<Vec<u8>> {
     let level = u32::try_from(level.clamp(0, 9)).unwrap_or(9);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
     encoder.write_all(data)?;
@@ -179,7 +179,7 @@ fn encode_ccitt_group4(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     Ok(infallible(encoder.finish()).finish())
 }
 
-pub(crate) fn set_bilevel_filter(
+pub fn set_bilevel_filter(
     dictionary: &mut OwnedDictionary,
     width: u32,
     height: u32,
@@ -224,7 +224,7 @@ fn image_mask_dictionary(width: u32, height: u32, codec: BilevelCodec) -> OwnedD
     dictionary
 }
 
-pub(crate) fn encode_best_bilevel_data(
+pub fn encode_best_bilevel_data(
     packed: &[u8],
     width: u32,
     height: u32,
@@ -247,7 +247,7 @@ pub(crate) fn encode_best_bilevel_data(
 }
 
 #[cfg(test)]
-pub(crate) fn encode_best_image_mask(
+pub fn encode_best_image_mask(
     packed: &[u8],
     width: u32,
     height: u32,
@@ -279,12 +279,11 @@ mod tests {
     }
 
     #[test]
-    fn group4_roundtrips_all_two_row_five_bit_patterns() {
+    fn group4_roundtrips_all_two_row_five_bit_patterns() -> Result<()> {
         for first in 0u8..32 {
             for second in 0u8..32 {
                 let packed = [packed_row(first, 5), packed_row(second, 5)].concat();
-                let encoded =
-                    encode_ccitt_group4(&packed, 5, 2).unwrap_or_else(|error| panic!("{error}"));
+                let encoded = encode_ccitt_group4(&packed, 5, 2)?;
                 let mut decoded = Vec::new();
                 assert!(
                     decode_g4(encoded.into_iter(), 5, Some(2), |line| {
@@ -302,10 +301,11 @@ mod tests {
                 assert_eq!(decoded, [first, second]);
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn moving_thin_feature_prefers_group4() {
+    fn moving_thin_feature_prefers_group4() -> Result<()> {
         let width = 1024u32;
         let height = 1024u32;
         let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
@@ -318,11 +318,11 @@ mod tests {
                 packed[row + byte] &= !(1 << (7 - (x & 7)));
             }
         }
-        let payload = encode_best_image_mask(&packed, width, height, 9)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let payload = encode_best_image_mask(&packed, width, height, 9)?;
         assert!(matches!(
             payload.dictionary.get(b"Filter".as_slice()),
             Some(OwnedObject::Name(name)) if name == b"CCITTFaxDecode"
         ));
+        Ok(())
     }
 }

@@ -516,12 +516,11 @@ fn write_objstm(
     let first = header.len();
     header.extend_from_slice(&body);
     let encoded = zlib_encode(&header, level)?;
+    let handle_count = handles.len();
+    let encoded_len = encoded.len();
     write!(
         output,
-        "<< /Type /ObjStm /N {} /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
-        handles.len(),
-        first,
-        encoded.len()
+        "<< /Type /ObjStm /N {handle_count} /First {first} /Filter /FlateDecode /Length {encoded_len} >>\nstream\n"
     )?;
     output.extend_from_slice(&encoded);
     output.extend_from_slice(b"\nendstream");
@@ -689,42 +688,69 @@ mod tests {
     use crate::{ObjectId, OwnedDictionary, SourcePdf};
 
     #[test]
-    fn compact_writer_round_trips_and_drops_unreachable_objects() {
+    fn compact_writer_round_trips_and_drops_unreachable_objects() -> crate::Result<()> {
         let document = match EditDocument::from_bytes(sample_pdf(true)) {
             Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "sample PDF should parse: {error}"
+                )));
+            }
         };
         let output = match write_pdf(&document) {
             Ok(output) => output,
-            Err(error) => panic!("rewrite should succeed: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewrite should succeed: {error}"
+                )));
+            }
         };
         let rewritten = match SourcePdf::from_bytes(output) {
             Ok(source) => source,
-            Err(error) => panic!("rewritten PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten PDF should parse: {error}"
+                )));
+            }
         };
 
         assert_eq!(rewritten.page_count(), 1);
         assert_eq!(rewritten.object_count(), 4);
         let stream = match rewritten.stream_data(ObjectId::new(4, 0)) {
             Ok(stream) => stream,
-            Err(error) => panic!("rewritten stream should exist: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten stream should exist: {error}"
+                )));
+            }
         };
         assert_eq!(stream.as_ref(), b"q Q");
+        Ok(())
     }
 
     #[test]
-    fn compact_writer_serializes_overlay_edits() {
+    fn compact_writer_serializes_overlay_edits() -> crate::Result<()> {
         let mut document = match EditDocument::from_bytes(sample_pdf(false)) {
             Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "sample PDF should parse: {error}"
+                )));
+            }
         };
         let catalog_id = document.source().catalog_id();
         let catalog = match document.edit_object(catalog_id) {
             Ok(catalog) => catalog,
-            Err(error) => panic!("catalog should materialize: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "catalog should materialize: {error}"
+                )));
+            }
         };
         let Some(dictionary) = catalog.as_dictionary_mut() else {
-            panic!("catalog should be a dictionary");
+            return Err(crate::Error::Invalid(
+                "catalog should be a dictionary".to_owned(),
+            ));
         };
         dictionary.insert(b"Lang".to_vec(), OwnedObject::String(b"en-GB".to_vec()));
 
@@ -733,10 +759,16 @@ mod tests {
             .add(OwnedObject::Dictionary(OwnedDictionary::new()));
         let catalog = match document.edit_object(catalog_id) {
             Ok(catalog) => catalog,
-            Err(error) => panic!("catalog should remain editable: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "catalog should remain editable: {error}"
+                )));
+            }
         };
         let Some(dictionary) = catalog.as_dictionary_mut() else {
-            panic!("catalog should be a dictionary");
+            return Err(crate::Error::Invalid(
+                "catalog should be a dictionary".to_owned(),
+            ));
         };
         dictionary.insert(
             b"PieceInfo".to_vec(),
@@ -745,40 +777,73 @@ mod tests {
 
         let output = match write_pdf(&document) {
             Ok(output) => output,
-            Err(error) => panic!("rewrite should succeed: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewrite should succeed: {error}"
+                )));
+            }
         };
         let rewritten = match SourcePdf::from_bytes(output) {
             Ok(source) => source,
-            Err(error) => panic!("rewritten PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten PDF should parse: {error}"
+                )));
+            }
         };
         assert_eq!(rewritten.object_count(), 5);
         let catalog = match rewritten.materialize(rewritten.catalog_id()) {
             Ok(catalog) => catalog,
-            Err(error) => panic!("rewritten catalog should materialize: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten catalog should materialize: {error}"
+                )));
+            }
         };
         let dictionary = match catalog {
             OwnedObject::Dictionary(dictionary) => dictionary,
-            other => panic!("expected catalog dictionary, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected catalog dictionary, got {other:?}"
+                )));
+            }
         };
         assert_eq!(
             dictionary.get(b"Lang".as_slice()),
             Some(&OwnedObject::String(b"en-GB".to_vec()))
         );
+        Ok(())
     }
 
     #[test]
-    fn compact_writer_preserves_trailer_state_and_its_references() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the trailer round-trip scenario keeps construction, rewrite, and all preserved-reference assertions together for end-to-end readability"
+    )]
+    fn compact_writer_preserves_trailer_state_and_its_references() -> crate::Result<()> {
         let document = match EditDocument::from_bytes(sample_pdf_with_trailer_state()) {
             Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "sample PDF should parse: {error}"
+                )));
+            }
         };
         let output = match write_pdf(&document) {
             Ok(output) => output,
-            Err(error) => panic!("rewrite should succeed: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewrite should succeed: {error}"
+                )));
+            }
         };
         let rewritten = match SourcePdf::from_bytes(output) {
             Ok(source) => source,
-            Err(error) => panic!("rewritten PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten PDF should parse: {error}"
+                )));
+            }
         };
 
         assert_eq!(rewritten.object_count(), 6);
@@ -788,7 +853,11 @@ mod tests {
 
         let id = match trailer.get(b"ID".as_slice()) {
             Some(OwnedObject::Array(id)) => id,
-            other => panic!("expected trailer ID array, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected trailer ID array, got {other:?}"
+                )));
+            }
         };
         assert_eq!(
             id,
@@ -800,12 +869,24 @@ mod tests {
 
         let info_id = match trailer.get(b"Info".as_slice()) {
             Some(OwnedObject::Reference(ObjectHandle::Existing(id))) => *id,
-            other => panic!("expected indirect Info dictionary, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected indirect Info dictionary, got {other:?}"
+                )));
+            }
         };
         let info = match rewritten.materialize(info_id) {
             Ok(OwnedObject::Dictionary(info)) => info,
-            Ok(other) => panic!("expected Info dictionary, got {other:?}"),
-            Err(error) => panic!("Info dictionary should survive: {error}"),
+            Ok(other) => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected Info dictionary, got {other:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "Info dictionary should survive: {error}"
+                )));
+            }
         };
         assert_eq!(
             info.get(b"Producer".as_slice()),
@@ -814,7 +895,11 @@ mod tests {
 
         let custom = match trailer.get(b"Custom".as_slice()) {
             Some(OwnedObject::Dictionary(custom)) => custom,
-            other => panic!("expected custom trailer dictionary, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected custom trailer dictionary, got {other:?}"
+                )));
+            }
         };
         assert_eq!(
             custom.get(b"Flag".as_slice()),
@@ -822,27 +907,50 @@ mod tests {
         );
         let custom_ref = match custom.get(b"Ref".as_slice()) {
             Some(OwnedObject::Reference(ObjectHandle::Existing(id))) => *id,
-            other => panic!("expected custom trailer reference, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected custom trailer reference, got {other:?}"
+                )));
+            }
         };
         match rewritten.materialize(custom_ref) {
             Ok(OwnedObject::Dictionary(dictionary)) => assert_eq!(
                 dictionary.get(b"Kept".as_slice()),
                 Some(&OwnedObject::Boolean(true))
             ),
-            Ok(other) => panic!("expected retained custom object, got {other:?}"),
-            Err(error) => panic!("custom trailer reference should survive: {error}"),
+            Ok(other) => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected retained custom object, got {other:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "custom trailer reference should survive: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn compact_writer_preserves_xref_stream_trailer_state_without_xref_mechanics() {
-        let document = match EditDocument::from_bytes(sample_xref_stream_pdf_with_trailer_state()) {
+    fn compact_writer_preserves_xref_stream_trailer_state_without_xref_mechanics()
+    -> crate::Result<()> {
+        let document = match EditDocument::from_bytes(sample_xref_stream_pdf_with_trailer_state()?)
+        {
             Ok(document) => document,
-            Err(error) => panic!("xref-stream sample should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "xref-stream sample should parse: {error}"
+                )));
+            }
         };
         let output = match write_pdf(&document) {
             Ok(output) => output,
-            Err(error) => panic!("rewrite should succeed: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewrite should succeed: {error}"
+                )));
+            }
         };
         assert!(
             output
@@ -858,7 +966,11 @@ mod tests {
 
         let rewritten = match SourcePdf::from_bytes(output) {
             Ok(source) => source,
-            Err(error) => panic!("rewritten PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten PDF should parse: {error}"
+                )));
+            }
         };
         assert_eq!(rewritten.object_count(), 4);
         let trailer = rewritten.preserved_trailer();
@@ -866,7 +978,11 @@ mod tests {
         assert!(trailer.contains_key(b"ID".as_slice()));
         let custom = match trailer.get(b"Custom".as_slice()) {
             Some(OwnedObject::Dictionary(custom)) => custom,
-            other => panic!("expected custom trailer dictionary, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected custom trailer dictionary, got {other:?}"
+                )));
+            }
         };
         assert_eq!(
             custom.get(b"Flag".as_slice()),
@@ -877,21 +993,32 @@ mod tests {
         assert!(!trailer.contains_key(b"Index".as_slice()));
         assert!(!trailer.contains_key(b"Length".as_slice()));
         assert!(!trailer.contains_key(b"DL".as_slice()));
+        Ok(())
     }
 
     #[test]
-    fn undefined_source_reference_rewrites_as_null() {
+    fn undefined_source_reference_rewrites_as_null() -> crate::Result<()> {
         let mut document = match EditDocument::from_bytes(sample_pdf(false)) {
             Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "sample PDF should parse: {error}"
+                )));
+            }
         };
         let catalog_id = document.source().catalog_id();
         let catalog = match document.edit_object(catalog_id) {
             Ok(catalog) => catalog,
-            Err(error) => panic!("catalog should materialize: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "catalog should materialize: {error}"
+                )));
+            }
         };
         let Some(dictionary) = catalog.as_dictionary_mut() else {
-            panic!("catalog should be a dictionary");
+            return Err(crate::Error::Invalid(
+                "catalog should be a dictionary".to_owned(),
+            ));
         };
         dictionary.insert(
             b"Missing".to_vec(),
@@ -900,54 +1027,81 @@ mod tests {
 
         let output = match write_pdf(&document) {
             Ok(output) => output,
-            Err(error) => panic!("rewrite should succeed: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewrite should succeed: {error}"
+                )));
+            }
         };
         let rewritten = match SourcePdf::from_bytes(output) {
             Ok(source) => source,
-            Err(error) => panic!("rewritten PDF should parse: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten PDF should parse: {error}"
+                )));
+            }
         };
         let catalog = match rewritten.materialize(rewritten.catalog_id()) {
             Ok(catalog) => catalog,
-            Err(error) => panic!("rewritten catalog should materialize: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "rewritten catalog should materialize: {error}"
+                )));
+            }
         };
         let OwnedObject::Dictionary(dictionary) = catalog else {
-            panic!("expected catalog dictionary");
+            return Err(crate::Error::Invalid(
+                "expected catalog dictionary".to_owned(),
+            ));
         };
         assert_eq!(
             dictionary.get(b"Missing".as_slice()),
             Some(&OwnedObject::Null)
         );
+        Ok(())
     }
 
     #[test]
-    fn scientific_reals_expand_to_pdf_decimal_syntax() {
+    fn scientific_reals_expand_to_pdf_decimal_syntax() -> crate::Result<()> {
         let small = match expand_scientific("1.25e-7") {
             Ok(value) => value,
-            Err(error) => panic!("scientific real should expand: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "scientific real should expand: {error}"
+                )));
+            }
         };
         let large = match expand_scientific("-2e3") {
             Ok(value) => value,
-            Err(error) => panic!("scientific real should expand: {error}"),
+            Err(error) => {
+                return Err(crate::Error::Invalid(format!(
+                    "scientific real should expand: {error}"
+                )));
+            }
         };
         assert_eq!(small, "0.000000125");
         assert_eq!(large, "-2000");
+        Ok(())
     }
 
     #[test]
-    fn large_source_integer_does_not_round_through_f64() {
+    fn large_source_integer_does_not_round_through_f64() -> crate::Result<()> {
         use hayro_syntax::object::FromBytes;
 
         let Some(number) = hayro_syntax::object::Number::from_bytes(b"9007199254740993") else {
-            panic!("integer should parse");
+            return Err(crate::Error::Invalid("integer should parse".to_owned()));
         };
         let mut output = Vec::new();
         if let Err(error) = write_hayro_number(&mut output, &number) {
-            panic!("integer should serialize: {error}");
+            return Err(crate::Error::Invalid(format!(
+                "integer should serialize: {error}"
+            )));
         }
         assert_eq!(output, b"9007199254740993");
+        Ok(())
     }
 
-    fn sample_xref_stream_pdf_with_trailer_state() -> Vec<u8> {
+    fn sample_xref_stream_pdf_with_trailer_state() -> crate::Result<Vec<u8>> {
         let mut pdf = b"%PDF-1.5\n".to_vec();
         let mut offsets = Vec::new();
         append_object(
@@ -983,14 +1137,17 @@ mod tests {
             push_xref_entry(
                 &mut entries,
                 1,
-                u32::try_from(offset).expect("test xref offset fits u32"),
+                u32::try_from(offset).map_err(|_| {
+                    crate::Error::Invalid("test xref offset exceeds u32".to_owned())
+                })?,
                 0,
             );
         }
         push_xref_entry(
             &mut entries,
             1,
-            u32::try_from(xref_offset).expect("test xref offset fits u32"),
+            u32::try_from(xref_offset)
+                .map_err(|_| crate::Error::Invalid("test xref offset exceeds u32".to_owned()))?,
             0,
         );
 
@@ -1005,7 +1162,7 @@ mod tests {
         pdf.extend_from_slice(&entries);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
         pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        pdf
+        Ok(pdf)
     }
 
     fn push_xref_entry(entries: &mut Vec<u8>, kind: u8, field2: u32, field3: u16) {

@@ -5,7 +5,8 @@ use crate::{
     analyze::{analyze_document_for_optimization, input_sha256},
     content::normalize_page_contents_hayro,
     dedup::{
-        canonicalize_appearance_streams_hayro, canonicalize_exact_extgstate_dictionaries_hayro,
+        TargetedDedupStats, canonicalize_appearance_streams_hayro,
+        canonicalize_exact_extgstate_dictionaries_hayro,
         canonicalize_exact_font_dictionaries_hayro,
         canonicalize_exact_structure_attribute_dictionaries_hayro,
         canonicalize_font_program_streams_hayro, canonicalize_form_xobjects_hayro,
@@ -14,9 +15,12 @@ use crate::{
         canonicalize_to_unicode_cmaps_hayro, canonicalize_type3_charprocs_hayro,
     },
     flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
-    font::{strip_font_editing_tables_hayro, union_sparse_cid_font_programs_after_dedup_hayro},
+    font::{
+        FontOptimizationStats, strip_font_editing_tables_hayro,
+        union_sparse_cid_font_programs_after_dedup_hayro,
+    },
     hidden_text::{
-        apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
+        HiddenTextApplyStats, apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
         remove_large_diagonal_text_hayro,
     },
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
@@ -25,16 +29,19 @@ use crate::{
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
-    prune::{prune_resources_hayro, prune_resources_with_usage_hayro},
+    prune::{ResourcePruneStats, prune_resources_hayro, prune_resources_with_usage_hayro},
     raster_layout::normalize_raster_layout_hayro,
     repeated_page_objects::{
-        remove_repeated_page_objects_hayro, repeated_page_objects_prefix_possible_hayro,
+        RepeatedPageObjectStats, remove_repeated_page_objects_hayro,
+        repeated_page_objects_prefix_possible_hayro,
     },
     scrub::scrub_edit_document_cos_privacy,
     structure_compact::compact_structure_hayro,
-    vector_compact::{compact_vector_paths_hayro, processing_factor_candidate},
+    vector_compact::{
+        VectorCompactionStats, compact_vector_paths_hayro, processing_factor_candidate,
+    },
 };
-use flpdf::{ImageOptimizationOptions, ImageOptimizationStats};
+use flpdf::{DuplicateInlineImageStats, ImageOptimizationOptions, ImageOptimizationStats};
 #[cfg(test)]
 use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
 use std::{
@@ -47,6 +54,34 @@ fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() ->
     let value = f();
     timings.insert(name.to_owned(), started.elapsed().as_secs_f64() * 1000.0);
     value
+}
+
+fn signed_size_delta(before: usize, after: usize) -> isize {
+    if before >= after {
+        isize::try_from(before - after).unwrap_or(isize::MAX)
+    } else {
+        isize::try_from(after - before).map_or(isize::MIN, |delta| -delta)
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the percentage is display-only; exact byte counts remain available in the report"
+)]
+fn savings_percent(saved_bytes: isize, input_bytes: usize) -> f64 {
+    if input_bytes == 0 {
+        0.0
+    } else {
+        saved_bytes as f64 * 100.0 / input_bytes as f64
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "stage timings are diagnostic milliseconds; exact microsecond counters are not part of the API"
+)]
+fn micros_to_millis(micros: u64) -> f64 {
+    micros as f64 / 1000.0
 }
 
 fn validate_config(cfg: &Config) -> Result<()> {
@@ -78,6 +113,12 @@ pub fn analyze_microstroke_rasterization(
     rasterize_pathological_microstrokes_hayro(&mut document, flate_level)
 }
 
+/// Optimize a PDF according to the supplied configuration.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
+/// an optimization pass fails, or the rewritten document cannot be serialized.
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
     let mut timings = BTreeMap::new();
@@ -98,6 +139,11 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
 /// its input identity matches. Callers that accept analysis objects from an
 /// untrusted boundary should keep their own trusted cached copy rather than
 /// round-tripping mutable user data into this function.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
+/// a required fresh analysis or optimization pass fails, or output serialization fails.
 pub fn optimize_pdf_with_analysis(
     input: &[u8],
     cfg: &Config,
@@ -121,6 +167,10 @@ pub fn optimize_pdf_with_analysis(
     optimize_pdf_with_document(document, cfg, before, timings)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the optimization pipeline intentionally keeps stage ordering, shared document state, timings, and report accounting together"
+)]
 fn optimize_pdf_with_document(
     mut document: EditDocument,
     cfg: &Config,
@@ -141,7 +191,7 @@ fn optimize_pdf_with_document(
         if cfg.remove_large_diagonal_text {
             remove_large_diagonal_text_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(HiddenTextApplyStats::default())
         }
     })?;
     let scrub = timed(&mut timings, "privacy-scrub", || {
@@ -152,7 +202,7 @@ fn optimize_pdf_with_document(
     // dedup so producer subsets can converge to the same program.
     let mut font_rendering = timed(&mut timings, "font-table-strip", || {
         if cfg.preservation.font_editing_support {
-            Ok(Default::default())
+            Ok(FontOptimizationStats::default())
         } else {
             strip_font_editing_tables_hayro(&mut document, cfg.flate_level)
         }
@@ -161,19 +211,19 @@ fn optimize_pdf_with_document(
         if cfg.deduplicate_metadata_streams {
             canonicalize_metadata_streams_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let font_dedup = timed(&mut timings, "font-dedup", || {
         if cfg.deduplicate_font_programs {
             canonicalize_font_program_streams_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let font_sparse_union = timed(&mut timings, "font-sparse-union", || {
         if cfg.preservation.font_editing_support {
-            Ok(Default::default())
+            Ok(FontOptimizationStats::default())
         } else {
             union_sparse_cid_font_programs_after_dedup_hayro(&mut document, cfg.flate_level)
         }
@@ -188,7 +238,7 @@ fn optimize_pdf_with_document(
         if cfg.deduplicate_to_unicode_cmaps {
             canonicalize_to_unicode_cmaps_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
@@ -204,7 +254,7 @@ fn optimize_pdf_with_document(
         if cfg.deduplicate_icc_profiles {
             canonicalize_icc_profiles_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
@@ -241,11 +291,11 @@ fn optimize_pdf_with_document(
         ("apply-plans", raster_layout.apply_plans_us),
         ("staging-cleanup", raster_layout.staging_cleanup_us),
     ] {
-        timings.insert(format!("raster/{name}"), micros as f64 / 1000.0);
+        timings.insert(format!("raster/{name}"), micros_to_millis(micros));
     }
     let physically_hidden_text = timed(&mut timings, "physical-hidden-text", || {
         if !cfg.raster_layout.enabled || !cfg.raster_layout.prune_hidden_paints {
-            return Ok(Default::default());
+            return Ok(HiddenTextApplyStats::default());
         }
         if raster_layout.page_hidden_text_inventory_complete {
             let fallback = raster_layout
@@ -254,7 +304,7 @@ fn optimize_pdf_with_document(
                 .copied()
                 .collect::<BTreeSet<_>>();
             if fallback.is_empty() {
-                Ok(Default::default())
+                Ok(HiddenTextApplyStats::default())
             } else {
                 prune_physically_hidden_text_hayro(&mut document, Some(&fallback))
             }
@@ -274,7 +324,7 @@ fn optimize_pdf_with_document(
                 cfg.inline_image_min_duplicate_payload_bytes,
             )
         } else {
-            Ok(Default::default())
+            Ok(DuplicateInlineImageStats::default())
         }
     })?;
 
@@ -291,35 +341,35 @@ fn optimize_pdf_with_document(
         if cfg.deduplicate_image_xobjects {
             canonicalize_image_xobjects_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let form_dedup = timed(&mut timings, "form-dedup", || {
         if cfg.deduplicate_form_xobjects {
             canonicalize_form_xobjects_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if cfg.deduplicate_appearance_streams {
             canonicalize_appearance_streams_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let type3_charproc_dedup = timed(&mut timings, "type3-dedup", || {
         if cfg.deduplicate_type3_charprocs {
             canonicalize_type3_charprocs_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
             remove_repeated_page_objects_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(RepeatedPageObjectStats::default())
         }
     })?;
 
@@ -427,13 +477,13 @@ fn optimize_pdf_with_document(
                 vector_cache,
             )
         } else {
-            Ok(Default::default())
+            Ok(VectorCompactionStats::default())
         }
     })?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
         if !cfg.prune_resources {
-            return Ok(Default::default());
+            return Ok(ResourcePruneStats::default());
         }
         let shared_usage_is_exact = cfg.raster_layout.enabled
             && raster_layout.resource_inventory_complete
@@ -458,7 +508,7 @@ fn optimize_pdf_with_document(
         if cfg.rasterize_excessive_small_vectors {
             rasterize_pathological_microstrokes_hayro(&mut document, cfg.flate_level)
         } else {
-            Ok(Default::default())
+            Ok(MicrostrokeRasterStats::default())
         }
     })?;
     let flate = timed(&mut timings, "flate-policy", || {
@@ -476,7 +526,7 @@ fn optimize_pdf_with_document(
         if cfg.deduplicate_page_contents {
             canonicalize_page_contents_hayro(&mut document)
         } else {
-            Ok(Default::default())
+            Ok(TargetedDedupStats::default())
         }
     })?;
     let structure_compaction = timed(&mut timings, "structure-compaction", || {
@@ -529,17 +579,16 @@ fn optimize_pdf_with_document(
                 "Print placement analysis failed ({error}); resolution-aware raster resizing was disabled for this document."
             ));
         } else if print_plan.stats.geometry_complete {
+            let images_placed = print_plan.stats.images_placed;
+            let image_uses = print_plan.stats.image_uses;
+            let downsample_candidates = print_plan.stats.downsample_candidates;
+            let existing_jpeg_candidates = print_plan.stats.existing_jpeg_resize_candidates;
+            let flate_candidates = print_plan.stats.flate_resize_candidates;
+            let images_resized = raster_transform.images_resized;
+            let jpeg_images_resized = raster_transform.jpeg_images_resized;
+            let flate_images_resized = raster_transform.flate_images_resized;
             notes.push(format!(
-                "Print placement analysis found {} raster image object(s) across {} use(s); {} exceed the {} PPI target, {} are conservative existing-JPEG candidates, {} are conservative Flate-encoded resize candidates, and {} were resized ({} JPEG, {} Flate-encoded).",
-                print_plan.stats.images_placed,
-                print_plan.stats.image_uses,
-                print_plan.stats.downsample_candidates,
-                target_ppi,
-                print_plan.stats.existing_jpeg_resize_candidates,
-                print_plan.stats.flate_resize_candidates,
-                raster_transform.images_resized,
-                raster_transform.jpeg_images_resized,
-                raster_transform.flate_images_resized
+                "Print placement analysis found {images_placed} raster image object(s) across {image_uses} use(s); {downsample_candidates} exceed the {target_ppi} PPI target, {existing_jpeg_candidates} are conservative existing-JPEG candidates, {flate_candidates} are conservative Flate-encoded resize candidates, and {images_resized} were resized ({jpeg_images_resized} JPEG, {flate_images_resized} Flate-encoded)."
             ));
         } else {
             notes.push(format!(
@@ -551,11 +600,10 @@ fn optimize_pdf_with_document(
     if raster_transform.images_optimized > 0
         && let ImagePolicy::Perceptual { jpeg_quality, .. } = &cfg.image_policy
     {
+        let images_optimized = raster_transform.images_optimized;
+        let saved_bytes = raster_transform.saved_bytes();
         notes.push(format!(
-            "Transcoded {} eligible raster image(s) to JPEG at quality {} and reduced their encoded payload by {} bytes.",
-            raster_transform.images_optimized,
-            jpeg_quality,
-            raster_transform.saved_bytes()
+            "Transcoded {images_optimized} eligible raster image(s) to JPEG at quality {jpeg_quality} and reduced their encoded payload by {saved_bytes} bytes."
         ));
     }
     if jpeg_entropy.streams_optimized > 0 {
@@ -741,12 +789,8 @@ fn optimize_pdf_with_document(
     }
 
     let input_bytes = before.input_bytes;
-    let saved_bytes = input_bytes as isize - output.len() as isize;
-    let saved_percent = if input_bytes == 0 {
-        0.0
-    } else {
-        saved_bytes as f64 * 100.0 / input_bytes as f64
-    };
+    let saved_bytes = signed_size_delta(input_bytes, output.len());
+    let saved_percent = savings_percent(saved_bytes, input_bytes);
     let reachability_cache = document.reachability_cache_stats();
     let report = OptimizationReport {
         before,
@@ -943,6 +987,10 @@ mod tests {
     fn perceptual_image_fixture() -> Result<Vec<u8>> {
         let width = 200_usize;
         let height = 200_usize;
+        let width_i64 = i64::try_from(width)
+            .map_err(|_| Error::Invalid("fixture width exceeds i64".to_owned()))?;
+        let height_i64 = i64::try_from(height)
+            .map_err(|_| Error::Invalid("fixture height exceeds i64".to_owned()))?;
         let mut state = 0x1234_5678_u32;
         let mut pixels = Vec::with_capacity(width * height);
         for _ in 0..width * height {
@@ -969,8 +1017,8 @@ mod tests {
                 b"/Subtype".as_slice(),
                 ObjectHandle::name(b"Image".to_vec()),
             ),
-            (b"/Width".as_slice(), ObjectHandle::integer(width as i64)),
-            (b"/Height".as_slice(), ObjectHandle::integer(height as i64)),
+            (b"/Width".as_slice(), ObjectHandle::integer(width_i64)),
+            (b"/Height".as_slice(), ObjectHandle::integer(height_i64)),
             (
                 b"/ColorSpace".as_slice(),
                 ObjectHandle::name(b"DeviceGray".to_vec()),
@@ -1001,8 +1049,8 @@ mod tests {
                     ObjectHandle::array(vec![
                         ObjectHandle::integer(0),
                         ObjectHandle::integer(0),
-                        ObjectHandle::integer(width as i64),
-                        ObjectHandle::integer(height as i64),
+                        ObjectHandle::integer(width_i64),
+                        ObjectHandle::integer(height_i64),
                     ]),
                 ),
                 (b"/Resources".to_vec(), resources),
@@ -1339,9 +1387,8 @@ mod tests {
         let input = perceptual_image_fixture()?;
         let mut config = Config::print();
         config.max_image_ppi = Some(0);
-        let error = match optimize_pdf(&input, &config) {
-            Ok(_) => return Err(Error::Invalid("zero PPI was not rejected".to_owned())),
-            Err(error) => error,
+        let Err(error) = optimize_pdf(&input, &config) else {
+            return Err(Error::Invalid("zero PPI was not rejected".to_owned()));
         };
         assert!(matches!(error, Error::Invalid(message) if message.contains("greater than zero")));
         Ok(())

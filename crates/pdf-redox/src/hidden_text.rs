@@ -31,7 +31,7 @@ fn flpdf_object_key(reference: ObjectRef) -> ObjectKey {
     )
 }
 
-fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
+const fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
     match handle {
         CowObjectHandle::Existing(id) => Some((id.number(), id.generation())),
         CowObjectHandle::New(_) => None,
@@ -47,7 +47,7 @@ struct Rect {
 }
 
 impl Rect {
-    fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+    const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
         Self {
             x0: x0.min(x1),
             y0: y0.min(y1),
@@ -56,7 +56,7 @@ impl Rect {
         }
     }
 
-    fn from_rectangle(rect: Rectangle) -> Self {
+    const fn from_rectangle(rect: Rectangle) -> Self {
         Self::new(rect.llx, rect.lly, rect.urx, rect.ury)
     }
 
@@ -80,7 +80,7 @@ impl Rect {
         self.intersect(target).map_or(0.0, |r| r.area() / area)
     }
 
-    fn to_public(self) -> PageRect {
+    const fn to_public(self) -> PageRect {
         PageRect {
             x0: self.x0,
             y0: self.y0,
@@ -114,13 +114,15 @@ enum Color {
 impl Color {
     fn is_dark(self) -> bool {
         let luminance = match self {
-            Self::Gray(g) => g,
-            Self::Rgb(r, g, b) => (0.2126 * r) + (0.7152 * g) + (0.0722 * b),
-            Self::Cmyk(c, m, y, k) => {
-                let r = 1.0 - (c * (1.0 - k) + k);
-                let g = 1.0 - (m * (1.0 - k) + k);
-                let b = 1.0 - (y * (1.0 - k) + k);
-                (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+            Self::Gray(gray) => gray,
+            Self::Rgb(red, green, blue) => {
+                0.0722_f64.mul_add(blue, 0.7152_f64.mul_add(green, 0.2126 * red))
+            }
+            Self::Cmyk(cyan, magenta, yellow, key) => {
+                let red = 1.0 - cyan.mul_add(1.0 - key, key);
+                let green = 1.0 - magenta.mul_add(1.0 - key, key);
+                let blue = 1.0 - yellow.mul_add(1.0 - key, key);
+                0.0722_f64.mul_add(blue, 0.7152_f64.mul_add(green, 0.2126 * red))
             }
             Self::Unknown => return false,
         };
@@ -326,7 +328,7 @@ impl OperandObject {
         }
     }
 
-    fn handle(&self) -> Option<&ObjectHandle> {
+    const fn handle(&self) -> Option<&ObjectHandle> {
         match self {
             Self::Scalar(_) => None,
             Self::Handle(value) => Some(value),
@@ -367,7 +369,7 @@ impl PathState {
         *self = Self::default();
     }
 
-    fn set_rect(&mut self, rect: Rect) {
+    const fn set_rect(&mut self, rect: Rect) {
         if self.single_rect.is_none() {
             self.single_rect = Some(rect);
             self.only_single_rect = true;
@@ -376,7 +378,7 @@ impl PathState {
         }
     }
 
-    fn mark_complex(&mut self) {
+    const fn mark_complex(&mut self) {
         self.only_single_rect = false;
     }
 }
@@ -437,16 +439,16 @@ impl<'a> PageScanner<'a> {
     }
 
     fn number(object: &OperandObject) -> Option<f64> {
-        if object.as_integer().is_some() {
-            return object.as_integer().map(|v| v as f64);
-        }
-        object.as_real()
+        object
+            .as_integer()
+            .and_then(crate::source::exact_i64_to_f64)
+            .or_else(|| object.as_real())
     }
 
     fn handle_number(object: &ObjectHandle) -> Option<f64> {
         object
             .as_integer()
-            .map(|value| value as f64)
+            .and_then(crate::source::exact_i64_to_f64)
             .or_else(|| object.as_real())
     }
 
@@ -501,9 +503,9 @@ impl<'a> PageScanner<'a> {
         }
         let local = Rectangle::new(
             0.0_f64.min(advance),
-            self.text.rise - (0.25 * size),
+            0.25_f64.mul_add(-size, self.text.rise),
             0.0_f64.max(advance),
-            self.text.rise + (0.9 * size),
+            0.9_f64.mul_add(size, self.text.rise),
         );
         let transformed = self.combined_text_matrix().transform_rectangle(local);
         let rect = Rect::from_rectangle(transformed);
@@ -591,7 +593,8 @@ impl<'a> PageScanner<'a> {
                 pending_adjustment = 0.0;
                 strings.push(bytes);
             } else if let Some(value) = Self::handle_number(item) {
-                pending_adjustment += (-value / 1000.0) * self.text.font_size * hscale;
+                pending_adjustment =
+                    ((-value / 1000.0) * self.text.font_size).mul_add(hscale, pending_adjustment);
             }
         }
         if !strings.is_empty() {
@@ -683,6 +686,10 @@ impl<'a> PageScanner<'a> {
         self.path.reset();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "PDF text and graphics operator state transitions must remain ordered and co-located for auditability"
+    )]
     fn apply_operator(&mut self, operator: &[u8], span_start: usize, span_end: usize) {
         match operator {
             b"q" => self.graphics_stack.push((self.graphics, self.text.clone())),
@@ -874,6 +881,10 @@ impl<'a> PageScanner<'a> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "hidden-text classification combines related accumulated parser state and confidence gates in one terminal decision"
+    )]
     fn finish(self) -> PageScan {
         let page_area = self.crop.area();
         let page_images: Vec<Rect> = self
@@ -1020,12 +1031,11 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.operands.push(OperandSpan {
-                object: OperandObject::Scalar(scalar),
-                offset,
-            });
         }
+        self.operands.push(OperandSpan {
+            object: OperandObject::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -1088,7 +1098,7 @@ struct PageScan {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct HiddenTextApplyStats {
+pub struct HiddenTextApplyStats {
     pub removed: usize,
 }
 
@@ -1131,7 +1141,7 @@ impl LargeDiagonalTextScanner {
     fn number(object: &OperandObject) -> Option<f64> {
         object
             .as_integer()
-            .map(|value| value as f64)
+            .and_then(crate::source::exact_i64_to_f64)
             .or_else(|| object.as_real())
     }
 
@@ -1353,12 +1363,11 @@ impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.operands.push(OperandSpan {
-                object: OperandObject::Scalar(scalar),
-                offset,
-            });
         }
+        self.operands.push(OperandSpan {
+            object: OperandObject::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -1417,7 +1426,7 @@ struct OptionalContentState {
     dead_code,
     reason = "retained only until final flpdf/Hayro hidden-text parity sweep"
 )]
-pub(crate) fn apply_hidden_text_policy<R: Read + Seek + 'static>(
+pub fn apply_hidden_text_policy<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
@@ -1491,7 +1500,7 @@ fn replace_page_content_hayro(
     Ok(())
 }
 
-pub(crate) fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
+pub fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
     let ocg = optional_content_state_hayro(document)?;
     let pages = document.page_handles()?;
     let mut findings = Vec::new();
@@ -1502,7 +1511,7 @@ pub(crate) fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<H
     Ok(findings)
 }
 
-pub(crate) fn apply_hidden_text_policy_hayro(
+pub fn apply_hidden_text_policy_hayro(
     document: &mut EditDocument,
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
@@ -1545,7 +1554,7 @@ pub(crate) fn apply_hidden_text_policy_hayro(
 ///
 /// This is intentionally opt-in: it targets watermark/stamp-style text while
 /// preserving horizontal/vertical page text and mixed text objects.
-fn pdf_token_delimiter(byte: u8) -> bool {
+const fn pdf_token_delimiter(byte: u8) -> bool {
     matches!(
         byte,
         0 | b'\t'
@@ -1632,7 +1641,7 @@ fn may_contain_diagonal_text_transform(input: &[u8]) -> bool {
     false
 }
 
-pub(crate) fn remove_large_diagonal_text_hayro(
+pub fn remove_large_diagonal_text_hayro(
     document: &mut EditDocument,
 ) -> Result<HiddenTextApplyStats> {
     let pages = document.page_handles()?;
@@ -1665,7 +1674,7 @@ pub(crate) fn remove_large_diagonal_text_hayro(
 /// they are visually hidden. Zero-opacity text is physically absent; occlusion
 /// findings are removed only when the analyzer itself classifies them as safe
 /// to remove, because approximate glyph bounds are not a proof of invisibility.
-pub(crate) fn prune_physically_hidden_text_hayro(
+pub fn prune_physically_hidden_text_hayro(
     document: &mut EditDocument,
     candidate_pages: Option<&BTreeSet<CowObjectHandle>>,
 ) -> Result<HiddenTextApplyStats> {
@@ -1846,8 +1855,8 @@ fn parse_cid_widths_hayro(
             index += 1;
             continue;
         }
+        index += 1;
         if let Some(end) = resolved_u32_hayro(document, next)? {
-            index += 1;
             let Some(width) = items.get(index) else {
                 break;
             };
@@ -1856,8 +1865,6 @@ fn parse_cid_widths_hayro(
                     out.insert(code, width);
                 }
             }
-            index += 1;
-        } else {
             index += 1;
         }
     }
@@ -2082,7 +2089,7 @@ fn page_content_bytes_hayro(document: &EditDocument, page: CowObjectHandle) -> R
 
 fn owned_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -2119,11 +2126,11 @@ fn page_crop_hayro(document: &EditDocument, page: CowObjectHandle) -> Result<Rec
     Ok(Rect::new(0.0, 0.0, 612.0, 792.0))
 }
 
-pub(crate) struct HiddenTextSharedContext {
+pub struct HiddenTextSharedContext {
     ocg: OptionalContentState,
 }
 
-pub(crate) fn hidden_text_shared_context_hayro(
+pub fn hidden_text_shared_context_hayro(
     document: &EditDocument,
 ) -> Result<HiddenTextSharedContext> {
     Ok(HiddenTextSharedContext {
@@ -2235,11 +2242,11 @@ fn physical_hidden_ranges(scan: PageScan) -> Vec<(usize, usize)> {
     ranges
 }
 
-pub(crate) fn scan_physical_hidden_text_with_callback_hayro<C>(
+pub fn scan_physical_hidden_text_with_callback_hayro<C>(
     document: &EditDocument,
     page: CowObjectHandle,
     page_number: usize,
-    context: &HiddenTextSharedContext,
+    shared_context: &HiddenTextSharedContext,
     content: &[u8],
     other: &mut C,
 ) -> Result<Vec<(usize, usize)>>
@@ -2250,15 +2257,15 @@ where
     let resources = build_resources_hayro(
         document,
         document.inherited_page_value(page, b"Resources")?,
-        &context.ocg,
+        &shared_context.ocg,
     )?;
     let mut scanner = PageScanner::new(
         page_number,
         crop,
         &resources,
-        &context.ocg.off,
-        context.ocg.base_off,
-        &context.ocg.on,
+        &shared_context.ocg.off,
+        shared_context.ocg.base_off,
+        &shared_context.ocg.on,
     );
     let mut tee = TeeCallbacks {
         first: other,
@@ -2409,7 +2416,7 @@ fn font_info(font: &ObjectHandle) -> Result<FontInfo> {
     } else {
         let first = font.try_get_key(b"/FirstChar")?;
         let first = if first.try_is_integer()? {
-            first.try_get_int_value()?.max(0) as u32
+            u32::try_from(first.try_get_int_value()?.max(0)).unwrap_or(u32::MAX)
         } else {
             0
         };
@@ -2454,20 +2461,20 @@ fn parse_cid_widths(widths: &ObjectHandle, out: &mut HashMap<u32, f64>) -> Resul
                 }
             }
             i += 1;
-        } else if let Some(end) = next.as_integer().and_then(|v| u32::try_from(v).ok()) {
-            i += 1;
-            let Some(width) = items.get(i) else {
-                break;
-            };
-            if width.try_is_number()? {
-                let value = width.try_get_numeric_value()?;
-                for code in start..=end.min(start.saturating_add(65_535)) {
-                    out.insert(code, value);
-                }
-            }
-            i += 1;
         } else {
             i += 1;
+            if let Some(end) = next.as_integer().and_then(|v| u32::try_from(v).ok()) {
+                let Some(width) = items.get(i) else {
+                    break;
+                };
+                if width.try_is_number()? {
+                    let value = width.try_get_numeric_value()?;
+                    for code in start..=end.min(start.saturating_add(65_535)) {
+                        out.insert(code, value);
+                    }
+                }
+                i += 1;
+            }
         }
     }
     Ok(())
@@ -2710,7 +2717,7 @@ fn hex_token(token: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn hex_nibble(byte: u8) -> Option<u8> {
+const fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -2844,32 +2851,38 @@ BT /F1 20 Tf 0.93969 0.34202 -0.34202 0.93969 70 70 Tm (tile08) Tj ET";
     #[test]
     fn large_diagonal_text_scanner_keeps_single_medium_diagonal_label() {
         let input = b"BT /F1 23.4 Tf 0.866025 0.5 -0.5 0.866025 0 0 Tm (C/NO:) Tj ET";
-        assert!(large_diagonal_ranges(input).is_empty());
+        assert_eq!(large_diagonal_ranges(input), Vec::<(usize, usize)>::new());
     }
 
     #[test]
     fn large_diagonal_text_scanner_keeps_large_horizontal_and_vertical_text() {
         let horizontal = b"BT /F1 72 Tf 1 0 0 1 0 0 Tm (TITLE) Tj ET";
         let vertical = b"BT /F1 72 Tf 0 1 -1 0 0 0 Tm (SIDE) Tj ET";
-        assert!(large_diagonal_ranges(horizontal).is_empty());
-        assert!(large_diagonal_ranges(vertical).is_empty());
+        assert_eq!(
+            large_diagonal_ranges(horizontal),
+            Vec::<(usize, usize)>::new()
+        );
+        assert_eq!(
+            large_diagonal_ranges(vertical),
+            Vec::<(usize, usize)>::new()
+        );
     }
 
     #[test]
     fn large_diagonal_text_scanner_keeps_small_diagonal_text() {
         let input = b"BT /F1 12 Tf 0.707106 0.707106 -0.707106 0.707106 0 0 Tm (label) Tj ET";
-        assert!(large_diagonal_ranges(input).is_empty());
+        assert_eq!(large_diagonal_ranges(input), Vec::<(usize, usize)>::new());
     }
 
     #[test]
     fn large_diagonal_text_scanner_keeps_mixed_text_object() {
         let input = b"BT /F1 48 Tf 0.707106 0.707106 -0.707106 0.707106 0 0 Tm (DRAFT) Tj 1 0 0 1 0 0 Tm (keep) Tj ET";
-        assert!(large_diagonal_ranges(input).is_empty());
+        assert_eq!(large_diagonal_ranges(input), Vec::<(usize, usize)>::new());
     }
 
     #[test]
     fn parses_basic_to_unicode_bfchar_and_bfrange() {
-        let cmap = br#"
+        let cmap = br"
             2 beginbfchar
             <01> <0041>
             <02> <03A9>
@@ -2877,7 +2890,7 @@ BT /F1 20 Tf 0.93969 0.34202 -0.34202 0.93969 70 70 Tm (tile08) Tj ET";
             1 beginbfrange
             <10> <12> <0061>
             endbfrange
-        "#;
+        ";
         let map = parse_to_unicode(cmap);
         assert_eq!(map.get(&vec![0x01]).map(String::as_str), Some("A"));
         assert_eq!(map.get(&vec![0x02]).map(String::as_str), Some("Ω"));

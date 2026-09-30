@@ -13,7 +13,7 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 #[derive(Debug, Default)]
-pub(crate) struct ScrubStats {
+pub struct ScrubStats {
     pub removed: BTreeMap<String, usize>,
     pub jpeg_metadata_bytes_removed: usize,
 }
@@ -26,13 +26,9 @@ impl ScrubStats {
 
 #[cfg(test)]
 fn dict_view(handle: &ObjectHandle) -> Option<ObjectHandle> {
-    if let Some(d) = handle.as_stream_dict() {
-        Some(d)
-    } else if handle.as_dictionary().is_some() {
-        Some(handle.clone())
-    } else {
-        None
-    }
+    handle
+        .as_stream_dict()
+        .or_else(|| handle.as_dictionary().map(|_| handle.clone()))
 }
 
 #[cfg(test)]
@@ -231,7 +227,11 @@ fn scrub_owned_cos_privacy_dictionary(
 /// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
 /// `/LastModified`. `BestEffort` can additionally remove thumbnails and form
 /// values, active content, attachment roots, signature values, and JPEG metadata.
-pub(crate) fn scrub_edit_document_cos_privacy(
+#[expect(
+    clippy::too_many_lines,
+    reason = "privacy scrubbing applies an ordered set of related catalog, trailer, stream, and object-graph transformations"
+)]
+pub fn scrub_edit_document_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
 ) -> Result<ScrubStats> {
@@ -715,7 +715,7 @@ fn scrub_catalog_javascript_name_tree(
 }
 
 #[cfg(test)]
-pub(crate) fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
+pub fn scrub_edit_document_metadata(document: &mut EditDocument) -> Result<ScrubStats> {
     scrub_edit_document_cos_privacy(
         document,
         &PrivacyConfig {
@@ -747,7 +747,11 @@ fn dangerous_action(action: &ObjectHandle) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(crate) fn scrub_pdf<R: Read + Seek + 'static>(
+#[expect(
+    clippy::too_many_lines,
+    reason = "the legacy test-only scrub path mirrors the ordered production privacy transform for parity coverage"
+)]
+pub fn scrub_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     cfg: &PrivacyConfig,
 ) -> Result<ScrubStats> {
@@ -939,18 +943,24 @@ mod tests {
             }
         }
 
-        let custom = match rewritten.trailer().get(b"Custom".as_slice()) {
-            Some(custom) => custom,
-            None => panic!("custom trailer root should survive"),
+        let Some(custom) = rewritten.trailer().get(b"Custom".as_slice()) else {
+            return Err(crate::Error::Invalid(
+                "custom trailer root should survive".to_owned(),
+            ));
         };
         let custom_id = match custom {
             OwnedObject::Reference(CowObjectHandle::Existing(id)) => *id,
-            other => panic!("expected custom trailer reference, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected custom trailer reference, got {other:?}"
+                )));
+            }
         };
         let custom = rewritten.source().materialize(custom_id)?;
-        let custom = match custom.as_dictionary() {
-            Some(dictionary) => dictionary,
-            None => panic!("custom trailer object should remain a dictionary"),
+        let Some(custom) = custom.as_dictionary() else {
+            return Err(crate::Error::Invalid(
+                "custom trailer object should remain a dictionary".to_owned(),
+            ));
         };
         assert_eq!(
             custom.get(b"Keep".as_slice()),
@@ -1035,16 +1045,21 @@ mod tests {
         let rewritten = EditDocument::from_bytes(output)?;
         let catalog_id = rewritten.source().catalog_id();
         let catalog = rewritten.source().materialize(catalog_id)?;
-        let catalog = match catalog.as_dictionary() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should remain a dictionary"),
+        let Some(catalog) = catalog.as_dictionary() else {
+            return Err(crate::Error::Invalid(
+                "catalog should remain a dictionary".to_owned(),
+            ));
         };
         assert!(!catalog.contains_key(b"AA".as_slice()));
         assert!(!catalog.contains_key(b"OpenAction".as_slice()));
 
         let names = match catalog.get(b"Names".as_slice()) {
             Some(OwnedObject::Dictionary(dictionary)) => dictionary,
-            other => panic!("expected direct Names dictionary, got {other:?}"),
+            other => {
+                return Err(crate::Error::Invalid(format!(
+                    "expected direct Names dictionary, got {other:?}"
+                )));
+            }
         };
         assert!(!names.contains_key(b"JavaScript".as_slice()));
         assert!(names.contains_key(b"Dests".as_slice()));
