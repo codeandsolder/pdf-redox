@@ -12,16 +12,17 @@ use std::{
     sync::Arc,
 };
 
-/// Immutable, lazily parsed source PDF backed by Hayro.
-///
-/// Hayro keeps the original bytes alive and parses objects on demand. Mutations
-/// belong in [`ObjectOverlay`] rather than in this source representation.
+/// Cached classification of a source object as a non-stream or a stream with an optional subtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceStreamKind {
     NotStream,
     Stream(Option<Vec<u8>>),
 }
 
+/// Immutable, lazily parsed source PDF backed by Hayro.
+///
+/// Hayro keeps the original bytes alive and parses objects on demand. Mutations
+/// belong in the copy-on-write object overlay rather than in this source representation.
 pub struct SourcePdf {
     pdf: Pdf,
     bytes: Arc<Vec<u8>>,
@@ -369,16 +370,19 @@ pub struct ObjectId {
 
 impl ObjectId {
     #[must_use]
+    /// Creates an identifier from a PDF object number and generation number.
     pub const fn new(number: i32, generation: i32) -> Self {
         Self { number, generation }
     }
 
     #[must_use]
+    /// Returns the PDF indirect-object number.
     pub const fn number(self) -> i32 {
         self.number
     }
 
     #[must_use]
+    /// Returns the PDF indirect-object generation number.
     pub const fn generation(self) -> i32 {
         self.generation
     }
@@ -409,6 +413,7 @@ pub struct NewObjectId(usize);
 
 impl NewObjectId {
     #[must_use]
+    /// Returns the zero-based overlay-object index.
     pub const fn index(self) -> usize {
         self.0
     }
@@ -418,10 +423,13 @@ impl NewObjectId {
 /// overlay object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectHandle {
+    /// Reference an indirect object that already exists in the source PDF.
     Existing(ObjectId),
+    /// Reference an object newly created in the copy-on-write overlay.
     New(NewObjectId),
 }
 
+/// Owned PDF dictionary keyed by decoded name bytes without the leading slash.
 pub type OwnedDictionary = BTreeMap<Vec<u8>, OwnedObject>;
 
 /// Stream payload used by an edited COS object.
@@ -431,7 +439,9 @@ pub type OwnedDictionary = BTreeMap<Vec<u8>, OwnedObject>;
 /// to [`Self::Owned`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamData {
+    /// Keep the encoded stream payload backed by the immutable source object.
     Source(ObjectId),
+    /// Store an encoded stream payload owned by the overlay.
     Owned(Vec<u8>),
 }
 
@@ -449,6 +459,7 @@ impl StreamData {
     }
 
     #[must_use]
+    /// Returns whether this stream payload still refers directly to immutable source bytes.
     pub const fn is_source_backed(&self) -> bool {
         matches!(self, Self::Source(_))
     }
@@ -460,23 +471,36 @@ impl StreamData {
 /// optimization pass only pays allocation cost for objects it actually edits.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnedObject {
+    /// PDF null object.
     Null,
+    /// PDF boolean object.
     Boolean(bool),
+    /// PDF integer object.
     Integer(i64),
+    /// PDF real-number object.
     Real(f64),
+    /// PDF name bytes without the leading slash.
     Name(Vec<u8>),
+    /// PDF string bytes.
     String(Vec<u8>),
+    /// Indirect reference to a source or newly created object.
     Reference(ObjectHandle),
+    /// PDF array containing owned COS values.
     Array(Vec<Self>),
+    /// PDF dictionary keyed by decoded name bytes.
     Dictionary(OwnedDictionary),
+    /// PDF stream dictionary together with its encoded payload.
     Stream {
+        /// Stream dictionary entries.
         dictionary: OwnedDictionary,
+        /// Encoded stream payload.
         data: StreamData,
     },
 }
 
 impl OwnedObject {
     #[must_use]
+    /// Returns the dictionary view of a dictionary or stream object.
     pub const fn as_dictionary(&self) -> Option<&OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
@@ -484,6 +508,7 @@ impl OwnedObject {
         }
     }
 
+    /// Returns the mutable dictionary view of a dictionary or stream object.
     pub const fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
@@ -503,7 +528,9 @@ impl OwnedObject {
 /// Mutation applied to an object that already exists in the source PDF.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExistingObjectChange {
+    /// Replace an existing source object with an owned object.
     Replace(OwnedObject),
+    /// Delete an existing source object from the rewritten graph.
     Delete,
 }
 
@@ -515,11 +542,13 @@ pub struct ObjectOverlay {
 }
 
 impl ObjectOverlay {
+    /// Records a replacement for an existing source object.
     pub fn replace(&mut self, id: ObjectId, object: OwnedObject) {
         self.existing
             .insert(id, ExistingObjectChange::Replace(object));
     }
 
+    /// Marks an existing source object for deletion.
     pub fn delete(&mut self, id: ObjectId) {
         self.existing.insert(id, ExistingObjectChange::Delete);
     }
@@ -547,19 +576,23 @@ impl ObjectOverlay {
         }
     }
 
+    /// Removes and returns any pending change for an existing source object.
     pub fn clear_change(&mut self, id: ObjectId) -> Option<ExistingObjectChange> {
         self.existing.remove(&id)
     }
 
     #[must_use]
+    /// Returns the pending change for an existing source object, if any.
     pub fn change(&self, id: ObjectId) -> Option<&ExistingObjectChange> {
         self.existing.get(&id)
     }
 
+    /// Iterates over pending changes to existing source objects.
     pub fn changes(&self) -> impl Iterator<Item = (ObjectId, &ExistingObjectChange)> {
         self.existing.iter().map(|(id, change)| (*id, change))
     }
 
+    /// Adds an owned object to the overlay and returns its temporary identifier.
     pub fn add(&mut self, object: OwnedObject) -> NewObjectId {
         let id = NewObjectId(self.added.len());
         self.added.push(object);
@@ -567,20 +600,24 @@ impl ObjectOverlay {
     }
 
     #[must_use]
+    /// Returns a newly added overlay object by temporary identifier.
     pub fn added(&self, id: NewObjectId) -> Option<&OwnedObject> {
         self.added.get(id.index())
     }
 
+    /// Returns a mutable newly added overlay object by temporary identifier.
     pub fn added_mut(&mut self, id: NewObjectId) -> Option<&mut OwnedObject> {
         self.added.get_mut(id.index())
     }
 
     #[must_use]
+    /// Returns all objects newly added to the overlay.
     pub fn added_objects(&self) -> &[OwnedObject] {
         &self.added
     }
 
     #[must_use]
+    /// Returns whether the overlay contains no replacements, deletions, or newly added objects.
     pub fn is_empty(&self) -> bool {
         self.existing.is_empty() && self.added.is_empty()
     }
@@ -681,10 +718,12 @@ impl EditDocument {
         })
     }
 
+    /// Returns the immutable parsed source document.
     pub const fn source(&self) -> &SourcePdf {
         &self.source
     }
 
+    /// Returns the preserved semantic trailer entries.
     pub const fn trailer(&self) -> &OwnedDictionary {
         &self.trailer
     }
@@ -766,11 +805,13 @@ impl EditDocument {
         self.reachability_cache_stats.get()
     }
 
+    /// Returns the preserved trailer entries for mutation and invalidates graph caches as required.
     pub fn trailer_mut(&mut self) -> &mut OwnedDictionary {
         self.mark_graph_maybe_mutated();
         &mut self.trailer
     }
 
+    /// Returns the copy-on-write object overlay.
     pub const fn overlay(&self) -> &ObjectOverlay {
         &self.overlay
     }
@@ -779,6 +820,7 @@ impl EditDocument {
     // to allocate or edit one known object should prefer add_object,
     // edit_object, or edit_added_object so reachability can reuse a cached
     // graph when indirect-reference edges stay unchanged.
+    /// Returns the copy-on-write object overlay for mutation and invalidates graph caches as required.
     pub fn overlay_mut(&mut self) -> &mut ObjectOverlay {
         self.mark_graph_maybe_mutated();
         &mut self.overlay
@@ -786,6 +828,7 @@ impl EditDocument {
 
     // Allocation alone cannot change output reachability; the reachable object
     // that eventually points at this handle will trigger edge validation.
+    /// Adds a new object to the document overlay and returns its temporary identifier.
     pub fn add_object(&mut self, object: OwnedObject) -> NewObjectId {
         self.overlay.add(object)
     }

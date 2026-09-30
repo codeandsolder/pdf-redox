@@ -1959,12 +1959,16 @@ fn hayro_stream_fingerprint_ignoring(
     hash_len_prefixed(&mut hasher, domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
 
-    let is_semantic = |key: &&Vec<u8>| {
-        key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-    };
-    let semantic_entry_count = dictionary.keys().filter(is_semantic).count();
+    let is_semantic = |key: &[u8]| key != b"Length" && !ignored_dictionary_keys.contains(&key);
+    let semantic_entry_count = dictionary
+        .keys()
+        .filter(|key| is_semantic(key.as_slice()))
+        .count();
     hasher.update((semantic_entry_count as u64).to_le_bytes());
-    for (key, value) in dictionary.iter().filter(|(key, _)| is_semantic(key)) {
+    for (key, value) in dictionary
+        .iter()
+        .filter(|(key, _)| is_semantic(key.as_slice()))
+    {
         hash_len_prefixed(&mut hasher, key);
         hash_owned_object(&mut hasher, value)?;
     }

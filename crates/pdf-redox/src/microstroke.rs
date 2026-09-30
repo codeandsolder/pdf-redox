@@ -20,15 +20,26 @@ const MAX_RASTER_PIXELS: usize = 100_000_000;
 const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 450.0;
 const MIN_STROKE_RASTER_PIXELS: f64 = 1.5;
 
+/// Internal-facing statistics from the pathological-microstroke rasterization pass.
+///
+/// This type is public only so the separate CLI crate can report dry-run diagnostics;
+/// it is hidden from the normal library documentation surface.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MicrostrokeRasterStats {
+    /// Number of pages whose content would be rewritten.
     pub pages_rewritten: usize,
+    /// Number of qualifying microstroke runs selected for rasterization.
     pub runs_rasterized: usize,
+    /// Number of individual strokes represented by the selected runs.
     pub strokes_rasterized: usize,
+    /// Total encoded bytes of generated image payloads.
     pub image_payload_bytes: usize,
+    /// Number of generated images encoded with CCITT Group 4.
     pub ccitt_images: usize,
+    /// Number of generated images encoded with Flate.
     pub flate_images: usize,
+    /// Estimated encoded bytes saved relative to the equivalent Flate representation.
     pub estimated_flate_bytes_saved: usize,
 }
 

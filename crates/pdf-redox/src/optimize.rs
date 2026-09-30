@@ -99,6 +99,14 @@ fn validate_config(cfg: &Config) -> Result<()> {
 /// Run the production pathological-microstroke detector and encoded-cost gate
 /// without serializing an output PDF. The temporary document may be rewritten
 /// internally, but the caller receives only the would-be rasterization stats.
+///
+/// This support entry point is public for the separate CLI crate and intentionally
+/// hidden from the normal library documentation surface.
+///
+/// # Errors
+///
+/// Returns an error when the Flate level is outside the supported range 0 through 9,
+/// the input PDF cannot be parsed, or required content cannot be decoded or inspected.
 #[doc(hidden)]
 pub fn analyze_microstroke_rasterization(
     input: &[u8],

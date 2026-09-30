@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Output policy controlling which classes of transformations are permitted.
 pub enum OutputProfile {
     /// No intended visual changes. Fresh rewrite, GC, stream normalization,
     /// lossless metadata cleanup only when explicitly requested.
@@ -18,6 +19,7 @@ pub enum OutputProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Policy for annotations that are not independently preserved as links or forms.
 pub enum AnnotationPolicy {
     /// Preserve annotation dictionaries and their interactive semantics.
     Preserve,
@@ -35,6 +37,7 @@ pub enum AnnotationPolicy {
     clippy::struct_excessive_bools,
     reason = "public preservation switches are independent serialized policy fields"
 )]
+/// Controls which interactive, structural, and authoring semantics survive a rewrite.
 pub struct PreservationConfig {
     /// Preserve Link annotation navigation/actions. Independent of whether
     /// other annotations are preserved, flattened, or discarded.
@@ -76,6 +79,7 @@ pub struct PreservationConfig {
 
 impl PreservationConfig {
     #[must_use]
+    /// Returns the preservation policy that retains normal document functionality and authoring semantics.
     pub const fn functional() -> Self {
         Self {
             links: true,
@@ -115,6 +119,7 @@ impl PreservationConfig {
     }
 
     #[must_use]
+    /// Returns the policy that retains what can affect the default visible page surface while dropping non-visual semantics.
     pub const fn visible_surface() -> Self {
         Self {
             links: false,
@@ -144,17 +149,27 @@ impl Default for PreservationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "mode")]
 #[derive(Default)]
+/// Raster-image optimization policy for the selected output profile.
 pub enum ImagePolicy {
     #[default]
+    /// Preserve eligible raster payloads without lossy transcoding or downsampling.
     Preserve,
+    /// Permit size-gated lossy image transcoding while retaining the configured resolution policy.
     Perceptual {
+        /// JPEG quality used when encoding eligible photographic raster data.
         jpeg_quality: u8,
+        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
         min_savings_percent: u8,
+        /// Whether perceptual optimization must retain the original pixel dimensions.
         preserve_resolution: bool,
     },
+    /// Permit print-oriented raster downsampling and recompression.
     Print {
+        /// JPEG quality used when encoding eligible photographic raster data.
         jpeg_quality: u8,
+        /// Target effective pixels per inch for eligible print-oriented downsampling.
         target_ppi: u16,
+        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
         min_savings_percent: u8,
     },
 }
@@ -250,12 +265,15 @@ impl Default for RasterLayoutConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "mode")]
+/// Policy for preserving or recompressing streams that use a lone Flate filter.
 pub enum FlatePolicy {
     /// Preserve unmodified lone-Flate streams byte-for-byte.
     Preserve,
     /// Recompress only lone-Flate streams that clear explicit size gates.
     Selective {
+        /// Minimum absolute encoded-byte reduction required to accept recompression.
         min_savings_bytes: usize,
+        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
         min_savings_percent: u8,
     },
     /// Ask the writer to recompress every eligible Flate stream.
@@ -273,9 +291,13 @@ impl Default for FlatePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Requested depth of privacy-oriented metadata and active-content cleanup.
 pub enum PrivacyLevel {
+    /// Perform no privacy-specific cleanup.
     None,
+    /// Remove authoring and document metadata without enabling the full best-effort scrub.
     Metadata,
+    /// Apply all enabled privacy cleanup, including active-content and attachment policies.
     BestEffort,
 }
 
@@ -284,7 +306,9 @@ pub enum PrivacyLevel {
     clippy::struct_excessive_bools,
     reason = "public privacy switches are independent serialized policy fields"
 )]
+/// Controls privacy-oriented cleanup independently from compression and preservation policy.
 pub struct PrivacyConfig {
+    /// Requested overall privacy-cleanup level.
     pub level: PrivacyLevel,
     /// Remove JPEG APP1/APP13/COM payloads without touching entropy-coded data.
     pub strip_jpeg_metadata: bool,
@@ -340,6 +364,7 @@ impl HiddenTextPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+/// Primary objective used when encoded size and display-list simplicity conflict.
 pub enum OptimizationGoal {
     /// Prefer the smallest encoded PDF; candidate structural rewrites may be
     /// rejected when they make the compressed representation larger.
@@ -355,18 +380,23 @@ pub enum OptimizationGoal {
     clippy::struct_excessive_bools,
     reason = "top-level configuration exposes independent user-selectable feature switches"
 )]
+/// Complete configuration for one optimization run.
 pub struct Config {
     #[serde(default)]
+    /// Semantic-preservation policy applied before privacy cleanup.
     pub preservation: PreservationConfig,
     /// Optional override for the effective-PPI limit used by print raster
     /// downsampling. `None` uses the profile's image-policy default.
     #[serde(default)]
     pub max_image_ppi: Option<u16>,
+    /// Raster-image optimization policy.
     pub image_policy: ImagePolicy,
     /// Optional structural raster-layout normalization (crop/join/fragment reconstruction).
     #[serde(default)]
     pub raster_layout: RasterLayoutConfig,
+    /// Privacy-cleanup policy applied after preservation transforms.
     pub privacy: PrivacyConfig,
+    /// Policy for text that is present in content streams but invisible in the default appearance.
     pub hidden_text: HiddenTextPolicy,
     /// Remove self-contained diagonal watermark text. Text at least 24 pt is removed directly;
     /// 20–24 pt text is removed only when the same payload repeats at least three times on a page.
@@ -439,6 +469,7 @@ pub struct Config {
 
 impl Config {
     #[must_use]
+    /// Returns the lossless structural-optimization baseline configuration.
     pub fn optimize_only() -> Self {
         Self {
             preservation: PreservationConfig::functional(),
@@ -473,6 +504,7 @@ impl Config {
     }
 
     #[must_use]
+    /// Returns the policy that retains what can affect the default visible page surface while dropping non-visual semantics.
     pub fn visible_surface() -> Self {
         Self {
             preservation: PreservationConfig::visible_surface(),
@@ -481,6 +513,7 @@ impl Config {
     }
 
     #[must_use]
+    /// Returns the perceptual preset with size-gated JPEG optimization enabled.
     pub fn perceptual() -> Self {
         Self {
             image_policy: ImagePolicy::Perceptual {
@@ -493,6 +526,7 @@ impl Config {
     }
 
     #[must_use]
+    /// Returns the print preset with resolution-aware raster optimization enabled.
     pub fn print() -> Self {
         Self {
             max_image_ppi: Some(600),
@@ -516,156 +550,187 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    /// Sets the complete semantic-preservation policy.
     pub const fn preservation(mut self, value: PreservationConfig) -> Self {
         self.config.preservation = value;
         self
     }
 
+    /// Sets whether link annotations and their navigation actions are preserved.
     pub const fn preserve_links(mut self, value: bool) -> Self {
         self.config.preservation.links = value;
         self
     }
 
+    /// Sets whether interactive form state and widget annotations are preserved.
     pub const fn preserve_forms(mut self, value: bool) -> Self {
         self.config.preservation.forms = value;
         self
     }
 
+    /// Sets whether outlines, destinations, page labels, threads, and open actions are preserved.
     pub const fn preserve_navigation(mut self, value: bool) -> Self {
         self.config.preservation.navigation = value;
         self
     }
 
+    /// Sets whether optional-content configuration and default layer visibility are preserved.
     pub const fn preserve_optional_content(mut self, value: bool) -> Self {
         self.config.preservation.optional_content = value;
         self
     }
 
+    /// Sets whether tagged-PDF accessibility structure and language metadata are preserved.
     pub const fn preserve_structure(mut self, value: bool) -> Self {
         self.config.preservation.structure = value;
         self
     }
 
+    /// Sets whether color-management output intents are preserved.
     pub const fn preserve_output_intents(mut self, value: bool) -> Self {
         self.config.preservation.output_intents = value;
         self
     }
 
+    /// Sets whether viewer layout, mode, and preference entries are preserved.
     pub const fn preserve_viewer_preferences(mut self, value: bool) -> Self {
         self.config.preservation.viewer_preferences = value;
         self
     }
 
+    /// Sets whether authoring and document metadata are preserved.
     pub const fn preserve_metadata(mut self, value: bool) -> Self {
         self.config.preservation.metadata = value;
         self
     }
 
+    /// Sets whether embedded font tables needed for later editing or reflow are preserved.
     pub const fn preserve_font_editing_support(mut self, value: bool) -> Self {
         self.config.preservation.font_editing_support = value;
         self
     }
 
+    /// Sets handling for annotations not independently protected by link or form preservation.
     pub const fn annotation_policy(mut self, value: AnnotationPolicy) -> Self {
         self.config.preservation.annotations = value;
         self
     }
 
+    /// Sets whether unrecognized catalog/page entries and objects reachable only from them are retained.
     pub const fn preserve_unknown_objects(mut self, value: bool) -> Self {
         self.config.preservation.unknown_objects = value;
         self
     }
 
+    /// Sets whether recognized child keys may be promoted when unknown catalog/page wrappers are dropped.
     pub const fn splice_unknown_wrappers(mut self, value: bool) -> Self {
         self.config.preservation.splice_unknown_wrappers = value;
         self
     }
 
+    /// Sets the complete structural raster-layout normalization policy.
     pub const fn raster_layout(mut self, value: RasterLayoutConfig) -> Self {
         self.config.raster_layout = value;
         self
     }
 
+    /// Sets whether structural raster-layout normalization is enabled.
     pub const fn normalize_raster_layout(mut self, value: bool) -> Self {
         self.config.raster_layout.enabled = value;
         self
     }
 
+    /// Sets whether eligible image masks are materialized into normalized alpha planes.
     pub const fn bake_image_masks(mut self, value: bool) -> Self {
         self.config.raster_layout.bake_masks = value;
         self
     }
 
+    /// Sets whether raster rewrites must preserve renderer-exact color/alpha sampling semantics.
     pub const fn exact_raster_rendering(mut self, value: bool) -> Self {
         self.config.raster_layout.exact_raster_rendering = value;
         self
     }
 
+    /// Sets the optional effective-PPI cap used by print raster downsampling.
     pub const fn max_image_ppi(mut self, value: Option<u16>) -> Self {
         self.config.max_image_ppi = value;
         self
     }
 
+    /// Sets the raster-image optimization policy.
     pub const fn image_policy(mut self, value: ImagePolicy) -> Self {
         self.config.image_policy = value;
         self
     }
 
+    /// Sets the privacy-cleanup policy.
     pub const fn privacy(mut self, value: PrivacyConfig) -> Self {
         self.config.privacy = value;
         self
     }
 
+    /// Sets the hidden-text removal policy.
     pub fn hidden_text(mut self, value: HiddenTextPolicy) -> Self {
         self.config.hidden_text = value;
         self
     }
 
+    /// Sets whether self-contained large diagonal watermark-like text is removed.
     pub const fn remove_large_diagonal_text(mut self, value: bool) -> Self {
         self.config.remove_large_diagonal_text = value;
         self
     }
 
+    /// Sets whether high-confidence repeated page objects are removed.
     pub const fn remove_repeated_page_objects(mut self, value: bool) -> Self {
         self.config.remove_repeated_page_objects = value;
         self
     }
 
+    /// Sets whether eligible small indirect objects are packed into object streams.
     pub const fn generate_object_streams(mut self, value: bool) -> Self {
         self.config.generate_object_streams = value;
         self
     }
 
+    /// Sets whether optimization prioritizes encoded size or processing simplicity.
     pub const fn optimization_goal(mut self, value: OptimizationGoal) -> Self {
         self.config.optimization_goal = value;
         self
     }
 
+    /// Sets whether page content streams are lexically normalized.
     pub const fn normalize_content_streams(mut self, value: bool) -> Self {
         self.config.normalize_content_streams = value;
         self
     }
 
+    /// Sets whether semantically equivalent vector paints are compacted.
     pub const fn compact_vector_paths(mut self, value: bool) -> Self {
         self.config.compact_vector_paths = value;
         self
     }
 
+    /// Sets whether pathological fields of tiny opaque vector strokes may be rasterized.
     pub const fn rasterize_excessive_small_vectors(mut self, value: bool) -> Self {
         self.config.rasterize_excessive_small_vectors = value;
         self
     }
 
+    /// Sets the policy for lone-Flate stream recompression.
     pub const fn flate_policy(mut self, value: FlatePolicy) -> Self {
         self.config.flate_policy = value;
         self
     }
 
+    /// Sets whether unused typed resource entries are pruned.
     pub const fn prune_resources(mut self, value: bool) -> Self {
         self.config.prune_resources = value;
         self
     }
 
+    /// Sets resource selectors that remain preserved even when resource pruning is enabled.
     pub fn keep_unused_resources(
         mut self,
         selectors: impl IntoIterator<Item = impl Into<String>>,
@@ -674,67 +739,80 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sets whether exact duplicate metadata streams are canonicalized.
     pub const fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
         self.config.deduplicate_metadata_streams = value;
         self
     }
 
+    /// Sets whether exact duplicate embedded font programs are canonicalized.
     pub const fn deduplicate_font_programs(mut self, value: bool) -> Self {
         self.config.deduplicate_font_programs = value;
         self
     }
 
+    /// Sets whether exact duplicate `ToUnicode` `CMaps` are canonicalized.
     pub const fn deduplicate_to_unicode_cmaps(mut self, value: bool) -> Self {
         self.config.deduplicate_to_unicode_cmaps = value;
         self
     }
 
+    /// Sets whether repeated inline images may be externalized and shared.
     pub const fn deduplicate_inline_images(mut self, value: bool) -> Self {
         self.config.deduplicate_inline_images = value;
         self
     }
 
+    /// Sets the minimum duplicated encoded inline-image payload required before externalization.
     pub const fn inline_image_min_duplicate_payload_bytes(mut self, value: usize) -> Self {
         self.config.inline_image_min_duplicate_payload_bytes = value;
         self
     }
 
+    /// Sets whether exact duplicate Image `XObjects` are canonicalized.
     pub const fn deduplicate_image_xobjects(mut self, value: bool) -> Self {
         self.config.deduplicate_image_xobjects = value;
         self
     }
 
+    /// Sets whether exact duplicate Form `XObjects` are canonicalized.
     pub const fn deduplicate_form_xobjects(mut self, value: bool) -> Self {
         self.config.deduplicate_form_xobjects = value;
         self
     }
 
+    /// Sets whether exact duplicate annotation appearance streams are canonicalized.
     pub const fn deduplicate_appearance_streams(mut self, value: bool) -> Self {
         self.config.deduplicate_appearance_streams = value;
         self
     }
 
+    /// Sets whether exact duplicate page content streams are canonicalized.
     pub const fn deduplicate_page_contents(mut self, value: bool) -> Self {
         self.config.deduplicate_page_contents = value;
         self
     }
 
+    /// Sets whether exact duplicate Type3 character-procedure streams are canonicalized.
     pub const fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
         self.config.deduplicate_type3_charprocs = value;
         self
     }
 
+    /// Sets whether exact duplicate ICC profile streams are canonicalized.
     pub const fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
         self.config.deduplicate_icc_profiles = value;
         self
     }
 
+    /// Sets the zlib compression level used for rewritten Flate streams.
     pub const fn flate_level(mut self, value: i32) -> Self {
         self.config.flate_level = value;
         self
     }
 
     #[must_use]
+    /// Finishes the builder and returns the configured optimization policy.
     pub fn build(self) -> Config {
         self.config
     }
