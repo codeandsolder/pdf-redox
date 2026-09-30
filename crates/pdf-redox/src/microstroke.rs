@@ -43,11 +43,11 @@ impl OperandValue {
         match self {
             Self::Scalar(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
             Self::Handle(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
         }
     }
@@ -107,6 +107,10 @@ impl StrokeColor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "named safety predicates make rasterization preconditions directly auditable"
+)]
 struct StrokeSafety {
     stroke_alpha_opaque: bool,
     fill_alpha_opaque: bool,
@@ -130,7 +134,7 @@ impl Default for StrokeSafety {
 }
 
 impl StrokeSafety {
-    fn safe_for_stencil(self) -> bool {
+    const fn safe_for_stencil(self) -> bool {
         self.stroke_alpha_opaque
             && self.fill_alpha_opaque
             && self.normal_blend
@@ -139,7 +143,7 @@ impl StrokeSafety {
             && self.fill_overprint_disabled
     }
 
-    fn invalidate(&mut self) {
+    const fn invalidate(&mut self) {
         *self = Self {
             stroke_alpha_opaque: false,
             fill_alpha_opaque: false,
@@ -198,7 +202,7 @@ impl StrokeState {
             && self.safety.safe_for_stencil()
     }
 
-    fn apply_ext_gstate(&mut self, patch: ExtGStatePatch) {
+    const fn apply_ext_gstate(&mut self, patch: ExtGStatePatch) {
         if !patch.supported {
             self.safety.invalidate();
             return;
@@ -277,7 +281,7 @@ impl MicroStrokeScanner {
         }
     }
 
-    fn invalidate_frame(&mut self) {
+    const fn invalidate_frame(&mut self) {
         if let Some(frame) = &mut self.frame {
             frame.stage = BlockStage::Invalid;
         }
@@ -345,6 +349,10 @@ impl MicroStrokeScanner {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "PDF graphics operator state transitions must remain ordered and co-located for auditability"
+    )]
     fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
         let end = offset.saturating_add(length);
         match operator {
@@ -508,11 +516,8 @@ impl MicroStrokeScanner {
                 self.invalidate_frame();
                 self.apply_ext_gstate();
             }
-            // These do not alter stroking geometry/color/safety.
-            b"g" | b"rg" | b"k" | b"cs" | b"sc" | b"scn" | b"M" | b"ri" | b"i" | b"BX" | b"EX"
-            | b"W" | b"W*" | b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" | b"BT" | b"ET" | b"Tc"
-            | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td" | b"TD" | b"Tm" | b"T*"
-            | b"Tj" | b"TJ" | b"'" | b"\"" | b"Do" | b"sh" => self.invalidate_frame(),
+            // Other operators either do not affect the tracked stroking state or are
+            // conservatively treated as a barrier for candidate-frame reuse.
             _ => self.invalidate_frame(),
         }
         self.operands.clear();
@@ -598,10 +603,10 @@ fn grouped_runs(input: &[u8], blocks: &[MicroStrokeBlock]) -> Vec<MicroStrokeRun
         while end_index < blocks.len() {
             let previous = &blocks[end_index - 1];
             let next = &blocks[end_index];
-            if previous.state != next.state
-                || previous.end > next.start
-                || !pdf_whitespace(&input[previous.end..next.start])
-            {
+            let Some(gap) = input.get(previous.end..next.start) else {
+                break;
+            };
+            if previous.state != next.state || !pdf_whitespace(gap) {
                 break;
             }
             end_index = end_index.saturating_add(1);
@@ -622,12 +627,22 @@ fn grouped_runs(input: &[u8], blocks: &[MicroStrokeBlock]) -> Vec<MicroStrokeRun
     runs
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "accepted pitches are bounded to 0.04..=0.25, so the scaled key is always 400..=2500"
+)]
+fn quantized_pitch_key(value: f64) -> Option<i32> {
+    let value = value.abs();
+    if !value.is_finite() || !(MIN_PITCH..=MAX_PITCH).contains(&value) {
+        return None;
+    }
+    Some((value * 10_000.0).round() as i32)
+}
+
 fn infer_pitch(lines: &[LineSegment]) -> Option<f64> {
-    let mut counts = BTreeMap::<i64, usize>::new();
+    let mut counts = BTreeMap::<i32, usize>::new();
     let mut add = |value: f64| {
-        let value = value.abs();
-        if value.is_finite() && (MIN_PITCH..=MAX_PITCH).contains(&value) {
-            let key = (value * 10_000.0).round() as i64;
+        if let Some(key) = quantized_pitch_key(value) {
             *counts.entry(key).or_default() += 1;
         }
     };
@@ -646,7 +661,7 @@ fn infer_pitch(lines: &[LineSegment]) -> Option<f64> {
     if support < 32 || support.saturating_mul(100) < lines.len() {
         return None;
     }
-    Some(key as f64 / 10_000.0)
+    Some(f64::from(key) / 10_000.0)
 }
 
 #[derive(Debug)]
@@ -659,9 +674,13 @@ struct RasterizedRun {
 }
 
 fn max_linear_scale(matrix: Matrix) -> Option<f64> {
-    let trace =
-        matrix.a * matrix.a + matrix.b * matrix.b + matrix.c * matrix.c + matrix.d * matrix.d;
-    let determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+    let trace = matrix.d.mul_add(
+        matrix.d,
+        matrix
+            .c
+            .mul_add(matrix.c, matrix.b.mul_add(matrix.b, matrix.a * matrix.a)),
+    );
+    let determinant = matrix.b.mul_add(-matrix.c, matrix.a * matrix.d);
     if !trace.is_finite()
         || !determinant.is_finite()
         || trace <= 0.0
@@ -669,10 +688,10 @@ fn max_linear_scale(matrix: Matrix) -> Option<f64> {
     {
         return None;
     }
-    let discriminant = (trace * trace - 4.0 * determinant * determinant)
+    let discriminant = ((4.0 * determinant).mul_add(-determinant, trace * trace))
         .max(0.0)
         .sqrt();
-    let scale2 = 0.5 * (trace + discriminant);
+    let scale2 = f64::midpoint(trace, discriminant);
     let scale = scale2.sqrt();
     (scale.is_finite() && scale > 0.0).then_some(scale)
 }
@@ -694,7 +713,7 @@ fn raster_sample_pitch(state: StrokeState, geometry_pitch: f64, user_unit: f64) 
     (pitch.is_finite() && pitch > 0.0).then_some(pitch)
 }
 
-fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
+const fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
     if after >= before {
         return false;
     }
@@ -703,6 +722,25 @@ fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
         && saved.saturating_mul(100) >= before.saturating_mul(MIN_RUN_SAVINGS_PERCENT)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is finite, nonnegative, integral-valued by construction, and bounded by the 16384-pixel raster limit"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the value is explicitly checked to be nonnegative before conversion"
+)]
+fn bounded_raster_index(value: f64) -> Option<usize> {
+    if !value.is_finite() || !(0.0..=16_384.0).contains(&value) {
+        return None;
+    }
+    Some(value as usize)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "geometry bounds, cap semantics, and raster safety gates form one cohesive scan-conversion operation"
+)]
 fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<RasterizedRun> {
     if !run.state.raster_safe() || !pitch.is_finite() || pitch <= 0.0 {
         return None;
@@ -763,14 +801,14 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
         return None;
     }
 
-    let pad = run.state.width * 0.5 + sample_pitch;
+    let pad = run.state.width.mul_add(0.5, sample_pitch);
     xmin -= pad;
     ymin -= pad;
     xmax += pad;
     ymax += pad;
     let scale = 1.0 / sample_pitch;
-    let width = ((xmax - xmin) * scale).ceil() as usize + 1;
-    let height = ((ymax - ymin) * scale).ceil() as usize + 1;
+    let width = bounded_raster_index(((xmax - xmin) * scale).ceil())?.checked_add(1)?;
+    let height = bounded_raster_index(((ymax - ymin) * scale).ceil())?.checked_add(1)?;
     if width == 0
         || height == 0
         || width > MAX_RASTER_DIMENSION
@@ -791,7 +829,7 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
         let y1 = (ymax - uy1) * scale;
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let len2 = dx * dx + dy * dy;
+        let len2 = dy.mul_add(dy, dx * dx);
         if len2 <= f64::EPSILON {
             continue;
         }
@@ -804,44 +842,52 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
             0.0
         };
         let square_cap_cross_limit = radius * length;
-        let min_x = (x0.min(x1) - radius - 1.0).floor().max(0.0) as usize;
-        let max_x = (x0.max(x1) + radius + 1.0).ceil().min((width - 1) as f64) as usize;
-        let min_y = (y0.min(y1) - radius - 1.0).floor().max(0.0) as usize;
-        let max_y = (y0.max(y1) + radius + 1.0).ceil().min((height - 1) as f64) as usize;
+        let min_x = bounded_raster_index((x0.min(x1) - radius - 1.0).floor().max(0.0))?;
+        let max_x = bounded_raster_index(
+            (x0.max(x1) + radius + 1.0)
+                .ceil()
+                .min(f64::from(width_u32 - 1)),
+        )?;
+        let min_y = bounded_raster_index((y0.min(y1) - radius - 1.0).floor().max(0.0))?;
+        let max_y = bounded_raster_index(
+            (y0.max(y1) + radius + 1.0)
+                .ceil()
+                .min(f64::from(height_u32 - 1)),
+        )?;
 
         for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
+            let py = f64::from(u32::try_from(y).ok()?) + 0.5;
             for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let raw_t = ((px - x0) * dx + (py - y0) * dy) * inv_len2;
+                let px = f64::from(u32::try_from(x).ok()?) + 0.5;
+                let raw_t = (py - y0).mul_add(dy, (px - x0) * dx) * inv_len2;
                 let paints = match run.state.cap {
                     0 => {
-                        if !(0.0..=1.0).contains(&raw_t) {
-                            false
-                        } else {
-                            let qx = x0 + raw_t * dx;
-                            let qy = y0 + raw_t * dy;
+                        if (0.0..=1.0).contains(&raw_t) {
+                            let qx = raw_t.mul_add(dx, x0);
+                            let qy = raw_t.mul_add(dy, y0);
                             let ex = px - qx;
                             let ey = py - qy;
-                            ex * ex + ey * ey <= radius2
+                            ey.mul_add(ey, ex * ex) <= radius2
+                        } else {
+                            false
                         }
                     }
                     1 => {
                         let t = raw_t.clamp(0.0, 1.0);
-                        let qx = x0 + t * dx;
-                        let qy = y0 + t * dy;
+                        let qx = t.mul_add(dx, x0);
+                        let qy = t.mul_add(dy, y0);
                         let ex = px - qx;
                         let ey = py - qy;
-                        ex * ex + ey * ey <= radius2
+                        ey.mul_add(ey, ex * ex) <= radius2
                     }
                     2 => {
                         if raw_t < -extension || raw_t > 1.0 + extension {
                             false
                         } else {
                             let t = raw_t.clamp(0.0, 1.0);
-                            let qx = x0 + t * dx;
-                            let qy = y0 + t * dy;
-                            let cross = ((px - qx) * -dy + (py - qy) * dx).abs();
+                            let qx = t.mul_add(dx, x0);
+                            let qy = t.mul_add(dy, y0);
+                            let cross = (py - qy).mul_add(dx, (px - qx) * -dy).abs();
                             cross <= square_cap_cross_limit
                         }
                     }
@@ -857,8 +903,8 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
     Some(RasterizedRun {
         x0: xmin,
         y0: ymin,
-        width_user: width as f64 / scale,
-        height_user: height as f64 / scale,
+        width_user: f64::from(width_u32) / scale,
+        height_user: f64::from(height_u32) / scale,
         mask,
     })
 }
@@ -876,7 +922,8 @@ fn compact_real(value: f64) -> String {
         text.pop();
     }
     if text == "-0" {
-        text = "0".to_owned();
+        text.clear();
+        text.push('0');
     }
     if let Some(rest) = text.strip_prefix("0.") {
         return format!(".{rest}");
@@ -962,7 +1009,7 @@ fn install_page_xobject(
 
 fn current_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -995,6 +1042,9 @@ fn ext_gstate_patches(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStatePatch>> {
+    const SUPPORTED_EXT_GSTATE_KEYS: &[&[u8]] = &[
+        b"Type", b"CA", b"ca", b"BM", b"SMask", b"OP", b"op", b"OPM", b"AIS", b"SA",
+    ];
     let Some(states) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
     else {
         return Ok(BTreeMap::new());
@@ -1018,9 +1068,6 @@ fn ext_gstate_patches(
                 Some(OwnedObject::Name(name)) if name == b"None"
             )),
         };
-        const SUPPORTED_EXT_GSTATE_KEYS: &[&[u8]] = &[
-            b"Type", b"CA", b"ca", b"BM", b"SMask", b"OP", b"op", b"OPM", b"AIS", b"SA",
-        ];
         let supported_keys = state
             .keys()
             .all(|key| SUPPORTED_EXT_GSTATE_KEYS.contains(&key.as_slice()));
@@ -1072,7 +1119,11 @@ struct Candidate {
     strokes: usize,
 }
 
-pub(crate) fn rasterize_pathological_microstrokes_hayro(
+#[expect(
+    clippy::too_many_lines,
+    reason = "candidate discovery, encoded-cost gating, and document rewrites form one ordered optimization pass"
+)]
+pub fn rasterize_pathological_microstrokes_hayro(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<MicrostrokeRasterStats> {
@@ -1232,26 +1283,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn groups_only_adjacent_identical_microstroke_state() {
+    fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
         let input = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q q 1 0 0 1 10.1 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        flpdf::parse_detached_content_stream(input, "microstroke test", &mut scanner)
-            .unwrap_or_else(|error| panic!("{error}"));
+        flpdf::parse_detached_content_stream(input, "microstroke test", &mut scanner)?;
         assert_eq!(scanner.blocks.len(), 2);
         let runs = grouped_runs(input, &scanner.blocks);
         assert!(runs.is_empty());
         assert_eq!(scanner.blocks[0].p0, (10.0, 20.0));
         assert_eq!(scanner.blocks[1].p0, (10.1, 20.0));
+        Ok(())
     }
 
     #[test]
-    fn fractional_line_cap_is_not_silently_truncated() {
+    fn fractional_line_cap_is_not_silently_truncated() -> Result<()> {
         let input = b"1.5 J q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        flpdf::parse_detached_content_stream(input, "microstroke fractional cap", &mut scanner)
-            .unwrap_or_else(|error| panic!("{error}"));
+        flpdf::parse_detached_content_stream(input, "microstroke fractional cap", &mut scanner)?;
         assert_eq!(scanner.blocks.len(), 1);
         assert!(!scanner.blocks[0].state.raster_safe());
+        Ok(())
     }
 
     #[test]
@@ -1299,7 +1350,7 @@ mod tests {
     fn pitch_detector_finds_plotter_grid() {
         let lines = (0..600)
             .map(|index| {
-                let y = index as f64 * 0.12;
+                let y = f64::from(index) * 0.12;
                 ((0.0, y), (0.12, y))
             })
             .collect::<Vec<_>>();
@@ -1317,10 +1368,12 @@ mod tests {
     }
 
     #[test]
-    fn continuous_micro_polyline_is_preserved_as_vector_data() {
-        let lines = (0..MIN_MICROSTROKE_RUN)
+    fn continuous_micro_polyline_is_preserved_as_vector_data() -> Result<()> {
+        let run_length = u32::try_from(MIN_MICROSTROKE_RUN)
+            .map_err(|_| crate::Error::Invalid("microstroke test run exceeds u32".to_owned()))?;
+        let lines = (0..run_length)
             .map(|index| {
-                let x0 = index as f64 * 0.12;
+                let x0 = f64::from(index) * 0.12;
                 ((x0, 0.0), (x0 + 0.12, 0.0))
             })
             .collect::<Vec<_>>();
@@ -1335,6 +1388,7 @@ mod tests {
             lines,
         };
         assert!(rasterize_run(&run, 0.12, 1.0).is_none());
+        Ok(())
     }
 
     #[test]
@@ -1368,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_raster_uses_zero_bits_for_ink() {
+    fn binary_raster_uses_zero_bits_for_ink() -> Result<()> {
         let run = MicroStrokeRun {
             start: 0,
             end: 0,
@@ -1379,7 +1433,9 @@ mod tests {
             },
             lines: vec![((0.0, 0.0), (1.0, 0.0)); MIN_MICROSTROKE_RUN],
         };
-        let raster = rasterize_run(&run, 0.12, 1.0).unwrap_or_else(|| panic!("raster"));
+        let raster = rasterize_run(&run, 0.12, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("expected raster".to_owned()))?;
         assert!(raster.mask.packed().iter().any(|byte| *byte != 0xff));
+        Ok(())
     }
 }

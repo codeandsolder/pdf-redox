@@ -5,7 +5,7 @@ const PAGE_TREE_FANOUT: usize = 256;
 const NAME_TREE_FANOUT: usize = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StructureCompactionStats {
+pub struct StructureCompactionStats {
     pub page_tree_nodes_before: usize,
     pub page_tree_nodes_after: usize,
     pub page_tree_nodes_removed: usize,
@@ -77,10 +77,43 @@ fn page_tree_node_count(document: &EditDocument, root: ObjectHandle) -> Result<O
     Ok(Some(seen.len()))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "page-tree rebuilding is one recursive structural transaction with shared parent and count invariants"
+)]
 fn compact_page_tree(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
 ) -> Result<()> {
+    const fn required_nodes(mut leaves: usize) -> usize {
+        let mut nodes = 1usize;
+        while leaves > PAGE_TREE_FANOUT {
+            leaves = leaves.div_ceil(PAGE_TREE_FANOUT);
+            nodes = nodes.saturating_add(leaves);
+        }
+        nodes
+    }
+
+    #[derive(Clone, Copy)]
+    struct Child {
+        handle: ObjectHandle,
+        pages: usize,
+    }
+
+    fn set_parent(
+        document: &mut EditDocument,
+        child: ObjectHandle,
+        parent: ObjectHandle,
+    ) -> Result<()> {
+        let Some(dictionary) = edit_handle(document, child)?.as_dictionary_mut() else {
+            return Err(Error::Invalid(
+                "page-tree child is not a dictionary".to_owned(),
+            ));
+        };
+        dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(parent));
+        Ok(())
+    }
+
     let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = current_dictionary(document, catalog_handle)? else {
         return Ok(());
@@ -97,15 +130,6 @@ fn compact_page_tree(
     if pages.is_empty() {
         stats.page_tree_nodes_after = before_nodes;
         return Ok(());
-    }
-
-    fn required_nodes(mut leaves: usize) -> usize {
-        let mut nodes = 1usize;
-        while leaves > PAGE_TREE_FANOUT {
-            leaves = leaves.div_ceil(PAGE_TREE_FANOUT);
-            nodes = nodes.saturating_add(leaves);
-        }
-        nodes
     }
 
     let after_nodes = required_nodes(pages.len());
@@ -143,26 +167,6 @@ fn compact_page_tree(
         for (key, value) in values {
             dictionary.insert(key.clone(), value.clone());
         }
-    }
-
-    #[derive(Clone, Copy)]
-    struct Child {
-        handle: ObjectHandle,
-        pages: usize,
-    }
-
-    fn set_parent(
-        document: &mut EditDocument,
-        child: ObjectHandle,
-        parent: ObjectHandle,
-    ) -> Result<()> {
-        let Some(dictionary) = edit_handle(document, child)?.as_dictionary_mut() else {
-            return Err(Error::Invalid(
-                "page-tree child is not a dictionary".to_owned(),
-            ));
-        };
-        dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(parent));
-        Ok(())
     }
 
     let mut level = pages
@@ -342,7 +346,7 @@ fn inline_destination_wrappers(
     Ok(inlined)
 }
 
-fn name_tree_required_nodes(pairs: usize) -> usize {
+const fn name_tree_required_nodes(pairs: usize) -> usize {
     if pairs <= NAME_TREE_FANOUT {
         return 1;
     }
@@ -371,6 +375,10 @@ struct NameChild {
     last: Vec<u8>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "name-tree replacement keeps collection, rebuilding, and parent-object rewrite invariants together"
+)]
 fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -> Result<usize> {
     if snapshot.pairs.is_empty() {
         let Some(root) = edit_handle(document, snapshot.root)?.as_dictionary_mut() else {
@@ -551,9 +559,7 @@ fn compact_catalog_name_trees(
     Ok(())
 }
 
-pub(crate) fn compact_structure_hayro(
-    document: &mut EditDocument,
-) -> Result<StructureCompactionStats> {
+pub fn compact_structure_hayro(document: &mut EditDocument) -> Result<StructureCompactionStats> {
     let mut stats = StructureCompactionStats::default();
     compact_catalog_name_trees(document, &mut stats)?;
     compact_page_tree(document, &mut stats)?;

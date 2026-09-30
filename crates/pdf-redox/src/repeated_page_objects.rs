@@ -12,7 +12,7 @@ const POSITION_TOLERANCE_PT: f64 = 12.0;
 const MIN_SUPPORT_PAGES: usize = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RepeatedPageObjectStats {
+pub struct RepeatedPageObjectStats {
     pub groups_removed: usize,
     pub all_pages_groups_removed: usize,
     pub after_first_groups_removed: usize,
@@ -60,11 +60,11 @@ impl OperandValue {
         match self {
             Self::Scalar(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
             Self::Handle(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
         }
     }
@@ -147,6 +147,10 @@ impl<'a> PageScanner<'a> {
         Some(values)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the rounded value is clamped to the full i32 range immediately before conversion"
+    )]
     fn quantized(value: f64, scale: f64) -> i32 {
         if !value.is_finite() {
             return 0;
@@ -539,7 +543,7 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
-pub(crate) fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> Result<bool> {
+pub fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> Result<bool> {
     let pages = document.page_handles()?;
     if pages.len() < MIN_SUPPORT_PAGES {
         return Ok(false);
@@ -565,7 +569,7 @@ pub(crate) fn repeated_page_objects_prefix_possible_hayro(document: &EditDocumen
         .is_empty())
 }
 
-pub(crate) fn remove_repeated_page_objects_hayro(
+pub fn remove_repeated_page_objects_hayro(
     document: &mut EditDocument,
 ) -> Result<RepeatedPageObjectStats> {
     let pages = document.page_handles()?;
@@ -743,6 +747,6 @@ mod tests {
         ];
         let (selected, modes) = select_persistent_candidates(&candidates, 3);
         assert!(selected.is_empty());
-        assert!(modes.is_empty());
+        assert_eq!(modes, Vec::<CoverageMode>::new());
     }
 }

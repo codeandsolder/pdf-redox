@@ -8,7 +8,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ResourcePruneStats {
+#[expect(
+    clippy::struct_field_names,
+    reason = "the repeated entries_removed suffix makes each public resource-pruning counter self-describing"
+)]
+pub struct ResourcePruneStats {
     pub entries_removed: usize,
     pub font_entries_removed: usize,
     pub xobject_entries_removed: usize,
@@ -19,7 +23,7 @@ pub(crate) struct ResourcePruneStats {
 }
 
 impl ResourcePruneStats {
-    fn record_category(&mut self, category: &[u8], count: usize) {
+    const fn record_category(&mut self, category: &[u8], count: usize) {
         self.entries_removed = self.entries_removed.saturating_add(count);
         let slot = match category {
             b"Font" => &mut self.font_entries_removed,
@@ -33,7 +37,7 @@ impl ResourcePruneStats {
         *slot = slot.saturating_add(count);
     }
 
-    fn merge(&mut self, other: Self) {
+    const fn merge(&mut self, other: Self) {
         self.entries_removed = self.entries_removed.saturating_add(other.entries_removed);
         self.font_entries_removed = self
             .font_entries_removed
@@ -258,7 +262,7 @@ fn install_form_resources(
     Ok(())
 }
 
-pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
+pub fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = document.current_owned_object(catalog)? else {
         return Ok(false);
@@ -340,7 +344,7 @@ pub(crate) fn should_prune_resources_hayro(document: &EditDocument) -> Result<bo
     Ok(false)
 }
 
-pub(crate) fn prune_xobject_candidates_for_content_hayro(
+pub fn prune_xobject_candidates_for_content_hayro(
     document: &EditDocument,
     mut resources: OwnedDictionary,
     content: &[u8],
@@ -379,7 +383,7 @@ pub(crate) fn prune_xobject_candidates_for_content_hayro(
     Ok((resources, removed))
 }
 
-pub(crate) fn prune_resources_with_usage_hayro(
+pub fn prune_resources_with_usage_hayro(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
     page_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
@@ -428,7 +432,7 @@ pub(crate) fn prune_resources_with_usage_hayro(
     Ok(stats)
 }
 
-pub(crate) fn prune_resources_hayro(
+pub fn prune_resources_hayro(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
 ) -> Result<ResourcePruneStats> {

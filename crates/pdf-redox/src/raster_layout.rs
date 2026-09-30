@@ -46,7 +46,11 @@ const RECONSTRUCTED_JPEG_QUALITY: u8 = 85;
 const MIN_TOTAL_CROP_MARGIN_PIXELS: u32 = 20;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RasterLayoutStats {
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent boolean facts in optimization telemetry are clearer as named fields"
+)]
+pub struct RasterLayoutStats {
     pub inline: FragmentedInlineExternalizationStats,
     pub pixel_clusters_reconstructed: usize,
     pub pixel_paints_reconstructed: usize,
@@ -120,7 +124,7 @@ impl ParsedOperandValue {
         match self {
             Self::Scalar(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
             Self::Handle(value) => parsed_number(value),
         }
@@ -233,6 +237,10 @@ struct ResourceUsage {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent PDF graphics-state flags are clearer and safer as named booleans"
+)]
 struct RasterScanner {
     xobjects: BTreeMap<Vec<u8>, ObjectHandle>,
     image_names: HashSet<Vec<u8>>,
@@ -320,7 +328,7 @@ impl RasterScanner {
         }
     }
 
-    fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
+    const fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
         match operator {
             b"CS" | b"cs" => Some(b"ColorSpace"),
             b"gs" => Some(b"ExtGState"),
@@ -400,7 +408,7 @@ impl RasterScanner {
         }
     }
 
-    fn vector_barrier(&mut self) {
+    const fn vector_barrier(&mut self) {
         self.vector_rect = None;
         self.vector_path_start = None;
         self.vector_path_is_single_rect = true;
@@ -462,8 +470,7 @@ impl RasterScanner {
                     {
                         self.vector_merge_candidate = true;
                     }
-                    let mut extended = false;
-                    if let Some(run) = &mut self.vector_run
+                    let extended = if let Some(run) = &mut self.vector_run
                         && run.epoch == current.epoch
                         && run.operator == current.operator
                         && let Some(merged) = merge_rect_fill_pair(run.rect, current.rect, run.ctm)
@@ -475,8 +482,10 @@ impl RasterScanner {
                         {
                             self.vector_merge_candidate = true;
                         }
-                        extended = true;
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     if !extended {
                         self.vector_run = Some(current);
                     }
@@ -494,7 +503,7 @@ impl RasterScanner {
         }
     }
 
-    fn barrier(&mut self) {
+    const fn barrier(&mut self) {
         self.epoch = self.epoch.saturating_add(1);
     }
 
@@ -612,10 +621,9 @@ impl RasterScanner {
                 if self.clip_polygon.is_some() {
                     self.clip_complex = true;
                 } else {
-                    self.clip = match self.clip {
-                        Some(current) => current.intersection(path),
-                        None => Some(path),
-                    };
+                    self.clip = self
+                        .clip
+                        .map_or(Some(path), |current| current.intersection(path));
                 }
             } else if !self.path_complex
                 && self.clip.is_none()
@@ -696,6 +704,10 @@ impl RasterScanner {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "PDF graphics-state transitions and paint capture must remain ordered and co-located for auditability"
+    )]
     fn operator(&mut self, operator: &[u8], offset: usize, length: usize) {
         self.record_resource_operator(operator);
         if self.analysis_only_no_images {
@@ -874,9 +886,12 @@ impl RasterScanner {
             }
             b"W" | b"W*" => self.clip_pending = true,
             b"n" => self.apply_pending_clip(),
-            // Ordinary non-path graphics-state setup is safe inside a single-image wrapper.
+            // Ordinary graphics setup and text-state operators are harmless unless a later
+            // paint consumes them.
             b"w" | b"J" | b"j" | b"M" | b"d" | b"g" | b"G" | b"rg" | b"RG" | b"k" | b"K"
-            | b"cs" | b"CS" | b"sc" | b"SC" | b"scn" | b"SCN" | b"BX" | b"EX" => {}
+            | b"cs" | b"CS" | b"sc" | b"SC" | b"scn" | b"SCN" | b"BX" | b"EX" | b"BT" | b"ET"
+            | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td" | b"TD" | b"Tm"
+            | b"T*" => {}
             // These actually paint/consume the current path. Simple rectangular fills are
             // retained in paint order so the hidden-paint pass can use them as opaque cover.
             b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" => {
@@ -907,12 +922,7 @@ impl RasterScanner {
                 self.text_with_ext_gstate |= self.gs_name.is_some();
                 self.mark_other_paint();
             }
-            // Marked-content boundaries are not visual barriers for clustering, but consuming
-            // one as part of an image wrapper would change document structure semantics.
-            b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" => self.mark_semantic_boundary(),
-            // Text-state operators are harmless unless followed by an actual text paint.
-            b"BT" | b"ET" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tf" | b"Tr" | b"Ts" | b"Td"
-            | b"TD" | b"Tm" | b"T*" => {}
+            // Unknown operators and marked-content boundaries are semantic barriers.
             _ => self.mark_semantic_boundary(),
         }
     }
@@ -929,16 +939,15 @@ impl ObjectHandleParserCallbacks for RasterScanner {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.resource_pending_operands = true;
-            if let Some(name) = scalar.as_name() {
-                self.resource_last_name = Some(name.to_vec());
-            }
-            self.operands.push(ParsedOperand {
-                value: ParsedOperandValue::Scalar(scalar),
-                offset,
-            });
         }
+        self.resource_pending_operands = true;
+        if let Some(name) = scalar.as_name() {
+            self.resource_last_name = Some(name.to_vec());
+        }
+        self.operands.push(ParsedOperand {
+            value: ParsedOperandValue::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -1094,36 +1103,38 @@ fn polygon_is_convex(points: &[(f64, f64)]) -> bool {
     if points.len() < 3 {
         return false;
     }
-    let mut sign = 0.0_f64;
+    let mut sign = 0_i8;
     for index in 0..points.len() {
         let a = points[index];
         let b = points[(index + 1) % points.len()];
         let c = points[(index + 2) % points.len()];
-        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        let cross = (b.1 - a.1).mul_add(-(c.0 - b.0), (b.0 - a.0) * (c.1 - b.1));
         if cross.abs() <= MATRIX_EPSILON {
             continue;
         }
-        if sign == 0.0 {
-            sign = cross.signum();
-        } else if cross.signum() != sign {
+        let current_sign = if cross.is_sign_positive() { 1 } else { -1 };
+        if sign == 0 {
+            sign = current_sign;
+        } else if current_sign != sign {
             return false;
         }
     }
-    sign != 0.0
+    sign != 0
 }
 
 fn convex_polygon_contains_point(points: &[(f64, f64)], point: (f64, f64)) -> bool {
-    let mut sign = 0.0_f64;
+    let mut sign = 0_i8;
     for index in 0..points.len() {
         let a = points[index];
         let b = points[(index + 1) % points.len()];
-        let cross = (b.0 - a.0) * (point.1 - a.1) - (b.1 - a.1) * (point.0 - a.0);
+        let cross = (b.1 - a.1).mul_add(-(point.0 - a.0), (b.0 - a.0) * (point.1 - a.1));
         if cross.abs() <= MATRIX_EPSILON {
             continue;
         }
-        if sign == 0.0 {
-            sign = cross.signum();
-        } else if cross.signum() != sign {
+        let current_sign = if cross.is_sign_positive() { 1 } else { -1 };
+        if sign == 0 {
+            sign = current_sign;
+        } else if current_sign != sign {
             return false;
         }
     }
@@ -1149,7 +1160,7 @@ fn point_in_rect(point: (f64, f64), rect: Rect) -> bool {
 }
 
 fn orientation(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
-    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    (b.1 - a.1).mul_add(-(c.0 - a.0), (b.0 - a.0) * (c.1 - a.1))
 }
 
 fn segments_intersect(a0: (f64, f64), a1: (f64, f64), b0: (f64, f64), b1: (f64, f64)) -> bool {
@@ -1215,7 +1226,7 @@ fn convex_polygon_intersects_rect(points: &[(f64, f64)], rect: Rect) -> bool {
 fn parsed_number(object: &FlObjectHandle) -> Option<f64> {
     object
         .as_integer()
-        .map(|value| value as f64)
+        .and_then(crate::source::exact_i64_to_f64)
         .or_else(|| object.as_real())
 }
 
@@ -1378,7 +1389,7 @@ fn current_number(document: &EditDocument, value: Option<&OwnedObject>) -> Resul
         return Ok(None);
     };
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -1435,6 +1446,66 @@ fn current_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<
     })
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded value is explicitly checked against the full u32 range before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the rounded value is explicitly checked to be nonnegative before conversion"
+)]
+fn rounded_nonnegative_u32(value: f64) -> Option<u32> {
+    let value = value.round();
+    if !value.is_finite() || !(0.0..=f64::from(u32::MAX)).contains(&value) {
+        return None;
+    }
+    Some(value as u32)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded value is explicitly checked against the full u32 range before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the rounded value is explicitly required to be positive before conversion"
+)]
+fn rounded_positive_u32(value: f64) -> Option<u32> {
+    let value = value.round();
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(value as u32)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the rounded value is explicitly checked against the full u8 range before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the rounded value is explicitly checked to be nonnegative before conversion"
+)]
+fn rounded_u8(value: f64) -> Option<u8> {
+    let value = value.round();
+    if !value.is_finite() || !(0.0..=f64::from(u8::MAX)).contains(&value) {
+        return None;
+    }
+    Some(value as u8)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the input is clamped to 0..=1 before scaling into the exact u8 domain"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the input is clamped to a nonnegative unit interval before conversion"
+)]
+fn unit_f64_to_u8(value: f64) -> u8 {
+    value.clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8
+}
+
 fn dimensions(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<Option<(u32, u32)>> {
     let Some(width) = current_number(document, dictionary.get(b"Width".as_slice()))? else {
         return Ok(None);
@@ -1445,12 +1516,13 @@ fn dimensions(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<O
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Ok(None);
     }
-    let width = width.round();
-    let height = height.round();
-    if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
+    let Some(width) = rounded_positive_u32(width) else {
         return Ok(None);
-    }
-    Ok(Some((width as u32, height as u32)))
+    };
+    let Some(height) = rounded_positive_u32(height) else {
+        return Ok(None);
+    };
+    Ok(Some((width, height)))
 }
 
 fn is_non_null(document: &EditDocument, value: Option<&OwnedObject>) -> Result<bool> {
@@ -1496,8 +1568,10 @@ fn color_components(document: &EditDocument, value: &OwnedObject) -> Result<Opti
                     let Some(n) = current_number(document, dictionary.get(b"N".as_slice()))? else {
                         return Ok(None);
                     };
-                    let n = n.round() as i64;
-                    Ok(usize::try_from(n).ok().filter(|n| (1..=4).contains(n)))
+                    let Some(n) = rounded_u8(n) else {
+                        return Ok(None);
+                    };
+                    Ok((1..=4).contains(&n).then_some(usize::from(n)))
                 }
                 _ => Ok(None),
             }
@@ -1636,7 +1710,7 @@ fn unpack_mask_samples(data: &[u8], width: u32, height: u32, bpc: u8) -> Option<
             let byte = *bytes.get(bit / 8)?;
             let shift = 8usize.checked_sub(usize::from(bpc))?.checked_sub(bit % 8)?;
             let sample = (u16::from(byte) >> shift) & max;
-            out.push(((sample * 255 + max / 2) / max) as u8);
+            out.push(u8::try_from((sample * 255 + max / 2) / max).ok()?);
             bit += usize::from(bpc);
         }
     }
@@ -1657,7 +1731,7 @@ fn unpack_packed_samples(data: &[u8], width: u32, height: u32, bpc: u8) -> Optio
         for _ in 0..width {
             let byte = *bytes.get(bit / 8)?;
             let shift = 8usize.checked_sub(usize::from(bpc))?.checked_sub(bit % 8)?;
-            out.push(((u16::from(byte) >> shift) & mask) as u8);
+            out.push(u8::try_from((u16::from(byte) >> shift) & mask).ok()?);
             bit += usize::from(bpc);
         }
     }
@@ -1677,8 +1751,8 @@ fn expand_low_bit_device_gray(
     let (decode_min, decode_max) = decode_pair(document, dictionary)?.unwrap_or((0.0, 1.0));
     let mut out = Vec::with_capacity(samples.len());
     for &sample in samples {
-        let value = decode_min + (f64::from(sample) / max_sample) * (decode_max - decode_min);
-        out.push((value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        let value = (f64::from(sample) / max_sample).mul_add(decode_max - decode_min, decode_min);
+        out.push(unit_f64_to_u8(value));
     }
     Ok(Some(out))
 }
@@ -1705,6 +1779,10 @@ fn decode_pair(
     Ok(Some((min, max)))
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "only the exact PDF Decode identity pair [0 1] can skip remapping"
+)]
 fn decode_mask_stream(
     document: &EditDocument,
     value: &OwnedObject,
@@ -1728,8 +1806,7 @@ fn decode_mask_stream(
     else {
         return Ok(None);
     };
-    let bpc = bpc.round() as i64;
-    let Ok(bpc) = u8::try_from(bpc) else {
+    let Some(bpc) = rounded_u8(bpc) else {
         return Ok(None);
     };
     if !matches!(bpc, 1 | 2 | 4 | 8) {
@@ -1751,12 +1828,13 @@ fn decode_mask_stream(
     let (decode_min, decode_max) = decode_pair(document, dictionary)?.unwrap_or((0.0, 1.0));
     if decode_min != 0.0 || decode_max != 1.0 || stencil_semantics {
         for sample in &mut alpha {
-            let mut value = decode_min + (f64::from(*sample) / 255.0) * (decode_max - decode_min);
+            let mut value =
+                (f64::from(*sample) / 255.0).mul_add(decode_max - decode_min, decode_min);
             value = value.clamp(0.0, 1.0);
             if stencil_semantics {
                 value = 1.0 - value;
             }
-            *sample = (value * 255.0 + 0.5) as u8;
+            *sample = unit_f64_to_u8(value);
         }
     }
     Ok(Some(AlphaPlane {
@@ -1788,7 +1866,7 @@ fn color_key_alpha(
         let Some(max) = current_number(document, pair.get(1))? else {
             return Ok(None);
         };
-        ranges.push((min.round() as i64, max.round() as i64));
+        ranges.push((min.round(), max.round()));
     }
     let expected = usize::try_from(width)
         .ok()
@@ -1799,10 +1877,10 @@ fn color_key_alpha(
     }
     let mut alpha = Vec::with_capacity(samples.len() / components);
     for pixel in samples.chunks_exact(components) {
-        let transparent = pixel
-            .iter()
-            .zip(&ranges)
-            .all(|(&sample, &(min, max))| i64::from(sample) >= min && i64::from(sample) <= max);
+        let transparent = pixel.iter().zip(&ranges).all(|(&sample, &(min, max))| {
+            let sample = f64::from(sample);
+            sample >= min && sample <= max
+        });
         alpha.push(if transparent { 0 } else { 255 });
     }
     Ok(Some(AlphaPlane {
@@ -1815,7 +1893,7 @@ fn color_key_alpha(
 fn indexed_palette(
     document: &EditDocument,
     color_space: &OwnedObject,
-) -> Result<Option<(usize, usize, Vec<u8>)>> {
+) -> Result<Option<(usize, u8, Vec<u8>)>> {
     let Some(OwnedObject::Array(values)) = document.resolve_owned_value(color_space)? else {
         return Ok(None);
     };
@@ -1843,11 +1921,9 @@ fn indexed_palette(
     let Some(hival) = current_number(document, values.get(2))? else {
         return Ok(None);
     };
-    let hival = hival.round();
-    if !hival.is_finite() || !(0.0..=255.0).contains(&hival) {
+    let Some(hival) = rounded_u8(hival) else {
         return Ok(None);
-    }
-    let hival = hival as usize;
+    };
     let Some(lookup) = document.resolve_owned_value(&values[3])? else {
         return Ok(None);
     };
@@ -1861,7 +1937,9 @@ fn indexed_palette(
         }
         _ => return Ok(None),
     };
-    let needed = (hival + 1).checked_mul(base_components);
+    let needed = usize::from(hival)
+        .checked_add(1)
+        .and_then(|colors| colors.checked_mul(base_components));
     if needed.is_none_or(|needed| bytes.len() < needed) {
         return Ok(None);
     }
@@ -1883,10 +1961,13 @@ fn expand_indexed_samples(
     let mut out = Vec::with_capacity(samples.len().saturating_mul(components));
     for &sample in samples {
         let index = if let Some((min, max)) = decode {
-            let mapped = min + (f64::from(sample) / max_sample) * (max - min);
-            mapped.round().clamp(0.0, hival as f64) as usize
+            let mapped = (f64::from(sample) / max_sample).mul_add(max - min, min);
+            let Some(index) = rounded_u8(mapped.clamp(0.0, f64::from(hival))) else {
+                return Ok(None);
+            };
+            usize::from(index)
         } else {
-            usize::from(sample).min(hival)
+            usize::from(sample.min(hival))
         };
         let start = index
             .checked_mul(components)
@@ -2037,14 +2118,14 @@ fn encoded_stream_payload_len(
     Ok(Some(data.bytes(document.source())?.len()))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "mask validation requires a sequence of tightly coupled semantic and pixel-safety gates"
+)]
 fn simple_binary_soft_mask_candidate(
     document: &EditDocument,
     handle: ObjectHandle,
 ) -> Result<bool> {
-    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
-    else {
-        return Ok(false);
-    };
     const SAFE_PARENT_KEYS: &[&[u8]] = &[
         b"Type",
         b"Subtype",
@@ -2069,25 +2150,6 @@ fn simple_binary_soft_mask_candidate(
         b"SMaskInData",
         b"Name",
     ];
-    if dictionary
-        .keys()
-        .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
-        || dictionary.contains_key(b"Mask".as_slice())
-        || current_number(document, dictionary.get(b"SMaskInData".as_slice()))?
-            .is_some_and(|value| value != 0.0)
-    {
-        return Ok(false);
-    }
-    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Stream {
-        dictionary: mask_dictionary,
-        ..
-    }) = document.resolve_owned_value(smask)?
-    else {
-        return Ok(false);
-    };
     const SAFE_MASK_KEYS: &[&[u8]] = &[
         b"Type",
         b"Subtype",
@@ -2110,6 +2172,29 @@ fn simple_binary_soft_mask_candidate(
         b"Length",
         b"Name",
     ];
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+    else {
+        return Ok(false);
+    };
+    if dictionary
+        .keys()
+        .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
+        || dictionary.contains_key(b"Mask".as_slice())
+        || current_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+            .is_some_and(|value| value != 0.0)
+    {
+        return Ok(false);
+    }
+    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Stream {
+        dictionary: mask_dictionary,
+        ..
+    }) = document.resolve_owned_value(smask)?
+    else {
+        return Ok(false);
+    };
     if mask_dictionary
         .keys()
         .any(|key| !SAFE_MASK_KEYS.contains(&key.as_slice()))
@@ -2152,6 +2237,10 @@ fn simple_binary_soft_mask_candidate(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "image dictionary interpretation, decoding, masks, and semantic-key construction are one cohesive materialization operation"
+)]
 fn image_info(
     document: &EditDocument,
     handle: ObjectHandle,
@@ -2176,11 +2265,7 @@ fn image_info(
     else {
         return Ok(None);
     };
-    let bpc = bpc.round();
-    if !bpc.is_finite() {
-        return Ok(None);
-    }
-    let Ok(bpc) = u8::try_from(bpc as i64) else {
+    let Some(bpc) = rounded_u8(bpc) else {
         return Ok(None);
     };
     if !matches!(bpc, 1 | 2 | 4 | 8) {
@@ -2241,14 +2326,14 @@ fn image_info(
     }
 
     let preserve_encoded_color = preserves_compact_color_encoding(document, dictionary)?;
-    let has_smask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
-    let has_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
-    let encoded_mask_bytes = if has_smask {
+    let has_soft_mask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
+    let has_explicit_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+    let encoded_mask_bytes = if has_soft_mask {
         match dictionary.get(b"SMask".as_slice()) {
             Some(smask) => encoded_stream_payload_len(document, smask)?.unwrap_or(0),
             None => 0,
         }
-    } else if has_mask {
+    } else if has_explicit_mask {
         match dictionary.get(b"Mask".as_slice()) {
             Some(mask) => encoded_stream_payload_len(document, mask)?.unwrap_or(0),
             None => 0,
@@ -2256,7 +2341,7 @@ fn image_info(
     } else {
         0
     };
-    if (has_smask || has_mask) && !bake_masks {
+    if (has_soft_mask || has_explicit_mask) && !bake_masks {
         return Ok(None);
     }
 
@@ -2283,7 +2368,7 @@ fn image_info(
                 _ => return Ok(None),
             }
         }
-        if (has_smask || has_mask) && alpha.is_none() {
+        if (has_soft_mask || has_explicit_mask) && alpha.is_none() {
             return Ok(None);
         }
         if let Some(alpha) = &alpha {
@@ -2640,40 +2725,43 @@ fn target_covered_by_opaque_union(
         )
         .map(|cover| cover.rect)
         .collect::<Vec<_>>();
-    match target_polygon {
-        Some(polygon) => rect_covered_by_union_in_polygon(target, &usable, polygon, epsilon),
-        None => rect_covered_by_union(target, &usable, epsilon),
-    }
+    target_polygon.map_or_else(
+        || rect_covered_by_union(target, &usable, epsilon),
+        |polygon| rect_covered_by_union_in_polygon(target, &usable, polygon, epsilon),
+    )
 }
 
-fn axis_aligned_candidate_rect(draw: &RasterDraw) -> Option<Option<Rect>> {
+#[derive(Debug, Clone, Copy)]
+enum CandidateRect {
+    Unsupported,
+    Invisible,
+    Visible(Rect),
+}
+
+fn axis_aligned_candidate_rect(draw: &RasterDraw) -> CandidateRect {
     if draw.ctm.b.abs() > MATRIX_EPSILON || draw.ctm.c.abs() > MATRIX_EPSILON {
-        return None;
+        return CandidateRect::Unsupported;
     }
     let rect = Rect::from_ctm(draw.ctm);
     if draw.clip_complex {
-        return Some(Some(rect));
+        return CandidateRect::Visible(rect);
     }
-    let rect = match draw.clip {
-        Some(clip) => rect.intersection(clip),
-        None => Some(rect),
+    let Some(rect) = draw.clip.map_or(Some(rect), |clip| rect.intersection(clip)) else {
+        return CandidateRect::Invisible;
     };
-    let Some(rect) = rect else {
-        return Some(None);
-    };
-    if let Some(polygon) = draw.clip_polygon.as_deref() {
-        if convex_polygon_contains_rect(polygon, rect) {
-            Some(Some(rect))
-        } else if !convex_polygon_intersects_rect(polygon, rect) {
-            Some(None)
-        } else {
-            // Partially clipped by a known polygon. The unclipped rectangle is a conservative
-            // superset for dead-paint testing, but not safe as an opaque-cover contribution.
-            Some(Some(rect))
-        }
-    } else {
-        Some(Some(rect))
-    }
+    draw.clip_polygon
+        .as_deref()
+        .map_or(CandidateRect::Visible(rect), |polygon| {
+            if convex_polygon_contains_rect(polygon, rect) {
+                CandidateRect::Visible(rect)
+            } else if !convex_polygon_intersects_rect(polygon, rect) {
+                CandidateRect::Invisible
+            } else {
+                // Partially clipped by a known polygon. The unclipped rectangle is a conservative
+                // superset for dead-paint testing, but not safe as an opaque-cover contribution.
+                CandidateRect::Visible(rect)
+            }
+        })
 }
 
 fn axis_aligned_opaque_cover_rect(draw: &RasterDraw) -> Option<Rect> {
@@ -2689,10 +2777,7 @@ fn axis_aligned_opaque_cover_rect(draw: &RasterDraw) -> Option<Rect> {
 }
 
 fn intersect_scope(rect: Rect, scope: Option<Rect>) -> Option<Rect> {
-    match scope {
-        Some(scope) => rect.intersection(scope),
-        None => Some(rect),
-    }
+    scope.map_or(Some(rect), |scope| rect.intersection(scope))
 }
 
 struct HiddenRasterPruneResult {
@@ -2710,19 +2795,27 @@ struct HiddenRasterPruneContext<'a> {
     stats: &'a mut RasterLayoutStats,
 }
 
+fn elapsed_micros_u64(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "visibility classification and coverage accounting are one ordered conservative pruning pass"
+)]
 fn prune_hidden_raster_paints(
     document: &EditDocument,
     resources: &OwnedDictionary,
     content: &[u8],
     scanner: &RasterScanner,
-    context: HiddenRasterPruneContext<'_>,
+    prune_context: HiddenRasterPruneContext<'_>,
 ) -> Result<HiddenRasterPruneResult> {
     let HiddenRasterPruneContext {
         scope,
         prune_occluded,
         image_cache,
         stats,
-    } = context;
+    } = prune_context;
     if scanner.draws.is_empty() {
         return Ok(HiddenRasterPruneResult {
             rewritten: content.to_vec(),
@@ -2736,7 +2829,7 @@ fn prune_hidden_raster_paints(
     let states = image_paint_states(document, resources)?;
     stats.hidden_state_us = stats
         .hidden_state_us
-        .saturating_add(state_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(state_started));
     let visibility_started = Instant::now();
     let mut visibility = HashMap::<ObjectHandle, Option<SampleImage>>::new();
     for draw in &scanner.draws {
@@ -2750,7 +2843,7 @@ fn prune_hidden_raster_paints(
     }
     stats.hidden_visibility_us = stats
         .hidden_visibility_us
-        .saturating_add(visibility_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(visibility_started));
 
     let coverage_started = Instant::now();
     let mut transparent = HashSet::new();
@@ -2784,16 +2877,15 @@ fn prune_hidden_raster_paints(
                     if state.alpha < ALPHA_OPAQUE || !state.normal_blend {
                         continue;
                     }
-                    let cover = match fill.clip {
-                        Some(clip) => fill.rect.intersection(clip),
-                        None => Some(fill.rect),
-                    }
-                    .filter(|rect| {
-                        fill.clip_polygon
-                            .as_deref()
-                            .is_none_or(|polygon| convex_polygon_contains_rect(polygon, *rect))
-                    })
-                    .and_then(|rect| intersect_scope(rect, scope));
+                    let cover = fill
+                        .clip
+                        .map_or(Some(fill.rect), |clip| fill.rect.intersection(clip))
+                        .filter(|rect| {
+                            fill.clip_polygon
+                                .as_deref()
+                                .is_none_or(|polygon| convex_polygon_contains_rect(polygon, *rect))
+                        })
+                        .and_then(|rect| intersect_scope(rect, scope));
                     if let Some(cover) = cover {
                         opaque_coverage.push(OpaqueCover {
                             rect: cover,
@@ -2806,12 +2898,15 @@ fn prune_hidden_raster_paints(
                         continue;
                     }
                     let draw = &scanner.draws[index];
-                    let Some(visible_rect) = axis_aligned_candidate_rect(draw) else {
-                        continue;
+                    let visible_rect = match axis_aligned_candidate_rect(draw) {
+                        CandidateRect::Unsupported => continue,
+                        CandidateRect::Invisible => {
+                            occluded.insert(index);
+                            continue;
+                        }
+                        CandidateRect::Visible(rect) => rect,
                     };
-                    let Some(visible_rect) =
-                        visible_rect.and_then(|rect| intersect_scope(rect, scope))
-                    else {
+                    let Some(visible_rect) = intersect_scope(visible_rect, scope) else {
                         occluded.insert(index);
                         continue;
                     };
@@ -2847,14 +2942,14 @@ fn prune_hidden_raster_paints(
 
     stats.hidden_coverage_us = stats
         .hidden_coverage_us
-        .saturating_add(coverage_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(coverage_started));
     let rewrite_started = Instant::now();
     let mut removed = transparent.clone();
     removed.extend(occluded.iter().copied());
     let rewritten = remove_raster_draws(content, &scanner.draws, &removed)?;
     stats.hidden_rewrite_us = stats
         .hidden_rewrite_us
-        .saturating_add(rewrite_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(rewrite_started));
     Ok(HiddenRasterPruneResult {
         rewritten,
         transparent: transparent.len(),
@@ -3091,6 +3186,10 @@ fn prepare_constant_color_mask_stencil(
     }))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "image normalization combines coupled decode, crop, alpha, and encoded-cost safety gates"
+)]
 fn prepare_image(
     info: &SampleImage,
     width: u32,
@@ -3384,7 +3483,7 @@ fn basis(draw: &RasterDraw, image: &SampleImage) -> Option<Basis> {
         draw.ctm.c / f64::from(image.height),
         draw.ctm.d / f64::from(image.height),
     );
-    let det = ux.0 * uy.1 - ux.1 * uy.0;
+    let det = ux.1.mul_add(-uy.0, ux.0 * uy.1);
     (det.abs() > MATRIX_EPSILON && det.is_finite()).then_some(Basis { ux, uy })
 }
 
@@ -3400,13 +3499,13 @@ fn basis_close(a: Basis, b: Basis) -> bool {
 }
 
 fn basis_coordinates(basis: Basis, dx: f64, dy: f64) -> Option<(f64, f64)> {
-    let det = basis.ux.0 * basis.uy.1 - basis.ux.1 * basis.uy.0;
+    let det = basis.ux.1.mul_add(-basis.uy.0, basis.ux.0 * basis.uy.1);
     if det.abs() <= MATRIX_EPSILON || !det.is_finite() {
         return None;
     }
     Some((
-        (dx * basis.uy.1 - dy * basis.uy.0) / det,
-        (dy * basis.ux.0 - dx * basis.ux.1) / det,
+        (dy.mul_add(-basis.uy.0, dx * basis.uy.1)) / det,
+        (dx.mul_add(-basis.ux.1, dy * basis.ux.0)) / det,
     ))
 }
 
@@ -3494,6 +3593,12 @@ enum MergeKind {
     NativeFragment,
     ConstantColorMaskStencil,
     AlphaCrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundCrop {
+    Uniform,
+    Crop(PixelCrop),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3614,7 +3719,7 @@ fn background_crop(
     components: usize,
     background: &[u8],
     tolerance: u8,
-) -> Option<Option<PixelCrop>> {
+) -> Option<BackgroundCrop> {
     let mut left = width;
     let mut top = height;
     let mut right = 0u32;
@@ -3640,9 +3745,9 @@ fn background_crop(
         }
     }
     if !any {
-        return Some(None);
+        return Some(BackgroundCrop::Uniform);
     }
-    Some(Some(PixelCrop {
+    Some(BackgroundCrop::Crop(PixelCrop {
         x: left,
         y: top,
         width: right - left,
@@ -3669,8 +3774,8 @@ fn crop_plan_geometry_to(plan: &mut MergePlan, crop: PixelCrop) -> Option<u64> {
         old.b * sx,
         old.c * sy,
         old.d * sy,
-        old.e + old.a * x + old.c * y,
-        old.f + old.b * x + old.d * y,
+        old.c.mul_add(y, old.a.mul_add(x, old.e)),
+        old.d.mul_add(y, old.b.mul_add(x, old.f)),
     );
     plan.width = crop.width;
     plan.height = crop.height;
@@ -3735,16 +3840,17 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
             &background,
             config.background_tolerance,
         )? {
-            None if crop_is_worthwhile(
-                plan.width,
-                plan.height,
-                PixelCrop {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                },
-            ) =>
+            BackgroundCrop::Uniform
+                if crop_is_worthwhile(
+                    plan.width,
+                    plan.height,
+                    PixelCrop {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                ) =>
             {
                 let old_pixels = u64::from(plan.width).checked_mul(u64::from(plan.height))?;
                 plan.width = 1;
@@ -3754,7 +3860,7 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
                 removed_pixels = removed_pixels.checked_add(old_pixels.saturating_sub(1))?;
                 background_cropped = old_pixels > 1;
             }
-            Some(crop) if crop_is_worthwhile(plan.width, plan.height, crop) => {
+            BackgroundCrop::Crop(crop) if crop_is_worthwhile(plan.width, plan.height, crop) => {
                 let original_ctm = plan.desired_ctm;
                 let old_pixels = crop_plan_to(plan, crop)?;
                 plan.background = Some(BackgroundPaint {
@@ -3765,12 +3871,16 @@ fn crop_merge_plan(plan: &mut MergePlan, config: &RasterLayoutConfig) -> Option<
                 removed_pixels = removed_pixels.checked_add(old_pixels)?;
                 background_cropped = true;
             }
-            None | Some(_) => {}
+            BackgroundCrop::Uniform | BackgroundCrop::Crop(_) => {}
         }
     }
     Some((transparent_cropped, background_cropped, removed_pixels))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "stripe reconstruction validates coupled geometry, source, alpha, and placement invariants before emitting one plan"
+)]
 fn build_stripe_plan(
     draws: &[RasterDraw],
     infos: &HashMap<ObjectHandle, SampleImage>,
@@ -3834,8 +3944,8 @@ fn build_stripe_plan(
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return None;
     }
-    let width = u32::try_from(width as u64).ok()?;
-    let height = u32::try_from(height as u64).ok()?;
+    let width = rounded_positive_u32(width)?;
+    let height = rounded_positive_u32(height)?;
     if u64::from(width).checked_mul(u64::from(height))? > max_pixels {
         return None;
     }
@@ -3850,13 +3960,8 @@ fn build_stripe_plan(
 
     for (index, x, y) in placements {
         let info = infos.get(&draws[index].target)?;
-        let x = (x - min_x).round() as i64;
-        let y = (y - min_y).round() as i64;
-        if x < 0 || y < 0 {
-            return None;
-        }
-        let x = u32::try_from(x).ok()?;
-        let y = u32::try_from(y).ok()?;
+        let x = rounded_nonnegative_u32(x - min_x)?;
+        let y = rounded_nonnegative_u32(y - min_y)?;
         if x.checked_add(info.width)? > width || y.checked_add(info.height)? > height {
             return None;
         }
@@ -3895,8 +4000,10 @@ fn build_stripe_plan(
     }
 
     let origin = (
-        first_draw.ctm.e + b.ux.0 * min_x + b.uy.0 * min_y,
-        first_draw.ctm.f + b.ux.1 * min_x + b.uy.1 * min_y,
+        b.uy.0
+            .mul_add(min_y, b.ux.0.mul_add(min_x, first_draw.ctm.e)),
+        b.uy.1
+            .mul_add(min_y, b.ux.1.mul_add(min_x, first_draw.ctm.f)),
     );
     let desired_ctm = Matrix::new(
         b.ux.0 * f64::from(width),
@@ -4026,7 +4133,7 @@ impl Rect {
         }
     }
 
-    fn union(self, other: Self) -> Self {
+    const fn union(self, other: Self) -> Self {
         Self {
             x0: self.x0.min(other.x0),
             y0: self.y0.min(other.y0),
@@ -4166,6 +4273,10 @@ fn resize_nearest(
     Some(out)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "pixel-cluster reconstruction validates coupled geometry and sampling invariants before emitting one plan"
+)]
 fn build_pixel_cluster_plan(
     draws: &[RasterDraw],
     infos: &HashMap<ObjectHandle, SampleImage>,
@@ -4229,15 +4340,13 @@ fn build_pixel_cluster_plan(
         return None;
     }
     if debug {
+        let member_count = members.len();
+        let x0 = bounds.x0;
+        let y0 = bounds.y0;
+        let x1 = bounds.x1;
+        let y1 = bounds.y1;
         eprintln!(
-            "pixel-build n={} bounds=({:.6},{:.6})-({:.6},{:.6}) pitch=({:.9},{:.9})",
-            members.len(),
-            bounds.x0,
-            bounds.y0,
-            bounds.x1,
-            bounds.y1,
-            pitch_x,
-            pitch_y
+            "pixel-build n={member_count} bounds=({x0:.6},{y0:.6})-({x1:.6},{y1:.6}) pitch=({pitch_x:.9},{pitch_y:.9})"
         );
     }
     let width = ((bounds.x1 - bounds.x0) / pitch_x).round().max(1.0);
@@ -4245,8 +4354,8 @@ fn build_pixel_cluster_plan(
     if !width.is_finite() || !height.is_finite() {
         return None;
     }
-    let width = u32::try_from(width as u64).ok()?;
-    let height = u32::try_from(height as u64).ok()?;
+    let width = rounded_positive_u32(width)?;
+    let height = rounded_positive_u32(height)?;
     let pixels = u64::from(width).checked_mul(u64::from(height))?;
     if pixels > config.max_reconstructed_pixels {
         return None;
@@ -4264,11 +4373,11 @@ fn build_pixel_cluster_plan(
         let draw = &draws[index];
         let info = infos.get(&draw.target)?;
         let rect = Rect::from_ctm(draw.ctm);
-        let x0 = ((rect.x0 - bounds.x0) / pitch_x).round() as i64;
-        let x1 = ((rect.x1 - bounds.x0) / pitch_x).round() as i64;
-        let y_from_top = ((bounds.y1 - rect.y1) / pitch_y).round() as i64;
-        let y_bottom = ((bounds.y1 - rect.y0) / pitch_y).round() as i64;
-        if x0 < 0 || y_from_top < 0 || x1 <= x0 || y_bottom <= y_from_top {
+        let x0 = rounded_nonnegative_u32((rect.x0 - bounds.x0) / pitch_x)?;
+        let x1 = rounded_nonnegative_u32((rect.x1 - bounds.x0) / pitch_x)?;
+        let y_from_top = rounded_nonnegative_u32((bounds.y1 - rect.y1) / pitch_y)?;
+        let y_bottom = rounded_nonnegative_u32((bounds.y1 - rect.y0) / pitch_y)?;
+        if x1 <= x0 || y_bottom <= y_from_top {
             if debug {
                 eprintln!(
                     "pixel-build reject=quantized-empty index={index} rect=({:.6},{:.6})-({:.6},{:.6}) q=({x0},{y_from_top})-({x1},{y_bottom})",
@@ -4277,10 +4386,9 @@ fn build_pixel_cluster_plan(
             }
             return None;
         }
-        let target_width = u32::try_from(x1 - x0).ok()?;
-        let target_height = u32::try_from(y_bottom - y_from_top).ok()?;
-        let x0 = u32::try_from(x0).ok()?;
-        let y0 = u32::try_from(y_from_top).ok()?;
+        let target_width = x1.checked_sub(x0)?;
+        let target_height = y_bottom.checked_sub(y_from_top)?;
+        let y0 = y_from_top;
         if x0.checked_add(target_width)? > width || y0.checked_add(target_height)? > height {
             if debug {
                 eprintln!(
@@ -4509,6 +4617,10 @@ fn native_pitch_close(a: (f64, f64), b: (f64, f64)) -> bool {
     rel_close(a.0, b.0, REL) && rel_close(a.1, b.1, REL)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "fragment grouping and candidate validation share spatial-index and source-compatibility state"
+)]
 fn find_native_fragment_plans(
     target: ContentTarget,
     draws: &[RasterDraw],
@@ -4728,6 +4840,10 @@ fn find_native_fragment_plans(
     out
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "cluster discovery and candidate validation share spatial-index and source-compatibility state"
+)]
 fn find_pixel_cluster_plans(
     target: ContentTarget,
     draws: &[RasterDraw],
@@ -4865,12 +4981,11 @@ fn find_pixel_cluster_plans(
                         templates.insert(info.semantic_key);
                     }
                 }
+                let member_count = members.len();
+                let template_count = templates.len();
+                let first_template = templates.iter().next();
                 eprintln!(
-                    "pixel-plan-rejected target={target:?} n={} sources={:?} templates={} first_template={:?}",
-                    members.len(),
-                    unique,
-                    templates.len(),
-                    templates.iter().next()
+                    "pixel-plan-rejected target={target:?} n={member_count} sources={unique:?} templates={template_count} first_template={first_template:?}"
                 );
             }
         }
@@ -4879,17 +4994,32 @@ fn find_pixel_cluster_plans(
 }
 
 fn inverse(matrix: Matrix) -> Option<Matrix> {
-    let det = matrix.a * matrix.d - matrix.b * matrix.c;
+    let det = matrix.b.mul_add(-matrix.c, matrix.a * matrix.d);
     if !det.is_finite() || det.abs() <= MATRIX_EPSILON {
         return None;
     }
-    let a = matrix.d / det;
-    let b = -matrix.b / det;
-    let c = -matrix.c / det;
-    let d = matrix.a / det;
-    let e = -(a * matrix.e + c * matrix.f);
-    let f = -(b * matrix.e + d * matrix.f);
-    Some(Matrix::new(a, b, c, d, e, f))
+    let linear_inverse = Matrix::new(
+        matrix.d / det,
+        -matrix.b / det,
+        -matrix.c / det,
+        matrix.a / det,
+        0.0,
+        0.0,
+    );
+    let horizontal_offset = -linear_inverse
+        .c
+        .mul_add(matrix.f, linear_inverse.a * matrix.e);
+    let vertical_offset = -linear_inverse
+        .d
+        .mul_add(matrix.f, linear_inverse.b * matrix.e);
+    Some(Matrix::new(
+        linear_inverse.a,
+        linear_inverse.b,
+        linear_inverse.c,
+        linear_inverse.d,
+        horizontal_offset,
+        vertical_offset,
+    ))
 }
 
 fn relative_matrix(current: Matrix, desired: Matrix) -> Option<Matrix> {
@@ -5016,6 +5146,10 @@ fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEnc
         .saturating_add(encoding.encoded_bytes_saved);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "plan application must preserve rewrite ordering, resource edits, and accumulated statistics atomically"
+)]
 fn apply_plans(
     document: &mut EditDocument,
     context: ApplyPlansContext<'_>,
@@ -5338,13 +5472,12 @@ fn append_alpha_crop_plans(
         if alpha.width != info.width || alpha.height != info.height {
             continue;
         }
-        let crop = if let Some(cached) = alpha_crop_bounds_cache.get(&draw.target) {
-            *cached
-        } else {
+        let cached = alpha_crop_bounds_cache.get(&draw.target).copied();
+        let crop = cached.unwrap_or_else(|| {
             let crop = alpha_crop(&alpha.data, info.width, info.height);
             alpha_crop_bounds_cache.insert(draw.target, crop);
             crop
-        };
+        });
         let Some(crop) = crop else {
             continue;
         };
@@ -5429,6 +5562,10 @@ struct MergePlanContext<'a> {
     user_unit: f64,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "candidate discovery coordinates several mutually exclusive reconstruction strategies over shared scanner state"
+)]
 fn build_merge_plans_for_scanner(
     document: &EditDocument,
     context: MergePlanContext<'_>,
@@ -5475,9 +5612,9 @@ fn build_merge_plans_for_scanner(
             let Some(dictionary) = object.as_dictionary() else {
                 continue;
             };
-            let has_smask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
-            let has_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
-            if !has_smask && !has_mask {
+            let has_soft_mask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
+            let has_explicit_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+            if !has_soft_mask && !has_explicit_mask {
                 continue;
             }
         }
@@ -5498,7 +5635,7 @@ fn build_merge_plans_for_scanner(
     }
     stats.image_materialize_us = stats
         .image_materialize_us
-        .saturating_add(image_materialize_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(image_materialize_started));
     if *DEBUG_RASTER && !scanner.draws.is_empty() {
         let max_dim = u32::from(config.pixel_cluster_max_source_dimension);
         let tiny_draws = scanner
@@ -5529,14 +5666,9 @@ fn build_merge_plans_for_scanner(
                 Some(_) => clip_partial += 1,
             }
         }
+        let decoded_images = infos.len();
         eprintln!(
-            "raster-target {target:?}: decoded_images={} tiny_draws={} clips none/full/partial/complex={}/{}/{}/{}",
-            infos.len(),
-            tiny,
-            clip_none,
-            clip_full,
-            clip_partial,
-            clip_complex
+            "raster-target {target:?}: decoded_images={decoded_images} tiny_draws={tiny} clips none/full/partial/complex={clip_none}/{clip_full}/{clip_partial}/{clip_complex}"
         );
     }
     let max_dim = u32::from(config.pixel_cluster_max_source_dimension);
@@ -5598,7 +5730,7 @@ fn build_merge_plans_for_scanner(
     };
     stats.native_plan_us = stats
         .native_plan_us
-        .saturating_add(native_plan_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(native_plan_started));
     for plan in &native_fragment_plans {
         used.extend(plan.members.iter().copied());
     }
@@ -5610,7 +5742,7 @@ fn build_merge_plans_for_scanner(
     };
     stats.stripe_plan_us = stats
         .stripe_plan_us
-        .saturating_add(stripe_plan_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(stripe_plan_started));
     for plan in &stripe_plans {
         used.extend(plan.members.iter().copied());
     }
@@ -5631,7 +5763,7 @@ fn build_merge_plans_for_scanner(
     }
     stats.pixel_plan_us = stats
         .pixel_plan_us
-        .saturating_add(pixel_plan_started.elapsed().as_micros() as u64);
+        .saturating_add(elapsed_micros_u64(pixel_plan_started));
 
     let mut claimed = initial_used.clone();
     for plan in &plans {
@@ -5649,7 +5781,11 @@ fn build_merge_plans_for_scanner(
     Ok(plans)
 }
 
-pub(crate) fn normalize_raster_layout_hayro(
+#[expect(
+    clippy::too_many_lines,
+    reason = "the raster normalization pipeline intentionally coordinates scan ordering, caches, rewrite plans, and statistics in one pass"
+)]
+pub fn normalize_raster_layout_hayro(
     document: &mut EditDocument,
     config: &RasterLayoutConfig,
     flate_level: i32,
@@ -5729,7 +5865,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             }
             stats.target_scan_us = stats
                 .target_scan_us
-                .saturating_add(scan_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(scan_started));
             continue;
         };
         let mut content = target_content(document, target)?;
@@ -5753,7 +5889,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             }
             stats.target_scan_us = stats
                 .target_scan_us
-                .saturating_add(scan_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(scan_started));
             if *DEBUG_RASTER {
                 eprintln!(
                     "raster-target {target:?}: scanner incomplete content={}",
@@ -5771,7 +5907,7 @@ pub(crate) fn normalize_raster_layout_hayro(
         }
         stats.target_scan_us = stats
             .target_scan_us
-            .saturating_add(scan_started.elapsed().as_micros() as u64);
+            .saturating_add(elapsed_micros_u64(scan_started));
 
         if scanner.inline_occurrences > 0 {
             if scanner.inline_occurrences < config.fragmented_paint_threshold {
@@ -5804,7 +5940,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             )?;
             stats.inline_externalize_us = stats
                 .inline_externalize_us
-                .saturating_add(inline_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(inline_started));
             stats.inline.scopes_rewritten = stats
                 .inline
                 .scopes_rewritten
@@ -5856,7 +5992,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             };
             stats.target_scan_us = stats
                 .target_scan_us
-                .saturating_add(rescan_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(rescan_started));
             scanner = rescanned.scanner;
             shared_hidden_ranges = rescanned.hidden_ranges;
             if let (ContentTarget::Page(page), Some(analysis), Some(cache)) = (
@@ -5925,7 +6061,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             predecoded_images = Some(visibility);
             stats.hidden_prune_us = stats
                 .hidden_prune_us
-                .saturating_add(hidden_prune_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(hidden_prune_started));
             if transparent != 0 || occluded != 0 {
                 stats.transparent_paints_pruned += transparent;
                 stats.occluded_raster_paints_pruned += occluded;
@@ -6021,7 +6157,7 @@ pub(crate) fn normalize_raster_layout_hayro(
                     cache.remove(&page);
                 }
                 let rewritten = remove_content_ranges(&content, removal_ranges)?;
-                install_target(document, target, resources.clone(), rewritten)?;
+                install_target(document, target, resources, rewritten)?;
             }
             continue;
         }
@@ -6045,7 +6181,7 @@ pub(crate) fn normalize_raster_layout_hayro(
             };
             stats.target_scan_us = stats
                 .target_scan_us
-                .saturating_add(rescan_started.elapsed().as_micros() as u64);
+                .saturating_add(elapsed_micros_u64(rescan_started));
             scanner = rescanned;
             pruned_draws.clear();
             plans = build_merge_plans_for_scanner(
@@ -6082,7 +6218,7 @@ pub(crate) fn normalize_raster_layout_hayro(
         )?;
         stats.apply_plans_us = stats
             .apply_plans_us
-            .saturating_add(apply_plans_started.elapsed().as_micros() as u64);
+            .saturating_add(elapsed_micros_u64(apply_plans_started));
         if applied.changed
             && let ContentTarget::Page(page) = target
             && let Some(cache) = vector_cache.as_deref_mut()
@@ -6107,7 +6243,9 @@ pub(crate) fn normalize_raster_layout_hayro(
             }
         }
 
-        if !scanner.resource_pending_operands {
+        if scanner.resource_pending_operands {
+            stats.resource_inventory_complete = false;
+        } else {
             let mut consumed = pruned_draws.clone();
             consumed.extend(applied.consumed_draws.iter().copied());
             let mut usage = scanner.resource_usage_after_removing(&consumed);
@@ -6133,14 +6271,12 @@ pub(crate) fn normalize_raster_layout_hayro(
                         .insert(form, usage.by_type);
                 }
             }
-        } else {
-            stats.resource_inventory_complete = false;
         }
     }
     let staging_cleanup_started = Instant::now();
     stats.staging_xobject_entries_removed =
         cleanup_fragmented_inline_staging_hayro(document, &staged_xobjects)?;
-    stats.staging_cleanup_us = staging_cleanup_started.elapsed().as_micros() as u64;
+    stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
     if *DEBUG_RASTER {
         eprintln!(
             "raster image decode cache: hits={} misses={} entries={} decoded_bytes={} clears={}",
@@ -6347,7 +6483,7 @@ mod tests {
     }
 
     #[test]
-    fn rectangular_clip_reduces_visible_raster_extent() {
+    fn rectangular_clip_reduces_visible_raster_extent() -> Result<()> {
         let mut draw = test_draw(1, 0.0);
         draw.ctm = Matrix::new(10.0, 0.0, 0.0, 10.0, 0.0, 0.0);
         draw.clip = Some(Rect {
@@ -6356,14 +6492,16 @@ mod tests {
             x1: 8.0,
             y1: 9.0,
         });
-        let rect = match axis_aligned_candidate_rect(&draw) {
-            Some(Some(rect)) => rect,
-            _ => panic!("expected visible axis-aligned clipped rectangle"),
+        let CandidateRect::Visible(rect) = axis_aligned_candidate_rect(&draw) else {
+            return Err(Error::Invalid(
+                "expected visible axis-aligned clipped rectangle".to_owned(),
+            ));
         };
         assert!((rect.x0 - 2.0).abs() < 1.0e-9);
         assert!((rect.y0 - 3.0).abs() < 1.0e-9);
         assert!((rect.x1 - 8.0).abs() < 1.0e-9);
         assert!((rect.y1 - 9.0).abs() < 1.0e-9);
+        Ok(())
     }
 
     #[test]
@@ -6431,13 +6569,14 @@ mod tests {
     }
 
     #[test]
-    fn stencil_alpha_pack_uses_zero_bits_for_painted_pixels() {
+    fn stencil_alpha_pack_uses_zero_bits_for_painted_pixels() -> Result<()> {
         let alpha = [255, 0, 255, 0, 0, 255, 0, 255, 255, 255];
         // Default PDF ImageMask /Decode [0 1]: zero paints, one is transparent.
-        let raster =
-            BilevelRaster::from_image_mask_alpha(&alpha, 5, 2).unwrap_or_else(|| panic!("raster"));
+        let raster = BilevelRaster::from_image_mask_alpha(&alpha, 5, 2)
+            .ok_or_else(|| Error::Invalid("expected image-mask raster".to_owned()))?;
         assert_eq!(raster.packed(), &[0b0101_1000, 0b0100_0000]);
         assert!(BilevelRaster::from_image_mask_alpha(&[0, 127], 2, 1).is_none());
+        Ok(())
     }
 
     fn stripe_test_image(width: u32, height: u32, data: Vec<u8>) -> SampleImage {
@@ -6489,7 +6628,7 @@ mod tests {
     }
 
     #[test]
-    fn vertical_stripe_plan_reassembles_source_pixels_in_raster_order() {
+    fn vertical_stripe_plan_reassembles_source_pixels_in_raster_order() -> Result<()> {
         let mut top = test_draw(1, 0.0);
         top.ctm = Matrix::new(6.0, 0.0, 0.0, 2.0, 10.0, 22.0);
         top.replace_ctm = top.ctm;
@@ -6514,9 +6653,9 @@ mod tests {
             ),
             Some(StripeAxis::Vertical)
         );
-        let plan = match build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024) {
-            Some(plan) => plan,
-            None => panic!("expected vertical stripe plan"),
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024)
+        else {
+            return Err(Error::Invalid("expected vertical stripe plan".to_owned()));
         };
         assert_eq!((plan.width, plan.height), (6, 4));
         assert_eq!(plan.data, (1..=24).collect::<Vec<_>>());
@@ -6524,10 +6663,11 @@ mod tests {
             plan.desired_ctm,
             Matrix::new(6.0, 0.0, 0.0, 4.0, 10.0, 20.0)
         );
+        Ok(())
     }
 
     #[test]
-    fn horizontal_stripe_plan_reassembles_source_pixels_row_by_row() {
+    fn horizontal_stripe_plan_reassembles_source_pixels_row_by_row() -> Result<()> {
         let mut left = test_draw(1, 0.0);
         left.ctm = Matrix::new(2.0, 0.0, 0.0, 6.0, 10.0, 20.0);
         left.replace_ctm = left.ctm;
@@ -6552,9 +6692,9 @@ mod tests {
             ),
             Some(StripeAxis::Horizontal)
         );
-        let plan = match build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Horizontal, 1024) {
-            Some(plan) => plan,
-            None => panic!("expected horizontal stripe plan"),
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Horizontal, 1024)
+        else {
+            return Err(Error::Invalid("expected horizontal stripe plan".to_owned()));
         };
         assert_eq!((plan.width, plan.height), (4, 6));
         assert_eq!(
@@ -6568,10 +6708,11 @@ mod tests {
             plan.desired_ctm,
             Matrix::new(4.0, 0.0, 0.0, 6.0, 10.0, 20.0)
         );
+        Ok(())
     }
 
     #[test]
-    fn vertical_stripe_plan_uses_geometry_not_content_order() {
+    fn vertical_stripe_plan_uses_geometry_not_content_order() -> Result<()> {
         let mut bottom = test_draw(1, 0.0);
         bottom.ctm = Matrix::new(6.0, 0.0, 0.0, 2.0, 10.0, 20.0);
         bottom.replace_ctm = bottom.ctm;
@@ -6596,19 +6737,22 @@ mod tests {
             ),
             Some(StripeAxis::Vertical)
         );
-        let plan = match build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024) {
-            Some(plan) => plan,
-            None => panic!("expected reverse-order vertical stripe plan"),
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024)
+        else {
+            return Err(Error::Invalid(
+                "expected reverse-order vertical stripe plan".to_owned(),
+            ));
         };
         assert_eq!(plan.data, (1..=24).collect::<Vec<_>>());
         assert_eq!(
             plan.desired_ctm,
             Matrix::new(6.0, 0.0, 0.0, 4.0, 10.0, 20.0)
         );
+        Ok(())
     }
 
     #[test]
-    fn rotated_vertical_stripe_plan_preserves_affine_geometry() {
+    fn rotated_vertical_stripe_plan_preserves_affine_geometry() -> Result<()> {
         // Per-source-pixel basis: ux=(0,1), uy=(-1,0), i.e. 90-degree rotation.
         let mut top = test_draw(1, 0.0);
         top.ctm = Matrix::new(0.0, 6.0, -2.0, 0.0, 8.0, 20.0);
@@ -6634,19 +6778,22 @@ mod tests {
             ),
             Some(StripeAxis::Vertical)
         );
-        let plan = match build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024) {
-            Some(plan) => plan,
-            None => panic!("expected rotated vertical stripe plan"),
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024)
+        else {
+            return Err(Error::Invalid(
+                "expected rotated vertical stripe plan".to_owned(),
+            ));
         };
         assert_eq!(plan.data, (1..=24).collect::<Vec<_>>());
         assert_eq!(
             plan.desired_ctm,
             Matrix::new(0.0, 6.0, -4.0, 0.0, 10.0, 20.0)
         );
+        Ok(())
     }
 
     #[test]
-    fn stripe_plan_composes_missing_and_explicit_alpha_without_reordering() {
+    fn stripe_plan_composes_missing_and_explicit_alpha_without_reordering() -> Result<()> {
         let mut top = test_draw(1, 0.0);
         top.ctm = Matrix::new(6.0, 0.0, 0.0, 2.0, 10.0, 22.0);
         top.replace_ctm = top.ctm;
@@ -6665,13 +6812,12 @@ mod tests {
             (draws[0].target, top_image),
             (draws[1].target, bottom_image),
         ]);
-        let plan = match build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024) {
-            Some(plan) => plan,
-            None => panic!("expected alpha stripe plan"),
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024)
+        else {
+            return Err(Error::Invalid("expected alpha stripe plan".to_owned()));
         };
-        let alpha = match plan.alpha {
-            Some(alpha) => alpha,
-            None => panic!("expected combined alpha"),
+        let Some(alpha) = plan.alpha else {
+            return Err(Error::Invalid("expected combined alpha".to_owned()));
         };
         assert_eq!(alpha.len(), 24);
         assert_eq!(&alpha[..12], &[255; 12]);
@@ -6679,6 +6825,7 @@ mod tests {
             &alpha[12..],
             &[0, 32, 64, 96, 128, 160, 192, 224, 255, 224, 192, 160]
         );
+        Ok(())
     }
 
     #[test]
@@ -6824,7 +6971,7 @@ mod tests {
     }
 
     #[test]
-    fn background_crop_finds_uniform_border() {
+    fn background_crop_finds_uniform_border() -> Result<()> {
         let mut data = vec![255u8; 4 * 4 * 3];
         for y in 1..3usize {
             for x in 1..3usize {
@@ -6832,20 +6979,20 @@ mod tests {
                 data[index..index + 3].fill(0);
             }
         }
-        let background = match dominant_border_sample(&data, 4, 4, 3) {
-            Some(background) => background,
-            None => panic!("expected white border"),
+        let Some(background) = dominant_border_sample(&data, 4, 4, 3) else {
+            return Err(Error::Invalid("expected white border".to_owned()));
         };
         assert_eq!(background, vec![255, 255, 255]);
         assert_eq!(
             background_crop(&data, 4, 4, 3, &background, 0),
-            Some(Some(PixelCrop {
+            Some(BackgroundCrop::Crop(PixelCrop {
                 x: 1,
                 y: 1,
                 width: 2,
                 height: 2,
             }))
         );
+        Ok(())
     }
 
     #[test]

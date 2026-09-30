@@ -941,7 +941,8 @@ fn appearance_content_hayro(
     if do_rotate {
         placement.rotatex90(rotate);
     }
-    Ok(format!("q\n{} cm\n/{} Do\nQ\n", placement.unparse(), resource_name).into_bytes())
+    let placement = placement.unparse();
+    Ok(format!("q\n{placement} cm\n/{resource_name} Do\nQ\n").into_bytes())
 }
 
 fn page_resources_hayro(

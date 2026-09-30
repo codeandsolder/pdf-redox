@@ -41,7 +41,7 @@ const MAX_CACHED_PATH_PROOF_BLOCKS: usize = 4 * 1024;
 const PATH_FORM_BBOX_MARGIN: f64 = 1.0;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct VectorCompactionStats {
+pub struct VectorCompactionStats {
     pub pages_compacted: usize,
     pub fill_groups_batched: usize,
     pub covered_fills_pruned: usize,
@@ -72,11 +72,11 @@ impl OperandValue {
         match self {
             Self::Scalar(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
             Self::Handle(value) => value
                 .as_integer()
-                .map(|value| value as f64)
+                .and_then(crate::source::exact_i64_to_f64)
                 .or_else(|| value.as_real()),
         }
     }
@@ -142,6 +142,10 @@ struct FillPaint {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "named safety predicates make fill-compaction preconditions directly auditable"
+)]
 struct FillSafety {
     fill_alpha_opaque: bool,
     normal_blend: bool,
@@ -163,7 +167,7 @@ impl Default for FillSafety {
 }
 
 impl FillSafety {
-    fn idempotent(self) -> bool {
+    const fn idempotent(self) -> bool {
         self.fill_alpha_opaque
             && self.normal_blend
             && self.no_soft_mask
@@ -171,7 +175,7 @@ impl FillSafety {
             && self.simple_fill_color
     }
 
-    fn invalidate_transparency(&mut self) {
+    const fn invalidate_transparency(&mut self) {
         self.fill_alpha_opaque = false;
         self.normal_blend = false;
         self.no_soft_mask = false;
@@ -188,7 +192,7 @@ struct ExtGStatePatch {
 }
 
 impl FillSafety {
-    fn apply_ext_gstate(&mut self, patch: ExtGStatePatch) {
+    const fn apply_ext_gstate(&mut self, patch: ExtGStatePatch) {
         if let Some(value) = patch.fill_alpha_opaque {
             self.fill_alpha_opaque = value;
         }
@@ -233,7 +237,7 @@ impl FillScanner {
         }
     }
 
-    fn clear_path(&mut self) {
+    const fn clear_path(&mut self) {
         self.current_rect = None;
         self.current_path_start = None;
         self.path_is_single_rect = true;
@@ -375,12 +379,11 @@ impl ObjectHandleParserCallbacks for FillScanner {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Scalar(scalar),
-                offset,
-            });
         }
+        self.operands.push(Operand {
+            value: OperandValue::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -422,7 +425,7 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1.0e-8 * a.abs().max(b.abs()).max(1.0)
 }
 
-pub(crate) fn merge_rect_fill_pair(a: [f64; 4], b: [f64; 4], ctm: Matrix) -> Option<[f64; 4]> {
+pub fn merge_rect_fill_pair(a: [f64; 4], b: [f64; 4], ctm: Matrix) -> Option<[f64; 4]> {
     let merged = merge_collinear_rects(
         Rect {
             x0: a[0],
@@ -441,7 +444,7 @@ pub(crate) fn merge_rect_fill_pair(a: [f64; 4], b: [f64; 4], ctm: Matrix) -> Opt
     Some([merged.x0, merged.y0, merged.x1, merged.y1])
 }
 
-pub(crate) fn compacted_rect_fill_len(rect: [f64; 4], operator: &[u8]) -> usize {
+pub fn compacted_rect_fill_len(rect: [f64; 4], operator: &[u8]) -> usize {
     format!(
         "{} {} {} {} re {}",
         pdf_number(rect[0]),
@@ -537,7 +540,7 @@ fn contained_rect_is_raster_safe(outer: Rect, inner: Rect, ctm: Matrix) -> bool 
     // Under the shared CTM, x/y-aligned rectangle edges become two pairs of
     // parallel lines. The perpendicular page-space distance produced by a
     // user-space x displacement is |det(CTM)| / |y basis|, and vice versa.
-    let determinant = (ctm.a * ctm.d - ctm.b * ctm.c).abs();
+    let determinant = ctm.b.mul_add(-ctm.c, ctm.a * ctm.d).abs();
     let x_basis = ctm.a.hypot(ctm.b);
     let y_basis = ctm.c.hypot(ctm.d);
     if !determinant.is_finite()
@@ -559,7 +562,7 @@ fn contained_rect_is_raster_safe(outer: Rect, inner: Rect, ctm: Matrix) -> bool 
         && (outer.y1 - inner.y1) * y_margin_scale >= margin
 }
 
-pub(crate) fn rect_contains_rect(outer: [f64; 4], inner: [f64; 4]) -> bool {
+pub fn rect_contains_rect(outer: [f64; 4], inner: [f64; 4]) -> bool {
     contains_rect(
         Rect {
             x0: outer[0],
@@ -748,7 +751,7 @@ fn compact_content(input: &[u8]) -> (Vec<u8>, VectorCompactionStats) {
 
 fn current_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value as f64),
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
         Some(OwnedObject::Real(value)) => Some(value),
         _ => None,
     })
@@ -838,7 +841,7 @@ struct PathBlockScanner {
 }
 
 impl PathBlockScanner {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             operands: Vec::new(),
             path_start: None,
@@ -859,7 +862,7 @@ impl PathBlockScanner {
         self.operator_count = 0;
     }
 
-    fn include_point(&mut self, x: f64, y: f64) {
+    const fn include_point(&mut self, x: f64, y: f64) {
         if !x.is_finite() || !y.is_finite() {
             self.path_valid = false;
             return;
@@ -902,9 +905,7 @@ impl PathBlockScanner {
         let expected = match operator {
             b"m" | b"l" => 2,
             b"c" => 6,
-            b"v" | b"y" => 4,
-            b"re" => 4,
-            b"h" => 0,
+            b"v" | b"y" | b"re" => 4,
             _ => 0,
         };
         let Some(values) = values.filter(|values| values.len() == expected) else {
@@ -1017,12 +1018,11 @@ impl ObjectHandleParserCallbacks for PathBlockScanner {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Scalar(scalar),
-                offset,
-            });
         }
+        self.operands.push(Operand {
+            value: OperandValue::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -1079,7 +1079,7 @@ struct TransformedBlockFrame {
 }
 
 impl TransformedBlockFrame {
-    fn new(path_empty: bool) -> Self {
+    const fn new(path_empty: bool) -> Self {
         Self {
             stage: TransformedBlockStage::ExpectPlacement,
             valid: path_empty,
@@ -1092,7 +1092,7 @@ impl TransformedBlockFrame {
         }
     }
 
-    fn include_point(&mut self, x: f64, y: f64) {
+    const fn include_point(&mut self, x: f64, y: f64) {
         if !x.is_finite() || !y.is_finite() {
             self.valid = false;
             return;
@@ -1113,7 +1113,7 @@ impl TransformedBlockFrame {
         });
     }
 
-    fn include_painted_bounds(&mut self, bounds: Rect) {
+    const fn include_painted_bounds(&mut self, bounds: Rect) {
         self.paint_bounds = Some(match self.paint_bounds {
             None => bounds,
             Some(current) => Rect {
@@ -1155,7 +1155,7 @@ struct TransformedBlockScanner {
 }
 
 impl TransformedBlockScanner {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             operands: Vec::new(),
             frames: Vec::new(),
@@ -1336,12 +1336,11 @@ impl ObjectHandleParserCallbacks for TransformedBlockScanner {
     ) -> flpdf::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Scalar(scalar),
-                offset,
-            });
         }
+        self.operands.push(Operand {
+            value: OperandValue::Scalar(scalar),
+            offset,
+        });
         Ok(ParseControl::Continue)
     }
 
@@ -1410,7 +1409,7 @@ struct ProcessingFactorScanner {
 }
 
 impl ProcessingFactorScanner {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             operands: Vec::new(),
             path: PathBlockScanner::new(),
@@ -1504,13 +1503,13 @@ fn factorable_processing_blocks(input: &[u8]) -> (Vec<PathBlock>, Vec<Transforme
     (scanner.path.blocks, scanner.transformed.blocks)
 }
 
-pub(crate) struct ProcessingVectorAnalysis {
+pub struct ProcessingVectorAnalysis {
     fills: Vec<FillPaint>,
     path_blocks: Vec<PathBlock>,
     transformed_blocks: Vec<TransformedBlock>,
 }
 
-fn processing_transformed_factor_candidate(
+const fn processing_transformed_factor_candidate(
     body_len: usize,
     operator_count: usize,
     occurrence_count: usize,
@@ -1521,7 +1520,7 @@ fn processing_transformed_factor_candidate(
     operator_count.saturating_mul(occurrence_count.saturating_sub(1)) >= 8
 }
 
-pub(crate) fn processing_factor_candidate(
+pub fn processing_factor_candidate(
     cache: &BTreeMap<ObjectHandle, ProcessingVectorAnalysis>,
 ) -> bool {
     let mut path_keys = HashSet::new();
@@ -1552,7 +1551,7 @@ pub(crate) fn processing_factor_candidate(
         })
 }
 
-pub(crate) struct ProcessingPageScanner {
+pub struct ProcessingPageScanner {
     fill: FillScanner,
     factor: ProcessingFactorScanner,
 }
@@ -1834,6 +1833,10 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "candidate discovery, semantic grouping, size gating, and form rewrites are one ordered factorization pass"
+)]
 fn factor_repeated_path_forms_hayro(
     document: &mut EditDocument,
     flate_level: i32,
@@ -1945,11 +1948,9 @@ fn factor_repeated_path_forms_hayro(
         .filter(|(_, _, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
         .collect::<Vec<_>>();
     if *DEBUG_VECTOR {
+        let candidate_count = candidates.len();
         eprintln!(
-            "path-forms scanned_blocks={} semantic_groups={} repeated_candidates={}",
-            scanned_blocks,
-            semantic_groups,
-            candidates.len()
+            "path-forms scanned_blocks={scanned_blocks} semantic_groups={semantic_groups} repeated_candidates={candidate_count}"
         );
     }
     if candidates.is_empty() {
@@ -2044,10 +2045,7 @@ fn factor_repeated_path_forms_hayro(
         after_flate = after_flate.saturating_add(compressed_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
-        eprintln!(
-            "path-forms flate before={} after={}",
-            before_flate, after_flate
-        );
+        eprintln!("path-forms flate before={before_flate} after={after_flate}");
     }
     // As with transformed Forms, everything above is speculative. Refuse a
     // factoring rewrite that does not win after compressed stream bytes and
@@ -2128,6 +2126,10 @@ fn factor_repeated_path_forms_hayro(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "transformed-block discovery, grouping, and rewrite validation are one ordered factorization pass"
+)]
 fn factor_repeated_transformed_blocks_hayro(
     document: &mut EditDocument,
     flate_level: i32,
@@ -2186,11 +2188,9 @@ fn factor_repeated_transformed_blocks_hayro(
         .filter(|(_, _, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
         .collect::<Vec<_>>();
     if *DEBUG_VECTOR {
+        let candidate_count = candidates.len();
         eprintln!(
-            "transform-forms scanned_blocks={} semantic_groups={} repeated_candidates={}",
-            scanned_blocks,
-            semantic_groups,
-            candidates.len()
+            "transform-forms scanned_blocks={scanned_blocks} semantic_groups={semantic_groups} repeated_candidates={candidate_count}"
         );
     }
     if candidates.is_empty() {
@@ -2280,10 +2280,7 @@ fn factor_repeated_transformed_blocks_hayro(
         after_flate = after_flate.saturating_add(compressed_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
-        eprintln!(
-            "transform-forms flate before={} after={}",
-            before_flate, after_flate
-        );
+        eprintln!("transform-forms flate before={before_flate} after={after_flate}");
     }
     // All work above is still speculative. Do not materialize Forms or rewrite
     // pages unless factoring wins after charging both compressed stream bytes
@@ -2360,7 +2357,11 @@ fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
     Ok(encoder.finish()?.len())
 }
 
-pub(crate) fn compact_vector_paths_hayro(
+#[expect(
+    clippy::too_many_lines,
+    reason = "vector compaction coordinates scan, factoring, rewrite, and statistics stages over shared document state"
+)]
+pub fn compact_vector_paths_hayro(
     document: &mut EditDocument,
     flate_level: i32,
     goal: OptimizationGoal,
@@ -2804,8 +2805,8 @@ mod tests {
     }
     #[test]
     fn resolved_opaque_ext_gstate_allows_covered_fill_pruning() {
-        let mut states = BTreeMap::new();
-        states.insert(
+        let mut ext_gstates = BTreeMap::new();
+        ext_gstates.insert(
             b"GS0".to_vec(),
             ExtGStatePatch {
                 fill_alpha_opaque: Some(true),
@@ -2815,22 +2816,22 @@ mod tests {
             },
         );
         let input = b"/GS0 gs 7 7 2 2 re f 0 0 20 20 re f";
-        let (output, stats) = compact_content_with_ext_gstates(input, &states);
+        let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 1);
         assert!(!String::from_utf8_lossy(&output).contains("0 0 2 2 re"));
     }
 
     #[test]
     fn ext_gstate_partial_update_does_not_reset_unsafe_alpha() {
-        let mut states = BTreeMap::new();
-        states.insert(
+        let mut ext_gstates = BTreeMap::new();
+        ext_gstates.insert(
             b"Half".to_vec(),
             ExtGStatePatch {
                 fill_alpha_opaque: Some(false),
                 ..Default::default()
             },
         );
-        states.insert(
+        ext_gstates.insert(
             b"Normal".to_vec(),
             ExtGStatePatch {
                 normal_blend: Some(true),
@@ -2838,7 +2839,7 @@ mod tests {
             },
         );
         let input = b"/Half gs /Normal gs 0 0 2 2 re f 0 0 10 10 re f";
-        let (output, stats) = compact_content_with_ext_gstates(input, &states);
+        let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 0);
         assert_eq!(output, input);
     }

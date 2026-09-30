@@ -7,7 +7,7 @@ use libjpeg_turbo_rs::{
 const MIN_JPEG_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct JpegEntropyStats {
+pub struct JpegEntropyStats {
     pub streams_considered: usize,
     pub streams_optimized: usize,
     pub original_encoded_bytes: usize,
@@ -15,7 +15,7 @@ pub(crate) struct JpegEntropyStats {
 }
 
 impl JpegEntropyStats {
-    pub(crate) fn saved_bytes(self) -> usize {
+    pub(crate) const fn saved_bytes(self) -> usize {
         self.original_encoded_bytes
             .saturating_sub(self.optimized_encoded_bytes)
     }
@@ -74,7 +74,7 @@ fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     (before == after).then_some(optimized)
 }
 
-pub(crate) fn optimize_jpeg_entropy_hayro(
+pub fn optimize_jpeg_entropy_hayro(
     document: &mut EditDocument,
     min_savings_bytes: usize,
     min_savings_percent: u8,
@@ -130,7 +130,7 @@ mod tests {
     use libjpeg_turbo_rs::{PixelFormat, Subsampling, compress, read_coefficients};
 
     #[test]
-    fn huffman_optimization_preserves_quantized_dct_coefficients() {
+    fn huffman_optimization_preserves_quantized_dct_coefficients() -> crate::Result<()> {
         let width = 96usize;
         let height = 80usize;
         let mut pixels = Vec::with_capacity(width * height * 3);
@@ -138,9 +138,15 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                pixels.push(((x * 255 / width) as u8).wrapping_add((state >> 27) as u8));
-                pixels.push(((y * 255 / height) as u8).wrapping_add((state >> 24) as u8));
-                pixels.push(((x + y) as u8).wrapping_add((state >> 29) as u8));
+                let x_gradient = u8::try_from(x * 255 / width)
+                    .map_err(|_| crate::Error::Invalid("x gradient exceeds u8".to_owned()))?;
+                let y_gradient = u8::try_from(y * 255 / height)
+                    .map_err(|_| crate::Error::Invalid("y gradient exceeds u8".to_owned()))?;
+                let diagonal = u8::try_from(x + y)
+                    .map_err(|_| crate::Error::Invalid("diagonal fixture exceeds u8".to_owned()))?;
+                pixels.push(x_gradient.wrapping_add((state >> 27) as u8));
+                pixels.push(y_gradient.wrapping_add((state >> 24) as u8));
+                pixels.push(diagonal.wrapping_add((state >> 29) as u8));
             }
         }
 
@@ -152,12 +158,15 @@ mod tests {
             88,
             Subsampling::S420,
         )
-        .unwrap_or_else(|error| panic!("{error}"));
-        let optimized = optimized_jpeg_bytes(&original)
-            .unwrap_or_else(|| panic!("generated JPEG should be transformable"));
+        .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+        let optimized = optimized_jpeg_bytes(&original).ok_or_else(|| {
+            crate::Error::Invalid("generated JPEG should be transformable".to_owned())
+        })?;
 
-        let before = read_coefficients(&original).unwrap_or_else(|error| panic!("{error}"));
-        let after = read_coefficients(&optimized).unwrap_or_else(|error| panic!("{error}"));
+        let before = read_coefficients(&original)
+            .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+        let after = read_coefficients(&optimized)
+            .map_err(|error| crate::Error::Invalid(error.to_string()))?;
         assert_eq!(before.width, after.width);
         assert_eq!(before.height, after.height);
         assert_eq!(before.components.len(), after.components.len());
@@ -167,5 +176,6 @@ mod tests {
             assert_eq!(left.blocks, right.blocks);
         }
         assert!(optimized.len() < original.len());
+        Ok(())
     }
 }

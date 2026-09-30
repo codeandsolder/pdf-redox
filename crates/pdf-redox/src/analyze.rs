@@ -598,15 +598,11 @@ fn filter_name(
 /// # Errors
 ///
 /// Returns an error when the input cannot be parsed or a referenced stream cannot be decoded.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the analysis is a single ordered aggregation pass over related document metrics"
-)]
 pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
     analyze_pdf_impl(input, true)
 }
 
-pub(crate) fn analyze_document_for_optimization(
+pub fn analyze_document_for_optimization(
     input: &[u8],
     document: &EditDocument,
 ) -> Result<PdfAnalysis> {
@@ -618,6 +614,10 @@ fn analyze_pdf_impl(input: &[u8], deep: bool) -> Result<PdfAnalysis> {
     analyze_document_impl(input, &document, deep)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the analysis is a single ordered aggregation pass over related document metrics"
+)]
 fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> Result<PdfAnalysis> {
     let objects = all_source_objects(document)?;
     let mut out = PdfAnalysis {

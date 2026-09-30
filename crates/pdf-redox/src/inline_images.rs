@@ -16,7 +16,7 @@ static DEBUG_RASTER: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_RASTER").is_some());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ContentTarget {
+pub enum ContentTarget {
     Page(ObjectHandle),
     Form(ObjectHandle),
 }
@@ -259,7 +259,7 @@ pub fn externalize_duplicate_inline_images_hayro(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FragmentedInlineExternalizationStats {
+pub struct FragmentedInlineExternalizationStats {
     pub scopes_rewritten: usize,
     pub occurrences_externalized: usize,
     pub xobjects_created: usize,
@@ -267,7 +267,7 @@ pub(crate) struct FragmentedInlineExternalizationStats {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct FragmentedInlineExternalization {
+pub struct FragmentedInlineExternalization {
     pub stats: FragmentedInlineExternalizationStats,
     pub staged_xobjects: HashSet<ObjectHandle>,
 }
@@ -277,7 +277,7 @@ pub(crate) struct FragmentedInlineExternalization {
 /// reconstruction, not a general PDF rewrite: normal pages/forms remain
 /// untouched, while repeated inline sprites within one scope share a local
 /// Image `XObject` immediately.
-pub(crate) fn externalize_fragmented_inline_target_hayro(
+pub fn externalize_fragmented_inline_target_hayro(
     document: &mut EditDocument,
     target: ContentTarget,
     min_occurrences: usize,
@@ -339,7 +339,7 @@ pub(crate) fn externalize_fragmented_inline_target_hayro(
 /// Remove only temporary `XObject` resource entries created by fragmented-inline
 /// staging that no longer have a `Do` reference after raster reconstruction.
 /// Other pre-existing resource entries are left untouched.
-pub(crate) fn cleanup_fragmented_inline_staging_hayro(
+pub fn cleanup_fragmented_inline_staging_hayro(
     document: &mut EditDocument,
     staged_xobjects: &HashSet<ObjectHandle>,
 ) -> Result<usize> {

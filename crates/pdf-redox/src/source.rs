@@ -31,11 +31,19 @@ pub struct SourcePdf {
 
 impl SourcePdf {
     /// Parse owned PDF bytes without making another full-document copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes do not form a supported PDF.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         Self::from_shared(Arc::new(bytes))
     }
 
     /// Parse PDF bytes already held in shared storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes do not form a supported PDF.
     pub fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self> {
         let pdf = Pdf::new(Arc::clone(&bytes)).map_err(SourceLoadError::from)?;
         Ok(Self {
@@ -95,6 +103,10 @@ impl SourcePdf {
     /// Indirect references stay as references and source stream payloads stay
     /// source-backed, so materializing a dictionary does not recursively clone
     /// the object graph or duplicate large encoded streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested object is not present in the source graph.
     pub fn materialize(&self, id: ObjectId) -> Result<OwnedObject> {
         Ok(owned_from_hayro(self.object(id)?, Some(id)))
     }
@@ -146,9 +158,8 @@ impl SourcePdf {
     ) -> Result<(Object<'_>, Vec<ObjectId>)> {
         let object = self.object(id)?;
         self.cache_source_stream_kind(id, &object);
-        let references = if let Some(references) = self.direct_reference_cache.borrow().get(&id) {
-            references.clone()
-        } else {
+        let cached_references = self.direct_reference_cache.borrow().get(&id).cloned();
+        let references = cached_references.unwrap_or_else(|| {
             let mut references = BTreeSet::new();
             collect_hayro_references(&object, &mut references);
             let references = references.into_iter().collect::<Vec<_>>();
@@ -156,7 +167,7 @@ impl SourcePdf {
                 .borrow_mut()
                 .insert(id, references.clone());
             references
-        };
+        });
         Ok((object, references))
     }
 
@@ -169,6 +180,10 @@ impl SourcePdf {
     /// This walks only the borrowed COS structure of that object. Referenced
     /// objects are not resolved or materialized, and stream payload bytes are
     /// never touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested object is not present in the source graph.
     pub fn references(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
         if let Some(references) = self.direct_reference_cache.borrow().get(&id) {
             return Ok(references.clone());
@@ -189,6 +204,10 @@ impl SourcePdf {
     ///
     /// For ordinary unencrypted files this remains a borrowed view into the
     /// source PDF. Hayro may allocate when decryption is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested object does not identify a source stream.
     pub fn stream_data(&self, id: ObjectId) -> Result<Cow<'_, [u8]>> {
         let stream =
             self.pdf
@@ -202,6 +221,10 @@ impl SourcePdf {
     }
 
     /// Return fully decoded bytes of a source stream on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object is not a source stream or its filters cannot be decoded.
     pub fn decoded_stream_data(&self, id: ObjectId) -> Result<Cow<'_, [u8]>> {
         let stream =
             self.pdf
@@ -245,7 +268,7 @@ impl SourcePdf {
 
 const MAX_TRAILER_NESTING: usize = 256;
 
-fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
+const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
     matches!(name, b"Size" | b"Root" | b"Encrypt" | b"Prev" | b"XRefStm")
         || xref_stream
             && matches!(
@@ -263,7 +286,7 @@ fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
             )
 }
 
-pub(crate) fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
+pub fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
     if depth > MAX_TRAILER_NESTING {
         return Err(Error::Invalid(
             "trailer direct-object nesting exceeds the supported limit".to_owned(),
@@ -345,14 +368,17 @@ pub struct ObjectId {
 }
 
 impl ObjectId {
+    #[must_use]
     pub const fn new(number: i32, generation: i32) -> Self {
         Self { number, generation }
     }
 
+    #[must_use]
     pub const fn number(self) -> i32 {
         self.number
     }
 
+    #[must_use]
     pub const fn generation(self) -> i32 {
         self.generation
     }
@@ -382,6 +408,7 @@ impl From<ObjectId> for ObjectIdentifier {
 pub struct NewObjectId(usize);
 
 impl NewObjectId {
+    #[must_use]
     pub const fn index(self) -> usize {
         self.0
     }
@@ -409,6 +436,11 @@ pub enum StreamData {
 }
 
 impl StreamData {
+    /// Return the payload bytes, resolving source-backed data lazily.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a source-backed payload no longer identifies a source stream.
     pub fn bytes<'a>(&'a self, source: &'a SourcePdf) -> Result<Cow<'a, [u8]>> {
         match self {
             Self::Source(id) => source.stream_data(*id),
@@ -416,6 +448,7 @@ impl StreamData {
         }
     }
 
+    #[must_use]
     pub const fn is_source_backed(&self) -> bool {
         matches!(self, Self::Source(_))
     }
@@ -443,14 +476,15 @@ pub enum OwnedObject {
 }
 
 impl OwnedObject {
-    pub fn as_dictionary(&self) -> Option<&OwnedDictionary> {
+    #[must_use]
+    pub const fn as_dictionary(&self) -> Option<&OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
             _ => None,
         }
     }
 
-    pub fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
+    pub const fn as_dictionary_mut(&mut self) -> Option<&mut OwnedDictionary> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream { dictionary, .. } => Some(dictionary),
             _ => None,
@@ -458,6 +492,7 @@ impl OwnedObject {
     }
 
     /// Collect indirect references contained in this owned COS value.
+    #[must_use]
     pub fn references(&self) -> Vec<ObjectHandle> {
         let mut references = BTreeSet::new();
         collect_owned_references(self, &mut references);
@@ -490,6 +525,10 @@ impl ObjectOverlay {
     }
 
     /// Materialize an existing source object only when it is first edited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source object is missing or was deleted from the overlay.
     pub fn edit<'a>(&'a mut self, source: &SourcePdf, id: ObjectId) -> Result<&'a mut OwnedObject> {
         let change = match self.existing.entry(id) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -512,6 +551,7 @@ impl ObjectOverlay {
         self.existing.remove(&id)
     }
 
+    #[must_use]
     pub fn change(&self, id: ObjectId) -> Option<&ExistingObjectChange> {
         self.existing.get(&id)
     }
@@ -526,6 +566,7 @@ impl ObjectOverlay {
         id
     }
 
+    #[must_use]
     pub fn added(&self, id: NewObjectId) -> Option<&OwnedObject> {
         self.added.get(id.index())
     }
@@ -534,17 +575,19 @@ impl ObjectOverlay {
         self.added.get_mut(id.index())
     }
 
+    #[must_use]
     pub fn added_objects(&self) -> &[OwnedObject] {
         &self.added
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.existing.is_empty() && self.added.is_empty()
     }
 }
 
 /// Borrowed view of one object encountered while walking the current COW graph.
-pub(crate) enum CurrentObject<'a> {
+pub enum CurrentObject<'a> {
     /// Object parsed lazily from the immutable Hayro source.
     Source(Object<'a>),
     /// Object already materialized in the overlay.
@@ -596,7 +639,7 @@ struct ReachableOutputCache {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ReachabilityCacheStats {
+pub struct ReachabilityCacheStats {
     pub queries: u64,
     pub rebuilds: u64,
     pub cache_hits: u64,
@@ -618,6 +661,11 @@ pub struct EditDocument {
 }
 
 impl EditDocument {
+    /// Parse a source PDF and initialize an empty copy-on-write overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source bytes do not form a supported PDF.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let source = SourcePdf::from_bytes(bytes)?;
         let trailer = source.preserved_trailer();
@@ -633,11 +681,11 @@ impl EditDocument {
         })
     }
 
-    pub fn source(&self) -> &SourcePdf {
+    pub const fn source(&self) -> &SourcePdf {
         &self.source
     }
 
-    pub fn trailer(&self) -> &OwnedDictionary {
+    pub const fn trailer(&self) -> &OwnedDictionary {
         &self.trailer
     }
 
@@ -714,7 +762,7 @@ impl EditDocument {
         Ok(())
     }
 
-    pub(crate) fn reachability_cache_stats(&self) -> ReachabilityCacheStats {
+    pub(super) const fn reachability_cache_stats(&self) -> ReachabilityCacheStats {
         self.reachability_cache_stats.get()
     }
 
@@ -723,7 +771,7 @@ impl EditDocument {
         &mut self.trailer
     }
 
-    pub fn overlay(&self) -> &ObjectOverlay {
+    pub const fn overlay(&self) -> &ObjectOverlay {
         &self.overlay
     }
 
@@ -742,6 +790,11 @@ impl EditDocument {
         self.overlay.add(object)
     }
 
+    /// Return a mutable overlay object previously allocated with `add_object`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reachability bookkeeping fails or the new-object ID is not allocated.
     pub fn edit_added_object(&mut self, id: NewObjectId) -> Result<&mut OwnedObject> {
         self.mark_object_maybe_mutated(ObjectHandle::New(id))?;
         self.overlay
@@ -749,6 +802,12 @@ impl EditDocument {
             .ok_or_else(|| Error::MissingNewObject { index: id.index() })
     }
 
+    /// Materialize and return a mutable source object in the overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reachability bookkeeping fails, the source object is missing,
+    /// or the object has been deleted from the overlay.
     pub fn edit_object(&mut self, id: ObjectId) -> Result<&mut OwnedObject> {
         self.mark_object_maybe_mutated(ObjectHandle::Existing(id))?;
         self.overlay.edit(&self.source, id)
@@ -808,10 +867,10 @@ impl EditDocument {
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                entries.push((
-                    b"/Length".to_vec(),
-                    FlObjectHandle::integer(bytes.len() as i64),
-                ));
+                let length = i64::try_from(bytes.len()).map_err(|_| {
+                    Error::Invalid("stream length exceeds the supported range".to_owned())
+                })?;
+                entries.push((b"/Length".to_vec(), FlObjectHandle::integer(length)));
                 let dictionary = FlObjectHandle::dictionary(entries);
                 Ok(FlObjectHandle::stream(dictionary, Rc::new(bytes)))
             }
@@ -849,10 +908,9 @@ impl EditDocument {
                 self.owned_to_flpdf_detached(value, 0)?,
             ));
         }
-        entries.push((
-            b"/Length".to_vec(),
-            FlObjectHandle::integer(bytes.len() as i64),
-        ));
+        let length = i64::try_from(bytes.len())
+            .map_err(|_| Error::Invalid("stream length exceeds the supported range".to_owned()))?;
+        entries.push((b"/Length".to_vec(), FlObjectHandle::integer(length)));
         let handle = FlObjectHandle::stream(FlObjectHandle::dictionary(entries), Rc::new(bytes));
         Ok(handle.get_stream_data(level)?.as_ref().clone())
     }
@@ -950,6 +1008,10 @@ impl EditDocument {
 
     /// Write the current COW graph as a compact fresh PDF using classic xref output.
     /// Production optimization normally selects writer options through `Config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current object graph cannot be serialized as a valid PDF.
     pub fn write_compact(&self) -> Result<Vec<u8>> {
         crate::writer::write_pdf(self)
     }
@@ -1069,6 +1131,10 @@ impl EditDocument {
 
     /// Collect all objects reachable from the document catalog after applying
     /// overlay replacements/deletions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current graph contains an invalid or deleted required reference.
     pub fn reachable_objects(&self) -> Result<Vec<ObjectHandle>> {
         self.reachable_from([ObjectHandle::Existing(self.source.catalog_id())])
     }
@@ -1289,7 +1355,7 @@ impl EditDocument {
                     }
                     None => match self.source.object(id) {
                         Ok(object) => visit(handle, CurrentObject::Source(object))?,
-                        Err(Error::MissingSourceObject { .. }) => continue,
+                        Err(Error::MissingSourceObject { .. }) => {}
                         Err(error) => return Err(error),
                     },
                 },
@@ -1306,6 +1372,10 @@ impl EditDocument {
     }
 
     /// Collect all objects reachable from an explicit root set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when graph traversal encounters an invalid or deleted required reference.
     pub fn reachable_from(
         &self,
         roots: impl IntoIterator<Item = ObjectHandle>,
@@ -1433,6 +1503,26 @@ fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<Obje
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the bit test below admits only i64 values exactly representable in binary64"
+)]
+pub fn exact_i64_to_f64(value: i64) -> Option<f64> {
+    let magnitude = value.unsigned_abs();
+    let significant_bits = u64::BITS - magnitude.leading_zeros();
+    let discarded_bits = significant_bits.saturating_sub(f64::MANTISSA_DIGITS);
+
+    (magnitude.trailing_zeros() >= discarded_bits).then_some(value as f64)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "this conversion is intentionally compared with Hayro's f64 view to canonicalize numerically integral PDF numbers"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact equality is intentional here: only numerically integral real values should canonicalize to Integer"
+)]
 fn owned_from_hayro(object: Object<'_>, stream_id: Option<ObjectId>) -> OwnedObject {
     match object {
         Object::Null(_) => OwnedObject::Null,
@@ -1494,6 +1584,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_i64_to_f64_rejects_only_lossy_conversions() {
+        assert_eq!(exact_i64_to_f64(0), Some(0.0));
+        assert_eq!(exact_i64_to_f64(1_i64 << 53), Some(9_007_199_254_740_992.0));
+        assert_eq!(
+            exact_i64_to_f64((1_i64 << 53) + 2),
+            Some(9_007_199_254_740_994.0)
+        );
+        assert_eq!(exact_i64_to_f64((1_i64 << 53) + 1), None);
+        assert_eq!(exact_i64_to_f64(-((1_i64 << 53) + 1)), None);
+        assert_eq!(
+            exact_i64_to_f64(i64::MIN),
+            Some(-9_223_372_036_854_775_808.0)
+        );
+        assert_eq!(exact_i64_to_f64(i64::MAX), None);
+    }
+
+    #[test]
     fn overlay_is_copy_on_write() {
         let id = ObjectId::new(12, 0);
         let mut overlay = ObjectOverlay::default();
@@ -1523,90 +1630,60 @@ mod tests {
     }
 
     #[test]
-    fn materialized_stream_keeps_source_payload_lazy() {
-        let source = match SourcePdf::from_bytes(sample_pdf()) {
-            Ok(source) => source,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn materialized_stream_keeps_source_payload_lazy() -> Result<()> {
+        let source = SourcePdf::from_bytes(sample_pdf())?;
         let stream_id = ObjectId::new(4, 0);
-        let object = match source.materialize(stream_id) {
-            Ok(object) => object,
-            Err(error) => panic!("stream should materialize: {error}"),
-        };
+        let object = source.materialize(stream_id)?;
 
-        let (dictionary, data) = match object {
-            OwnedObject::Stream { dictionary, data } => (dictionary, data),
-            other => panic!("expected stream, got {other:?}"),
+        let OwnedObject::Stream { dictionary, data } = object else {
+            return Err(Error::Invalid("expected stream fixture".to_owned()));
         };
         assert!(!dictionary.contains_key(b"Length".as_slice()));
         assert_eq!(data, StreamData::Source(stream_id));
-        let bytes = match data.bytes(&source) {
-            Ok(bytes) => bytes,
-            Err(error) => panic!("stream bytes should resolve: {error}"),
-        };
+        let bytes = data.bytes(&source)?;
         assert_eq!(bytes.as_ref(), b"q Q");
+        Ok(())
     }
 
     #[test]
-    fn decoded_source_stream_cache_is_bypassed_after_edit() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn decoded_source_stream_cache_is_bypassed_after_edit() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
         let stream_id = ObjectId::new(4, 0);
         let handle = ObjectHandle::Existing(stream_id);
-        let first = match document.decoded_content_stream_data(handle) {
-            Ok(bytes) => bytes,
-            Err(error) => panic!("source stream should decode: {error}"),
-        };
+        let first = document.decoded_content_stream_data(handle)?;
         assert_eq!(first, b"q Q");
-        let stream = match document.edit_object(stream_id) {
-            Ok(stream) => stream,
-            Err(error) => panic!("source stream should be editable: {error}"),
-        };
+        let stream = document.edit_object(stream_id)?;
         let OwnedObject::Stream { data, .. } = stream else {
-            panic!("fixture object should be a stream");
+            return Err(Error::Invalid(
+                "fixture object should be a stream".to_owned(),
+            ));
         };
         *data = StreamData::Owned(b"BT ET".to_vec());
-        let second = match document.decoded_content_stream_data(handle) {
-            Ok(bytes) => bytes,
-            Err(error) => panic!("edited stream should decode: {error}"),
-        };
+        let second = document.decoded_content_stream_data(handle)?;
         assert_eq!(second, b"BT ET");
+        Ok(())
     }
 
     #[test]
-    fn first_edit_materializes_only_target_object() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn first_edit_materializes_only_target_object() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
         assert!(document.overlay().is_empty());
 
         let catalog_id = document.source().catalog_id();
-        let catalog = match document.edit_object(catalog_id) {
-            Ok(object) => object,
-            Err(error) => panic!("catalog should materialize: {error}"),
-        };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let catalog = document.edit_object(catalog_id)?;
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            return Err(Error::Invalid("catalog should be a dictionary".to_owned()));
         };
         dictionary.insert(b"Lang".to_vec(), OwnedObject::String(b"en".to_vec()));
 
         assert_eq!(document.overlay().changes().count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn reachability_walks_source_without_materializing_overlay() {
-        let document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
-        let reachable = match document.reachable_objects() {
-            Ok(reachable) => reachable,
-            Err(error) => panic!("source graph should be reachable: {error}"),
-        };
+    fn reachability_walks_source_without_materializing_overlay() -> Result<()> {
+        let document = EditDocument::from_bytes(sample_pdf())?;
+        let reachable = document.reachable_objects()?;
 
         assert_eq!(
             reachable,
@@ -1618,25 +1695,17 @@ mod tests {
             ]
         );
         assert!(document.overlay().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn unreachable_allocation_does_not_invalidate_output_reachability() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
-        let before = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("initial output graph should be reachable: {error}"),
-        };
+    fn unreachable_allocation_does_not_invalidate_output_reachability() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let before = document.reachable_output_objects()?;
         assert_eq!(document.reachability_cache_stats().rebuilds, 1);
 
         let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
-        let after_allocation = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("cached output graph should remain reachable: {error}"),
-        };
+        let after_allocation = document.reachable_output_objects()?;
         assert_eq!(after_allocation, before);
         assert!(!after_allocation.contains(&ObjectHandle::New(added)));
         let stats = document.reachability_cache_stats();
@@ -1644,81 +1713,56 @@ mod tests {
         assert!(stats.cache_hits >= 1);
 
         let catalog_id = document.source().catalog_id();
-        let catalog = match document.edit_object(catalog_id) {
-            Ok(object) => object,
-            Err(error) => panic!("catalog should materialize: {error}"),
-        };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let catalog = document.edit_object(catalog_id)?;
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            return Err(Error::Invalid("catalog should be a dictionary".to_owned()));
         };
         dictionary.insert(
             b"PieceInfo".to_vec(),
             OwnedObject::Reference(ObjectHandle::New(added)),
         );
 
-        let linked = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("linked output graph should be reachable: {error}"),
-        };
+        let linked = document.reachable_output_objects()?;
         assert!(linked.contains(&ObjectHandle::New(added)));
         assert_eq!(document.reachability_cache_stats().rebuilds, 2);
+        Ok(())
     }
 
     #[test]
-    fn reachability_follows_new_overlay_references() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn reachability_follows_new_overlay_references() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
         let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
         let catalog_id = document.source().catalog_id();
-        let catalog = match document.edit_object(catalog_id) {
-            Ok(object) => object,
-            Err(error) => panic!("catalog should materialize: {error}"),
-        };
-        let dictionary = match catalog.as_dictionary_mut() {
-            Some(dictionary) => dictionary,
-            None => panic!("catalog should be a dictionary"),
+        let catalog = document.edit_object(catalog_id)?;
+        let Some(dictionary) = catalog.as_dictionary_mut() else {
+            return Err(Error::Invalid("catalog should be a dictionary".to_owned()));
         };
         dictionary.insert(
             b"PieceInfo".to_vec(),
             OwnedObject::Reference(ObjectHandle::New(added)),
         );
 
-        let reachable = match document.reachable_objects() {
-            Ok(reachable) => reachable,
-            Err(error) => panic!("overlay graph should be reachable: {error}"),
-        };
+        let reachable = document.reachable_objects()?;
         assert!(reachable.contains(&ObjectHandle::New(added)));
+        Ok(())
     }
 
     #[test]
-    fn reachable_output_cache_reuses_after_edge_stable_edit() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
-        let before = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("initial output graph should be reachable: {error}"),
-        };
+    fn reachable_output_cache_reuses_after_edge_stable_edit() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let before = document.reachable_output_objects()?;
         let initial_stats = document.reachability_cache_stats();
         assert_eq!(initial_stats.rebuilds, 1);
 
-        let stream = match document.edit_object(ObjectId::new(4, 0)) {
-            Ok(stream) => stream,
-            Err(error) => panic!("stream should be editable: {error}"),
-        };
+        let stream = document.edit_object(ObjectId::new(4, 0))?;
         let OwnedObject::Stream { data, .. } = stream else {
-            panic!("fixture object should be a stream");
+            return Err(Error::Invalid(
+                "fixture object should be a stream".to_owned(),
+            ));
         };
         *data = StreamData::Owned(b"BT ET".to_vec());
 
-        let after = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("edge-stable output graph should be reachable: {error}"),
-        };
+        let after = document.reachable_output_objects()?;
         assert_eq!(after, before);
 
         let stats = document.reachability_cache_stats();
@@ -1726,81 +1770,58 @@ mod tests {
         assert_eq!(stats.edge_checks, 1);
         assert_eq!(stats.edge_stable_reuses, 1);
         assert!(stats.cache_hits >= 1);
+        Ok(())
     }
 
     #[test]
-    fn reachable_output_cache_invalidates_after_object_edit() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
-        let before = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("initial output graph should be reachable: {error}"),
-        };
+    fn reachable_output_cache_invalidates_after_object_edit() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let before = document.reachable_output_objects()?;
         assert!(before.contains(&ObjectHandle::Existing(ObjectId::new(4, 0))));
         // Hit the cache before changing the graph.
-        let cached = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("cached output graph should be reachable: {error}"),
-        };
+        let cached = document.reachable_output_objects()?;
         assert_eq!(cached, before);
 
-        let page = match document.edit_object(ObjectId::new(3, 0)) {
-            Ok(page) => page,
-            Err(error) => panic!("page should be editable: {error}"),
-        };
+        let page = document.edit_object(ObjectId::new(3, 0))?;
         let Some(dictionary) = page.as_dictionary_mut() else {
-            panic!("page should be a dictionary");
+            return Err(Error::Invalid("page should be a dictionary".to_owned()));
         };
         dictionary.remove(b"Contents".as_slice());
 
-        let after = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("edited output graph should be reachable: {error}"),
-        };
+        let after = document.reachable_output_objects()?;
         assert!(!after.contains(&ObjectHandle::Existing(ObjectId::new(4, 0))));
+        Ok(())
     }
 
     #[test]
-    fn reachable_output_cache_invalidates_after_trailer_edit() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn reachable_output_cache_invalidates_after_trailer_edit() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
         let added = document.add_object(OwnedObject::Dictionary(OwnedDictionary::new()));
-        let before = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("initial output graph should be reachable: {error}"),
-        };
+        let before = document.reachable_output_objects()?;
         assert!(!before.contains(&ObjectHandle::New(added)));
 
         document.trailer_mut().insert(
             b"Info".to_vec(),
             OwnedObject::Reference(ObjectHandle::New(added)),
         );
-        let after = match document.reachable_output_objects() {
-            Ok(handles) => handles,
-            Err(error) => panic!("trailer-edited output graph should be reachable: {error}"),
-        };
+        let after = document.reachable_output_objects()?;
         assert!(after.contains(&ObjectHandle::New(added)));
+        Ok(())
     }
 
     #[test]
-    fn reachability_rejects_dangling_deleted_reference() {
-        let mut document = match EditDocument::from_bytes(sample_pdf()) {
-            Ok(document) => document,
-            Err(error) => panic!("sample PDF should parse: {error}"),
-        };
+    fn reachability_rejects_dangling_deleted_reference() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
         document.overlay_mut().delete(ObjectId::new(4, 0));
 
-        match document.reachable_objects() {
+        assert!(matches!(
+            document.reachable_objects(),
             Err(Error::DeletedReferencedObject {
                 number: 4,
                 generation: 0,
-            }) => {}
-            other => panic!("expected dangling-reference error, got {other:?}"),
-        }
+            })
+        ));
+        Ok(())
     }
 
     fn sample_pdf() -> Vec<u8> {

@@ -66,18 +66,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_exif_without_touching_scan() {
+    fn strips_exif_without_touching_scan() -> crate::Result<()> {
         let jpeg = [
             0xff, 0xd8, 0xff, 0xe1, 0x00, 0x06, b'E', b'X', b'I', b'F', 0xff, 0xda, 0x00, 0x02,
             0x11, 0x22, 0xff, 0xd9,
         ];
         let Some((out, n)) = strip_jpeg_metadata(&jpeg, false) else {
-            panic!("test JPEG should contain removable EXIF metadata");
+            return Err(crate::Error::Invalid(
+                "test JPEG should contain removable EXIF metadata".to_owned(),
+            ));
         };
         assert_eq!(n, 8);
         assert_eq!(
             out,
             [0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0x11, 0x22, 0xff, 0xd9]
         );
+        Ok(())
     }
 }

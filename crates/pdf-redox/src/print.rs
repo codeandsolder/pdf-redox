@@ -295,10 +295,6 @@ struct PlacementWalkState<'a> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the test traversal mirrors the production form-walk call shape"
-)]
 fn scan_form<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     form: &ObjectHandle,
@@ -720,7 +716,8 @@ mod tests {
             Vec::new()
         };
         page_handles.push(page);
-        let count = i64::try_from(page_handles.len()).expect("test page count fits i64");
+        let count = i64::try_from(page_handles.len())
+            .map_err(|_| Error::Invalid("test page count exceeds i64".to_owned()))?;
         pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
         pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
         pdf.mark_object_handle_dirty(&pages)?;
@@ -784,10 +781,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn shared_image_uses_largest_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -816,10 +809,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn resource_less_form_inherits_page_xobjects_for_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1200, 600)?;
@@ -949,10 +938,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn nested_form_matrix_contributes_to_image_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 500)?;
@@ -1011,10 +996,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the test asserts exact deterministic PDF geometry values"
-    )]
     fn page_user_unit_scales_physical_placement() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let image = image(&mut pdf, 1000, 1000)?;

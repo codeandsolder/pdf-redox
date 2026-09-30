@@ -1,6 +1,6 @@
 use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
 
-pub(crate) fn decoded_content_value(
+pub fn decoded_content_value(
     document: &EditDocument,
     value: &OwnedObject,
     out: &mut Vec<u8>,
@@ -41,7 +41,7 @@ pub(crate) fn decoded_content_value(
     Ok(())
 }
 
-pub(crate) fn resolved_dictionary(
+pub fn resolved_dictionary(
     document: &EditDocument,
     value: Option<&OwnedObject>,
 ) -> Result<Option<OwnedDictionary>> {
@@ -53,7 +53,7 @@ pub(crate) fn resolved_dictionary(
         .and_then(|value| value.as_dictionary().cloned()))
 }
 
-pub(crate) fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
+pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
     let Some(page) = document.current_owned_object(page)? else {
         return Ok(Vec::new());
     };
@@ -68,11 +68,11 @@ pub(crate) fn page_content(document: &EditDocument, page: ObjectHandle) -> Resul
     Ok(decoded)
 }
 
-pub(crate) fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
+pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
     document.decoded_stream_data(form, flpdf::DecodeLevel::Specialized)
 }
 
-pub(crate) fn page_resources(
+pub fn page_resources(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
@@ -82,7 +82,7 @@ pub(crate) fn page_resources(
     resolved_dictionary(document, Some(&value))
 }
 
-pub(crate) fn form_resources(
+pub fn form_resources(
     document: &EditDocument,
     form: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
@@ -95,7 +95,7 @@ pub(crate) fn form_resources(
     resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))
 }
 
-pub(crate) fn replace_page_content(
+pub fn replace_page_content(
     document: &mut EditDocument,
     page: ObjectHandle,
     bytes: Vec<u8>,
