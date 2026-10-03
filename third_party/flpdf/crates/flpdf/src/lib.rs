@@ -160,8 +160,8 @@ pub use cache::{CacheEntry, ObjectCache};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
 pub use content_stream::{
-    parse_content_operations, parse_detached_content_stream, ObjectHandleParserCallbacks,
-    ParseControl,
+    parse_content_operations, parse_detached_content_stream,
+    parse_detached_content_stream_recovering, ObjectHandleParserCallbacks, ParseControl,
 };
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::Diagnostics;

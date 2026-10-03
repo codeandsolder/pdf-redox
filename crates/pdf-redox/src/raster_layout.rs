@@ -1296,8 +1296,12 @@ fn scan_target(
     content: &[u8],
 ) -> Result<Option<RasterScanner>> {
     let mut scanner = new_raster_scanner(document, resources)?;
-    flpdf::parse_detached_content_stream(content, "raster-layout normalization", &mut scanner)?;
-    if !scanner.complete {
+    let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
+        content,
+        "raster-layout normalization",
+        &mut scanner,
+    )?;
+    if stopped_on_container_eof || !scanner.complete {
         return Ok(None);
     }
     let _ = target;
@@ -1333,20 +1337,27 @@ fn scan_target_shared(
     if collect_vector {
         let mut scanner = RasterVectorScanner::new(document, resources)?;
         let hidden_ranges = if let Some(context) = hidden_context {
-            Some(scan_physical_hidden_text_with_callback_hayro(
+            let Some(hidden_ranges) = scan_physical_hidden_text_with_callback_hayro(
                 document,
                 page,
                 page_number,
                 context,
                 content,
                 &mut scanner,
-            )?)
+            )?
+            else {
+                return Ok(None);
+            };
+            Some(hidden_ranges)
         } else {
-            flpdf::parse_detached_content_stream(
+            let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
                 content,
                 "shared raster/vector page content",
                 &mut scanner,
             )?;
+            if stopped_on_container_eof {
+                return Ok(None);
+            }
             None
         };
         let (raster, vector_analysis) = scanner.finish();
@@ -1362,16 +1373,27 @@ fn scan_target_shared(
 
     let mut scanner = new_raster_scanner(document, resources)?;
     let hidden_ranges = if let Some(context) = hidden_context {
-        Some(scan_physical_hidden_text_with_callback_hayro(
+        let Some(hidden_ranges) = scan_physical_hidden_text_with_callback_hayro(
             document,
             page,
             page_number,
             context,
             content,
             &mut scanner,
-        )?)
+        )?
+        else {
+            return Ok(None);
+        };
+        Some(hidden_ranges)
     } else {
-        flpdf::parse_detached_content_stream(content, "raster-layout normalization", &mut scanner)?;
+        let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
+            content,
+            "raster-layout normalization",
+            &mut scanner,
+        )?;
+        if stopped_on_container_eof {
+            return Ok(None);
+        }
         None
     };
     if !scanner.complete {

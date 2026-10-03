@@ -24,8 +24,7 @@ pub fn decoded_content_value(
     };
     match value {
         OwnedObject::Stream { .. } => {
-            let bytes =
-                document.decoded_owned_stream_data(&value, flpdf::DecodeLevel::Specialized)?;
+            let bytes = document.decoded_content_stream_value(&value)?;
             if !out.is_empty() && out.last() != Some(&b'\n') {
                 out.push(b'\n');
             }
@@ -69,7 +68,7 @@ pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u
 }
 
 pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
-    document.decoded_stream_data(form, flpdf::DecodeLevel::Specialized)
+    document.decoded_content_stream_data(form)
 }
 
 pub fn page_resources(

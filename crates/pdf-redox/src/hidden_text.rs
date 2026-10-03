@@ -2183,7 +2183,7 @@ pub fn scan_physical_hidden_text_with_callback_hayro<C>(
     shared_context: &HiddenTextSharedContext,
     content: &[u8],
     other: &mut C,
-) -> Result<Vec<(usize, usize)>>
+) -> Result<Option<Vec<(usize, usize)>>>
 where
     C: ObjectHandleParserCallbacks,
 {
@@ -2205,12 +2205,15 @@ where
         first: other,
         second: &mut scanner,
     };
-    flpdf::parse_detached_content_stream(
+    let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
         content,
         "shared raster/hidden-text page content",
         &mut tee,
     )?;
-    Ok(physical_hidden_ranges(scanner.finish()))
+    if stopped_on_container_eof {
+        return Ok(None);
+    }
+    Ok(Some(physical_hidden_ranges(scanner.finish())))
 }
 
 fn scan_page_hayro(

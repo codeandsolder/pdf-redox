@@ -958,6 +958,39 @@ impl EditDocument {
         Ok(handle.get_stream_data(level)?.as_ref().clone())
     }
 
+    /// Decode page/Form content while accepting codec warnings that preserve
+    /// usable output. Runtime codec errors and unsupported filter chains remain fatal.
+    pub(crate) fn decoded_content_stream_value(&self, stream: &OwnedObject) -> Result<Vec<u8>> {
+        let OwnedObject::Stream { dictionary, data } = stream else {
+            return Err(Error::Invalid("object is not a stream".to_owned()));
+        };
+        let bytes = data.bytes(self.source())?.into_owned();
+        let mut entries = Vec::new();
+        for key in [
+            b"Filter".as_slice(),
+            b"DecodeParms".as_slice(),
+            b"F".as_slice(),
+            b"FFilter".as_slice(),
+            b"FDecodeParms".as_slice(),
+        ] {
+            let Some(value) = dictionary.get(key) else {
+                continue;
+            };
+            entries.push((
+                [b"/".as_slice(), key].concat(),
+                self.owned_to_flpdf_detached(value, 0)?,
+            ));
+        }
+        let filter_dictionary = FlObjectHandle::dictionary(entries);
+        let outcome = flpdf::filters::decode_stream_data_recovering(&filter_dictionary, &bytes)?;
+        for event in outcome.events {
+            if let flpdf::filters::StreamDecodeEvent::Error(error) = event {
+                return Err(error.into());
+            }
+        }
+        Ok(outcome.data)
+    }
+
     /// Decode a current indirect stream through the standalone filter-codec bridge.
     pub(crate) fn decoded_stream_data(
         &self,
@@ -991,7 +1024,7 @@ impl EditDocument {
                 if let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id) {
                     return Ok(decoded.clone());
                 }
-                let decoded = self.decoded_owned_stream_data(&stream, DecodeLevel::Specialized)?;
+                let decoded = self.decoded_content_stream_value(&stream)?;
                 if decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES {
                     let mut cache = self.decoded_content_stream_cache.borrow_mut();
                     if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES
@@ -1003,7 +1036,12 @@ impl EditDocument {
                 return Ok(decoded);
             }
         }
-        self.decoded_stream_data(handle, DecodeLevel::Specialized)
+        let Some(stream) = self.current_owned_object(handle)? else {
+            return Err(Error::Invalid(
+                "stream reference resolves to null".to_owned(),
+            ));
+        };
+        self.decoded_content_stream_value(&stream)
     }
 
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
@@ -1288,10 +1326,12 @@ impl EditDocument {
                     number: id.number,
                     generation: id.generation,
                 }),
-                None => Ok(matches!(
-                    self.source.source_stream_kind(id)?,
-                    SourceStreamKind::Stream(Some(name)) if name.as_slice() == subtype
-                )),
+                None => match self.source.source_stream_kind(id) {
+                    Ok(SourceStreamKind::Stream(Some(name))) => Ok(name.as_slice() == subtype),
+                    Ok(SourceStreamKind::NotStream | SourceStreamKind::Stream(None))
+                    | Err(Error::MissingSourceObject { .. }) => Ok(false),
+                    Err(error) => Err(error),
+                },
             },
             ObjectHandle::New(id) => {
                 let Some(OwnedObject::Stream { dictionary, .. }) = self.overlay.added(id) else {
@@ -1665,6 +1705,30 @@ mod tests {
         overlay.delete(id);
         assert_eq!(overlay.change(id), Some(&ExistingObjectChange::Delete));
         assert!(!overlay.is_empty());
+    }
+
+    #[test]
+    fn missing_source_stream_subtype_is_null_like() -> Result<()> {
+        let document = EditDocument::from_bytes(sample_pdf())?;
+        assert!(
+            !document
+                .stream_subtype_is(ObjectHandle::Existing(ObjectId::new(999_999, 0)), b"Image",)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_decode_keeps_output_from_recoverable_flate_warning() -> Result<()> {
+        let document = EditDocument::from_bytes(sample_pdf())?;
+        let stream = OwnedObject::Stream {
+            dictionary: OwnedDictionary::from([(
+                b"Filter".to_vec(),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            )]),
+            data: StreamData::Owned(vec![0x78, 0x9c, 0x4b, 0x04]),
+        };
+        assert_eq!(document.decoded_content_stream_value(&stream)?, b"a");
+        Ok(())
     }
 
     #[test]

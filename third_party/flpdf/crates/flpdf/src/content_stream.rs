@@ -235,6 +235,23 @@ pub(crate) fn parse_content_stream_handles_with_recoverable_warnings_and_status<
     parse_content_stream_handles_internal(input, Some(context), source_description, callbacks)
 }
 
+/// Parse detached decoded content bytes with qpdf-style recoverable warnings.
+///
+/// The returned flag is true when malformed container syntax forced an early
+/// logical EOF. Callers that require a complete scan should conservatively
+/// abandon their transformation when that happens.
+pub fn parse_detached_content_stream_recovering<C: ObjectHandleParserCallbacks>(
+    input: &[u8],
+    source_description: &str,
+    callbacks: &mut C,
+) -> Result<bool> {
+    parse_content_stream_handles_with_recoverable_warnings_and_status(
+        input,
+        source_description,
+        callbacks,
+    )
+}
+
 /// Parse decoded content bytes into ObjectHandle callbacks.
 pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     input: &[u8],

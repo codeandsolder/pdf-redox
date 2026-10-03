@@ -53,17 +53,116 @@ fn qpdf_compatible_decode(data: &[u8]) -> Option<Vec<u8>> {
     flpdf::filters::decode_stream_data(&dictionary, data).ok()
 }
 
+fn is_app_or_com_marker(marker: u8) -> bool {
+    (0xe0..=0xef).contains(&marker) || marker == 0xfe
+}
+
+fn source_app_com_markers(data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if data.get(..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut position = 2usize;
+    let mut markers = Vec::new();
+    while position < data.len() {
+        let marker_start = position;
+        if data[position] != 0xff {
+            return None;
+        }
+        while data.get(position) == Some(&0xff) {
+            position += 1;
+        }
+        let marker = *data.get(position)?;
+        position += 1;
+        match marker {
+            0xda | 0xd9 => return Some(markers),
+            0x00 | 0xff => return None,
+            0x01 | 0xd0..=0xd8 => {}
+            _ => {
+                let length_bytes = data.get(position..position.checked_add(2)?)?;
+                let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+                if length < 2 {
+                    return None;
+                }
+                let end = position.checked_add(length)?;
+                if end > data.len() {
+                    return None;
+                }
+                if is_app_or_com_marker(marker) {
+                    markers.push(data[marker_start..end].to_vec());
+                }
+                position = end;
+            }
+        }
+    }
+    None
+}
+
+fn restore_source_app_com_markers(source: &[u8], transformed: &[u8]) -> Option<Vec<u8>> {
+    let source_markers = source_app_com_markers(source)?;
+    if transformed.get(..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(transformed.len());
+    output.extend_from_slice(&[0xff, 0xd8]);
+    for marker in source_markers {
+        output.extend_from_slice(&marker);
+    }
+
+    let mut position = 2usize;
+    while position < transformed.len() {
+        let marker_start = position;
+        if transformed[position] != 0xff {
+            return None;
+        }
+        while transformed.get(position) == Some(&0xff) {
+            position += 1;
+        }
+        let marker = *transformed.get(position)?;
+        position += 1;
+        match marker {
+            0xda | 0xd9 => {
+                output.extend_from_slice(&transformed[marker_start..]);
+                return Some(output);
+            }
+            0x00 | 0xff => return None,
+            0x01 | 0xd0..=0xd8 => {
+                output.extend_from_slice(&transformed[marker_start..position]);
+            }
+            _ => {
+                let length_bytes = transformed.get(position..position.checked_add(2)?)?;
+                let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+                if length < 2 {
+                    return None;
+                }
+                let end = position.checked_add(length)?;
+                if end > transformed.len() {
+                    return None;
+                }
+                if !is_app_or_com_marker(marker) {
+                    output.extend_from_slice(&transformed[marker_start..end]);
+                }
+                position = end;
+            }
+        }
+    }
+    None
+}
+
 fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let optimized = transform_jpeg_with_options(
         data,
         &TransformOptions {
             op: TransformOp::None,
             optimize: true,
-            copy_markers: MarkerCopyMode::All,
+            // The coefficient writer synthesizes JFIF APP0. Strip all of its
+            // APP/COM output and restore the source marker sequence exactly below.
+            copy_markers: MarkerCopyMode::None,
             ..Default::default()
         },
     )
     .ok()?;
+    let optimized = restore_source_app_com_markers(data, &optimized)?;
 
     // libjpeg-turbo-rs's coefficient reader accepts some entropy streams that
     // qpdf's Pl_DCT compatibility path rejects. Require the before/after JPEGs
@@ -128,6 +227,48 @@ pub fn optimize_jpeg_entropy_hayro(
 mod tests {
     use super::*;
     use libjpeg_turbo_rs::{PixelFormat, Subsampling, compress, read_coefficients};
+
+    #[test]
+    fn huffman_optimization_preserves_source_app_markers_without_synthesizing_jfif()
+    -> crate::Result<()> {
+        let width = 32usize;
+        let height = 32usize;
+        let pixels = vec![96u8; width * height * 3];
+        let generated = compress(
+            &pixels,
+            width,
+            height,
+            PixelFormat::Rgb,
+            88,
+            Subsampling::S444,
+        )
+        .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+        let stripped = restore_source_app_com_markers(&[0xff, 0xd8, 0xff, 0xd9], &generated)
+            .ok_or_else(|| {
+                crate::Error::Invalid("generated JPEG marker parse failed".to_owned())
+            })?;
+        let adobe = [
+            0xff, 0xee, 0x00, 0x0e, b'A', b'd', b'o', b'b', b'e', 0x00, 0x64, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let mut source = Vec::with_capacity(stripped.len() + adobe.len());
+        source.extend_from_slice(&[0xff, 0xd8]);
+        source.extend_from_slice(&adobe);
+        source.extend_from_slice(&stripped[2..]);
+
+        let optimized = optimized_jpeg_bytes(&source).ok_or_else(|| {
+            crate::Error::Invalid("Adobe-only JPEG should be transformable".to_owned())
+        })?;
+        assert_eq!(
+            source_app_com_markers(&optimized),
+            source_app_com_markers(&source)
+        );
+        assert_eq!(
+            source_app_com_markers(&optimized),
+            Some(vec![adobe.to_vec()])
+        );
+        Ok(())
+    }
 
     #[test]
     fn huffman_optimization_preserves_quantized_dct_coefficients() -> crate::Result<()> {
