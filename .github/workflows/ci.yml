@@ -34,7 +34,7 @@ jobs:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
@@ -53,7 +53,7 @@ jobs:
 
 
   rust-shared-cache:
-    name: Rust 1.98.1 (shared sccache)
+    name: Rust 1.99.0 (shared sccache)
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -61,12 +61,12 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
     with:
       command: |
-        cargo +1.98.1 fmt --all -- --check
+        cargo +1.99.0 fmt --all -- --check
         git diff --check
-        cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +1.98.1 test --locked --workspace --all-features
-        RUSTDOCFLAGS=-Dwarnings cargo +1.98.1 doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "1.98.1"
+        cargo +1.99.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +1.99.0 test --locked --workspace --all-features
+        RUSTDOCFLAGS=-Dwarnings cargo +1.99.0 doc --locked --workspace --all-features --no-deps
+      rust-toolchain: "1.99.0"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2

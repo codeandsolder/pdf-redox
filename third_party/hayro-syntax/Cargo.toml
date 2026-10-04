@@ -23,6 +23,6 @@ smallvec = "1"
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 memchr = { version = "2.8.0", default-features = false, features = ["alloc"], optional = true }
 zune-jpeg = { version = "0.5", default-features = false, optional = true }
-hayro-ccitt = { version = "0.3.0", default-features = false, optional = true }
-hayro-jbig2 = { version = "0.3.0", default-features = false, optional = true }
+hayro-ccitt = { version = "0.4.0", default-features = false, optional = true }
+hayro-jbig2 = { version = "0.3.1", default-features = false, optional = true }
 hayro-jpeg2000 = { version = "0.4.0", default-features = false, optional = true }

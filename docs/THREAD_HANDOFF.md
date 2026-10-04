@@ -2,15 +2,23 @@
 
 ## Canonical locations
 
-- Server working tree: `/srv/scratch/pdf-desht`
+- Cold-storage working tree: `/srv/scratch/projects/pdf-desht/pdf-desht`
+- Laptop working tree: `/home/jan/projects/pdf-redox`
 - GitHub: `https://github.com/codeandsolder/pdf-redox`
-- Branch: `raster-layout-normalization` (experimental optimizer work; base HEAD `241f6b9`)
+- Canonical branch: `main`
 - Canonical Notion project: `https://app.notion.com/p/Datasheet-PDF-normalization-compression-research-3d4f74be9020816db31be12bf88871f6`
 - Architecture page: `https://app.notion.com/p/3dbf74be90208135ade6e9d916d40ffa`
 - Validation detail page: `https://app.notion.com/p/3dbf74be90208145b1e8fb3ad5d56670`
 - Representative production corpus: `/srv/scratch/pdf-redox-writer-corpus`
 - Fully validated parser-free baseline: `/srv/scratch/pdf-desht-build/hayro-parser-free-final-20260915/output`
 - Post-quality-pass equivalence run: `/srv/scratch/pdf-desht-build/hayro-quality-final-20260915/output`
+
+## Current repository state — 2026-10-04
+
+The production branch is `main` on GitHub, laptop, and cold-storage. The development/CI toolchain is Rust 1.99.0 while the declared MSRV remains Rust 1.92.0. The October integration sweep also updates `libc` to 0.2.190, vendored flpdf's `cc` lock to 1.6.0, and the Hayro decoder pair to `hayro-ccitt` 0.4.0 + `hayro-jbig2` 0.3.1 so the dependency graph remains duplicate-free.
+
+Current gates pass on the laptop: Rust 1.99 fmt, strict workspace Clippy, all workspace tests, rustdoc, wasm32 check, `cargo tree -d`, Rust 1.92 MSRV, and the rust-skills2 nightly strict policy.
+
 
 ## Current production architecture
 
