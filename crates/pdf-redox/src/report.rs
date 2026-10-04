@@ -390,6 +390,21 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Estimated encoded bytes saved by vector transformed form.
     pub vector_transformed_form_estimated_flate_bytes_saved: usize,
+    #[serde(default)]
+    /// Number of shared resource-aware q-block run Forms created.
+    pub vector_shared_run_forms_created: usize,
+    #[serde(default)]
+    /// Number of pages rewritten by shared q-block run factoring.
+    pub vector_shared_run_pages_rewritten: usize,
+    #[serde(default)]
+    /// Number of q-block occurrences replaced by shared run Forms.
+    pub vector_shared_run_blocks_replaced: usize,
+    #[serde(default)]
+    /// Decoded duplicate bytes factored into shared run Forms.
+    pub vector_shared_run_decoded_bytes_factored: usize,
+    #[serde(default)]
+    /// Estimated encoded bytes saved by shared q-block run factoring.
+    pub vector_shared_run_estimated_flate_bytes_saved: usize,
     /// Number of metadata duplicate streams detected.
     pub metadata_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to metadata duplicate.

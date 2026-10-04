@@ -497,7 +497,8 @@ fn optimize_pdf_with_document(
             && raster_layout.resource_inventory_complete
             && physically_hidden_text.removed == 0
             && inline_image_dedup.occurrences_externalized == 0
-            && repeated_page_objects.objects_removed == 0;
+            && repeated_page_objects.objects_removed == 0
+            && vector_compaction.shared_run_forms_created == 0;
         if shared_usage_is_exact {
             prune_resources_with_usage_hayro(
                 &mut document,
@@ -761,6 +762,16 @@ fn optimize_pdf_with_document(
             vector_compaction.transformed_form_estimated_flate_bytes_saved
         ));
     }
+    if vector_compaction.shared_run_forms_created > 0 {
+        notes.push(format!(
+            "Factored {} shared resource-aware q-block run(s) into Form XObjects across {} page(s), replacing {} block occurrence(s), removing about {} decoded duplicate bytes, and saving about {} encoded bytes.",
+            vector_compaction.shared_run_forms_created,
+            vector_compaction.shared_run_pages_rewritten,
+            vector_compaction.shared_run_blocks_replaced,
+            vector_compaction.shared_run_decoded_bytes_factored,
+            vector_compaction.shared_run_estimated_flate_bytes_saved
+        ));
+    }
     if microstroke_raster.runs_rasterized > 0 {
         notes.push(format!(
             "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
@@ -847,6 +858,13 @@ fn optimize_pdf_with_document(
             .transformed_form_operators_eliminated,
         vector_transformed_form_estimated_flate_bytes_saved: vector_compaction
             .transformed_form_estimated_flate_bytes_saved,
+        vector_shared_run_forms_created: vector_compaction.shared_run_forms_created,
+        vector_shared_run_pages_rewritten: vector_compaction.shared_run_pages_rewritten,
+        vector_shared_run_blocks_replaced: vector_compaction.shared_run_blocks_replaced,
+        vector_shared_run_decoded_bytes_factored: vector_compaction
+            .shared_run_decoded_bytes_factored,
+        vector_shared_run_estimated_flate_bytes_saved: vector_compaction
+            .shared_run_estimated_flate_bytes_saved,
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,

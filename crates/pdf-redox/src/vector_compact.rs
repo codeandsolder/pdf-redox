@@ -5,6 +5,7 @@ use crate::{
 use flate2::{Compression, write::ZlibEncoder};
 use flpdf::content_stream::ContentScalar;
 use flpdf::{Matrix, ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
+use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::{
@@ -58,6 +59,11 @@ pub struct VectorCompactionStats {
     pub transformed_form_occurrences_replaced: usize,
     pub transformed_form_operators_eliminated: usize,
     pub transformed_form_estimated_flate_bytes_saved: usize,
+    pub shared_run_forms_created: usize,
+    pub shared_run_pages_rewritten: usize,
+    pub shared_run_blocks_replaced: usize,
+    pub shared_run_decoded_bytes_factored: usize,
+    pub shared_run_estimated_flate_bytes_saved: usize,
     pub generated_page_xobjects: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
 }
 
@@ -2350,6 +2356,738 @@ fn factor_repeated_transformed_blocks_hayro(
     })
 }
 
+const MIN_SHARED_RUN_DECODED_BYTES: usize = 64 * 1024;
+const MIN_SHARED_RUN_ESTIMATED_SAVINGS: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SharedResourceKind {
+    ColorSpace,
+    ExtGState,
+    XObject,
+}
+
+impl SharedResourceKind {
+    const fn dictionary_key(self) -> &'static [u8] {
+        match self {
+            Self::ColorSpace => b"ColorSpace",
+            Self::ExtGState => b"ExtGState",
+            Self::XObject => b"XObject",
+        }
+    }
+
+    const fn name_prefix(self) -> &'static str {
+        match self {
+            Self::ColorSpace => "CS",
+            Self::ExtGState => "GS",
+            Self::XObject => "XO",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SharedResourceRef {
+    kind: SharedResourceKind,
+    target: ObjectHandle,
+}
+
+fn shared_resource_name(resource: SharedResourceRef) -> Vec<u8> {
+    let suffix = match resource.target {
+        ObjectHandle::Existing(id) => format!("O{}G{}", id.number(), id.generation()),
+        ObjectHandle::New(id) => format!("N{}", id.index()),
+    };
+    format!("PdfRedoxShared{}{}", resource.kind.name_prefix(), suffix).into_bytes()
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedResourceTargets {
+    color_spaces: BTreeMap<Vec<u8>, ObjectHandle>,
+    ext_gstates: BTreeMap<Vec<u8>, ObjectHandle>,
+    xobjects: BTreeMap<Vec<u8>, ObjectHandle>,
+}
+
+impl SharedResourceTargets {
+    fn target(&self, kind: SharedResourceKind, name: &[u8]) -> Option<ObjectHandle> {
+        let map = match kind {
+            SharedResourceKind::ColorSpace => &self.color_spaces,
+            SharedResourceKind::ExtGState => &self.ext_gstates,
+            SharedResourceKind::XObject => &self.xobjects,
+        };
+        map.get(name).copied()
+    }
+}
+
+fn indirect_resource_targets(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+    key: &[u8],
+) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+    let Some(dictionary) = resolved_dictionary(document, resources.get(key))? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(dictionary
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            OwnedObject::Reference(target) => Some((name, target)),
+            _ => None,
+        })
+        .collect())
+}
+
+fn shared_resource_targets(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<SharedResourceTargets> {
+    let resources = page_effective_resources(document, page)?;
+    Ok(SharedResourceTargets {
+        color_spaces: indirect_resource_targets(document, &resources, b"ColorSpace")?,
+        ext_gstates: indirect_resource_targets(document, &resources, b"ExtGState")?,
+        xobjects: indirect_resource_targets(document, &resources, b"XObject")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SharedOperand {
+    name: Option<Vec<u8>>,
+    offset: usize,
+    length: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SharedResourceUse {
+    start: usize,
+    end: usize,
+    resource: SharedResourceRef,
+}
+
+#[derive(Debug, Clone)]
+struct SharedQBlock {
+    start: usize,
+    end: usize,
+    digest: [u8; 32],
+    resource_uses: Vec<SharedResourceUse>,
+}
+
+fn canonicalized_shared_span(
+    input: &[u8],
+    start: usize,
+    end: usize,
+    uses: &[SharedResourceUse],
+) -> Option<Vec<u8>> {
+    if start > end || end > input.len() {
+        return None;
+    }
+    let mut uses = uses
+        .iter()
+        .copied()
+        .filter(|use_| start <= use_.start && use_.end <= end)
+        .collect::<Vec<_>>();
+    uses.sort_unstable_by_key(|use_| use_.start);
+    let mut output = Vec::with_capacity(end.saturating_sub(start));
+    let mut cursor = start;
+    for use_ in uses {
+        if use_.start < cursor || use_.end < use_.start || use_.end > end {
+            return None;
+        }
+        output.extend_from_slice(input.get(cursor..use_.start)?);
+        output.push(b'/');
+        output.extend_from_slice(&shared_resource_name(use_.resource));
+        cursor = use_.end;
+    }
+    output.extend_from_slice(input.get(cursor..end)?);
+    Some(output)
+}
+
+struct SharedQBlockScanner<'a> {
+    input: &'a [u8],
+    targets: &'a SharedResourceTargets,
+    operands: Vec<SharedOperand>,
+    depth: usize,
+    block_start: Option<usize>,
+    block_valid: bool,
+    resource_uses: Vec<SharedResourceUse>,
+    blocks: Vec<SharedQBlock>,
+}
+
+impl<'a> SharedQBlockScanner<'a> {
+    const fn new(input: &'a [u8], targets: &'a SharedResourceTargets) -> Self {
+        Self {
+            input,
+            targets,
+            operands: Vec::new(),
+            depth: 0,
+            block_start: None,
+            block_valid: true,
+            resource_uses: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    fn record_resource(&mut self, kind: SharedResourceKind, operands: &[SharedOperand]) {
+        if operands.len() != 1 {
+            self.block_valid = false;
+            return;
+        }
+        let Some(name) = operands[0].name.as_deref() else {
+            self.block_valid = false;
+            return;
+        };
+        let Some(target) = self.targets.target(kind, name) else {
+            self.block_valid = false;
+            return;
+        };
+        self.resource_uses.push(SharedResourceUse {
+            start: operands[0].offset,
+            end: operands[0].offset.saturating_add(operands[0].length),
+            resource: SharedResourceRef { kind, target },
+        });
+    }
+
+    fn close_outer_block(&mut self, end: usize) {
+        let Some(start) = self.block_start.take() else {
+            self.resource_uses.clear();
+            self.block_valid = true;
+            return;
+        };
+        if self.block_valid
+            && end > start
+            && let Some(canonical) =
+                canonicalized_shared_span(self.input, start, end, &self.resource_uses)
+        {
+            let digest: [u8; 32] = Sha256::digest(&canonical).into();
+            self.blocks.push(SharedQBlock {
+                start,
+                end,
+                digest,
+                resource_uses: std::mem::take(&mut self.resource_uses),
+            });
+        } else {
+            self.resource_uses.clear();
+        }
+        self.block_valid = true;
+    }
+
+    fn process_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+        operands: &[SharedOperand],
+    ) {
+        let end = offset.saturating_add(length);
+        if self.depth == 0 {
+            if operator == b"q" && operands.is_empty() {
+                self.depth = 1;
+                self.block_start = Some(offset);
+                self.block_valid = true;
+                self.resource_uses.clear();
+            }
+            return;
+        }
+
+        match operator {
+            b"q" => {
+                if !operands.is_empty() {
+                    self.block_valid = false;
+                }
+                self.depth = self.depth.saturating_add(1);
+            }
+            b"Q" => {
+                if !operands.is_empty() {
+                    self.block_valid = false;
+                }
+                self.depth = self.depth.saturating_sub(1);
+                if self.depth == 0 {
+                    self.close_outer_block(end);
+                }
+            }
+            b"cs" | b"CS" => {
+                self.record_resource(SharedResourceKind::ColorSpace, operands);
+            }
+            b"gs" => self.record_resource(SharedResourceKind::ExtGState, operands),
+            b"Do" => self.record_resource(SharedResourceKind::XObject, operands),
+            b"scn" | b"SCN" => {
+                if operands.iter().any(|operand| operand.name.is_some()) {
+                    self.block_valid = false;
+                }
+            }
+            b"cm" | b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" | b"W" | b"W*" | b"n"
+            | b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"w" | b"J"
+            | b"j" | b"M" | b"d" | b"G" | b"g" | b"RG" | b"rg" | b"K" | b"k" | b"ri" | b"i" => {}
+            _ => self.block_valid = false,
+        }
+    }
+}
+
+impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
+    const HANDLES_CONTENT_SCALARS: bool = true;
+
+    fn handle_scalar(
+        &mut self,
+        scalar: ContentScalar,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = scalar.as_operator() {
+            let operands = std::mem::take(&mut self.operands);
+            self.process_operator(operator, offset, length, &operands);
+        } else {
+            self.operands.push(SharedOperand {
+                name: scalar.as_name().map(ToOwned::to_owned),
+                offset,
+                length,
+            });
+        }
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        let operands = std::mem::take(&mut self.operands);
+        self.process_operator(operator, offset, length, &operands);
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_object(
+        &mut self,
+        object: FlObjectHandle,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = object.as_operator() {
+            let operands = std::mem::take(&mut self.operands);
+            self.process_operator(&operator, offset, length, &operands);
+        } else if object.as_inline_image().is_some() {
+            if self.depth > 0 {
+                self.block_valid = false;
+            }
+            self.operands.clear();
+        } else {
+            self.operands.push(SharedOperand {
+                name: object.as_name(),
+                offset,
+                length,
+            });
+        }
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        Ok(())
+    }
+}
+
+fn factorable_shared_q_blocks(input: &[u8], targets: &SharedResourceTargets) -> Vec<SharedQBlock> {
+    let mut scanner = SharedQBlockScanner::new(input, targets);
+    if flpdf::parse_detached_content_stream(input, "shared q-block factoring", &mut scanner)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    scanner.blocks
+}
+
+const fn shared_gap_is_trivia(bytes: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => cursor += 1,
+            b'%' => {
+                cursor += 1;
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn shared_page_visible_box(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
+    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+        let Some(value) = document.inherited_page_value(page, key)? else {
+            continue;
+        };
+        let Some(OwnedObject::Array(values)) = document.resolve_owned_value(&value)? else {
+            continue;
+        };
+        if values.len() != 4 {
+            continue;
+        }
+        let mut numbers = [0.0; 4];
+        let mut valid = true;
+        for (index, value) in values.iter().enumerate() {
+            let Some(number) = current_number(document, value)? else {
+                valid = false;
+                break;
+            };
+            if !number.is_finite() {
+                valid = false;
+                break;
+            }
+            numbers[index] = number;
+        }
+        if !valid {
+            continue;
+        }
+        let bounds = Rect {
+            x0: numbers[0].min(numbers[2]),
+            y0: numbers[1].min(numbers[3]),
+            x1: numbers[0].max(numbers[2]),
+            y1: numbers[1].max(numbers[3]),
+        };
+        if bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0 {
+            return Ok(Some(bounds));
+        }
+    }
+    Ok(None)
+}
+
+const fn same_rect(left: Rect, right: Rect) -> bool {
+    left.x0.to_bits() == right.x0.to_bits()
+        && left.y0.to_bits() == right.y0.to_bits()
+        && left.x1.to_bits() == right.x1.to_bits()
+        && left.y1.to_bits() == right.y1.to_bits()
+}
+
+struct SharedPageData {
+    page: ObjectHandle,
+    decoded: Vec<u8>,
+    blocks: Vec<SharedQBlock>,
+    bounds: Rect,
+}
+
+#[derive(Debug, Clone)]
+struct SharedRunCandidate {
+    page_indices: Vec<usize>,
+    start_block: usize,
+    end_block: usize,
+    bounds: Rect,
+}
+
+fn shared_blocks_contiguous(page: &SharedPageData, left: usize, right: usize) -> bool {
+    let Some(left) = page.blocks.get(left) else {
+        return false;
+    };
+    let Some(right) = page.blocks.get(right) else {
+        return false;
+    };
+    left.end <= right.start
+        && shared_gap_is_trivia(page.decoded.get(left.end..right.start).unwrap_or_default())
+}
+
+fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunCandidate> {
+    fn recurse(
+        page_data: &[SharedPageData],
+        page_indices: &[usize],
+        cursor: usize,
+        out: &mut Vec<SharedRunCandidate>,
+    ) {
+        let mut groups = BTreeMap::<[u8; 32], Vec<usize>>::new();
+        for &page_index in page_indices {
+            if let Some(block) = page_data[page_index].blocks.get(cursor) {
+                groups.entry(block.digest).or_default().push(page_index);
+            }
+        }
+        for group in groups.into_values().filter(|group| group.len() >= 2) {
+            let reference = group[0];
+            let mut end = cursor.saturating_add(1);
+            while let Some(reference_block) = page_data[reference].blocks.get(end) {
+                if !shared_blocks_contiguous(&page_data[reference], end - 1, end) {
+                    break;
+                }
+                let all_match = group.iter().all(|&page_index| {
+                    page_data[page_index]
+                        .blocks
+                        .get(end)
+                        .is_some_and(|block| block.digest == reference_block.digest)
+                        && shared_blocks_contiguous(&page_data[page_index], end - 1, end)
+                });
+                if !all_match {
+                    break;
+                }
+                end = end.saturating_add(1);
+            }
+            let bounds = page_data[reference].bounds;
+            if group
+                .iter()
+                .all(|&page_index| same_rect(page_data[page_index].bounds, bounds))
+            {
+                out.push(SharedRunCandidate {
+                    page_indices: group.clone(),
+                    start_block: cursor,
+                    end_block: end,
+                    bounds,
+                });
+            }
+            recurse(page_data, &group, end, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    let all_pages = (0..page_data.len()).collect::<Vec<_>>();
+    recurse(page_data, &all_pages, 0, &mut out);
+    out
+}
+
+fn shared_run_body(
+    page: &SharedPageData,
+    candidate: &SharedRunCandidate,
+) -> Option<(Vec<u8>, BTreeSet<SharedResourceRef>)> {
+    let mut body = Vec::new();
+    let mut resources = BTreeSet::new();
+    for block in page
+        .blocks
+        .get(candidate.start_block..candidate.end_block)?
+    {
+        let canonical =
+            canonicalized_shared_span(&page.decoded, block.start, block.end, &block.resource_uses)?;
+        body.extend_from_slice(&canonical);
+        body.push(b'\n');
+        resources.extend(block.resource_uses.iter().map(|use_| use_.resource));
+    }
+    Some((body, resources))
+}
+
+fn shared_form_resources(resources: &BTreeSet<SharedResourceRef>) -> OwnedDictionary {
+    let mut by_kind = BTreeMap::<SharedResourceKind, OwnedDictionary>::new();
+    for &resource in resources {
+        by_kind.entry(resource.kind).or_default().insert(
+            shared_resource_name(resource),
+            OwnedObject::Reference(resource.target),
+        );
+    }
+    let mut outer = OwnedDictionary::new();
+    for (kind, dictionary) in by_kind {
+        outer.insert(
+            kind.dictionary_key().to_vec(),
+            OwnedObject::Dictionary(dictionary),
+        );
+    }
+    outer
+}
+
+fn shared_form_dictionary(
+    bounds: Rect,
+    resources: &BTreeSet<SharedResourceRef>,
+) -> OwnedDictionary {
+    let mut dictionary = path_form_dictionary(bounds);
+    dictionary.insert(
+        b"Resources".to_vec(),
+        OwnedObject::Dictionary(shared_form_resources(resources)),
+    );
+    dictionary
+}
+
+struct SelectedSharedRun {
+    candidate: SharedRunCandidate,
+    name: Vec<u8>,
+    body: Vec<u8>,
+    resources: BTreeSet<SharedResourceRef>,
+    compressed_body_bytes: usize,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared-run factoring scans, proves resource identity, models encoded savings, then commits one fail-closed transaction"
+)]
+fn factor_shared_q_prefix_runs_hayro(
+    document: &mut EditDocument,
+    flate_level: i32,
+    pages: &[ObjectHandle],
+) -> Result<VectorCompactionStats> {
+    let mut page_data = Vec::new();
+    let mut occupied_names = BTreeSet::new();
+    for &page in pages {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        let Some(bounds) = shared_page_visible_box(document, page)? else {
+            continue;
+        };
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
+        let targets = shared_resource_targets(document, page)?;
+        let blocks = factorable_shared_q_blocks(&decoded, &targets);
+        if blocks.is_empty() {
+            continue;
+        }
+        let resources = page_effective_resources(document, page)?;
+        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
+        {
+            occupied_names.extend(xobjects.keys().cloned());
+        }
+        page_data.push(SharedPageData {
+            page,
+            decoded,
+            blocks,
+            bounds,
+        });
+    }
+    if page_data.len() < 2 {
+        return Ok(VectorCompactionStats::default());
+    }
+
+    let candidates = collect_shared_run_candidates(&page_data);
+    let mut selected = Vec::new();
+    let mut form_index = 0usize;
+    for candidate in candidates {
+        let representative = candidate.page_indices[0];
+        let first = &page_data[representative].blocks[candidate.start_block];
+        let last = &page_data[representative].blocks[candidate.end_block - 1];
+        let decoded_span = last.end.saturating_sub(first.start);
+        if decoded_span < MIN_SHARED_RUN_DECODED_BYTES {
+            continue;
+        }
+        let Some((body, resources)) = shared_run_body(&page_data[representative], &candidate)
+        else {
+            continue;
+        };
+        let compressed_body_bytes = compressed_len(&body, flate_level)?;
+        let conservative_overhead = 384usize
+            .saturating_add(resources.len().saturating_mul(96))
+            .saturating_add(candidate.page_indices.len().saturating_mul(32));
+        let repeated_body_savings =
+            compressed_body_bytes.saturating_mul(candidate.page_indices.len().saturating_sub(1));
+        if repeated_body_savings
+            < conservative_overhead.saturating_add(MIN_SHARED_RUN_ESTIMATED_SAVINGS)
+        {
+            continue;
+        }
+        let name = path_form_name(form_index.saturating_add(20_000), &mut occupied_names);
+        form_index = form_index.saturating_add(1);
+        selected.push(SelectedSharedRun {
+            candidate,
+            name,
+            body,
+            resources,
+            compressed_body_bytes,
+        });
+    }
+    if selected.is_empty() {
+        return Ok(VectorCompactionStats::default());
+    }
+
+    let mut replacements_by_page = vec![Vec::<(usize, usize, Vec<u8>)>::new(); page_data.len()];
+    let mut affected_pages = BTreeSet::new();
+    for run in &selected {
+        let replacement = [b" /".as_slice(), run.name.as_slice(), b" Do ".as_slice()].concat();
+        for &page_index in &run.candidate.page_indices {
+            let first = &page_data[page_index].blocks[run.candidate.start_block];
+            let last = &page_data[page_index].blocks[run.candidate.end_block - 1];
+            replacements_by_page[page_index].push((first.start, last.end, replacement.clone()));
+            affected_pages.insert(page_index);
+        }
+    }
+
+    let mut before_flate = 0usize;
+    let mut after_flate = 0usize;
+    let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
+    for &page_index in &affected_pages {
+        let page = &page_data[page_index];
+        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
+        let Some(rewritten) =
+            apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
+        else {
+            return Ok(VectorCompactionStats::default());
+        };
+        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        rewritten_pages.insert(page_index, rewritten);
+    }
+    let resource_refs = selected
+        .iter()
+        .map(|run| run.resources.len())
+        .sum::<usize>();
+    let page_refs = selected
+        .iter()
+        .map(|run| run.candidate.page_indices.len())
+        .sum::<usize>();
+    after_flate = after_flate
+        .saturating_add(
+            selected
+                .iter()
+                .map(|run| run.compressed_body_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(selected.len().saturating_mul(384))
+        .saturating_add(resource_refs.saturating_mul(96))
+        .saturating_add(page_refs.saturating_mul(32));
+    if after_flate >= before_flate {
+        return Ok(VectorCompactionStats::default());
+    }
+
+    let mut form_handles = Vec::with_capacity(selected.len());
+    for run in &selected {
+        form_handles.push(ObjectHandle::New(document.add_object(
+            OwnedObject::Stream {
+                dictionary: shared_form_dictionary(run.candidate.bounds, &run.resources),
+                data: StreamData::Owned(run.body.clone()),
+            },
+        )));
+    }
+    for (page_index, rewritten) in rewritten_pages {
+        replace_page_content(document, page_data[page_index].page, rewritten)?;
+    }
+    for (run, handle) in selected.iter().zip(form_handles) {
+        for &page_index in &run.candidate.page_indices {
+            install_page_xobject(
+                document,
+                page_data[page_index].page,
+                run.name.clone(),
+                handle,
+            )?;
+        }
+    }
+
+    let mut generated_page_xobjects = BTreeMap::<ObjectHandle, BTreeSet<Vec<u8>>>::new();
+    let mut blocks_replaced = 0usize;
+    let mut decoded_factored = 0usize;
+    for run in &selected {
+        let block_count = run
+            .candidate
+            .end_block
+            .saturating_sub(run.candidate.start_block);
+        blocks_replaced = blocks_replaced
+            .saturating_add(block_count.saturating_mul(run.candidate.page_indices.len()));
+        let mut occurrence_bytes = 0usize;
+        for &page_index in &run.candidate.page_indices {
+            let first = &page_data[page_index].blocks[run.candidate.start_block];
+            let last = &page_data[page_index].blocks[run.candidate.end_block - 1];
+            occurrence_bytes =
+                occurrence_bytes.saturating_add(last.end.saturating_sub(first.start));
+            generated_page_xobjects
+                .entry(page_data[page_index].page)
+                .or_default()
+                .insert(run.name.clone());
+        }
+        decoded_factored =
+            decoded_factored.saturating_add(occurrence_bytes.saturating_sub(run.body.len()));
+    }
+
+    Ok(VectorCompactionStats {
+        pages_compacted: affected_pages.len(),
+        decoded_bytes_removed: decoded_factored,
+        estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+        shared_run_forms_created: selected.len(),
+        shared_run_pages_rewritten: affected_pages.len(),
+        shared_run_blocks_replaced: blocks_replaced,
+        shared_run_decoded_bytes_factored: decoded_factored,
+        shared_run_estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+        generated_page_xobjects,
+        ..VectorCompactionStats::default()
+    })
+}
+
 fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
     let level = u32::try_from(flate_level.clamp(0, 9)).unwrap_or(9);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
@@ -2469,6 +3207,24 @@ pub fn compact_vector_paths_hayro(
             transformed.transformed_form_estimated_flate_bytes_saved;
         total.estimated_flate_bytes_saved += transformed.estimated_flate_bytes_saved;
         for (page, names) in &transformed.generated_page_xobjects {
+            total
+                .generated_page_xobjects
+                .entry(*page)
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+
+        let shared_runs = factor_shared_q_prefix_runs_hayro(document, flate_level, &pages)?;
+        total.pages_compacted += shared_runs.pages_compacted;
+        total.decoded_bytes_removed += shared_runs.decoded_bytes_removed;
+        total.estimated_flate_bytes_saved += shared_runs.estimated_flate_bytes_saved;
+        total.shared_run_forms_created += shared_runs.shared_run_forms_created;
+        total.shared_run_pages_rewritten += shared_runs.shared_run_pages_rewritten;
+        total.shared_run_blocks_replaced += shared_runs.shared_run_blocks_replaced;
+        total.shared_run_decoded_bytes_factored += shared_runs.shared_run_decoded_bytes_factored;
+        total.shared_run_estimated_flate_bytes_saved +=
+            shared_runs.shared_run_estimated_flate_bytes_saved;
+        for (page, names) in &shared_runs.generated_page_xobjects {
             total
                 .generated_page_xobjects
                 .entry(*page)
@@ -2842,5 +3598,67 @@ mod tests {
         let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 0);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn shared_q_block_digest_uses_resource_identity() {
+        let color = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let state = ObjectHandle::Existing(ObjectId::new(4, 0));
+        let image = ObjectHandle::Existing(ObjectId::new(5, 0));
+        let first_targets = SharedResourceTargets {
+            color_spaces: BTreeMap::from([(b"CSA".to_vec(), color)]),
+            ext_gstates: BTreeMap::from([(b"GSA".to_vec(), state)]),
+            xobjects: BTreeMap::from([(b"ImA".to_vec(), image)]),
+        };
+        let second_targets = SharedResourceTargets {
+            color_spaces: BTreeMap::from([(b"OtherCS".to_vec(), color)]),
+            ext_gstates: BTreeMap::from([(b"OtherGS".to_vec(), state)]),
+            xobjects: BTreeMap::from([(b"OtherImage".to_vec(), image)]),
+        };
+        let first =
+            b"q 0 0 m 10 0 l 10 10 l h W* n /CSA cs 1 1 1 scn /GSA gs q 1 0 0 1 2 3 cm /ImA Do Q Q";
+        let second = b"q 0 0 m 10 0 l 10 10 l h W* n /OtherCS cs 1 1 1 scn /OtherGS gs q 1 0 0 1 2 3 cm /OtherImage Do Q Q";
+        let first_blocks = factorable_shared_q_blocks(first, &first_targets);
+        let second_blocks = factorable_shared_q_blocks(second, &second_targets);
+        assert_eq!(first_blocks.len(), 1);
+        assert_eq!(second_blocks.len(), 1);
+        assert_eq!(first_blocks[0].digest, second_blocks[0].digest);
+
+        let canonical = canonicalized_shared_span(
+            first,
+            first_blocks[0].start,
+            first_blocks[0].end,
+            &first_blocks[0].resource_uses,
+        );
+        assert!(canonical.is_some());
+        let canonical = canonical.unwrap_or_default();
+        assert!(
+            canonical
+                .windows(b"PdfRedoxSharedCSO3G0".len())
+                .any(|window| { window == b"PdfRedoxSharedCSO3G0" })
+        );
+        assert!(
+            canonical
+                .windows(b"PdfRedoxSharedGSO4G0".len())
+                .any(|window| { window == b"PdfRedoxSharedGSO4G0" })
+        );
+        assert!(
+            canonical
+                .windows(b"PdfRedoxSharedXOO5G0".len())
+                .any(|window| { window == b"PdfRedoxSharedXOO5G0" })
+        );
+    }
+
+    #[test]
+    fn shared_q_block_rejects_unsupported_font_semantics() {
+        let targets = SharedResourceTargets::default();
+        let input = b"q BT /F1 12 Tf (x) Tj ET Q";
+        assert!(factorable_shared_q_blocks(input, &targets).is_empty());
+    }
+
+    #[test]
+    fn shared_q_block_gap_accepts_only_pdf_trivia() {
+        assert!(shared_gap_is_trivia(b" \n% comment\r\n\t"));
+        assert!(!shared_gap_is_trivia(b" 0 0 m "));
     }
 }
