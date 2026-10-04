@@ -327,7 +327,7 @@ fn config_from_args(args: &Args) -> Config {
     };
     cfg.flate_level = args.flate_level.unwrap_or_else(|| {
         if cfg.optimization_goal == OptimizationGoal::Processing {
-            5
+            6
         } else {
             cfg.flate_level
         }
@@ -454,7 +454,7 @@ mod tests {
     fn processing_uses_faster_flate_default() -> Result<(), clap::Error> {
         let args =
             Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
-        assert_eq!(config_from_args(&args).flate_level, 5);
+        assert_eq!(config_from_args(&args).flate_level, 6);
         Ok(())
     }
 
