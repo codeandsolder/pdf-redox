@@ -2641,6 +2641,42 @@ mod tests {
         assert_eq!(removed, 0);
         assert_eq!(output, input);
     }
+
+    #[test]
+    fn stroke_form_occurrences_match_translation_and_inherited_state() {
+        let input =
+            b"1 w 2 M q 0 0 m 1 0 l 1 1 l 0 1 l h S Q 4 w 5 M q 10 0 m 11 0 l 11 1 l 10 1 l h S Q";
+        let occurrences = stroke_form_occurrences(input).expect("parse");
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(occurrences[0].signature, occurrences[1].signature);
+        assert_eq!((occurrences[0].origin_x, occurrences[0].origin_y), (0, 0));
+        assert_eq!(
+            (occurrences[1].origin_x, occurrences[1].origin_y),
+            (1000, 0)
+        );
+        assert_eq!(occurrences[0].bbox_margin_grid, 101);
+        assert_eq!(occurrences[1].bbox_margin_grid, 1001);
+
+        let replacement =
+            stroke_form_replacement(b"PdfRedoxStroke0", &occurrences[0], &occurrences[1])
+                .expect("translation");
+        assert_eq!(replacement, b"q\n1 0 0 1 10 0 cm\n/PdfRedoxStroke0 Do\nQ\n");
+    }
+
+    #[test]
+    fn stroke_form_occurrence_rejects_open_caller_path() {
+        let input = b"0 0 m q 10 0 m 11 0 l S Q";
+        let occurrences = stroke_form_occurrences(input).expect("parse");
+        assert!(occurrences.is_empty());
+    }
+
+    #[test]
+    fn stroke_form_occurrence_rejects_unsafe_extended_graphics_state() {
+        let input = b"/GS0 gs q 0 0 m 1 0 l 1 1 l 0 1 l h S Q q 10 0 m 11 0 l 11 1 l 10 1 l h S Q";
+        let occurrences = stroke_form_occurrences(input).expect("parse");
+        assert!(occurrences.is_empty());
+    }
+
     #[test]
     fn paint_batching_is_idempotent() {
         let strokes = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
