@@ -11,6 +11,7 @@ mod error;
 mod flate;
 mod font;
 mod hidden_text;
+mod icc_alternate;
 mod images;
 mod inline_images;
 mod jpeg;

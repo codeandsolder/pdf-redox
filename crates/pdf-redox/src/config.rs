@@ -463,6 +463,10 @@ pub struct Config {
     /// Canonicalize byte- and dictionary-identical ICC profile streams referenced from
     /// `/ICCBased` color-space arrays.
     pub deduplicate_icc_profiles: bool,
+    /// Replace eligible large `/ICCBased` color spaces with their declared Device alternate.
+    /// This intentionally drops embedded color-management transforms and is therefore lossy.
+    #[serde(default)]
+    pub elide_icc_profiles_to_alternate: bool,
     /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
     pub flate_level: i32,
 }
@@ -499,6 +503,7 @@ impl Config {
             deduplicate_page_contents: true,
             deduplicate_type3_charprocs: true,
             deduplicate_icc_profiles: true,
+            elide_icc_profiles_to_alternate: false,
             flate_level: 9,
         }
     }
@@ -802,6 +807,12 @@ impl ConfigBuilder {
     /// Sets whether exact duplicate ICC profile streams are canonicalized.
     pub const fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
         self.config.deduplicate_icc_profiles = value;
+        self
+    }
+
+    /// Sets whether eligible `ICCBased` spaces are replaced by their declared Device alternate.
+    pub const fn elide_icc_profiles_to_alternate(mut self, value: bool) -> Self {
+        self.config.elide_icc_profiles_to_alternate = value;
         self
     }
 

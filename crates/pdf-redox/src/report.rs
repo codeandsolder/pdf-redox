@@ -517,6 +517,18 @@ pub struct OptimizationReport {
     pub icc_duplicate_raw_bytes: usize,
     /// Number of ICC references canonicalized.
     pub icc_references_canonicalized: usize,
+    #[serde(default)]
+    /// Number of large ICC profiles eligible for alternate-space elision.
+    pub icc_alternate_profiles_eligible: usize,
+    #[serde(default)]
+    /// Number of ICC profiles made unreachable by alternate-space elision.
+    pub icc_alternate_profiles_elided: usize,
+    #[serde(default)]
+    /// Number of `ICCBased` color-space values replaced by their declared alternate.
+    pub icc_alternate_references_rewritten: usize,
+    #[serde(default)]
+    /// Encoded ICC profile bytes made unreachable by alternate-space elision.
+    pub icc_alternate_encoded_bytes_elided: usize,
     /// Number of raster images transcoded.
     pub raster_images_transcoded: usize,
     /// Number of raster images resized.

@@ -23,6 +23,7 @@ use crate::{
         HiddenTextApplyStats, apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
         remove_large_diagonal_text_hayro,
     },
+    icc_alternate::{IccAlternateElisionStats, elide_icc_profiles_to_alternates_hayro},
     images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
     inline_images::externalize_duplicate_inline_images_hayro,
     jpeg_optimize::optimize_jpeg_entropy_hayro,
@@ -263,6 +264,13 @@ fn optimize_pdf_with_document(
             canonicalize_icc_profiles_hayro(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
+        }
+    })?;
+    let icc_alternate = timed(&mut timings, "icc-alternate-elision", || {
+        if cfg.elide_icc_profiles_to_alternate {
+            elide_icc_profiles_to_alternates_hayro(&mut document)
+        } else {
+            Ok(IccAlternateElisionStats::default())
         }
     })?;
     let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
@@ -727,6 +735,14 @@ fn optimize_pdf_with_document(
             icc_dedup.references_canonicalized, icc_dedup.duplicate_streams_detected
         ));
     }
+    if icc_alternate.references_rewritten > 0 {
+        notes.push(format!(
+            "Replaced {} ICCBased color-space value(s) with their declared Device alternate, making {} large ICC profile(s) unreachable and removing about {} encoded profile bytes. Color management is intentionally simplified.",
+            icc_alternate.references_rewritten,
+            icc_alternate.profiles_elided,
+            icc_alternate.encoded_profile_bytes_elided
+        ));
+    }
     if font_rendering.programs_optimized > 0 {
         notes.push(format!(
             "Removed PDF-rendering-unused embedded-font editing/layout tables from {} font program(s): {} -> {} encoded bytes ({} decoded table bytes removed).",
@@ -774,7 +790,7 @@ fn optimize_pdf_with_document(
     }
     if vector_compaction.path_coordinates_canonicalized > 0 {
         notes.push(format!(
-            "Canonicalized {} path-coordinate operand(s) across {} page(s) within a 0.00005 pt page-space error bound, removing about {} decoded bytes and saving about {} encoded bytes.",
+            "Canonicalized {} path-coordinate operand(s) across {} page(s) within a 0.0071 pt page-space error bound, removing about {} decoded bytes and saving about {} encoded bytes.",
             vector_compaction.path_coordinates_canonicalized,
             vector_compaction.path_coordinate_pages_rewritten,
             vector_compaction.path_coordinate_decoded_bytes_removed,
@@ -928,6 +944,10 @@ fn optimize_pdf_with_document(
         icc_duplicate_streams_detected: icc_dedup.duplicate_streams_detected,
         icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
         icc_references_canonicalized: icc_dedup.references_canonicalized,
+        icc_alternate_profiles_eligible: icc_alternate.profiles_eligible,
+        icc_alternate_profiles_elided: icc_alternate.profiles_elided,
+        icc_alternate_references_rewritten: icc_alternate.references_rewritten,
+        icc_alternate_encoded_bytes_elided: icc_alternate.encoded_profile_bytes_elided,
         raster_images_transcoded: raster_transform.images_optimized,
         raster_images_resized: raster_transform.images_resized,
         raster_jpeg_images_resized: raster_transform.jpeg_images_resized,

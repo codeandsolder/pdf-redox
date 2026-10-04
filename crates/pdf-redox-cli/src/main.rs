@@ -93,9 +93,12 @@ struct Args {
     /// Drop tagged-PDF/accessibility structure.
     #[arg(long)]
     drop_structure: bool,
-    /// Drop color-management output intents.
-    #[arg(long)]
+    /// Drop color-management output intents. Enabled automatically by processing mode.
+    #[arg(long, conflicts_with = "keep_output_intents")]
     drop_output_intents: bool,
+    /// Preserve color-management output intents even in processing mode.
+    #[arg(long, conflicts_with = "drop_output_intents")]
+    keep_output_intents: bool,
     /// Drop viewer layout/mode/preferences.
     #[arg(long)]
     drop_viewer_preferences: bool,
@@ -234,6 +237,13 @@ struct Args {
     /// Preserve separate exact duplicate ICC profile streams instead of canonicalizing them.
     #[arg(long)]
     no_icc_dedup: bool,
+    /// Replace eligible large `ICCBased` color spaces with their declared Device alternate.
+    /// Enabled automatically by --optimize-for processing.
+    #[arg(long, conflicts_with = "keep_icc_color_management")]
+    elide_icc_to_alternate: bool,
+    /// Keep embedded ICC color-management transforms even in processing mode.
+    #[arg(long, conflicts_with = "elide_icc_to_alternate")]
+    keep_icc_color_management: bool,
     /// Recursively analyze every PDF below INPUT and emit one aggregate JSON report.
     #[arg(long)]
     corpus: bool,
@@ -277,9 +287,8 @@ fn config_from_args(args: &Args) -> Config {
     if args.drop_structure {
         cfg.preservation.structure = false;
     }
-    if args.drop_output_intents {
-        cfg.preservation.output_intents = false;
-    }
+    cfg.preservation.output_intents = args.keep_output_intents
+        || (!args.drop_output_intents && !matches!(args.optimize_for, OptimizeForArg::Processing));
     if args.drop_viewer_preferences {
         cfg.preservation.viewer_preferences = false;
     }
@@ -379,6 +388,9 @@ fn config_from_args(args: &Args) -> Config {
     cfg.deduplicate_page_contents = !args.no_page_content_dedup;
     cfg.deduplicate_type3_charprocs = !args.no_type3_charproc_dedup;
     cfg.deduplicate_icc_profiles = !args.no_icc_dedup;
+    cfg.elide_icc_profiles_to_alternate = args.elide_icc_to_alternate
+        || (matches!(args.optimize_for, OptimizeForArg::Processing)
+            && !args.keep_icc_color_management);
 
     cfg
 }
@@ -455,6 +467,40 @@ mod tests {
         let args =
             Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
         assert_eq!(config_from_args(&args).flate_level, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn processing_drops_output_intents_by_default() -> Result<(), clap::Error> {
+        let args =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
+        assert!(!config_from_args(&args).preservation.output_intents);
+
+        let keep = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--optimize-for",
+            "processing",
+            "--keep-output-intents",
+        ])?;
+        assert!(config_from_args(&keep).preservation.output_intents);
+        Ok(())
+    }
+
+    #[test]
+    fn processing_elides_eligible_icc_profiles_by_default() -> Result<(), clap::Error> {
+        let args =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
+        assert!(config_from_args(&args).elide_icc_profiles_to_alternate);
+
+        let keep = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--optimize-for",
+            "processing",
+            "--keep-icc-color-management",
+        ])?;
+        assert!(!config_from_args(&keep).elide_icc_profiles_to_alternate);
         Ok(())
     }
 

@@ -1545,11 +1545,11 @@ impl PathCoordinateCandidateScanner {
                 if !value.is_finite() {
                     return false;
                 }
-                let scaled = value * 10_000.0;
+                let scaled = value * PATH_COORDINATE_SCALE;
                 if !scaled.is_finite() {
                     return false;
                 }
-                let rounded = scaled.round() / 10_000.0;
+                let rounded = scaled.round() / PATH_COORDINATE_SCALE;
                 if rounded.to_bits() == value.to_bits()
                     || (rounded - value).abs() > MAX_PATH_COORDINATE_PAGE_ERROR_PT
                 {
@@ -3184,8 +3184,8 @@ fn factor_shared_q_prefix_runs_hayro(
     })
 }
 
-const PATH_COORDINATE_SCALE: f64 = 10_000.0;
-const MAX_PATH_COORDINATE_PAGE_ERROR_PT: f64 = 0.000_05;
+const PATH_COORDINATE_SCALE: f64 = 100.0;
+const MAX_PATH_COORDINATE_PAGE_ERROR_PT: f64 = 0.0071;
 const MIN_PATH_COORDINATE_FLATE_SAVINGS: usize = 4 * 1024;
 const PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR: usize = 200;
 
@@ -3232,7 +3232,7 @@ impl<'a> PathCoordinateScanner<'a> {
 
     fn rounded_coordinate_bytes(value: f64) -> Option<Vec<u8>> {
         let rounded = Self::rounded_coordinate(value)?;
-        let mut out = format!("{rounded:.4}");
+        let mut out = format!("{rounded:.2}");
         while out.contains('.') && out.ends_with('0') {
             out.pop();
         }
@@ -4173,25 +4173,25 @@ mod tests {
 
     #[test]
     fn path_coordinate_canonicalization_respects_ctm_magnification() {
-        let input = b"100 0 0 100 0 0 cm 1.00004 2.00004 m 3.00004 4.00004 l S";
+        let input = b"100 0 0 100 0 0 cm 1.004 2.004 m 3.004 4.004 l S";
         assert!(canonicalize_path_coordinates(input, 1.0).is_none());
     }
 
     #[test]
     fn path_coordinate_canonicalization_checks_rectangle_far_corner() {
-        let input = b"1.00004 2 3.00004 4 re f";
+        let input = b"1.004 2 3.004 4 re f";
         assert!(canonicalize_path_coordinates(input, 1.0).is_none());
     }
 
     #[test]
     fn path_coordinate_canonicalization_restores_ctm_across_q() {
-        let input = b"q 100 0 0 100 0 0 cm 1.00004 2 m S Q 5.00003 6.00003 m S";
+        let input = b"q 100 0 0 100 0 0 cm 1.004 2 m S Q 5.003 6.003 m S";
         let Some((output, count)) = canonicalize_path_coordinates(input, 1.0) else {
             panic!("expected outer path rewrite");
         };
         let output = String::from_utf8_lossy(&output);
         assert_eq!(count, 2);
-        assert!(output.contains("1.00004 2 m"));
+        assert!(output.contains("1.004 2 m"));
         assert!(output.contains("5 6 m"));
     }
 }
