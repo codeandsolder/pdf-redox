@@ -65,7 +65,7 @@ jobs:
         git diff --check
         cargo +1.98.1 clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo +1.98.1 test --locked --workspace --all-features
-        RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --locked --workspace --all-features --no-deps
+        RUSTDOCFLAGS=-Dwarnings cargo +1.98.1 doc --locked --workspace --all-features --no-deps
       rust-toolchain: "1.98.1"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
