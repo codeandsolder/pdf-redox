@@ -579,8 +579,15 @@ fn optimize_pdf_with_document(
             Ok(MicrostrokeRasterStats::default())
         }
     })?;
+    let adaptive_flate_high_effort =
+        cfg.optimization_goal == crate::OptimizationGoal::Processing && cfg.flate_level == 6;
     let flate = timed(&mut timings, "flate-policy", || {
-        apply_flate_policy_hayro(&mut document, cfg.flate_policy, cfg.flate_level)
+        apply_flate_policy_hayro(
+            &mut document,
+            cfg.flate_policy,
+            cfg.flate_level,
+            adaptive_flate_high_effort,
+        )
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.normalize_content_streams {
@@ -603,8 +610,12 @@ fn optimize_pdf_with_document(
 
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
-    timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams_hayro(&mut document, cfg.flate_level)
+    let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
+        compress_unfiltered_streams_hayro(
+            &mut document,
+            cfg.flate_level,
+            adaptive_flate_high_effort,
+        )
     })?;
     let output = timed(&mut timings, "writer", || {
         crate::writer::write_pdf_with_options(
@@ -934,6 +945,25 @@ fn optimize_pdf_with_document(
         ));
     }
 
+    let adaptive_flate_streams_tested = flate
+        .high_effort_streams_tested
+        .saturating_add(unfiltered_flate.high_effort_streams_tested);
+    let adaptive_flate_streams_selected = flate
+        .high_effort_streams_selected
+        .saturating_add(unfiltered_flate.high_effort_streams_selected);
+    let adaptive_flate_extra_savings = flate
+        .high_effort_extra_savings_bytes
+        .saturating_add(unfiltered_flate.high_effort_extra_savings_bytes);
+    if adaptive_flate_streams_selected > 0 {
+        notes.push(format!(
+            "Selected high-effort Flate for {} of {} highly-compressible large stream(s), saving about {} additional encoded bytes beyond level {}.",
+            adaptive_flate_streams_selected,
+            adaptive_flate_streams_tested,
+            adaptive_flate_extra_savings,
+            cfg.flate_level
+        ));
+    }
+
     let input_bytes = before.input_bytes;
     let saved_bytes = signed_size_delta(input_bytes, output.len());
     let saved_percent = savings_percent(saved_bytes, input_bytes);
@@ -1149,6 +1179,9 @@ fn optimize_pdf_with_document(
         print_target_pixels: print_plan.stats.target_pixels,
         flate_streams_selected_for_recompression: flate.streams_selected,
         flate_estimated_savings_bytes: flate.estimated_savings_bytes,
+        flate_high_effort_streams_tested: adaptive_flate_streams_tested,
+        flate_high_effort_streams_selected: adaptive_flate_streams_selected,
+        flate_high_effort_extra_savings_bytes: adaptive_flate_extra_savings,
         preservation_pages: preservation.pages,
         preservation_annotation_entries_seen: preservation.annotation_entries_seen,
         preservation_annotation_entries_flattened: preservation.annotation_entries_flattened,

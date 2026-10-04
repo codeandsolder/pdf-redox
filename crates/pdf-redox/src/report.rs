@@ -798,6 +798,15 @@ pub struct OptimizationReport {
     pub flate_streams_selected_for_recompression: usize,
     /// Estimated encoded-byte saving from the Flate streams selected for recompression.
     pub flate_estimated_savings_bytes: usize,
+    /// Number of large highly-compressible streams that received a high-effort Flate trial.
+    #[serde(default)]
+    pub flate_high_effort_streams_tested: usize,
+    /// Number of streams for which high-effort Flate beat the configured baseline and was installed.
+    #[serde(default)]
+    pub flate_high_effort_streams_selected: usize,
+    /// Additional encoded bytes saved by selected high-effort Flate beyond the configured baseline.
+    #[serde(default)]
+    pub flate_high_effort_extra_savings_bytes: usize,
     #[serde(default)]
     /// Number of preservation pages.
     pub preservation_pages: usize,
