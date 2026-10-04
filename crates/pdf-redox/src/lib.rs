@@ -3,6 +3,7 @@
 
 mod analyze;
 mod bilevel;
+mod cff_cid;
 mod config;
 mod content;
 mod dedup;

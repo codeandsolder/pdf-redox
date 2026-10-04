@@ -32,15 +32,20 @@ const CIDFONT_TYPE2_UNUSED_TABLES: [[u8; 4]; 2] = [*b"cmap", *b"post"];
 struct FontProgramUsage {
     simple_truetype: bool,
     cidfont_type2: bool,
+    cidfont_type0: bool,
 }
 
 impl FontProgramUsage {
     const fn cidfont_type2_only(self) -> bool {
-        self.cidfont_type2 && !self.simple_truetype
+        self.cidfont_type2 && !self.simple_truetype && !self.cidfont_type0
+    }
+
+    const fn cidfont_type0_only(self) -> bool {
+        self.cidfont_type0 && !self.simple_truetype && !self.cidfont_type2
     }
 
     const fn simple_truetype_only(self) -> bool {
-        self.simple_truetype && !self.cidfont_type2
+        self.simple_truetype && !self.cidfont_type2 && !self.cidfont_type0
     }
 }
 
@@ -1446,16 +1451,33 @@ fn resolved_owned_dictionary(
         .and_then(|value| value.as_dictionary().cloned()))
 }
 
-fn descriptor_program_ref(
+fn descriptor_program_ref_for(
     document: &EditDocument,
     descriptor: Option<&OwnedObject>,
+    key: &[u8],
 ) -> Result<Option<CowObjectHandle>> {
     let Some(descriptor) = resolved_owned_dictionary(document, descriptor)? else {
         return Ok(None);
     };
-    Ok(direct_owned_reference(
-        descriptor.get(b"FontFile2".as_slice()),
-    ))
+    Ok(direct_owned_reference(descriptor.get(key)))
+}
+
+fn descriptor_program_ref(
+    document: &EditDocument,
+    descriptor: Option<&OwnedObject>,
+) -> Result<Option<CowObjectHandle>> {
+    descriptor_program_ref_for(document, descriptor, b"FontFile2")
+}
+
+fn is_cidfont_type0c_program(document: &EditDocument, program: CowObjectHandle) -> Result<bool> {
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(program)?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            == Some(b"CIDFontType0C"),
+    )
 }
 
 fn union_fontfile2_program(
@@ -1552,6 +1574,7 @@ fn page_font_program(
     if subtype.as_deref() != Some(b"Type0") {
         return Ok(None);
     }
+
     let encoding = owned_name_value(document, font.get(b"Encoding".as_slice()))?;
     let identity_encoding = matches!(encoding.as_deref(), Some(b"Identity-H" | b"Identity-V"));
     let Some(descendants) = font.get(b"DescendantFonts".as_slice()) else {
@@ -1566,27 +1589,47 @@ fn page_font_program(
     let Some(cid_font) = resolved_owned_dictionary(document, descendants.first())? else {
         return Ok(None);
     };
-    if owned_name_value(document, cid_font.get(b"Subtype".as_slice()))?.as_deref()
-        != Some(b"CIDFontType2")
-    {
-        return Ok(None);
+    let cid_subtype = owned_name_value(document, cid_font.get(b"Subtype".as_slice()))?;
+
+    match cid_subtype.as_deref() {
+        Some(b"CIDFontType2") => {
+            let Some(program) =
+                descriptor_program_ref(document, cid_font.get(b"FontDescriptor".as_slice()))?
+            else {
+                return Ok(None);
+            };
+            if !identity_encoding {
+                return Ok(Some(PageCidFontProgram::Unsafe(program)));
+            }
+            let Some(mapping) =
+                cid_to_gid_mapping(document, cid_font.get(b"CIDToGIDMap".as_slice()))?
+            else {
+                return Ok(Some(PageCidFontProgram::Unsafe(program)));
+            };
+            Ok(Some(PageCidFontProgram::Eligible(CidFontGlyphSpec {
+                program,
+                mapping,
+            })))
+        }
+        Some(b"CIDFontType0") => {
+            let Some(program) = descriptor_program_ref_for(
+                document,
+                cid_font.get(b"FontDescriptor".as_slice()),
+                b"FontFile3",
+            )?
+            else {
+                return Ok(None);
+            };
+            if !identity_encoding || !is_cidfont_type0c_program(document, program)? {
+                return Ok(Some(PageCidFontProgram::Unsafe(program)));
+            }
+            Ok(Some(PageCidFontProgram::Eligible(CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            })))
+        }
+        _ => Ok(None),
     }
-    let Some(program) =
-        descriptor_program_ref(document, cid_font.get(b"FontDescriptor".as_slice()))?
-    else {
-        return Ok(None);
-    };
-    if !identity_encoding {
-        return Ok(Some(PageCidFontProgram::Unsafe(program)));
-    }
-    let Some(mapping) = cid_to_gid_mapping(document, cid_font.get(b"CIDToGIDMap".as_slice()))?
-    else {
-        return Ok(Some(PageCidFontProgram::Unsafe(program)));
-    };
-    Ok(Some(PageCidFontProgram::Eligible(CidFontGlyphSpec {
-        program,
-        mapping,
-    })))
 }
 
 struct IdentityCidGlyphScanner<'a> {
@@ -2030,10 +2073,17 @@ fn inspect_hayro_font_dictionary(
             Some(b"TrueType") => FontProgramUsage {
                 simple_truetype: true,
                 cidfont_type2: false,
+                cidfont_type0: false,
             },
             Some(b"CIDFontType2") => FontProgramUsage {
                 simple_truetype: false,
                 cidfont_type2: true,
+                cidfont_type0: false,
+            },
+            Some(b"CIDFontType0") => FontProgramUsage {
+                simple_truetype: false,
+                cidfont_type2: false,
+                cidfont_type0: true,
             },
             _ => FontProgramUsage::default(),
         };
@@ -2062,10 +2112,17 @@ fn inspect_owned_font_dictionary(
                 Some(b"TrueType") => FontProgramUsage {
                     simple_truetype: true,
                     cidfont_type2: false,
+                    cidfont_type0: false,
                 },
                 Some(b"CIDFontType2") => FontProgramUsage {
                     simple_truetype: false,
                     cidfont_type2: true,
+                    cidfont_type0: false,
+                },
+                Some(b"CIDFontType0") => FontProgramUsage {
+                    simple_truetype: false,
+                    cidfont_type2: false,
+                    cidfont_type0: true,
                 },
                 _ => FontProgramUsage::default(),
             };
@@ -2090,6 +2147,7 @@ fn merge_program_usage(
     let merged = program_usage.entry(program).or_default();
     merged.simple_truetype |= usage.simple_truetype;
     merged.cidfont_type2 |= usage.cidfont_type2;
+    merged.cidfont_type0 |= usage.cidfont_type0;
 }
 
 fn hayro_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
@@ -2101,10 +2159,17 @@ fn hayro_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
         Some(b"TrueType") => FontProgramUsage {
             simple_truetype: true,
             cidfont_type2: false,
+            cidfont_type0: false,
         },
         Some(b"CIDFontType2") => FontProgramUsage {
             simple_truetype: false,
             cidfont_type2: true,
+            cidfont_type0: false,
+        },
+        Some(b"CIDFontType0") => FontProgramUsage {
+            simple_truetype: false,
+            cidfont_type2: false,
+            cidfont_type0: true,
         },
         _ => FontProgramUsage::default(),
     }
@@ -2192,10 +2257,17 @@ fn owned_dictionary_font_usage(
             Some(b"TrueType") => FontProgramUsage {
                 simple_truetype: true,
                 cidfont_type2: false,
+                cidfont_type0: false,
             },
             Some(b"CIDFontType2") => FontProgramUsage {
                 simple_truetype: false,
                 cidfont_type2: true,
+                cidfont_type0: false,
+            },
+            Some(b"CIDFontType0") => FontProgramUsage {
+                simple_truetype: false,
+                cidfont_type2: false,
+                cidfont_type0: true,
             },
             _ => FontProgramUsage::default(),
         },
@@ -2436,6 +2508,7 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
         let merged = descriptor_usage.entry(descriptor).or_default();
         merged.simple_truetype |= usage.simple_truetype;
         merged.cidfont_type2 |= usage.cidfont_type2;
+        merged.cidfont_type0 |= usage.cidfont_type0;
     }
 
     let mut program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
@@ -2539,6 +2612,7 @@ pub fn strip_font_editing_tables_hayro(
         let merged = descriptor_usage.entry(descriptor).or_default();
         merged.simple_truetype |= usage.simple_truetype;
         merged.cidfont_type2 |= usage.cidfont_type2;
+        merged.cidfont_type0 |= usage.cidfont_type0;
     }
 
     let mut program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
@@ -2588,6 +2662,15 @@ pub fn strip_font_editing_tables_hayro(
             true
         });
         if allow_outline_subset
+            && usage.cidfont_type0_only()
+            && let Some(cids) = identity_glyph_usage.get(&program)
+            && !cids.is_empty()
+            && let Some((subset, removed)) = crate::cff_cid::subset_cid_font(&candidate, cids)
+        {
+            candidate = subset;
+            removed_outline_bytes = removed;
+            changed = true;
+        } else if allow_outline_subset
             && usage.cidfont_type2_only()
             && let Some(gids) = identity_glyph_usage.get(&program)
             && !gids.is_empty()
@@ -3144,6 +3227,7 @@ mod tests {
         let cid_usage = FontProgramUsage {
             simple_truetype: false,
             cidfont_type2: true,
+            cidfont_type0: false,
         };
         let Some((trimmed, _)) = sfnt_for_pdf_rendering(&source, cid_usage) else {
             return Err(Error::Invalid("expected CID-only table removal".to_owned()));
@@ -3155,6 +3239,7 @@ mod tests {
         let simple_usage = FontProgramUsage {
             simple_truetype: true,
             cidfont_type2: false,
+            cidfont_type0: false,
         };
         let Some((simple, _)) = sfnt_for_pdf_rendering(&source, simple_usage) else {
             return Err(Error::Invalid("expected metadata table removal".to_owned()));
