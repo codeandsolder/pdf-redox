@@ -528,6 +528,24 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Bytes removed by font glyph outline.
     pub font_glyph_outline_bytes_removed: usize,
+    /// Number of `CIDFontType2` TrueType programs densely GID-remapped.
+    #[serde(default)]
+    pub font_dense_programs_remapped: usize,
+    /// Number of explicit `CIDToGIDMap` streams rewritten for dense GIDs.
+    #[serde(default)]
+    pub font_dense_cid_to_gid_maps_rewritten: usize,
+    /// Number of dead TrueType glyph slots removed by dense GID compaction.
+    #[serde(default)]
+    pub font_dense_glyph_slots_removed: usize,
+    /// Decoded font-program bytes removed by dense GID compaction.
+    #[serde(default)]
+    pub font_dense_decoded_bytes_removed: usize,
+    /// Original encoded bytes for dense-remapped font programs plus maps.
+    #[serde(default)]
+    pub font_dense_original_encoded_bytes: usize,
+    /// Optimized encoded bytes for dense-remapped font programs plus maps.
+    #[serde(default)]
+    pub font_dense_optimized_encoded_bytes: usize,
     /// Number of to unicode duplicate streams detected.
     pub to_unicode_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to to unicode duplicate.

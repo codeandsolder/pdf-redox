@@ -16,8 +16,8 @@ use crate::{
     },
     flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
     font::{
-        FontOptimizationStats, strip_font_editing_tables_hayro,
-        union_sparse_cid_font_programs_after_dedup_hayro,
+        FontOptimizationStats, dense_compact_cidfont_type2_programs_hayro,
+        strip_font_editing_tables_hayro, union_sparse_cid_font_programs_after_dedup_hayro,
     },
     hidden_text::{
         HiddenTextApplyStats, apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
@@ -248,6 +248,15 @@ fn optimize_pdf_with_document(
     font_rendering.optimized_encoded_bytes += font_sparse_union.optimized_encoded_bytes;
     font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
     font_rendering.glyph_outline_bytes_removed += font_sparse_union.glyph_outline_bytes_removed;
+    let font_dense = timed(&mut timings, "font-dense-gid", || {
+        if cfg.preservation.font_editing_support
+            || cfg.optimization_goal != crate::OptimizationGoal::Processing
+        {
+            Ok(FontOptimizationStats::default())
+        } else {
+            dense_compact_cidfont_type2_programs_hayro(&mut document, cfg.flate_level)
+        }
+    })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
         if cfg.deduplicate_to_unicode_cmaps {
             canonicalize_to_unicode_cmaps_hayro(&mut document)
@@ -801,6 +810,17 @@ fn optimize_pdf_with_document(
             font_rendering.glyph_outline_bytes_removed
         ));
     }
+    if font_dense.programs_dense_remapped > 0 {
+        notes.push(format!(
+            "Densely remapped {} CIDFontType2 TrueType program(s), rewriting {} explicit CIDToGIDMap stream(s), removing {} dead glyph slot(s) and about {} decoded font bytes ({} -> {} encoded bytes including maps).",
+            font_dense.programs_dense_remapped,
+            font_dense.cid_to_gid_maps_rewritten,
+            font_dense.dense_glyph_slots_removed,
+            font_dense.dense_decoded_bytes_removed,
+            font_dense.original_encoded_bytes,
+            font_dense.optimized_encoded_bytes
+        ));
+    }
     if vector_compaction.path_forms_created > 0 {
         notes.push(format!(
             "Factored {} repeated painted path block(s) into Form XObjects across {} page(s), replacing {} occurrence(s) and removing about {} decoded duplicate bytes.",
@@ -1021,6 +1041,12 @@ fn optimize_pdf_with_document(
         font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
         font_programs_glyph_subset: font_rendering.programs_glyph_subset,
         font_glyph_outline_bytes_removed: font_rendering.glyph_outline_bytes_removed,
+        font_dense_programs_remapped: font_dense.programs_dense_remapped,
+        font_dense_cid_to_gid_maps_rewritten: font_dense.cid_to_gid_maps_rewritten,
+        font_dense_glyph_slots_removed: font_dense.dense_glyph_slots_removed,
+        font_dense_decoded_bytes_removed: font_dense.dense_decoded_bytes_removed,
+        font_dense_original_encoded_bytes: font_dense.original_encoded_bytes,
+        font_dense_optimized_encoded_bytes: font_dense.optimized_encoded_bytes,
         to_unicode_duplicate_streams_detected: to_unicode_dedup.duplicate_streams_detected,
         to_unicode_duplicate_raw_bytes: to_unicode_dedup.duplicate_raw_bytes,
         to_unicode_references_canonicalized: to_unicode_dedup.references_canonicalized,

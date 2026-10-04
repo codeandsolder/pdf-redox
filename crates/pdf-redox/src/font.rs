@@ -53,6 +53,10 @@ impl FontProgramUsage {
 pub struct FontOptimizationStats {
     pub programs_optimized: usize,
     pub programs_glyph_subset: usize,
+    pub programs_dense_remapped: usize,
+    pub cid_to_gid_maps_rewritten: usize,
+    pub dense_glyph_slots_removed: usize,
+    pub dense_decoded_bytes_removed: usize,
     pub original_encoded_bytes: usize,
     pub optimized_encoded_bytes: usize,
     pub decoded_table_bytes_removed: usize,
@@ -692,6 +696,325 @@ fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
         output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
     }
     Some((output, removed_glyph_bytes))
+}
+
+#[derive(Debug, Clone)]
+struct DenseGlyphSubset {
+    bytes: Vec<u8>,
+    old_to_new: Vec<Option<u16>>,
+    removed_decoded_bytes: usize,
+}
+
+fn trivial_merg_is_gid_invariant(table: &[u8]) -> bool {
+    // MERG with zero ClassDef tables contains no glyph IDs. The merge-entry
+    // matrix is indexed only by merge class and can therefore survive a GID
+    // renumber unchanged.
+    table.len() >= 10 && be16(table, 0) == Some(0) && be16(table, 6) == Some(0)
+}
+
+fn remap_composite_components(glyph: &mut [u8], old_to_new: &[Option<u16>]) -> Option<()> {
+    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+    const WE_HAVE_A_SCALE: u16 = 0x0008;
+    const MORE_COMPONENTS: u16 = 0x0020;
+    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+    const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
+
+    if glyph.len() < 10 {
+        return Some(());
+    }
+    let contours = i16::from_be_bytes([glyph[0], glyph[1]]);
+    if contours >= 0 {
+        return Some(());
+    }
+
+    let mut offset = 10usize;
+    loop {
+        let flags = be16(glyph, offset)?;
+        let old_gid = usize::from(be16(glyph, offset + 2)?);
+        let new_gid = old_to_new.get(old_gid).copied().flatten()?;
+        glyph[offset + 2..offset + 4].copy_from_slice(&new_gid.to_be_bytes());
+
+        offset = offset.checked_add(4)?;
+        offset = offset.checked_add(if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+            4
+        } else {
+            2
+        })?;
+        offset = offset.checked_add(if flags & WE_HAVE_A_SCALE != 0 {
+            2
+        } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+            4
+        } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
+            8
+        } else {
+            0
+        })?;
+        if offset > glyph.len() {
+            return None;
+        }
+        if flags & MORE_COMPONENTS == 0 {
+            if flags & WE_HAVE_INSTRUCTIONS != 0 {
+                let instruction_len = usize::from(be16(glyph, offset)?);
+                offset = offset.checked_add(2)?.checked_add(instruction_len)?;
+                if offset > glyph.len() {
+                    return None;
+                }
+            }
+            break;
+        }
+    }
+    Some(())
+}
+
+fn sfnt_hmetric(
+    hmtx: &[u8],
+    glyph_count: usize,
+    long_metric_count: usize,
+    gid: usize,
+) -> Option<(u16, [u8; 2])> {
+    if long_metric_count == 0 || long_metric_count > glyph_count || gid >= glyph_count {
+        return None;
+    }
+    let long_bytes = long_metric_count.checked_mul(4)?;
+    let trailing_count = glyph_count.checked_sub(long_metric_count)?;
+    let required = long_bytes.checked_add(trailing_count.checked_mul(2)?)?;
+    if hmtx.len() < required {
+        return None;
+    }
+
+    let advance_offset = if gid < long_metric_count {
+        gid.checked_mul(4)?
+    } else {
+        long_metric_count.checked_sub(1)?.checked_mul(4)?
+    };
+    let advance = be16(hmtx, advance_offset)?;
+    let lsb_offset = if gid < long_metric_count {
+        advance_offset.checked_add(2)?
+    } else {
+        long_bytes.checked_add(gid.checked_sub(long_metric_count)?.checked_mul(2)?)?
+    };
+    Some((
+        advance,
+        [*hmtx.get(lsb_offset)?, *hmtx.get(lsb_offset + 1)?],
+    ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "dense SFNT reconstruction shares glyph closure, composite remapping, metrics, loca, and checksum invariants that are safer to audit together"
+)]
+fn sfnt_compact_glyph_ids(
+    bytes: &[u8],
+    requested_gids: &BTreeSet<u16>,
+) -> Option<DenseGlyphSubset> {
+    if bytes.len() < 12 || bytes.get(..4)? != [0, 1, 0, 0] {
+        return None;
+    }
+
+    let table_count = usize::from(be16(bytes, 4)?);
+    for index in 0..table_count {
+        let record = 12usize.checked_add(index.checked_mul(16)?)?;
+        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
+        match &tag {
+            b"head" | b"hhea" | b"maxp" | b"hmtx" | b"glyf" | b"loca" | b"fpgm" | b"prep"
+            | b"cvt " | b"gasp" | b"meta" => {}
+            b"MERG" => {
+                let table = sfnt_table(bytes, tag)?;
+                if !trivial_merg_is_gid_invariant(table) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let maxp = sfnt_table(bytes, *b"maxp")?;
+    let head = sfnt_table(bytes, *b"head")?;
+    let hhea = sfnt_table(bytes, *b"hhea")?;
+    let hmtx = sfnt_table(bytes, *b"hmtx")?;
+    let glyf = sfnt_table(bytes, *b"glyf")?;
+    if maxp.len() < 6 || head.len() < 52 || hhea.len() < 36 {
+        return None;
+    }
+    let glyph_count = usize::from(be16(maxp, 4)?);
+    if glyph_count == 0
+        || requested_gids
+            .iter()
+            .any(|gid| usize::from(*gid) >= glyph_count)
+    {
+        return None;
+    }
+    let offsets = sfnt_glyph_offsets(bytes)?;
+    let loca_format = i16::from_be_bytes([head[50], head[51]]);
+    let long_metric_count = usize::from(be16(hhea, 34)?);
+    // Validate the metric table before doing any mutation.
+    let _ = sfnt_hmetric(
+        hmtx,
+        glyph_count,
+        long_metric_count,
+        glyph_count.checked_sub(1)?,
+    )?;
+
+    let mut keep = vec![false; glyph_count];
+    keep[0] = true;
+    let mut pending = VecDeque::from([0usize]);
+    for gid in requested_gids {
+        let gid = usize::from(*gid);
+        if !keep[gid] {
+            keep[gid] = true;
+            pending.push_back(gid);
+        }
+    }
+    while let Some(gid) = pending.pop_front() {
+        let glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
+        for component in composite_components(glyph)? {
+            let component = usize::from(component);
+            if component >= glyph_count {
+                return None;
+            }
+            if !keep[component] {
+                keep[component] = true;
+                pending.push_back(component);
+            }
+        }
+    }
+
+    let kept = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(gid, keep)| keep.then_some(gid))
+        .collect::<Vec<_>>();
+    if kept.len() >= glyph_count {
+        return None;
+    }
+    let new_count = u16::try_from(kept.len()).ok()?;
+    let mut old_to_new = vec![None; glyph_count];
+    for (new_gid, old_gid) in kept.iter().copied().enumerate() {
+        old_to_new[old_gid] = Some(u16::try_from(new_gid).ok()?);
+    }
+
+    let alignment = if loca_format == 0 { 2usize } else { 4usize };
+    let mut rebuilt_glyf = Vec::new();
+    let mut rebuilt_offsets = Vec::with_capacity(kept.len() + 1);
+    for old_gid in &kept {
+        rebuilt_offsets.push(rebuilt_glyf.len());
+        let mut glyph = glyf.get(offsets[*old_gid]..offsets[*old_gid + 1])?.to_vec();
+        remap_composite_components(&mut glyph, &old_to_new)?;
+        rebuilt_glyf.extend_from_slice(&glyph);
+        while rebuilt_glyf.len() % alignment != 0 {
+            rebuilt_glyf.push(0);
+        }
+    }
+    rebuilt_offsets.push(rebuilt_glyf.len());
+
+    let mut rebuilt_loca = Vec::with_capacity(match loca_format {
+        0 => (kept.len() + 1).checked_mul(2)?,
+        1 => (kept.len() + 1).checked_mul(4)?,
+        _ => return None,
+    });
+    match loca_format {
+        0 => {
+            for offset in &rebuilt_offsets {
+                if offset % 2 != 0 || offset / 2 > usize::from(u16::MAX) {
+                    return None;
+                }
+                rebuilt_loca.extend_from_slice(&u16::try_from(offset / 2).ok()?.to_be_bytes());
+            }
+        }
+        1 => {
+            for offset in &rebuilt_offsets {
+                rebuilt_loca.extend_from_slice(&u32::try_from(*offset).ok()?.to_be_bytes());
+            }
+        }
+        _ => return None,
+    }
+
+    let mut rebuilt_hmtx = Vec::with_capacity(kept.len().checked_mul(4)?);
+    for old_gid in &kept {
+        let (advance, lsb) = sfnt_hmetric(hmtx, glyph_count, long_metric_count, *old_gid)?;
+        rebuilt_hmtx.extend_from_slice(&advance.to_be_bytes());
+        rebuilt_hmtx.extend_from_slice(&lsb);
+    }
+    let mut rebuilt_hhea = hhea.to_vec();
+    rebuilt_hhea[34..36].copy_from_slice(&new_count.to_be_bytes());
+
+    let mut rebuilt_maxp = maxp.to_vec();
+    rebuilt_maxp[4..6].copy_from_slice(&new_count.to_be_bytes());
+
+    let mut tables = Vec::<([u8; 4], Vec<u8>)>::with_capacity(table_count);
+    for index in 0..table_count {
+        let record = 12usize.checked_add(index.checked_mul(16)?)?;
+        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
+        let data = match &tag {
+            b"glyf" => rebuilt_glyf.clone(),
+            b"loca" => rebuilt_loca.clone(),
+            b"hmtx" => rebuilt_hmtx.clone(),
+            b"hhea" => rebuilt_hhea.clone(),
+            b"maxp" => rebuilt_maxp.clone(),
+            _ => {
+                let (offset, length) = sfnt_table_record(bytes, tag)?;
+                let mut data = bytes.get(offset..offset.checked_add(length)?)?.to_vec();
+                if tag == *b"head" {
+                    if data.len() < 12 {
+                        return None;
+                    }
+                    data[8..12].fill(0);
+                }
+                data
+            }
+        };
+        tables.push((tag, data));
+    }
+    tables.sort_unstable_by_key(|(tag, _)| *tag);
+
+    let new_table_count = tables.len();
+    let max_power = 1_usize << (usize::BITS - 1 - new_table_count.leading_zeros());
+    let search_range = u16::try_from(max_power.checked_mul(16)?).ok()?;
+    let entry_selector = u16::try_from(max_power.trailing_zeros()).ok()?;
+    let range_shift = u16::try_from(new_table_count.checked_mul(16)?)
+        .ok()?
+        .checked_sub(search_range)?;
+
+    let mut output = Vec::with_capacity(bytes.len());
+    output.extend_from_slice(&bytes[..4]);
+    output.extend_from_slice(&u16::try_from(new_table_count).ok()?.to_be_bytes());
+    output.extend_from_slice(&search_range.to_be_bytes());
+    output.extend_from_slice(&entry_selector.to_be_bytes());
+    output.extend_from_slice(&range_shift.to_be_bytes());
+    let directory_offset = output.len();
+    output.resize(directory_offset + new_table_count * 16, 0);
+
+    let mut head_offset = None;
+    for (index, (tag, data)) in tables.iter().enumerate() {
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+        let offset = output.len();
+        output.extend_from_slice(data);
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+        let record = directory_offset + index * 16;
+        output[record..record + 4].copy_from_slice(tag);
+        output[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
+        output[record + 8..record + 12].copy_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
+        output[record + 12..record + 16]
+            .copy_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
+        if tag == b"head" {
+            head_offset = Some(offset);
+        }
+    }
+    if let Some(offset) = head_offset {
+        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
+        output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
+    }
+
+    Some(DenseGlyphSubset {
+        removed_decoded_bytes: bytes.len().saturating_sub(output.len()),
+        bytes: output,
+        old_to_new,
+    })
 }
 
 fn subset_base_font_name(name: &[u8]) -> Vec<u8> {
@@ -2470,6 +2793,371 @@ fn replace_current_stream_data(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DenseCidProgramUsers {
+    maps: BTreeSet<CowObjectHandle>,
+    unsafe_mapping: bool,
+}
+
+fn collect_dense_cidfont_users_from_object(
+    document: &EditDocument,
+    object: &OwnedObject,
+    users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+                == Some(b"CIDFontType2")
+                && let Some(program) =
+                    descriptor_program_ref(document, dictionary.get(b"FontDescriptor".as_slice()))?
+            {
+                let entry = users.entry(program).or_default();
+                match dictionary.get(b"CIDToGIDMap".as_slice()) {
+                    Some(OwnedObject::Reference(map))
+                        if matches!(
+                            document.current_owned_object(*map)?,
+                            Some(OwnedObject::Stream { .. })
+                        ) =>
+                    {
+                        entry.maps.insert(*map);
+                    }
+                    _ => entry.unsafe_mapping = true,
+                }
+            }
+            for value in dictionary.values() {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_dense_cidfont_users_from_object(document, value, users)?;
+                }
+            }
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_dense_cidfont_users_from_object(document, value, users)?;
+                }
+            }
+        }
+        OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_)
+        | OwnedObject::Reference(_) => {}
+    }
+    Ok(())
+}
+
+fn dense_cid_program_users(
+    document: &EditDocument,
+) -> Result<HashMap<CowObjectHandle, DenseCidProgramUsers>> {
+    let mut users = HashMap::new();
+    for handle in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        collect_dense_cidfont_users_from_object(document, &object, &mut users)?;
+    }
+    Ok(users)
+}
+
+fn current_font_program_usage(
+    document: &EditDocument,
+) -> Result<HashMap<CowObjectHandle, FontProgramUsage>> {
+    let mut descriptor_usage_edges = Vec::new();
+    let mut descriptor_program_edges = Vec::new();
+    let mut direct_program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
+    document.walk_output_objects(|handle, object| match object {
+        CurrentObject::Source(object) => {
+            match &object {
+                HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
+                    handle,
+                    dictionary,
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                ),
+                HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
+                    handle,
+                    stream.dict(),
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                ),
+                _ => {}
+            }
+            inspect_hayro_direct_font_object(
+                &object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            );
+            Ok(())
+        }
+        CurrentObject::Owned(object) => {
+            if let Some(dictionary) = object.as_dictionary() {
+                inspect_owned_font_dictionary(
+                    document,
+                    handle,
+                    dictionary,
+                    &mut descriptor_usage_edges,
+                    &mut descriptor_program_edges,
+                )?;
+            }
+            inspect_owned_direct_font_object(
+                document,
+                object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            )?;
+            Ok(())
+        }
+    })?;
+
+    let mut descriptor_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
+    for (descriptor, usage) in descriptor_usage_edges {
+        let merged = descriptor_usage.entry(descriptor).or_default();
+        merged.simple_truetype |= usage.simple_truetype;
+        merged.cidfont_type2 |= usage.cidfont_type2;
+        merged.cidfont_type0 |= usage.cidfont_type0;
+    }
+
+    let mut program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
+    for (descriptor, program) in descriptor_program_edges {
+        let Some(usage) = descriptor_usage.get(&descriptor).copied() else {
+            continue;
+        };
+        merge_program_usage(&mut program_usage, program, usage);
+    }
+    for (program, usage) in direct_program_usage {
+        merge_program_usage(&mut program_usage, program, usage);
+    }
+    Ok(program_usage)
+}
+
+fn decoded_u16_mapping(
+    document: &EditDocument,
+    handle: CowObjectHandle,
+) -> Result<Option<(OwnedDictionary, Vec<u16>, usize)>> {
+    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(handle)?
+    else {
+        return Ok(None);
+    };
+    let raw = data.bytes(document.source())?;
+    let decoded = if dictionary.contains_key(b"Filter".as_slice()) {
+        let Some(filter_dictionary) = flpdf_filter_dictionary(document, &dictionary)? else {
+            return Ok(None);
+        };
+        let Ok(decoded) = decode_stream_data(&filter_dictionary, raw.as_ref()) else {
+            return Ok(None);
+        };
+        decoded
+    } else {
+        raw.as_ref().to_vec()
+    };
+    if decoded.len() % 2 != 0 {
+        return Ok(None);
+    }
+    let values = decoded
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect::<Vec<_>>();
+    Ok(Some((dictionary, values, raw.len())))
+}
+
+fn encode_like_stream(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    decoded: &[u8],
+    flate_level: i32,
+) -> Result<Option<Vec<u8>>> {
+    if dictionary.get(b"Filter".as_slice()).is_none() {
+        return Ok(Some(decoded.to_vec()));
+    }
+    let Some(filter_dictionary) = flpdf_filter_dictionary(document, dictionary)? else {
+        return Ok(None);
+    };
+    Ok(encode_stream_data_with_flate_level(&filter_dictionary, decoded, flate_level).ok())
+}
+
+fn set_font_program_length1(
+    document: &mut EditDocument,
+    handle: CowObjectHandle,
+    decoded_len: usize,
+) -> Result<()> {
+    let decoded_len = i64::try_from(decoded_len)
+        .map_err(|_| Error::Invalid("dense font program length exceeds i64".to_owned()))?;
+    let object = match handle {
+        CowObjectHandle::Existing(id) => document.edit_object(id)?,
+        CowObjectHandle::New(id) => document.edit_added_object(id)?,
+    };
+    let OwnedObject::Stream { dictionary, .. } = object else {
+        return Err(Error::Invalid(
+            "dense font program reference does not resolve to a stream".to_owned(),
+        ));
+    };
+    dictionary.insert(b"Length1".to_vec(), OwnedObject::Integer(decoded_len));
+    Ok(())
+}
+
+/// Densely renumber TrueType GIDs for `CIDFontType2` programs whose every PDF
+/// user has an explicit rewritable `CIDToGIDMap`. Every GID addressable by those
+/// maps is retained (plus composite dependencies), so page text codes and CID
+/// widths stay unchanged; only the embedded SFNT and CID-to-GID map values move.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dense CID remapping keeps whole-program eligibility, map preparation, SFNT rewrite, and atomic size gating together for auditability"
+)]
+pub fn dense_compact_cidfont_type2_programs_hayro(
+    document: &mut EditDocument,
+    flate_level: i32,
+) -> Result<FontOptimizationStats> {
+    let program_usage = current_font_program_usage(document)?;
+    let users = dense_cid_program_users(document)?;
+    if users.is_empty() {
+        return Ok(FontOptimizationStats::default());
+    }
+
+    let mut map_programs = HashMap::<CowObjectHandle, BTreeSet<CowObjectHandle>>::new();
+    for (program, program_users) in &users {
+        for map in &program_users.maps {
+            map_programs.entry(*map).or_default().insert(*program);
+        }
+    }
+
+    let mut stats = FontOptimizationStats::default();
+    for (program, program_users) in users {
+        if program_users.unsafe_mapping || program_users.maps.is_empty() {
+            continue;
+        }
+        if !program_usage
+            .get(&program)
+            .copied()
+            .is_some_and(FontProgramUsage::cidfont_type2_only)
+        {
+            continue;
+        }
+        if program_users.maps.iter().any(|map| {
+            map_programs
+                .get(map)
+                .is_some_and(|programs| programs.len() != 1)
+        }) {
+            continue;
+        }
+
+        let mut requested_gids = BTreeSet::from([0_u16]);
+        let mut map_data = Vec::<(CowObjectHandle, OwnedDictionary, Vec<u16>, usize)>::new();
+        let mut maps_ok = true;
+        for map in &program_users.maps {
+            let Some((dictionary, values, raw_len)) = decoded_u16_mapping(document, *map)? else {
+                maps_ok = false;
+                break;
+            };
+            requested_gids.extend(values.iter().copied());
+            map_data.push((*map, dictionary, values, raw_len));
+        }
+        if !maps_ok {
+            continue;
+        }
+
+        let Some(OwnedObject::Stream {
+            dictionary: program_dictionary,
+            data: program_data,
+        }) = document.current_owned_object(program)?
+        else {
+            continue;
+        };
+        let program_raw = program_data.bytes(document.source())?;
+        let program_decoded = if program_dictionary.contains_key(b"Filter".as_slice()) {
+            let Some(filter_dictionary) = flpdf_filter_dictionary(document, &program_dictionary)?
+            else {
+                continue;
+            };
+            let Ok(decoded) = decode_stream_data(&filter_dictionary, program_raw.as_ref()) else {
+                continue;
+            };
+            decoded
+        } else {
+            program_raw.as_ref().to_vec()
+        };
+        let Some(dense) = sfnt_compact_glyph_ids(&program_decoded, &requested_gids) else {
+            continue;
+        };
+        let Some(encoded_program) =
+            encode_like_stream(document, &program_dictionary, &dense.bytes, flate_level)?
+        else {
+            continue;
+        };
+
+        let mut encoded_maps = Vec::<(CowObjectHandle, Vec<u8>, usize)>::new();
+        let mut remap_ok = true;
+        for (map, dictionary, values, raw_len) in map_data {
+            let mut decoded = Vec::with_capacity(values.len().saturating_mul(2));
+            for old_gid in values {
+                let Some(new_gid) = dense
+                    .old_to_new
+                    .get(usize::from(old_gid))
+                    .copied()
+                    .flatten()
+                else {
+                    remap_ok = false;
+                    break;
+                };
+                decoded.extend_from_slice(&new_gid.to_be_bytes());
+            }
+            if !remap_ok {
+                break;
+            }
+            let Some(encoded) = encode_like_stream(document, &dictionary, &decoded, flate_level)?
+            else {
+                remap_ok = false;
+                break;
+            };
+            encoded_maps.push((map, encoded, raw_len));
+        }
+        if !remap_ok {
+            continue;
+        }
+
+        let before_encoded = program_raw.len().saturating_add(
+            encoded_maps
+                .iter()
+                .map(|(_, _, raw_len)| *raw_len)
+                .sum::<usize>(),
+        );
+        let after_encoded = encoded_program.len().saturating_add(
+            encoded_maps
+                .iter()
+                .map(|(_, encoded, _)| encoded.len())
+                .sum::<usize>(),
+        );
+        if after_encoded >= before_encoded {
+            continue;
+        }
+
+        replace_current_stream_data(document, program, encoded_program)?;
+        set_font_program_length1(document, program, dense.bytes.len())?;
+        for (map, encoded, _) in encoded_maps {
+            replace_current_stream_data(document, map, encoded)?;
+        }
+
+        stats.programs_optimized = stats.programs_optimized.saturating_add(1);
+        stats.programs_glyph_subset = stats.programs_glyph_subset.saturating_add(1);
+        stats.programs_dense_remapped = stats.programs_dense_remapped.saturating_add(1);
+        stats.cid_to_gid_maps_rewritten = stats
+            .cid_to_gid_maps_rewritten
+            .saturating_add(program_users.maps.len());
+        stats.dense_glyph_slots_removed = stats
+            .dense_glyph_slots_removed
+            .saturating_add(dense.old_to_new.iter().filter(|gid| gid.is_none()).count());
+        stats.dense_decoded_bytes_removed = stats
+            .dense_decoded_bytes_removed
+            .saturating_add(dense.removed_decoded_bytes);
+        stats.original_encoded_bytes = stats.original_encoded_bytes.saturating_add(before_encoded);
+        stats.optimized_encoded_bytes = stats.optimized_encoded_bytes.saturating_add(after_encoded);
+    }
+    Ok(stats)
+}
+
 /// Union compatible sparse `CIDFontType2` programs after exact font-program
 /// deduplication has already canonicalized byte-identical stripped subsets.
 pub fn union_sparse_cid_font_programs_after_dedup_hayro(
@@ -2742,7 +3430,7 @@ pub fn strip_font_editing_tables_hayro(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SourcePdf;
+    use crate::{ObjectId, SourcePdf};
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::{Cursor, Write};
 
@@ -2888,6 +3576,114 @@ mod tests {
                 .as_bytes(),
         );
         Ok(pdf)
+    }
+
+    fn dense_cidfont_fixture() -> Result<Vec<u8>> {
+        let font = sparse_union_test_font(
+            &[
+                Some(simple_test_glyph(0x10)),
+                None,
+                None,
+                Some(simple_test_glyph(0x13)),
+            ],
+            [0, 0, 100, 100],
+        )?;
+        let map = [0_u8, 0, 0, 0, 0, 0, 0, 3];
+
+        let content = b"BT /F1 10 Tf <0003> Tj ET";
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                content.len(),
+                String::from_utf8_lossy(content)
+            )
+            .as_bytes(),
+        );
+        let mut font_stream = format!(
+            "5 0 obj\n<< /Length {} /Length1 {} >>\nstream\n",
+            font.len(),
+            font.len()
+        )
+        .into_bytes();
+        font_stream.extend_from_slice(&font);
+        font_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &font_stream);
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /DenseTest /Encoding /Identity-H /DescendantFonts [7 0 R] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /DenseTest /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R /CIDToGIDMap 9 0 R /DW 1000 /W [3 [500]] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /FontDescriptor /FontName /DenseTest /Flags 4 /FontBBox [0 0 100 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile2 5 0 R >>\nendobj\n",
+        );
+        let mut map_stream = format!("9 0 obj\n<< /Length {} >>\nstream\n", map.len()).into_bytes();
+        map_stream.extend_from_slice(&map);
+        map_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &map_stream);
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Ok(pdf)
+    }
+
+    #[test]
+    fn dense_cidfont_rewrites_explicit_map_and_is_idempotent() -> Result<()> {
+        let mut document = EditDocument::from_bytes(dense_cidfont_fixture()?)?;
+        let first = dense_compact_cidfont_type2_programs_hayro(&mut document, 9)?;
+        assert_eq!(first.programs_dense_remapped, 1);
+        assert_eq!(first.cid_to_gid_maps_rewritten, 1);
+        assert_eq!(first.dense_glyph_slots_removed, 2);
+
+        let cid_map_stream = CowObjectHandle::Existing(ObjectId::new(9, 0));
+        let decoded_map = document.decoded_stream_data(cid_map_stream, DecodeLevel::Generalized)?;
+        assert_eq!(decoded_map.as_slice(), &[0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
+        let decoded_program = document.decoded_stream_data(program, DecodeLevel::Generalized)?;
+        let maxp = sfnt_table(decoded_program.as_ref(), *b"maxp")
+            .ok_or_else(|| Error::Invalid("dense fixture lost maxp".to_owned()))?;
+        assert_eq!(be16(maxp, 4), Some(2));
+
+        let output = document.write_compact()?;
+        let mut reparsed = EditDocument::from_bytes(output)?;
+        let second = dense_compact_cidfont_type2_programs_hayro(&mut reparsed, 9)?;
+        assert_eq!(second.programs_dense_remapped, 0);
+        assert_eq!(second.cid_to_gid_maps_rewritten, 0);
+        Ok(())
     }
 
     #[test]
@@ -3355,6 +4151,93 @@ mod tests {
         assert!(rebuilt[3] > rebuilt[2]); // requested composite retained
         assert_eq!(rebuilt[4], rebuilt[3]); // unused gid 3 has an empty outline
         assert_eq!(rebuilt[4], subset_glyf.len());
+        Ok(())
+    }
+
+    #[test]
+    fn dense_gids_remap_composites_and_metrics() -> Result<()> {
+        let mut head = [0_u8; 54];
+        head[50..52].copy_from_slice(&1_i16.to_be_bytes()); // long loca
+        let mut hhea = [0_u8; 36];
+        hhea[34..36].copy_from_slice(&4_u16.to_be_bytes());
+        let mut maxp = vec![0, 1, 0, 0, 0, 4];
+        maxp.resize(32, 0);
+
+        let glyph0 = [0_u8; 10];
+        let glyph1 = vec![0x44_u8; 20]; // deliberately unused slot
+        let mut glyph2 = [0_u8; 10];
+        glyph2[2..4].copy_from_slice(&1_i16.to_be_bytes());
+        let mut glyph3 = Vec::new();
+        glyph3.extend_from_slice(&(-1_i16).to_be_bytes());
+        glyph3.extend_from_slice(&[0_u8; 8]);
+        glyph3.extend_from_slice(&1_u16.to_be_bytes()); // ARG_1_AND_2_ARE_WORDS
+        glyph3.extend_from_slice(&2_u16.to_be_bytes()); // component old gid 2
+        glyph3.extend_from_slice(&[0_u8; 4]);
+
+        let mut glyf = Vec::new();
+        let mut offsets = Vec::new();
+        for glyph in [
+            glyph0.as_slice(),
+            glyph1.as_slice(),
+            glyph2.as_slice(),
+            glyph3.as_slice(),
+        ] {
+            offsets.push(
+                u32::try_from(glyf.len())
+                    .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
+            );
+            glyf.extend_from_slice(glyph);
+        }
+        offsets.push(
+            u32::try_from(glyf.len())
+                .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
+        );
+        let loca = offsets
+            .iter()
+            .flat_map(|offset| offset.to_be_bytes())
+            .collect::<Vec<_>>();
+        let mut hmtx = Vec::new();
+        for advance in [100_u16, 200, 300, 400] {
+            hmtx.extend_from_slice(&advance.to_be_bytes());
+            hmtx.extend_from_slice(&0_i16.to_be_bytes());
+        }
+        let source = sfnt(&[
+            (*b"head", &head),
+            (*b"hhea", &hhea),
+            (*b"maxp", &maxp),
+            (*b"hmtx", &hmtx),
+            (*b"loca", &loca),
+            (*b"glyf", &glyf),
+        ]);
+
+        let Some(dense) = sfnt_compact_glyph_ids(&source, &BTreeSet::from([3_u16])) else {
+            return Err(Error::Invalid("expected a dense GID subset".to_owned()));
+        };
+        assert_eq!(dense.old_to_new, vec![Some(0), None, Some(1), Some(2)]);
+        assert!(dense.removed_decoded_bytes > 0);
+
+        let dense_maxp = sfnt_table(&dense.bytes, *b"maxp")
+            .ok_or_else(|| Error::Invalid("missing maxp".to_owned()))?;
+        assert_eq!(be16(dense_maxp, 4), Some(3));
+        let dense_hhea = sfnt_table(&dense.bytes, *b"hhea")
+            .ok_or_else(|| Error::Invalid("missing hhea".to_owned()))?;
+        assert_eq!(be16(dense_hhea, 34), Some(3));
+        let dense_hmtx = sfnt_table(&dense.bytes, *b"hmtx")
+            .ok_or_else(|| Error::Invalid("missing hmtx".to_owned()))?;
+        assert_eq!(be16(dense_hmtx, 0), Some(100));
+        assert_eq!(be16(dense_hmtx, 4), Some(300));
+        assert_eq!(be16(dense_hmtx, 8), Some(400));
+
+        let dense_loca = sfnt_table(&dense.bytes, *b"loca")
+            .ok_or_else(|| Error::Invalid("missing loca".to_owned()))?;
+        let dense_glyf = sfnt_table(&dense.bytes, *b"glyf")
+            .ok_or_else(|| Error::Invalid("missing glyf".to_owned()))?;
+        let composite_start = usize::try_from(
+            be32(dense_loca, 2 * 4)
+                .ok_or_else(|| Error::Invalid("missing composite loca".to_owned()))?,
+        )
+        .map_err(|_| Error::Invalid("composite loca overflow".to_owned()))?;
+        assert_eq!(be16(dense_glyf, composite_start + 12), Some(1));
         Ok(())
     }
 
