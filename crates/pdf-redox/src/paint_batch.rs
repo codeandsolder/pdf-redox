@@ -53,6 +53,15 @@ pub struct CollinearPathStats {
     pub estimated_flate_bytes_saved: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StrokeFormFactorStats {
+    pub pages_rewritten: usize,
+    pub forms_created: usize,
+    pub occurrences_replaced: usize,
+    pub decoded_bytes_factored: usize,
+    pub estimated_flate_bytes_saved: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Point {
     x: f64,
@@ -983,6 +992,10 @@ const MAX_OUTLINED_GLYPH_EXTENT_GRID: i64 = 16 * 100;
 const MAX_TYPE3_GLYPHS_PER_FONT: usize = 255;
 const MIN_OUTLINED_GLYPH_OCCURRENCES: usize = 2;
 const MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS: usize = 16 * 1024;
+const MIN_STROKE_FORM_BODY_BYTES: usize = 256;
+const MIN_STROKE_FORM_ESTIMATED_SAVINGS: usize = 2 * 1024;
+const STROKE_FORM_OVERHEAD_BYTES: usize = 512;
+const STROKE_FORM_OCCURRENCE_OVERHEAD_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct GridBounds {
@@ -1198,6 +1211,250 @@ fn structural_grid_coordinate(value: f64) -> Option<i64> {
     #[allow(clippy::cast_possible_truncation)]
     let coordinate = rounded as i64;
     Some(coordinate)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StrokeGraphicsState {
+    line_width: Option<f64>,
+    miter_limit: Option<f64>,
+}
+
+impl Default for StrokeGraphicsState {
+    fn default() -> Self {
+        Self {
+            line_width: Some(1.0),
+            miter_limit: Some(10.0),
+        }
+    }
+}
+
+impl StrokeGraphicsState {
+    fn bbox_margin_grid(self) -> Option<i64> {
+        let width = self.line_width?;
+        let miter = self.miter_limit?;
+        if !width.is_finite() || width < 0.0 || !miter.is_finite() || miter <= 0.0 {
+            return None;
+        }
+        let scaled = width * 0.5 * miter.max(1.0) * STRUCTURAL_GRID_SCALE;
+        if !scaled.is_finite() || scaled < 0.0 || scaled > 9_007_199_254_740_990.0 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let rounded_up = scaled.ceil() as i64;
+        rounded_up.checked_add(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StrokeFormOccurrence {
+    start: usize,
+    end: usize,
+    body_start: usize,
+    body_end: usize,
+    origin_x: i64,
+    origin_y: i64,
+    bounds: GridBounds,
+    bbox_margin_grid: i64,
+    signature: Vec<u8>,
+}
+
+fn stroke_signature_value(signature: &mut Vec<u8>, value: i64) {
+    signature.extend_from_slice(&value.to_be_bytes());
+}
+
+fn stroke_form_path_event(
+    event: &Event,
+    origin_x: i64,
+    origin_y: i64,
+    signature: &mut Vec<u8>,
+    bounds: &mut Option<GridBounds>,
+) -> Option<()> {
+    let expected = match event.operator.as_slice() {
+        b"m" | b"l" => 2,
+        b"c" => 6,
+        b"v" | b"y" | b"re" => 4,
+        b"h" => 0,
+        _ => return None,
+    };
+    if !event.all_operands_numeric || event.numbers.len() != expected {
+        return None;
+    }
+    signature.push(u8::try_from(event.operator.len()).ok()?);
+    signature.extend_from_slice(&event.operator);
+
+    if event.operator == b"h" {
+        return Some(());
+    }
+
+    let values = event
+        .numbers
+        .iter()
+        .copied()
+        .map(structural_grid_coordinate)
+        .collect::<Option<SmallVec<[i64; 6]>>>()?;
+    if event.operator == b"re" {
+        let x = values[0];
+        let y = values[1];
+        let width = values[2];
+        let height = values[3];
+        stroke_signature_value(signature, x.checked_sub(origin_x)?);
+        stroke_signature_value(signature, y.checked_sub(origin_y)?);
+        stroke_signature_value(signature, width);
+        stroke_signature_value(signature, height);
+        let x1 = x.checked_add(width)?;
+        let y1 = y.checked_add(height)?;
+        for (px, py) in [(x, y), (x1, y1)] {
+            let point = GridBounds::from_point(px, py);
+            match bounds {
+                Some(bounds) => bounds.include(point),
+                None => *bounds = Some(point),
+            }
+        }
+        return Some(());
+    }
+
+    for pair in values.as_slice().as_chunks::<2>().0 {
+        let x = pair[0];
+        let y = pair[1];
+        stroke_signature_value(signature, x.checked_sub(origin_x)?);
+        stroke_signature_value(signature, y.checked_sub(origin_y)?);
+        let point = GridBounds::from_point(x, y);
+        match bounds {
+            Some(bounds) => bounds.include(point),
+            None => *bounds = Some(point),
+        }
+    }
+    Some(())
+}
+
+fn fenced_stroke_form_occurrence(
+    input: &[u8],
+    events: &[Event],
+    index: usize,
+    caller_path_empty: bool,
+    state: StrokeGraphicsState,
+) -> Option<(StrokeFormOccurrence, usize)> {
+    if !caller_path_empty {
+        return None;
+    }
+    let save = events.get(index)?;
+    let first = events.get(index + 1)?;
+    if save.operator != b"q"
+        || save.operand_count != 0
+        || first.operator != b"m"
+        || first.numbers.len() != 2
+        || !first.all_operands_numeric
+        || !adjacent(input, save, first)
+    {
+        return None;
+    }
+    let origin_x = structural_grid_coordinate(first.numbers[0])?;
+    let origin_y = structural_grid_coordinate(first.numbers[1])?;
+    let mut signature = b"PdfRedoxStrokeForm1".to_vec();
+    let mut bounds = None::<GridBounds>;
+    let mut cursor = index + 1;
+    let mut previous = save;
+
+    loop {
+        let event = events.get(cursor)?;
+        if !adjacent(input, previous, event) {
+            return None;
+        }
+        if matches!(
+            event.operator.as_slice(),
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re"
+        ) {
+            stroke_form_path_event(event, origin_x, origin_y, &mut signature, &mut bounds)?;
+            previous = event;
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+
+    let stroke = events.get(cursor)?;
+    let restore = events.get(cursor + 1)?;
+    if stroke.operator != b"S"
+        || stroke.operand_count != 0
+        || restore.operator != b"Q"
+        || restore.operand_count != 0
+        || !adjacent(input, previous, stroke)
+        || !adjacent(input, stroke, restore)
+    {
+        return None;
+    }
+    signature.push(1);
+    signature.extend_from_slice(b"S");
+
+    Some((
+        StrokeFormOccurrence {
+            start: save.start,
+            end: restore.end,
+            body_start: first.start,
+            body_end: stroke.end,
+            origin_x,
+            origin_y,
+            bounds: bounds?,
+            bbox_margin_grid: state.bbox_margin_grid()?,
+            signature,
+        },
+        cursor + 2,
+    ))
+}
+
+fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
+    let events = events_for(input, "repeated fenced stroke form factoring")?;
+    if !page_paint_batching_is_safe(&events) {
+        return Some(Vec::new());
+    }
+
+    let mut occurrences = Vec::new();
+    let mut state = StrokeGraphicsState::default();
+    let mut state_stack = Vec::<StrokeGraphicsState>::new();
+    let mut path_nonempty = false;
+    let mut index = 0usize;
+
+    while index < events.len() {
+        let event = &events[index];
+        if event.operator == b"q"
+            && let Some((occurrence, next)) =
+                fenced_stroke_form_occurrence(input, &events, index, !path_nonempty, state)
+        {
+            occurrences.push(occurrence);
+            path_nonempty = false;
+            index = next;
+            continue;
+        }
+
+        match event.operator.as_slice() {
+            b"q" => state_stack.push(state),
+            b"Q" => {
+                state = state_stack.pop().unwrap_or(StrokeGraphicsState {
+                    line_width: None,
+                    miter_limit: None,
+                });
+            }
+            b"w" if event.operand_count == 1 => {
+                state.line_width = event
+                    .sole_number
+                    .filter(|value| value.is_finite() && *value >= 0.0);
+            }
+            b"M" if event.operand_count == 1 => {
+                state.miter_limit = event
+                    .sole_number
+                    .filter(|value| value.is_finite() && *value > 0.0);
+            }
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" => {
+                path_nonempty = true;
+            }
+            b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" => {
+                path_nonempty = false;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(occurrences)
 }
 
 fn outlined_glyph_transaction(
@@ -1485,7 +1742,7 @@ struct GlyphFontPlan {
     shapes: Vec<GlyphShapePlan>,
 }
 
-fn outlined_glyph_pdf_number(value: i64) -> String {
+fn structural_pdf_number(value: i64) -> String {
     let negative = value < 0;
     let magnitude = i128::from(value).abs();
     let whole = magnitude / 100;
@@ -1509,9 +1766,9 @@ fn outlined_glyph_charproc(input: &[u8], component: &GlyphComponent) -> Option<V
     let y = component.origin_y.checked_neg()?;
     let mut output = Vec::new();
     output.extend_from_slice(b"0 0 d0\n1 0 0 1 ");
-    output.extend_from_slice(outlined_glyph_pdf_number(x).as_bytes());
+    output.extend_from_slice(structural_pdf_number(x).as_bytes());
     output.push(b' ');
-    output.extend_from_slice(outlined_glyph_pdf_number(y).as_bytes());
+    output.extend_from_slice(structural_pdf_number(y).as_bytes());
     output.extend_from_slice(b" cm\n");
     output.extend_from_slice(input.get(component.start..component.end)?);
     output.push(b'\n');
@@ -1531,19 +1788,16 @@ fn outlined_glyph_placement(
     output.extend_from_slice(b"BT /");
     output.extend_from_slice(font_name);
     output.extend_from_slice(b" 1 Tf 1 0 0 1 ");
-    output.extend_from_slice(outlined_glyph_pdf_number(component.origin_x).as_bytes());
+    output.extend_from_slice(structural_pdf_number(component.origin_x).as_bytes());
     output.push(b' ');
-    output.extend_from_slice(outlined_glyph_pdf_number(component.origin_y).as_bytes());
+    output.extend_from_slice(structural_pdf_number(component.origin_y).as_bytes());
     output.extend_from_slice(b" Tm <");
     output.extend_from_slice(format!("{code:02X}").as_bytes());
     output.extend_from_slice(b"> Tj ET\n");
     Some(output)
 }
 
-fn outlined_glyph_page_resources(
-    document: &EditDocument,
-    page: ObjectHandle,
-) -> Result<OwnedDictionary> {
+fn page_resources(document: &EditDocument, page: ObjectHandle) -> Result<OwnedDictionary> {
     Ok(match document.inherited_page_value(page, b"Resources")? {
         Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
         None => OwnedDictionary::default(),
@@ -1556,7 +1810,7 @@ fn install_page_font(
     name: Vec<u8>,
     target: ObjectHandle,
 ) -> Result<()> {
-    let mut resources = outlined_glyph_page_resources(document, page)?;
+    let mut resources = page_resources(document, page)?;
     let mut fonts =
         resolved_dictionary(document, resources.get(b"Font".as_slice()))?.unwrap_or_default();
     fonts.insert(name, OwnedObject::Reference(target));
@@ -1580,6 +1834,282 @@ fn outlined_glyph_font_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> V
         }
         serial = serial.saturating_add(1);
     }
+}
+
+fn install_page_xobject(
+    document: &mut EditDocument,
+    page: ObjectHandle,
+    name: Vec<u8>,
+    target: ObjectHandle,
+) -> Result<()> {
+    let mut resources = page_resources(document, page)?;
+    let mut xobjects =
+        resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
+    xobjects.insert(name, OwnedObject::Reference(target));
+    resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
+    let object = match page {
+        ObjectHandle::Existing(id) => document.edit_object(id)?,
+        ObjectHandle::New(id) => document.edit_added_object(id)?,
+    };
+    if let Some(dictionary) = object.as_dictionary_mut() {
+        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+    }
+    Ok(())
+}
+
+fn stroke_form_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
+    let mut serial = index;
+    loop {
+        let name = format!("PdfRedoxStroke{serial}").into_bytes();
+        if occupied.insert(name.clone()) {
+            return name;
+        }
+        serial = serial.saturating_add(1);
+    }
+}
+
+fn structural_grid_real(value: i64) -> Option<f64> {
+    crate::source::exact_i64_to_f64(value).map(|value| value / STRUCTURAL_GRID_SCALE)
+}
+
+fn stroke_form_dictionary(bounds: GridBounds, margin_grid: i64) -> Option<OwnedDictionary> {
+    let x0 = bounds.x0.checked_sub(margin_grid)?;
+    let y0 = bounds.y0.checked_sub(margin_grid)?;
+    let x1 = bounds.x1.checked_add(margin_grid)?;
+    let y1 = bounds.y1.checked_add(margin_grid)?;
+    let mut dictionary = OwnedDictionary::new();
+    dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec()));
+    dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
+    dictionary.insert(b"FormType".to_vec(), OwnedObject::Integer(1));
+    dictionary.insert(
+        b"BBox".to_vec(),
+        OwnedObject::Array(vec![
+            OwnedObject::Real(structural_grid_real(x0)?),
+            OwnedObject::Real(structural_grid_real(y0)?),
+            OwnedObject::Real(structural_grid_real(x1)?),
+            OwnedObject::Real(structural_grid_real(y1)?),
+        ]),
+    );
+    dictionary.insert(
+        b"Resources".to_vec(),
+        OwnedObject::Dictionary(OwnedDictionary::new()),
+    );
+    Some(dictionary)
+}
+
+fn stroke_form_replacement(
+    name: &[u8],
+    canonical: &StrokeFormOccurrence,
+    occurrence: &StrokeFormOccurrence,
+) -> Option<Vec<u8>> {
+    let dx = occurrence.origin_x.checked_sub(canonical.origin_x)?;
+    let dy = occurrence.origin_y.checked_sub(canonical.origin_y)?;
+    let mut output = Vec::new();
+    output.extend_from_slice(b"q\n1 0 0 1 ");
+    output.extend_from_slice(structural_pdf_number(dx).as_bytes());
+    output.push(b' ');
+    output.extend_from_slice(structural_pdf_number(dy).as_bytes());
+    output.extend_from_slice(b" cm\n/");
+    output.extend_from_slice(name);
+    output.extend_from_slice(b" Do\nQ\n");
+    Some(output)
+}
+
+#[derive(Debug, Clone)]
+struct StrokeFormPageData {
+    page: ObjectHandle,
+    decoded: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct StrokeFormPageOccurrence {
+    page_index: usize,
+    occurrence: StrokeFormOccurrence,
+}
+
+#[derive(Debug, Clone)]
+struct StrokeFormPlan {
+    name: Vec<u8>,
+    body: Vec<u8>,
+    bounds: GridBounds,
+    bbox_margin_grid: i64,
+    canonical: StrokeFormOccurrence,
+    occurrences: Vec<StrokeFormPageOccurrence>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the all-or-nothing form factoring plan and mutation sequence together"
+)]
+pub fn factor_repeated_stroke_forms_hayro(
+    document: &mut EditDocument,
+    flate_level: i32,
+) -> Result<StrokeFormFactorStats> {
+    let pages = document.page_handles()?;
+    let mut page_data = Vec::<StrokeFormPageData>::new();
+    let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
+    let mut occupied_names = BTreeSet::<Vec<u8>>::new();
+
+    for page in pages {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
+        if decoded.len() < MIN_PAGE_CONTENT_BYTES {
+            continue;
+        }
+        let Some(occurrences) = stroke_form_occurrences(&decoded) else {
+            continue;
+        };
+        let resources = page_resources(document, page)?;
+        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
+        {
+            occupied_names.extend(xobjects.keys().cloned());
+        }
+        let page_index = page_data.len();
+        for occurrence in occurrences {
+            groups
+                .entry(occurrence.signature.clone())
+                .or_default()
+                .push(StrokeFormPageOccurrence {
+                    page_index,
+                    occurrence,
+                });
+        }
+        page_data.push(StrokeFormPageData { page, decoded });
+    }
+
+    let mut plans = Vec::<StrokeFormPlan>::new();
+    let mut form_index = 0usize;
+    for occurrences in groups.into_values() {
+        if occurrences.len() < 2 {
+            continue;
+        }
+        let canonical_page = occurrences[0].page_index;
+        let canonical = occurrences[0].occurrence.clone();
+        let body_len = canonical.body_end.saturating_sub(canonical.body_start);
+        if body_len < MIN_STROKE_FORM_BODY_BYTES {
+            continue;
+        }
+        let Some(body) = page_data
+            .get(canonical_page)
+            .and_then(|page| page.decoded.get(canonical.body_start..canonical.body_end))
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let max_margin_grid = occurrences
+            .iter()
+            .map(|item| item.occurrence.bbox_margin_grid)
+            .max()
+            .unwrap_or(canonical.bbox_margin_grid);
+        let name = stroke_form_name(form_index, &mut occupied_names);
+        form_index = form_index.saturating_add(1);
+        plans.push(StrokeFormPlan {
+            name,
+            body,
+            bounds: canonical.bounds,
+            bbox_margin_grid: max_margin_grid,
+            canonical,
+            occurrences,
+        });
+    }
+    if plans.is_empty() {
+        return Ok(StrokeFormFactorStats::default());
+    }
+
+    let mut replacements_by_page = vec![Vec::<(usize, usize, Vec<u8>)>::new(); page_data.len()];
+    let mut occurrence_count = 0usize;
+    let mut decoded_factored = 0usize;
+    for plan in &plans {
+        for item in &plan.occurrences {
+            let Some(replacement) =
+                stroke_form_replacement(&plan.name, &plan.canonical, &item.occurrence)
+            else {
+                return Ok(StrokeFormFactorStats::default());
+            };
+            replacements_by_page[item.page_index].push((
+                item.occurrence.start,
+                item.occurrence.end,
+                replacement,
+            ));
+            occurrence_count = occurrence_count.saturating_add(1);
+            decoded_factored = decoded_factored
+                .saturating_add(item.occurrence.end.saturating_sub(item.occurrence.start));
+        }
+    }
+
+    let affected_pages = replacements_by_page
+        .iter()
+        .enumerate()
+        .filter_map(|(index, replacements)| (!replacements.is_empty()).then_some(index))
+        .collect::<Vec<_>>();
+    let mut before_flate = 0usize;
+    let mut after_flate = 0usize;
+    let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
+    for &page_index in &affected_pages {
+        let page = &page_data[page_index];
+        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
+        let Some(rewritten) =
+            apply_replacements(&page.decoded, replacements_by_page[page_index].clone())
+        else {
+            return Ok(StrokeFormFactorStats::default());
+        };
+        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        rewritten_pages.insert(page_index, rewritten);
+    }
+    for plan in &plans {
+        after_flate = after_flate.saturating_add(compressed_len(&plan.body, flate_level)?);
+    }
+    after_flate = after_flate
+        .saturating_add(plans.len().saturating_mul(STROKE_FORM_OVERHEAD_BYTES))
+        .saturating_add(occurrence_count.saturating_mul(STROKE_FORM_OCCURRENCE_OVERHEAD_BYTES));
+    if before_flate <= after_flate
+        || before_flate.saturating_sub(after_flate) < MIN_STROKE_FORM_ESTIMATED_SAVINGS
+    {
+        return Ok(StrokeFormFactorStats::default());
+    }
+
+    for plan in &plans {
+        let Some(dictionary) = stroke_form_dictionary(plan.bounds, plan.bbox_margin_grid) else {
+            return Ok(StrokeFormFactorStats::default());
+        };
+        let form = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary,
+            data: StreamData::Owned(plan.body.clone()),
+        }));
+        let pages = plan
+            .occurrences
+            .iter()
+            .map(|item| item.page_index)
+            .collect::<BTreeSet<_>>();
+        for page_index in pages {
+            install_page_xobject(
+                document,
+                page_data[page_index].page,
+                plan.name.clone(),
+                form,
+            )?;
+        }
+    }
+    for (page_index, rewritten) in rewritten_pages {
+        replace_page_content(document, page_data[page_index].page, rewritten)?;
+    }
+
+    Ok(StrokeFormFactorStats {
+        pages_rewritten: affected_pages.len(),
+        forms_created: plans.len(),
+        occurrences_replaced: occurrence_count,
+        decoded_bytes_factored: decoded_factored,
+        estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+    })
 }
 
 fn outlined_glyph_shape_weight(input: &[u8], occurrences: &[GlyphComponent]) -> usize {
@@ -1621,7 +2151,7 @@ fn outlined_glyph_plans(
         return Ok(Vec::new());
     }
 
-    let resources = outlined_glyph_page_resources(document, page)?;
+    let resources = page_resources(document, page)?;
     let mut occupied = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
         .map(|fonts| fonts.keys().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_default();

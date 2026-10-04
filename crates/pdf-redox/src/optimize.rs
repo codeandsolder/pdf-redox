@@ -30,8 +30,9 @@ use crate::{
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     paint_batch::{
         CollinearPathStats, MarkedContentCoalesceStats, OutlinedGlyphFactorStats, PaintBatchStats,
-        batch_page_paints_hayro, coalesce_optional_content_hayro, compact_collinear_paths_hayro,
-        factor_outlined_glyphs_hayro,
+        StrokeFormFactorStats, batch_page_paints_hayro, coalesce_optional_content_hayro,
+        compact_collinear_paths_hayro, factor_outlined_glyphs_hayro,
+        factor_repeated_stroke_forms_hayro,
     },
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
@@ -547,6 +548,15 @@ fn optimize_pdf_with_document(
         }
     })?;
 
+    let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
+        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        {
+            factor_repeated_stroke_forms_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(StrokeFormFactorStats::default())
+        }
+    })?;
+
     let resource_prune = timed(&mut timings, "resource-prune", || {
         if !cfg.prune_resources {
             return Ok(ResourcePruneStats::default());
@@ -557,7 +567,8 @@ fn optimize_pdf_with_document(
             && inline_image_dedup.occurrences_externalized == 0
             && repeated_page_objects.objects_removed == 0
             && vector_compaction.shared_run_forms_created == 0
-            && outlined_glyphs.fonts_created == 0;
+            && outlined_glyphs.fonts_created == 0
+            && stroke_forms.forms_created == 0;
         if shared_usage_is_exact {
             prune_resources_with_usage_hayro(
                 &mut document,
@@ -910,6 +921,16 @@ fn optimize_pdf_with_document(
             paint_batch.estimated_flate_bytes_saved
         ));
     }
+    if stroke_forms.forms_created > 0 {
+        notes.push(format!(
+            "Factored {} repeated independently-stroked path block occurrence(s) into {} translation-reused Form XObject(s) across {} page(s), factoring about {} decoded bytes and saving about {} encoded bytes.",
+            stroke_forms.occurrences_replaced,
+            stroke_forms.forms_created,
+            stroke_forms.pages_rewritten,
+            stroke_forms.decoded_bytes_factored,
+            stroke_forms.estimated_flate_bytes_saved
+        ));
+    }
     if microstroke_raster.runs_rasterized > 0 {
         notes.push(format!(
             "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
@@ -1049,6 +1070,11 @@ fn optimize_pdf_with_document(
         paint_batch_paints_eliminated: paint_batch.paints_eliminated,
         paint_batch_decoded_bytes_removed: paint_batch.decoded_bytes_removed,
         paint_batch_estimated_flate_bytes_saved: paint_batch.estimated_flate_bytes_saved,
+        stroke_form_pages_rewritten: stroke_forms.pages_rewritten,
+        stroke_forms_created: stroke_forms.forms_created,
+        stroke_form_occurrences_replaced: stroke_forms.occurrences_replaced,
+        stroke_form_decoded_bytes_factored: stroke_forms.decoded_bytes_factored,
+        stroke_form_estimated_flate_bytes_saved: stroke_forms.estimated_flate_bytes_saved,
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,

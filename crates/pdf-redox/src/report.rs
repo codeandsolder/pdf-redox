@@ -480,6 +480,21 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Estimated encoded bytes saved by paint batching.
     pub paint_batch_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by repeated fenced-stroke Form factoring.
+    #[serde(default)]
+    pub stroke_form_pages_rewritten: usize,
+    /// Number of reusable Form `XObjects` created for repeated independently-stroked paths.
+    #[serde(default)]
+    pub stroke_forms_created: usize,
+    /// Number of fenced stroke occurrences replaced by Form invocations.
+    #[serde(default)]
+    pub stroke_form_occurrences_replaced: usize,
+    /// Decoded source bytes covered by repeated fenced-stroke Form factoring.
+    #[serde(default)]
+    pub stroke_form_decoded_bytes_factored: usize,
+    /// Estimated encoded bytes saved by repeated fenced-stroke Form factoring.
+    #[serde(default)]
+    pub stroke_form_estimated_flate_bytes_saved: usize,
     /// Number of metadata duplicate streams detected.
     pub metadata_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to metadata duplicate.
