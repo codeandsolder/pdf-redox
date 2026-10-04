@@ -631,405 +631,6 @@ pub fn plan_print_downsampling<R: Read + Seek + 'static>(
     Ok(plan)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Error;
-    use flpdf::ObjectHandle;
-    use std::{io::Cursor, rc::Rc};
-
-    fn assert_close(actual: f64, expected: f64) {
-        assert!(
-            (actual - expected).abs() <= 1.0e-9,
-            "expected {expected}, got {actual}"
-        );
-    }
-
-    fn stream(pdf: &Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
-        pdf.new_stream_with_data(Rc::new(bytes.to_vec()))
-            .map_err(Into::into)
-    }
-
-    fn image(pdf: &mut Pdf<Cursor<Vec<u8>>>, width: i64, height: i64) -> Result<ObjectHandle> {
-        let image = stream(pdf, b"pixels")?;
-        let dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        for (key, value) in [
-            (b"/Type".as_slice(), ObjectHandle::name(b"XObject".to_vec())),
-            (
-                b"/Subtype".as_slice(),
-                ObjectHandle::name(b"Image".to_vec()),
-            ),
-            (b"/Width".as_slice(), ObjectHandle::integer(width)),
-            (b"/Height".as_slice(), ObjectHandle::integer(height)),
-            (
-                b"/ColorSpace".as_slice(),
-                ObjectHandle::name(b"DeviceGray".to_vec()),
-            ),
-            (b"/BitsPerComponent".as_slice(), ObjectHandle::integer(8)),
-        ] {
-            dict.replace_key(key, value)?;
-        }
-        pdf.mark_object_handle_dirty(&dict)?;
-        Ok(image)
-    }
-
-    fn resources(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
-        ObjectHandle::dictionary(vec![(
-            b"/XObject".to_vec(),
-            ObjectHandle::dictionary(
-                entries
-                    .into_iter()
-                    .map(|(name, object)| (name.to_vec(), object))
-                    .collect(),
-            ),
-        )])
-    }
-
-    fn add_page(
-        pdf: &mut Pdf<Cursor<Vec<u8>>>,
-        content: &[u8],
-        resources: ObjectHandle,
-        user_unit: Option<f64>,
-    ) -> Result<()> {
-        let catalog = pdf.root_handle()?;
-        let pages = catalog.try_get_key(b"/Pages")?;
-        pdf.resolve(&pages)?;
-        let contents = stream(pdf, content)?;
-        let mut entries = vec![
-            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-            (b"/Parent".to_vec(), pages.clone()),
-            (
-                b"/MediaBox".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(612),
-                    ObjectHandle::integer(792),
-                ]),
-            ),
-            (b"/Resources".to_vec(), resources),
-            (b"/Contents".to_vec(), contents),
-        ];
-        if let Some(user_unit) = user_unit {
-            entries.push((b"/UserUnit".to_vec(), ObjectHandle::real(user_unit)));
-        }
-        let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(entries))?;
-        let kids = pages.try_get_key(b"/Kids")?;
-        let mut page_handles = if kids.try_is_array()? {
-            kids.try_get_array_as_vector()?
-        } else {
-            Vec::new()
-        };
-        page_handles.push(page);
-        let count = i64::try_from(page_handles.len())
-            .map_err(|_| Error::Invalid("test page count exceeds i64".to_owned()))?;
-        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
-        pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
-        pdf.mark_object_handle_dirty(&pages)?;
-        Ok(())
-    }
-
-    #[test]
-    fn print_resize_eligibility_rejects_ambiguous_jpeg_color_semantics() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-        let dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-
-        dict.replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceCMYK".to_vec()))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-
-        dict.replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceRGB".to_vec()))?;
-        dict.replace_key(
-            b"/Decode",
-            ObjectHandle::array(vec![
-                ObjectHandle::integer(1),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(1),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(1),
-                ObjectHandle::integer(0),
-            ]),
-        )?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-
-        dict.replace_key(b"/Decode", ObjectHandle::null())?;
-        dict.replace_key(
-            b"/DecodeParms",
-            ObjectHandle::dictionary(vec![(
-                b"/ColorTransform".to_vec(),
-                ObjectHandle::integer(0),
-            )]),
-        )?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-
-        dict.replace_key(b"/DecodeParms", ObjectHandle::null())?;
-        dict.replace_key(b"/Mask", ObjectHandle::array(vec![]))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-
-        dict.replace_key(b"/Mask", ObjectHandle::null())?;
-        dict.replace_key(b"/BitsPerComponent", ObjectHandle::integer(1))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
-        Ok(())
-    }
-
-    #[test]
-    fn shared_image_uses_largest_physical_placement() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-        add_page(
-            &mut pdf,
-            b"q 300 0 0 150 0 0 cm /Im Do Q q 72 0 0 36 0 0 cm /Im Do Q\n",
-            resources(vec![(b"/Im", image)]),
-            None,
-        )?;
-
-        let collection = collect_image_placements(&mut pdf)?;
-        let placements = collection.placements;
-        let complete = collection.complete;
-        assert!(complete);
-        let placement = placements
-            .get(&image_ref)
-            .ok_or_else(|| Error::Invalid("image placement not collected".to_owned()))?;
-        assert_eq!(placement.uses, 2);
-        assert_close(placement.max_width_points, 300.0);
-        assert_close(placement.max_height_points, 150.0);
-        assert_eq!(placement.target_dimensions(144), (600, 300));
-        Ok(())
-    }
-
-    #[test]
-    fn resource_less_form_inherits_page_xobjects_for_placement() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-
-        let form = stream(&pdf, b"q 300 0 0 150 0 0 cm /Im Do Q\n")?;
-        let form_dict = form
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
-        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
-        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        pdf.mark_object_handle_dirty(&form_dict)?;
-
-        add_page(
-            &mut pdf,
-            b"q 72 0 0 36 0 0 cm /Im Do Q /Fm Do\n",
-            resources(vec![(b"/Im", image), (b"/Fm", form)]),
-            None,
-        )?;
-
-        let collection = collect_image_placements(&mut pdf)?;
-        let placements = collection.placements;
-        let complete = collection.complete;
-        assert!(complete);
-        let placement = placements
-            .get(&image_ref)
-            .ok_or_else(|| Error::Invalid("inherited image placement not collected".to_owned()))?;
-        assert_eq!(placement.uses, 2);
-        assert_close(placement.max_width_points, 300.0);
-        assert_close(placement.max_height_points, 150.0);
-        assert_eq!(placement.target_dimensions(144), (600, 300));
-        Ok(())
-    }
-
-    #[test]
-    fn resize_targets_are_scoped_to_pages_that_actually_use_the_image() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-        let dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-
-        add_page(
-            &mut pdf,
-            b"q 72 0 0 36 0 0 cm /Im Do Q\n",
-            resources(vec![(b"/Im", image.clone())]),
-            None,
-        )?;
-        add_page(&mut pdf, b"q Q\n", resources(vec![(b"/Im", image)]), None)?;
-        let page_refs = flpdf::pages::page_refs(&mut pdf)?;
-        let plan = plan_print_downsampling(&mut pdf, 450)?;
-
-        assert!(plan.stats.geometry_complete);
-        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 1);
-        assert!(plan.resize_targets.contains_key(&(page_refs[0], image_ref)));
-        assert!(!plan.resize_targets.contains_key(&(page_refs[1], image_ref)));
-        Ok(())
-    }
-
-    #[test]
-    fn form_local_image_is_measured_but_not_targeted_for_resize() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-        let dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-
-        let form = stream(&pdf, b"q 72 0 0 36 0 0 cm /Im Do Q\n")?;
-        let form_dict = form
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
-        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
-        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        form_dict.replace_key(b"/Resources", resources(vec![(b"/Im", image)]))?;
-        pdf.mark_object_handle_dirty(&form_dict)?;
-
-        add_page(&mut pdf, b"/Fm Do\n", resources(vec![(b"/Fm", form)]), None)?;
-
-        let plan = plan_print_downsampling(&mut pdf, 450)?;
-        assert!(plan.stats.geometry_complete);
-        assert_eq!(plan.stats.downsample_candidates, 1);
-        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 0);
-        assert!(
-            !plan
-                .resize_targets
-                .keys()
-                .any(|(_, candidate)| *candidate == image_ref)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn incomplete_geometry_vetoes_all_resize_targets() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1200, 600)?;
-        let dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
-        pdf.mark_object_handle_dirty(&dict)?;
-
-        add_page(
-            &mut pdf,
-            b"q 72 0 0 36 0 0 cm /Im Do Q /Missing Do\n",
-            resources(vec![(b"/Im", image)]),
-            None,
-        )?;
-
-        let plan = plan_print_downsampling(&mut pdf, 450)?;
-        assert!(!plan.stats.geometry_complete);
-        assert_eq!(plan.stats.downsample_candidates, 1);
-        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 0);
-        assert!(plan.resize_targets.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn nested_form_matrix_contributes_to_image_placement() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1000, 500)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-
-        let form = stream(&pdf, b"q 2 0 0 1 0 0 cm /Im Do Q\n")?;
-        let form_dict = form
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
-        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
-        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        form_dict.replace_key(
-            b"/BBox",
-            ObjectHandle::array(vec![
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(1),
-                ObjectHandle::integer(1),
-            ]),
-        )?;
-        form_dict.replace_key(
-            b"/Matrix",
-            ObjectHandle::array(vec![
-                ObjectHandle::real(0.5),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(0),
-                ObjectHandle::real(0.5),
-                ObjectHandle::integer(0),
-                ObjectHandle::integer(0),
-            ]),
-        )?;
-        form_dict.replace_key(b"/Resources", resources(vec![(b"/Im", image)]))?;
-        pdf.mark_object_handle_dirty(&form_dict)?;
-
-        add_page(
-            &mut pdf,
-            b"q 100 0 0 100 0 0 cm /Fm Do Q\n",
-            resources(vec![(b"/Fm", form)]),
-            None,
-        )?;
-
-        let collection = collect_image_placements(&mut pdf)?;
-        let placements = collection.placements;
-        let complete = collection.complete;
-        assert!(complete);
-        let placement = placements
-            .get(&image_ref)
-            .ok_or_else(|| Error::Invalid("nested image placement not collected".to_owned()))?;
-        assert_eq!(placement.uses, 1);
-        assert_close(placement.max_width_points, 100.0);
-        assert_close(placement.max_height_points, 50.0);
-        assert_eq!(placement.target_dimensions(450), (625, 313));
-        Ok(())
-    }
-
-    #[test]
-    fn page_user_unit_scales_physical_placement() -> Result<()> {
-        let mut pdf = Pdf::empty()?;
-        let image = image(&mut pdf, 1000, 1000)?;
-        let image_ref = image
-            .object_ref()
-            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
-        add_page(
-            &mut pdf,
-            b"q 72 0 0 72 0 0 cm /Im Do Q\n",
-            resources(vec![(b"/Im", image)]),
-            Some(2.0),
-        )?;
-
-        let collection = collect_image_placements(&mut pdf)?;
-        let placements = collection.placements;
-        let complete = collection.complete;
-        assert!(complete);
-        let placement = placements
-            .get(&image_ref)
-            .ok_or_else(|| Error::Invalid("UserUnit image placement not collected".to_owned()))?;
-        assert_close(placement.max_width_points, 144.0);
-        assert_close(placement.max_height_points, 144.0);
-        assert_eq!(placement.target_dimensions(300), (600, 600));
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CowDrawEvent {
     target: crate::ObjectHandle,
@@ -1621,4 +1222,403 @@ pub fn plan_print_downsampling_hayro(
         }
     }
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use flpdf::ObjectHandle;
+    use std::{io::Cursor, rc::Rc};
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn stream(pdf: &Pdf<Cursor<Vec<u8>>>, bytes: &[u8]) -> Result<ObjectHandle> {
+        pdf.new_stream_with_data(Rc::new(bytes.to_vec()))
+            .map_err(Into::into)
+    }
+
+    fn image(pdf: &mut Pdf<Cursor<Vec<u8>>>, width: i64, height: i64) -> Result<ObjectHandle> {
+        let image = stream(pdf, b"pixels")?;
+        let dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        for (key, value) in [
+            (b"/Type".as_slice(), ObjectHandle::name(b"XObject".to_vec())),
+            (
+                b"/Subtype".as_slice(),
+                ObjectHandle::name(b"Image".to_vec()),
+            ),
+            (b"/Width".as_slice(), ObjectHandle::integer(width)),
+            (b"/Height".as_slice(), ObjectHandle::integer(height)),
+            (
+                b"/ColorSpace".as_slice(),
+                ObjectHandle::name(b"DeviceGray".to_vec()),
+            ),
+            (b"/BitsPerComponent".as_slice(), ObjectHandle::integer(8)),
+        ] {
+            dict.replace_key(key, value)?;
+        }
+        pdf.mark_object_handle_dirty(&dict)?;
+        Ok(image)
+    }
+
+    fn resources(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
+        ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(
+                entries
+                    .into_iter()
+                    .map(|(name, object)| (name.to_vec(), object))
+                    .collect(),
+            ),
+        )])
+    }
+
+    fn add_page(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        content: &[u8],
+        resources: ObjectHandle,
+        user_unit: Option<f64>,
+    ) -> Result<()> {
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        pdf.resolve(&pages)?;
+        let contents = stream(pdf, content)?;
+        let mut entries = vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Parent".to_vec(), pages.clone()),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+            (b"/Resources".to_vec(), resources),
+            (b"/Contents".to_vec(), contents),
+        ];
+        if let Some(user_unit) = user_unit {
+            entries.push((b"/UserUnit".to_vec(), ObjectHandle::real(user_unit)));
+        }
+        let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(entries))?;
+        let kids = pages.try_get_key(b"/Kids")?;
+        let mut page_handles = if kids.try_is_array()? {
+            kids.try_get_array_as_vector()?
+        } else {
+            Vec::new()
+        };
+        page_handles.push(page);
+        let count = i64::try_from(page_handles.len())
+            .map_err(|_| Error::Invalid("test page count exceeds i64".to_owned()))?;
+        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
+        pages.replace_key(b"/Count", ObjectHandle::integer(count))?;
+        pdf.mark_object_handle_dirty(&pages)?;
+        Ok(())
+    }
+
+    #[test]
+    fn print_resize_eligibility_rejects_ambiguous_jpeg_color_semantics() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+        let dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+
+        dict.replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceCMYK".to_vec()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+
+        dict.replace_key(b"/ColorSpace", ObjectHandle::name(b"DeviceRGB".to_vec()))?;
+        dict.replace_key(
+            b"/Decode",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(0),
+            ]),
+        )?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+
+        dict.replace_key(b"/Decode", ObjectHandle::null())?;
+        dict.replace_key(
+            b"/DecodeParms",
+            ObjectHandle::dictionary(vec![(
+                b"/ColorTransform".to_vec(),
+                ObjectHandle::integer(0),
+            )]),
+        )?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+
+        dict.replace_key(b"/DecodeParms", ObjectHandle::null())?;
+        dict.replace_key(b"/Mask", ObjectHandle::array(vec![]))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+
+        dict.replace_key(b"/Mask", ObjectHandle::null())?;
+        dict.replace_key(b"/BitsPerComponent", ObjectHandle::integer(1))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        assert!(!is_resize_safe_existing_jpeg(&mut pdf, image_ref));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_image_uses_largest_physical_placement() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+        add_page(
+            &mut pdf,
+            b"q 300 0 0 150 0 0 cm /Im Do Q q 72 0 0 36 0 0 cm /Im Do Q\n",
+            resources(vec![(b"/Im", image)]),
+            None,
+        )?;
+
+        let collection = collect_image_placements(&mut pdf)?;
+        let placements = collection.placements;
+        let complete = collection.complete;
+        assert!(complete);
+        let placement = placements
+            .get(&image_ref)
+            .ok_or_else(|| Error::Invalid("image placement not collected".to_owned()))?;
+        assert_eq!(placement.uses, 2);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
+        assert_eq!(placement.target_dimensions(144), (600, 300));
+        Ok(())
+    }
+
+    #[test]
+    fn resource_less_form_inherits_page_xobjects_for_placement() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+
+        let form = stream(&pdf, b"q 300 0 0 150 0 0 cm /Im Do Q\n")?;
+        let form_dict = form
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
+        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        pdf.mark_object_handle_dirty(&form_dict)?;
+
+        add_page(
+            &mut pdf,
+            b"q 72 0 0 36 0 0 cm /Im Do Q /Fm Do\n",
+            resources(vec![(b"/Im", image), (b"/Fm", form)]),
+            None,
+        )?;
+
+        let collection = collect_image_placements(&mut pdf)?;
+        let placements = collection.placements;
+        let complete = collection.complete;
+        assert!(complete);
+        let placement = placements
+            .get(&image_ref)
+            .ok_or_else(|| Error::Invalid("inherited image placement not collected".to_owned()))?;
+        assert_eq!(placement.uses, 2);
+        assert_close(placement.max_width_points, 300.0);
+        assert_close(placement.max_height_points, 150.0);
+        assert_eq!(placement.target_dimensions(144), (600, 300));
+        Ok(())
+    }
+
+    #[test]
+    fn resize_targets_are_scoped_to_pages_that_actually_use_the_image() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+        let dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+
+        add_page(
+            &mut pdf,
+            b"q 72 0 0 36 0 0 cm /Im Do Q\n",
+            resources(vec![(b"/Im", image.clone())]),
+            None,
+        )?;
+        add_page(&mut pdf, b"q Q\n", resources(vec![(b"/Im", image)]), None)?;
+        let page_refs = flpdf::pages::page_refs(&mut pdf)?;
+        let plan = plan_print_downsampling(&mut pdf, 450)?;
+
+        assert!(plan.stats.geometry_complete);
+        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 1);
+        assert!(plan.resize_targets.contains_key(&(page_refs[0], image_ref)));
+        assert!(!plan.resize_targets.contains_key(&(page_refs[1], image_ref)));
+        Ok(())
+    }
+
+    #[test]
+    fn form_local_image_is_measured_but_not_targeted_for_resize() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+        let dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+
+        let form = stream(&pdf, b"q 72 0 0 36 0 0 cm /Im Do Q\n")?;
+        let form_dict = form
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
+        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        form_dict.replace_key(b"/Resources", resources(vec![(b"/Im", image)]))?;
+        pdf.mark_object_handle_dirty(&form_dict)?;
+
+        add_page(&mut pdf, b"/Fm Do\n", resources(vec![(b"/Fm", form)]), None)?;
+
+        let plan = plan_print_downsampling(&mut pdf, 450)?;
+        assert!(plan.stats.geometry_complete);
+        assert_eq!(plan.stats.downsample_candidates, 1);
+        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 0);
+        assert!(
+            !plan
+                .resize_targets
+                .keys()
+                .any(|(_, candidate)| *candidate == image_ref)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_geometry_vetoes_all_resize_targets() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1200, 600)?;
+        let dict = image
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"DCTDecode".to_vec()))?;
+        pdf.mark_object_handle_dirty(&dict)?;
+
+        add_page(
+            &mut pdf,
+            b"q 72 0 0 36 0 0 cm /Im Do Q /Missing Do\n",
+            resources(vec![(b"/Im", image)]),
+            None,
+        )?;
+
+        let plan = plan_print_downsampling(&mut pdf, 450)?;
+        assert!(!plan.stats.geometry_complete);
+        assert_eq!(plan.stats.downsample_candidates, 1);
+        assert_eq!(plan.stats.existing_jpeg_resize_candidates, 0);
+        assert!(plan.resize_targets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_form_matrix_contributes_to_image_placement() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1000, 500)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+
+        let form = stream(&pdf, b"q 2 0 0 1 0 0 cm /Im Do Q\n")?;
+        let form_dict = form
+            .as_stream_dict()
+            .ok_or_else(|| Error::Invalid("fixture form has no stream dictionary".to_owned()))?;
+        form_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        form_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        form_dict.replace_key(
+            b"/BBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(1),
+            ]),
+        )?;
+        form_dict.replace_key(
+            b"/Matrix",
+            ObjectHandle::array(vec![
+                ObjectHandle::real(0.5),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::real(0.5),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+            ]),
+        )?;
+        form_dict.replace_key(b"/Resources", resources(vec![(b"/Im", image)]))?;
+        pdf.mark_object_handle_dirty(&form_dict)?;
+
+        add_page(
+            &mut pdf,
+            b"q 100 0 0 100 0 0 cm /Fm Do Q\n",
+            resources(vec![(b"/Fm", form)]),
+            None,
+        )?;
+
+        let collection = collect_image_placements(&mut pdf)?;
+        let placements = collection.placements;
+        let complete = collection.complete;
+        assert!(complete);
+        let placement = placements
+            .get(&image_ref)
+            .ok_or_else(|| Error::Invalid("nested image placement not collected".to_owned()))?;
+        assert_eq!(placement.uses, 1);
+        assert_close(placement.max_width_points, 100.0);
+        assert_close(placement.max_height_points, 50.0);
+        assert_eq!(placement.target_dimensions(450), (625, 313));
+        Ok(())
+    }
+
+    #[test]
+    fn page_user_unit_scales_physical_placement() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let image = image(&mut pdf, 1000, 1000)?;
+        let image_ref = image
+            .object_ref()
+            .ok_or_else(|| Error::Invalid("fixture image is not indirect".to_owned()))?;
+        add_page(
+            &mut pdf,
+            b"q 72 0 0 72 0 0 cm /Im Do Q\n",
+            resources(vec![(b"/Im", image)]),
+            Some(2.0),
+        )?;
+
+        let collection = collect_image_placements(&mut pdf)?;
+        let placements = collection.placements;
+        let complete = collection.complete;
+        assert!(complete);
+        let placement = placements
+            .get(&image_ref)
+            .ok_or_else(|| Error::Invalid("UserUnit image placement not collected".to_owned()))?;
+        assert_close(placement.max_width_points, 144.0);
+        assert_close(placement.max_height_points, 144.0);
+        assert_eq!(placement.target_dimensions(300), (600, 600));
+        Ok(())
+    }
 }

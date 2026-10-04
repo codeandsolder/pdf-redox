@@ -977,10 +977,7 @@ fn optimize_pdf_with_document(
         .saturating_add(unfiltered_flate.high_effort_extra_savings_bytes);
     if adaptive_flate_streams_selected > 0 {
         notes.push(format!(
-            "Selected high-effort Flate for {} of {} highly-compressible large stream(s), saving about {} additional encoded bytes beyond level {}.",
-            adaptive_flate_streams_selected,
-            adaptive_flate_streams_tested,
-            adaptive_flate_extra_savings,
+            "Selected high-effort Flate for {adaptive_flate_streams_selected} of {adaptive_flate_streams_tested} highly-compressible large stream(s), saving about {adaptive_flate_extra_savings} additional encoded bytes beyond level {}.",
             cfg.flate_level
         ));
     }

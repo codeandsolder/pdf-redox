@@ -223,8 +223,12 @@ mod tests {
         ]));
         let eligible = BTreeMap::from([(profile, b"DeviceCMYK".to_vec())]);
         assert_eq!(rewrite_iccbased_values(&mut value, &eligible), 1);
+        assert!(
+            matches!(value, OwnedObject::Dictionary(_)),
+            "dictionary expected"
+        );
         let OwnedObject::Dictionary(dictionary) = value else {
-            panic!("dictionary expected");
+            return;
         };
         assert_eq!(
             dictionary.get(b"CS".as_slice()),

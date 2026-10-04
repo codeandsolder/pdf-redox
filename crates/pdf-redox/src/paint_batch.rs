@@ -1208,7 +1208,10 @@ fn structural_grid_coordinate(value: f64) -> Option<i64> {
     if (scaled - rounded).abs() > 1.0e-6 || rounded.abs() > 9_007_199_254_740_991.0 {
         return None;
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "value is finite, integral, and restricted to f64 exact-integer range above"
+    )]
     let coordinate = rounded as i64;
     Some(coordinate)
 }
@@ -1239,7 +1242,10 @@ impl StrokeGraphicsState {
         if !scaled.is_finite() || scaled < 0.0 || scaled > 9_007_199_254_740_990.0 {
             return None;
         }
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "finite nonnegative value is bounded below f64 exact-integer limit above"
+        )]
         let rounded_up = scaled.ceil() as i64;
         rounded_up.checked_add(1)
     }
@@ -2433,16 +2439,35 @@ pub fn batch_page_paints_hayro(
 mod tests {
     use super::*;
 
+    macro_rules! some {
+        ($value:expr, $message:literal) => {{
+            let value = $value;
+            assert!(value.is_some(), $message);
+            let Some(value) = value else {
+                return;
+            };
+            value
+        }};
+    }
+
     fn operator_count(output: &[u8], operator: &[u8]) -> usize {
-        events_for(output, "paint batching operator count")
-            .expect("parse output")
+        let events = events_for(output, "paint batching operator count");
+        assert!(events.is_some(), "parse output");
+        let Some(events) = events else {
+            return 0;
+        };
+        events
             .iter()
             .filter(|event| event.operator == operator)
             .count()
     }
 
     fn assert_known_operators(output: &[u8]) {
-        let events = events_for(output, "paint batching test output").expect("parse output");
+        let events = events_for(output, "paint batching test output");
+        assert!(events.is_some(), "parse output");
+        let Some(events) = events else {
+            return;
+        };
         assert!(
             events.iter().all(|event| {
                 matches!(
@@ -2471,7 +2496,7 @@ mod tests {
     #[test]
     fn batches_consecutive_strokes_without_reordering() {
         let input = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.source_paints_batched, 3);
         assert_eq!(stats.paints_eliminated, 2);
         assert_eq!(operator_count(&output, b"S"), 1);
@@ -2483,7 +2508,7 @@ mod tests {
     #[test]
     fn graphics_state_change_splits_stroke_batches() {
         let input = b"0 0 m 1 0 l S 2 w 2 0 m 3 0 l S";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output, input);
     }
@@ -2491,7 +2516,7 @@ mod tests {
     #[test]
     fn ext_gstate_disables_page_paint_batching() {
         let input = b"/GS1 gs 0 0 m 1 0 l S 2 0 m 3 0 l S";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output, input);
     }
@@ -2499,7 +2524,7 @@ mod tests {
     #[test]
     fn batches_same_winding_closed_fill_stroke_transactions() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 0.5 0 m 1.5 0 l 1.5 1 l h b Q";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.source_paints_batched, 2);
         assert_eq!(stats.paints_eliminated, 1);
         assert_eq!(operator_count(&output, b"B"), 1);
@@ -2509,7 +2534,7 @@ mod tests {
     #[test]
     fn opposite_winding_overlap_is_not_batched() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 0.5 0 m 0.5 1 l 1.5 1 l h b Q";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output, input);
     }
@@ -2517,7 +2542,7 @@ mod tests {
     #[test]
     fn opposite_winding_disjoint_paths_are_batched() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 2 1 l 3 1 l h b Q";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 1);
         assert_known_operators(&output);
     }
@@ -2525,7 +2550,7 @@ mod tests {
     #[test]
     fn zero_area_fill_can_join_any_winding() {
         let input = b"q 1 M 0 0 m 1 0 l h b Q q 1 M 0 0 m 1 0 l 1 1 l h b Q";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 1);
         assert_known_operators(&output);
     }
@@ -2533,7 +2558,7 @@ mod tests {
     #[test]
     fn differing_miter_limit_splits_closed_fill_batches() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 2 M 2 0 m 3 0 l 3 1 l h b Q";
-        let (output, stats) = batch_content(input).expect("parse");
+        let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output, input);
     }
@@ -2544,7 +2569,7 @@ mod tests {
         for index in 0..=MAX_SOURCE_PATHS_PER_BATCH {
             input.extend_from_slice(format!("{index} 0 m {index} 1 l S ").as_bytes());
         }
-        let (output, stats) = batch_content(&input).expect("parse");
+        let (output, stats) = some!(batch_content(&input), "parse");
         assert_eq!(stats.source_paints_batched, MAX_SOURCE_PATHS_PER_BATCH + 1);
         assert_eq!(stats.paints_eliminated, MAX_SOURCE_PATHS_PER_BATCH - 1);
         assert_eq!(operator_count(&output, b"S"), 2);
@@ -2553,7 +2578,7 @@ mod tests {
     #[test]
     fn outlined_glyph_components_match_after_translation() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 1 0 m 2 0 l 2 1 l h b Q q 1 M 10 0 m 11 0 l 11 1 l h b Q q 1 M 11 0 m 12 0 l 12 1 l h b Q";
-        let components = outlined_glyph_components(input).expect("parse");
+        let components = some!(outlined_glyph_components(input), "parse");
         assert_eq!(components.len(), 2);
         assert_eq!(components[0].source_paints, 2);
         assert_eq!(components[1].source_paints, 2);
@@ -2563,7 +2588,7 @@ mod tests {
     #[test]
     fn outlined_glyph_factor_rejects_noncontiguous_components() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 10 0 m 11 0 l 11 1 l h b Q q 1 M 1 0 m 2 0 l 2 1 l h b Q";
-        let components = outlined_glyph_components(input).expect("parse");
+        let components = some!(outlined_glyph_components(input), "parse");
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].source_paints, 1);
         assert_eq!(components[0].origin_x, 1000);
@@ -2572,13 +2597,13 @@ mod tests {
     #[test]
     fn outlined_glyph_factor_leaves_existing_text_pages_alone() {
         let input = b"BT ET q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 1 0 m 2 0 l 2 1 l h b Q";
-        let components = outlined_glyph_components(input).expect("parse");
+        let components = some!(outlined_glyph_components(input), "parse");
         assert!(components.is_empty());
     }
     #[test]
     fn coalesces_adjacent_identical_optional_content() {
         let input = b"/OC /MC0 BDC 0 0 m 1 0 l S EMC /OC /MC0 BDC 2 0 m 3 0 l S EMC";
-        let (output, count) = coalesce_adjacent_ocg_content(input).expect("parse");
+        let (output, count) = some!(coalesce_adjacent_ocg_content(input), "parse");
         assert_eq!(count, 1);
         assert_eq!(operator_count(&output, b"BDC"), 1);
         assert_eq!(operator_count(&output, b"EMC"), 1);
@@ -2592,7 +2617,7 @@ mod tests {
     #[test]
     fn keeps_different_optional_content_boundaries() {
         let input = b"/OC /MC0 BDC 0 0 m 1 0 l S EMC /OC /MC1 BDC 2 0 m 3 0 l S EMC";
-        let (output, count) = coalesce_adjacent_ocg_content(input).expect("parse");
+        let (output, count) = some!(coalesce_adjacent_ocg_content(input), "parse");
         assert_eq!(count, 0);
         assert_eq!(output, input);
     }
@@ -2600,14 +2625,14 @@ mod tests {
     #[test]
     fn keeps_non_oc_marked_content_boundaries() {
         let input = b"/Span /P0 BDC 0 0 m 1 0 l S EMC /Span /P0 BDC 2 0 m 3 0 l S EMC";
-        let (output, count) = coalesce_adjacent_ocg_content(input).expect("parse");
+        let (output, count) = some!(coalesce_adjacent_ocg_content(input), "parse");
         assert_eq!(count, 0);
         assert_eq!(output, input);
     }
     #[test]
     fn removes_exact_forward_collinear_vertex() {
         let input = b"0 0 m 1 0 l 2 0 l S";
-        let (output, removed) = compact_collinear_line_points(input).expect("parse");
+        let (output, removed) = some!(compact_collinear_line_points(input), "parse");
         assert_eq!(removed, 1);
         assert!(
             !output
@@ -2628,7 +2653,7 @@ mod tests {
             b"0 0 m 1 0 l 0 0 l S".as_slice(),
             b"0 0 m 1 0 l 1 0 l S".as_slice(),
         ] {
-            let (output, removed) = compact_collinear_line_points(input).expect("parse");
+            let (output, removed) = some!(compact_collinear_line_points(input), "parse");
             assert_eq!(removed, 0);
             assert_eq!(output, input);
         }
@@ -2637,7 +2662,7 @@ mod tests {
     #[test]
     fn keeps_off_grid_collinear_vertices() {
         let input = b"0 0 m 0.001 0 l 0.002 0 l S";
-        let (output, removed) = compact_collinear_line_points(input).expect("parse");
+        let (output, removed) = some!(compact_collinear_line_points(input), "parse");
         assert_eq!(removed, 0);
         assert_eq!(output, input);
     }
@@ -2646,7 +2671,7 @@ mod tests {
     fn stroke_form_occurrences_match_translation_and_inherited_state() {
         let input =
             b"1 w 2 M q 0 0 m 1 0 l 1 1 l 0 1 l h S Q 4 w 5 M q 10 0 m 11 0 l 11 1 l 10 1 l h S Q";
-        let occurrences = stroke_form_occurrences(input).expect("parse");
+        let occurrences = some!(stroke_form_occurrences(input), "parse");
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].signature, occurrences[1].signature);
         assert_eq!((occurrences[0].origin_x, occurrences[0].origin_y), (0, 0));
@@ -2657,39 +2682,40 @@ mod tests {
         assert_eq!(occurrences[0].bbox_margin_grid, 101);
         assert_eq!(occurrences[1].bbox_margin_grid, 1001);
 
-        let replacement =
-            stroke_form_replacement(b"PdfRedoxStroke0", &occurrences[0], &occurrences[1])
-                .expect("translation");
+        let replacement = some!(
+            stroke_form_replacement(b"PdfRedoxStroke0", &occurrences[0], &occurrences[1]),
+            "translation"
+        );
         assert_eq!(replacement, b"q\n1 0 0 1 10 0 cm\n/PdfRedoxStroke0 Do\nQ\n");
     }
 
     #[test]
     fn stroke_form_occurrence_rejects_open_caller_path() {
         let input = b"0 0 m q 10 0 m 11 0 l S Q";
-        let occurrences = stroke_form_occurrences(input).expect("parse");
+        let occurrences = some!(stroke_form_occurrences(input), "parse");
         assert!(occurrences.is_empty());
     }
 
     #[test]
     fn stroke_form_occurrence_rejects_unsafe_extended_graphics_state() {
         let input = b"/GS0 gs q 0 0 m 1 0 l 1 1 l 0 1 l h S Q q 10 0 m 11 0 l 11 1 l 10 1 l h S Q";
-        let occurrences = stroke_form_occurrences(input).expect("parse");
+        let occurrences = some!(stroke_form_occurrences(input), "parse");
         assert!(occurrences.is_empty());
     }
 
     #[test]
     fn paint_batching_is_idempotent() {
         let strokes = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
-        let (first, first_stats) = batch_content(strokes).expect("parse");
+        let (first, first_stats) = some!(batch_content(strokes), "parse");
         assert!(first_stats.paints_eliminated > 0);
-        let (second, second_stats) = batch_content(&first).expect("parse generated output");
+        let (second, second_stats) = some!(batch_content(&first), "parse generated output");
         assert_eq!(second_stats.paints_eliminated, 0);
         assert_eq!(second, first);
 
         let fills = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 3 0 l 3 1 l h b Q";
-        let (first, first_stats) = batch_content(fills).expect("parse");
+        let (first, first_stats) = some!(batch_content(fills), "parse");
         assert!(first_stats.paints_eliminated > 0);
-        let (second, second_stats) = batch_content(&first).expect("parse generated output");
+        let (second, second_stats) = some!(batch_content(&first), "parse generated output");
         assert_eq!(second_stats.paints_eliminated, 0);
         assert_eq!(second, first);
     }

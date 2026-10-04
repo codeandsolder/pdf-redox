@@ -2491,7 +2491,7 @@ fn shared_resource_name(resource: SharedResourceRef) -> Vec<u8> {
         ObjectHandle::Existing(id) => format!("O{}G{}", id.number(), id.generation()),
         ObjectHandle::New(id) => format!("N{}", id.index()),
     };
-    format!("PdfRedoxShared{}{}", resource.kind.name_prefix(), suffix).into_bytes()
+    format!("PdfRedoxShared{}{suffix}", resource.kind.name_prefix()).into_bytes()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3524,13 +3524,9 @@ fn canonicalize_page_path_coordinates_hayro(
             .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
         if *DEBUG_VECTOR {
             eprintln!(
-                "path-coordinate page={page:?} candidates={coordinates} decoded={} -> {} flate={} -> {} savings={} required={}",
+                "path-coordinate page={page:?} candidates={coordinates} decoded={} -> {} flate={before_flate} -> {after_flate} savings={savings} required={required}",
                 decoded.len(),
-                canonicalized.len(),
-                before_flate,
-                after_flate,
-                savings,
-                required
+                canonicalized.len()
             );
         }
         if savings < required {
@@ -4161,8 +4157,10 @@ mod tests {
     #[test]
     fn path_coordinate_canonicalization_rounds_only_path_operands() {
         let input = b"0.123456 rg 255.96000671 518.76000977 m 254.16000366 518.76000977 l S";
-        let Some((output, count)) = canonicalize_path_coordinates(input, 1.0) else {
-            panic!("expected path coordinate rewrite");
+        let result = canonicalize_path_coordinates(input, 1.0);
+        assert!(result.is_some(), "expected path coordinate rewrite");
+        let Some((output, count)) = result else {
+            return;
         };
         let output = String::from_utf8_lossy(&output);
         assert_eq!(count, 4);
@@ -4186,8 +4184,10 @@ mod tests {
     #[test]
     fn path_coordinate_canonicalization_restores_ctm_across_q() {
         let input = b"q 100 0 0 100 0 0 cm 1.004 2 m S Q 5.003 6.003 m S";
-        let Some((output, count)) = canonicalize_path_coordinates(input, 1.0) else {
-            panic!("expected outer path rewrite");
+        let result = canonicalize_path_coordinates(input, 1.0);
+        assert!(result.is_some(), "expected outer path rewrite");
+        let Some((output, count)) = result else {
+            return;
         };
         let output = String::from_utf8_lossy(&output);
         assert_eq!(count, 2);
