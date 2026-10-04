@@ -18,6 +18,7 @@ mod jpeg;
 mod jpeg_optimize;
 mod microstroke;
 mod optimize;
+mod paint_batch;
 mod preservation;
 mod print;
 mod prune;

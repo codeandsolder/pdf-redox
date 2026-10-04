@@ -28,6 +28,10 @@ use crate::{
     inline_images::externalize_duplicate_inline_images_hayro,
     jpeg_optimize::optimize_jpeg_entropy_hayro,
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
+    paint_batch::{
+        OutlinedGlyphFactorStats, PaintBatchStats, batch_page_paints_hayro,
+        factor_outlined_glyphs_hayro,
+    },
     preservation::{PreservationStats, apply_preservation_policy_hayro},
     print::{PrintPlanHayro, plan_print_downsampling_hayro},
     prune::{ResourcePruneStats, prune_resources_hayro, prune_resources_with_usage_hayro},
@@ -497,6 +501,24 @@ fn optimize_pdf_with_document(
         }
     })?;
 
+    let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
+        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        {
+            factor_outlined_glyphs_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(OutlinedGlyphFactorStats::default())
+        }
+    })?;
+
+    let paint_batch = timed(&mut timings, "paint-batching", || {
+        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        {
+            batch_page_paints_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(PaintBatchStats::default())
+        }
+    })?;
+
     let resource_prune = timed(&mut timings, "resource-prune", || {
         if !cfg.prune_resources {
             return Ok(ResourcePruneStats::default());
@@ -506,7 +528,8 @@ fn optimize_pdf_with_document(
             && physically_hidden_text.removed == 0
             && inline_image_dedup.occurrences_externalized == 0
             && repeated_page_objects.objects_removed == 0
-            && vector_compaction.shared_run_forms_created == 0;
+            && vector_compaction.shared_run_forms_created == 0
+            && outlined_glyphs.fonts_created == 0;
         if shared_usage_is_exact {
             prune_resources_with_usage_hayro(
                 &mut document,
@@ -797,6 +820,28 @@ fn optimize_pdf_with_document(
             vector_compaction.path_coordinate_estimated_flate_bytes_saved
         ));
     }
+    if outlined_glyphs.occurrences_replaced > 0 {
+        notes.push(format!(
+            "Recovered {} reusable outlined glyph shape(s) in {} synthetic Type3 font(s), replacing {} glyph occurrence(s) spanning {} source paint operation(s), removing about {} decoded bytes and saving about {} encoded bytes.",
+            outlined_glyphs.glyphs_created,
+            outlined_glyphs.fonts_created,
+            outlined_glyphs.occurrences_replaced,
+            outlined_glyphs.source_paints_replaced,
+            outlined_glyphs.decoded_bytes_removed,
+            outlined_glyphs.estimated_flate_bytes_saved
+        ));
+    }
+    if paint_batch.paints_eliminated > 0 {
+        notes.push(format!(
+            "Collapsed {} source paint operation(s) into {} bounded compound paint group(s) across {} page(s), eliminating {} paint operations, removing about {} decoded bytes, and saving about {} encoded bytes.",
+            paint_batch.source_paints_batched,
+            paint_batch.groups_created,
+            paint_batch.pages_rewritten,
+            paint_batch.paints_eliminated,
+            paint_batch.decoded_bytes_removed,
+            paint_batch.estimated_flate_bytes_saved
+        ));
+    }
     if microstroke_raster.runs_rasterized > 0 {
         notes.push(format!(
             "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
@@ -896,6 +941,19 @@ fn optimize_pdf_with_document(
             .path_coordinate_decoded_bytes_removed,
         vector_path_coordinate_estimated_flate_bytes_saved: vector_compaction
             .path_coordinate_estimated_flate_bytes_saved,
+        outlined_glyph_pages_rewritten: outlined_glyphs.pages_rewritten,
+        outlined_glyph_fonts_created: outlined_glyphs.fonts_created,
+        outlined_glyph_shapes_created: outlined_glyphs.glyphs_created,
+        outlined_glyph_occurrences_replaced: outlined_glyphs.occurrences_replaced,
+        outlined_glyph_source_paints_replaced: outlined_glyphs.source_paints_replaced,
+        outlined_glyph_decoded_bytes_removed: outlined_glyphs.decoded_bytes_removed,
+        outlined_glyph_estimated_flate_bytes_saved: outlined_glyphs.estimated_flate_bytes_saved,
+        paint_batch_pages_rewritten: paint_batch.pages_rewritten,
+        paint_batch_groups_created: paint_batch.groups_created,
+        paint_batch_source_paints_batched: paint_batch.source_paints_batched,
+        paint_batch_paints_eliminated: paint_batch.paints_eliminated,
+        paint_batch_decoded_bytes_removed: paint_batch.decoded_bytes_removed,
+        paint_batch_estimated_flate_bytes_saved: paint_batch.estimated_flate_bytes_saved,
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,

@@ -417,6 +417,45 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Estimated encoded bytes saved by path-coordinate canonicalization.
     pub vector_path_coordinate_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by outlined-glyph Type3 factoring.
+    #[serde(default)]
+    pub outlined_glyph_pages_rewritten: usize,
+    /// Number of synthetic Type3 fonts created from outlined glyphs.
+    #[serde(default)]
+    pub outlined_glyph_fonts_created: usize,
+    /// Number of reusable outlined glyph shapes created.
+    #[serde(default)]
+    pub outlined_glyph_shapes_created: usize,
+    /// Number of outlined glyph occurrences replaced with Type3 text shows.
+    #[serde(default)]
+    pub outlined_glyph_occurrences_replaced: usize,
+    /// Number of source paint operations covered by outlined glyph factoring.
+    #[serde(default)]
+    pub outlined_glyph_source_paints_replaced: usize,
+    /// Decoded page-content bytes removed by outlined glyph factoring.
+    #[serde(default)]
+    pub outlined_glyph_decoded_bytes_removed: usize,
+    /// Estimated encoded bytes saved by outlined glyph factoring.
+    #[serde(default)]
+    pub outlined_glyph_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by bounded compound paint batching.
+    #[serde(default)]
+    pub paint_batch_pages_rewritten: usize,
+    #[serde(default)]
+    /// Number of bounded compound paint groups created.
+    pub paint_batch_groups_created: usize,
+    #[serde(default)]
+    /// Number of source paint operations participating in batching.
+    pub paint_batch_source_paints_batched: usize,
+    #[serde(default)]
+    /// Number of paint operations eliminated by batching.
+    pub paint_batch_paints_eliminated: usize,
+    #[serde(default)]
+    /// Decoded content bytes removed by paint batching.
+    pub paint_batch_decoded_bytes_removed: usize,
+    #[serde(default)]
+    /// Estimated encoded bytes saved by paint batching.
+    pub paint_batch_estimated_flate_bytes_saved: usize,
     /// Number of metadata duplicate streams detected.
     pub metadata_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to metadata duplicate.
