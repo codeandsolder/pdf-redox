@@ -64,6 +64,10 @@ pub struct VectorCompactionStats {
     pub shared_run_blocks_replaced: usize,
     pub shared_run_decoded_bytes_factored: usize,
     pub shared_run_estimated_flate_bytes_saved: usize,
+    pub path_coordinates_canonicalized: usize,
+    pub path_coordinate_pages_rewritten: usize,
+    pub path_coordinate_decoded_bytes_removed: usize,
+    pub path_coordinate_estimated_flate_bytes_saved: usize,
     pub generated_page_xobjects: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
 }
 
@@ -1513,6 +1517,79 @@ pub struct ProcessingVectorAnalysis {
     fills: Vec<FillPaint>,
     path_blocks: Vec<PathBlock>,
     transformed_blocks: Vec<TransformedBlock>,
+    path_coordinate_candidate: bool,
+}
+
+#[derive(Default)]
+struct PathCoordinateCandidateScanner {
+    operands: Vec<(Option<f64>, usize)>,
+    candidate: bool,
+}
+
+impl PathCoordinateCandidateScanner {
+    fn process_operator(&mut self, operator: &[u8]) {
+        let expected = match operator {
+            b"m" | b"l" => 2,
+            b"c" => 6,
+            b"v" | b"y" | b"re" => 4,
+            _ => {
+                self.operands.clear();
+                return;
+            }
+        };
+        if self.operands.len() == expected {
+            self.candidate |= self.operands.iter().any(|(value, length)| {
+                let Some(value) = *value else {
+                    return false;
+                };
+                if !value.is_finite() {
+                    return false;
+                }
+                let scaled = value * 10_000.0;
+                if !scaled.is_finite() {
+                    return false;
+                }
+                let rounded = scaled.round() / 10_000.0;
+                if rounded.to_bits() == value.to_bits()
+                    || (rounded - value).abs() > MAX_PATH_COORDINATE_PAGE_ERROR_PT
+                {
+                    return false;
+                }
+                let mut rendered = format!("{rounded:.4}");
+                while rendered.contains('.') && rendered.ends_with('0') {
+                    rendered.pop();
+                }
+                if rendered.ends_with('.') {
+                    rendered.pop();
+                }
+                if rendered == "-0" {
+                    "0".clone_into(&mut rendered);
+                }
+                rendered.len() < *length
+            });
+        }
+        self.operands.clear();
+    }
+
+    fn handle_scalar_value(&mut self, scalar: &ContentScalar, length: usize) {
+        self.operands.push((
+            scalar
+                .as_integer()
+                .and_then(crate::source::exact_i64_to_f64)
+                .or_else(|| scalar.as_real()),
+            length,
+        ));
+    }
+
+    fn handle_object_value(&mut self, object: &FlObjectHandle, length: usize) {
+        self.operands.push((
+            object
+                .as_integer()
+                .and_then(crate::source::exact_i64_to_f64)
+                .or_else(|| object.as_real()),
+            length,
+        ));
+    }
 }
 
 const fn processing_transformed_factor_candidate(
@@ -1552,6 +1629,9 @@ pub fn processing_factor_candidate(
         }
     }
     repeated_path
+        || cache
+            .values()
+            .any(|analysis| analysis.path_coordinate_candidate)
         || transformed.values().any(|(count, body_len, operators)| {
             processing_transformed_factor_candidate(*body_len, *operators, *count)
         })
@@ -1560,6 +1640,7 @@ pub fn processing_factor_candidate(
 pub struct ProcessingPageScanner {
     fill: FillScanner,
     factor: ProcessingFactorScanner,
+    path_coordinates: PathCoordinateCandidateScanner,
 }
 
 impl ProcessingPageScanner {
@@ -1567,6 +1648,7 @@ impl ProcessingPageScanner {
         Self {
             fill: FillScanner::new(ext_gstates),
             factor: ProcessingFactorScanner::new(),
+            path_coordinates: PathCoordinateCandidateScanner::default(),
         }
     }
 
@@ -1582,6 +1664,7 @@ impl ProcessingPageScanner {
             fills: self.fill.fills,
             path_blocks: self.factor.path.blocks,
             transformed_blocks: self.factor.transformed.blocks,
+            path_coordinate_candidate: self.path_coordinates.candidate,
         }
     }
 }
@@ -1599,6 +1682,11 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         offset: usize,
         length: usize,
     ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = scalar.as_operator() {
+            self.path_coordinates.process_operator(operator);
+        } else {
+            self.path_coordinates.handle_scalar_value(&scalar, length);
+        }
         let fill = self.fill.handle_scalar(scalar.clone(), offset, length)?;
         let factor = self.factor.handle_scalar(scalar, offset, length)?;
         if matches!(fill, ParseControl::Stop) || matches!(factor, ParseControl::Stop) {
@@ -1614,6 +1702,7 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         offset: usize,
         length: usize,
     ) -> flpdf::Result<ParseControl> {
+        self.path_coordinates.process_operator(operator);
         let fill = self.fill.handle_operator(operator, offset, length)?;
         let factor = self.factor.handle_operator(operator, offset, length)?;
         if matches!(fill, ParseControl::Stop) || matches!(factor, ParseControl::Stop) {
@@ -1629,6 +1718,13 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         offset: usize,
         length: usize,
     ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = object.as_operator() {
+            self.path_coordinates.process_operator(&operator);
+        } else if object.as_inline_image().is_some() {
+            self.path_coordinates.operands.clear();
+        } else {
+            self.path_coordinates.handle_object_value(&object, length);
+        }
         let fill = self.fill.handle_object(object.clone(), offset, length)?;
         let factor = self.factor.handle_object(object, offset, length)?;
         Ok(
@@ -3088,6 +3184,377 @@ fn factor_shared_q_prefix_runs_hayro(
     })
 }
 
+const PATH_COORDINATE_SCALE: f64 = 10_000.0;
+const MAX_PATH_COORDINATE_PAGE_ERROR_PT: f64 = 0.000_05;
+const MIN_PATH_COORDINATE_FLATE_SAVINGS: usize = 4 * 1024;
+const PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR: usize = 200;
+
+#[derive(Debug, Clone)]
+struct PathCoordinateOperand {
+    value: Option<f64>,
+    offset: usize,
+    length: usize,
+}
+
+struct PathCoordinateScanner<'a> {
+    input: &'a [u8],
+    operands: Vec<PathCoordinateOperand>,
+    ctm: Option<Matrix>,
+    state_stack: Vec<Option<Matrix>>,
+    user_unit: f64,
+    replacements: Vec<(usize, usize, Vec<u8>)>,
+    coordinates_canonicalized: usize,
+}
+
+impl<'a> PathCoordinateScanner<'a> {
+    fn new(input: &'a [u8], user_unit: f64) -> Self {
+        Self {
+            input,
+            operands: Vec::new(),
+            ctm: Some(Matrix::default()),
+            state_stack: Vec::new(),
+            user_unit,
+            replacements: Vec::new(),
+            coordinates_canonicalized: 0,
+        }
+    }
+
+    fn rounded_coordinate(value: f64) -> Option<f64> {
+        if !value.is_finite() {
+            return None;
+        }
+        let scaled = value * PATH_COORDINATE_SCALE;
+        if !scaled.is_finite() {
+            return None;
+        }
+        Some(scaled.round() / PATH_COORDINATE_SCALE)
+    }
+
+    fn rounded_coordinate_bytes(value: f64) -> Option<Vec<u8>> {
+        let rounded = Self::rounded_coordinate(value)?;
+        let mut out = format!("{rounded:.4}");
+        while out.contains('.') && out.ends_with('0') {
+            out.pop();
+        }
+        if out.ends_with('.') {
+            out.pop();
+        }
+        if out == "-0" {
+            "0".clone_into(&mut out);
+        }
+        Some(out.into_bytes())
+    }
+
+    fn point_error(&self, old: (f64, f64), new: (f64, f64)) -> Option<f64> {
+        let ctm = self.ctm?;
+        let old = ctm.transform(old.0, old.1);
+        let new = ctm.transform(new.0, new.1);
+        Some((old.0 - new.0).hypot(old.1 - new.1) * self.user_unit)
+    }
+
+    fn path_geometry_is_within_tolerance(&self, operator: &[u8], old: &[f64], new: &[f64]) -> bool {
+        let point_ok = |this: &Self, old: (f64, f64), new: (f64, f64)| {
+            this.point_error(old, new)
+                .is_some_and(|error| error <= MAX_PATH_COORDINATE_PAGE_ERROR_PT)
+        };
+        match operator {
+            b"m" | b"l" if old.len() == 2 && new.len() == 2 => {
+                point_ok(self, (old[0], old[1]), (new[0], new[1]))
+            }
+            b"c" if old.len() == 6 && new.len() == 6 => (0..3).all(|index| {
+                let offset = index * 2;
+                point_ok(
+                    self,
+                    (old[offset], old[offset + 1]),
+                    (new[offset], new[offset + 1]),
+                )
+            }),
+            b"v" | b"y" if old.len() == 4 && new.len() == 4 => (0..2).all(|index| {
+                let offset = index * 2;
+                point_ok(
+                    self,
+                    (old[offset], old[offset + 1]),
+                    (new[offset], new[offset + 1]),
+                )
+            }),
+            b"re" if old.len() == 4 && new.len() == 4 => {
+                let old_points = [
+                    (old[0], old[1]),
+                    (old[0] + old[2], old[1]),
+                    (old[0], old[1] + old[3]),
+                    (old[0] + old[2], old[1] + old[3]),
+                ];
+                let new_points = [
+                    (new[0], new[1]),
+                    (new[0] + new[2], new[1]),
+                    (new[0], new[1] + new[3]),
+                    (new[0] + new[2], new[1] + new[3]),
+                ];
+                old_points
+                    .into_iter()
+                    .zip(new_points)
+                    .all(|(old, new)| point_ok(self, old, new))
+            }
+            _ => false,
+        }
+    }
+
+    fn canonicalize_path_operands(&mut self, operator: &[u8]) {
+        let expected = match operator {
+            b"m" | b"l" => 2,
+            b"c" => 6,
+            b"v" | b"y" | b"re" => 4,
+            _ => return,
+        };
+        if self.operands.len() != expected || self.ctm.is_none() {
+            return;
+        }
+        let Some(old) = self
+            .operands
+            .iter()
+            .map(|operand| operand.value)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let Some(new) = old
+            .iter()
+            .copied()
+            .map(Self::rounded_coordinate)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        if !self.path_geometry_is_within_tolerance(operator, &old, &new) {
+            return;
+        }
+
+        let mut pending = Vec::new();
+        for (operand, &rounded) in self.operands.iter().zip(&new) {
+            if rounded.to_bits() == operand.value.unwrap_or_default().to_bits() {
+                continue;
+            }
+            let Some(replacement) = Self::rounded_coordinate_bytes(rounded) else {
+                return;
+            };
+            let end = operand.offset.saturating_add(operand.length);
+            let Some(original) = self.input.get(operand.offset..end) else {
+                return;
+            };
+            if replacement.len() >= original.len() {
+                continue;
+            }
+            pending.push((operand.offset, end, replacement));
+        }
+        self.coordinates_canonicalized =
+            self.coordinates_canonicalized.saturating_add(pending.len());
+        self.replacements.extend(pending);
+    }
+
+    fn concat_ctm(&mut self) {
+        let matrix = self
+            .operands
+            .iter()
+            .map(|operand| operand.value)
+            .collect::<Option<Vec<_>>>()
+            .filter(|values| values.len() == 6)
+            .map(|values| {
+                Matrix::new(
+                    values[0], values[1], values[2], values[3], values[4], values[5],
+                )
+            });
+        match (&mut self.ctm, matrix) {
+            (Some(ctm), Some(matrix)) => ctm.concat(matrix),
+            _ => self.ctm = None,
+        }
+    }
+
+    fn process_operator(&mut self, operator: &[u8]) {
+        match operator {
+            b"q" => self.state_stack.push(self.ctm),
+            b"Q" => {
+                self.ctm = self.state_stack.pop().unwrap_or(None);
+            }
+            b"cm" => self.concat_ctm(),
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"re" => {
+                self.canonicalize_path_operands(operator);
+            }
+            _ => {}
+        }
+        self.operands.clear();
+    }
+}
+
+impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
+    const HANDLES_CONTENT_SCALARS: bool = true;
+
+    fn handle_scalar(
+        &mut self,
+        scalar: ContentScalar,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = scalar.as_operator() {
+            self.process_operator(operator);
+        } else {
+            let value = scalar
+                .as_integer()
+                .and_then(crate::source::exact_i64_to_f64)
+                .or_else(|| scalar.as_real());
+            self.operands.push(PathCoordinateOperand {
+                value,
+                offset,
+                length,
+            });
+        }
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_operator(
+        &mut self,
+        operator: &[u8],
+        _offset: usize,
+        _length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        self.process_operator(operator);
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_object(
+        &mut self,
+        object: FlObjectHandle,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        if let Some(operator) = object.as_operator() {
+            self.process_operator(&operator);
+        } else if object.as_inline_image().is_some() {
+            self.operands.clear();
+        } else {
+            let value = object
+                .as_integer()
+                .and_then(crate::source::exact_i64_to_f64)
+                .or_else(|| object.as_real());
+            self.operands.push(PathCoordinateOperand {
+                value,
+                offset,
+                length,
+            });
+        }
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8>, usize)> {
+    if !user_unit.is_finite() || user_unit <= 0.0 {
+        return None;
+    }
+    let mut scanner = PathCoordinateScanner::new(input, user_unit);
+    let parsed = flpdf::parse_detached_content_stream(
+        input,
+        "path coordinate canonicalization",
+        &mut scanner,
+    );
+    if *DEBUG_VECTOR {
+        eprintln!(
+            "path-coordinate-scan parsed={} stack={} replacements={} coordinates={}",
+            parsed.is_ok(),
+            scanner.state_stack.len(),
+            scanner.replacements.len(),
+            scanner.coordinates_canonicalized
+        );
+    }
+    parsed.ok()?;
+    if !scanner.state_stack.is_empty() || scanner.replacements.is_empty() {
+        return None;
+    }
+    let output = apply_span_replacements(input, &scanner.replacements)?;
+    Some((output, scanner.coordinates_canonicalized))
+}
+
+fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<f64>> {
+    let Some(object) = document.current_owned_object(page)? else {
+        return Ok(None);
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(None);
+    };
+    let Some(value) = dictionary.get(b"UserUnit".as_slice()) else {
+        return Ok(Some(1.0));
+    };
+    let Some(value) = current_number(document, value)? else {
+        return Ok(None);
+    };
+    Ok((value.is_finite() && value > 0.0).then_some(value))
+}
+
+fn canonicalize_page_path_coordinates_hayro(
+    document: &mut EditDocument,
+    flate_level: i32,
+    pages: &[ObjectHandle],
+) -> Result<VectorCompactionStats> {
+    let mut stats = VectorCompactionStats::default();
+    for &page in pages {
+        let Some(user_unit) = page_user_unit(document, page)? else {
+            continue;
+        };
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
+        let Some((canonicalized, coordinates)) = canonicalize_path_coordinates(&decoded, user_unit)
+        else {
+            continue;
+        };
+        let before_flate = compressed_len(&decoded, flate_level)?;
+        let after_flate = compressed_len(&canonicalized, flate_level)?;
+        let savings = before_flate.saturating_sub(after_flate);
+        let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
+            .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
+        if *DEBUG_VECTOR {
+            eprintln!(
+                "path-coordinate page={page:?} candidates={coordinates} decoded={} -> {} flate={} -> {} savings={} required={}",
+                decoded.len(),
+                canonicalized.len(),
+                before_flate,
+                after_flate,
+                savings,
+                required
+            );
+        }
+        if savings < required {
+            continue;
+        }
+        replace_page_content(document, page, canonicalized.clone())?;
+        stats.pages_compacted = stats.pages_compacted.saturating_add(1);
+        stats.path_coordinate_pages_rewritten =
+            stats.path_coordinate_pages_rewritten.saturating_add(1);
+        stats.path_coordinates_canonicalized = stats
+            .path_coordinates_canonicalized
+            .saturating_add(coordinates);
+        stats.path_coordinate_decoded_bytes_removed = stats
+            .path_coordinate_decoded_bytes_removed
+            .saturating_add(decoded.len().saturating_sub(canonicalized.len()));
+        stats.path_coordinate_estimated_flate_bytes_saved = stats
+            .path_coordinate_estimated_flate_bytes_saved
+            .saturating_add(savings);
+        stats.estimated_flate_bytes_saved =
+            stats.estimated_flate_bytes_saved.saturating_add(savings);
+    }
+    Ok(stats)
+}
+
 fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
     let level = u32::try_from(flate_level.clamp(0, 9)).unwrap_or(9);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
@@ -3231,6 +3698,18 @@ pub fn compact_vector_paths_hayro(
                 .or_default()
                 .extend(names.iter().cloned());
         }
+
+        let path_coordinates =
+            canonicalize_page_path_coordinates_hayro(document, flate_level, &pages)?;
+        total.pages_compacted += path_coordinates.pages_compacted;
+        total.decoded_bytes_removed += path_coordinates.decoded_bytes_removed;
+        total.estimated_flate_bytes_saved += path_coordinates.estimated_flate_bytes_saved;
+        total.path_coordinates_canonicalized += path_coordinates.path_coordinates_canonicalized;
+        total.path_coordinate_pages_rewritten += path_coordinates.path_coordinate_pages_rewritten;
+        total.path_coordinate_decoded_bytes_removed +=
+            path_coordinates.path_coordinate_decoded_bytes_removed;
+        total.path_coordinate_estimated_flate_bytes_saved +=
+            path_coordinates.path_coordinate_estimated_flate_bytes_saved;
     }
     Ok(total)
 }
@@ -3272,6 +3751,7 @@ mod tests {
                     operator_count: 8,
                 })
                 .collect(),
+            path_coordinate_candidate: false,
         }
     }
 
@@ -3300,6 +3780,21 @@ mod tests {
     }
 
     #[test]
+    fn processing_factor_candidate_keeps_path_coordinate_noise() {
+        let page = ObjectHandle::Existing(ObjectId::new(1, 0));
+        let cache = BTreeMap::from([(
+            page,
+            ProcessingVectorAnalysis {
+                fills: Vec::new(),
+                path_blocks: Vec::new(),
+                transformed_blocks: Vec::new(),
+                path_coordinate_candidate: true,
+            },
+        )]);
+        assert!(processing_factor_candidate(&cache));
+    }
+
+    #[test]
     fn processing_factor_candidate_rejects_repeated_unfactorable_transforms() {
         let first = ObjectHandle::Existing(ObjectId::new(1, 0));
         let second = ObjectHandle::Existing(ObjectId::new(2, 0));
@@ -3319,6 +3814,7 @@ mod tests {
                 semantic_key: key.to_vec(),
                 operator_count: 32,
             }],
+            path_coordinate_candidate: false,
         };
         let cache = BTreeMap::from([
             (first, tiny(b"same-transform")),
@@ -3660,5 +4156,42 @@ mod tests {
     fn shared_q_block_gap_accepts_only_pdf_trivia() {
         assert!(shared_gap_is_trivia(b" \n% comment\r\n\t"));
         assert!(!shared_gap_is_trivia(b" 0 0 m "));
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_rounds_only_path_operands() {
+        let input = b"0.123456 rg 255.96000671 518.76000977 m 254.16000366 518.76000977 l S";
+        let Some((output, count)) = canonicalize_path_coordinates(input, 1.0) else {
+            panic!("expected path coordinate rewrite");
+        };
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(count, 4);
+        assert!(output.contains("0.123456 rg"));
+        assert!(output.contains("255.96 518.76 m"));
+        assert!(output.contains("254.16 518.76 l"));
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_respects_ctm_magnification() {
+        let input = b"100 0 0 100 0 0 cm 1.00004 2.00004 m 3.00004 4.00004 l S";
+        assert!(canonicalize_path_coordinates(input, 1.0).is_none());
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_checks_rectangle_far_corner() {
+        let input = b"1.00004 2 3.00004 4 re f";
+        assert!(canonicalize_path_coordinates(input, 1.0).is_none());
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_restores_ctm_across_q() {
+        let input = b"q 100 0 0 100 0 0 cm 1.00004 2 m S Q 5.00003 6.00003 m S";
+        let Some((output, count)) = canonicalize_path_coordinates(input, 1.0) else {
+            panic!("expected outer path rewrite");
+        };
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(count, 2);
+        assert!(output.contains("1.00004 2 m"));
+        assert!(output.contains("5 6 m"));
     }
 }

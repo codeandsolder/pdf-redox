@@ -772,6 +772,15 @@ fn optimize_pdf_with_document(
             vector_compaction.shared_run_estimated_flate_bytes_saved
         ));
     }
+    if vector_compaction.path_coordinates_canonicalized > 0 {
+        notes.push(format!(
+            "Canonicalized {} path-coordinate operand(s) across {} page(s) within a 0.00005 pt page-space error bound, removing about {} decoded bytes and saving about {} encoded bytes.",
+            vector_compaction.path_coordinates_canonicalized,
+            vector_compaction.path_coordinate_pages_rewritten,
+            vector_compaction.path_coordinate_decoded_bytes_removed,
+            vector_compaction.path_coordinate_estimated_flate_bytes_saved
+        ));
+    }
     if microstroke_raster.runs_rasterized > 0 {
         notes.push(format!(
             "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
@@ -865,6 +874,12 @@ fn optimize_pdf_with_document(
             .shared_run_decoded_bytes_factored,
         vector_shared_run_estimated_flate_bytes_saved: vector_compaction
             .shared_run_estimated_flate_bytes_saved,
+        vector_path_coordinates_canonicalized: vector_compaction.path_coordinates_canonicalized,
+        vector_path_coordinate_pages_rewritten: vector_compaction.path_coordinate_pages_rewritten,
+        vector_path_coordinate_decoded_bytes_removed: vector_compaction
+            .path_coordinate_decoded_bytes_removed,
+        vector_path_coordinate_estimated_flate_bytes_saved: vector_compaction
+            .path_coordinate_estimated_flate_bytes_saved,
         metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
         metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
         metadata_references_canonicalized: metadata_dedup.references_canonicalized,
