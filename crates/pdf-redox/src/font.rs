@@ -114,10 +114,7 @@ fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
     for index in 0..table_count {
         let record = directory.checked_add(index.checked_mul(16)?)?;
         let tag: [u8; 4] = bytes.get(record..record.checked_add(4)?)?.try_into().ok()?;
-        if matches!(
-            &tag,
-            b"EBDT" | b"EBLC" | b"EBSC" | b"CBDT" | b"CBLC" | b"sbix" | b"SVG "
-        ) {
+        if matches!(&tag, b"EBSC" | b"CBDT" | b"CBLC" | b"sbix" | b"SVG ") {
             return None;
         }
         let offset = usize::try_from(be32(bytes, record.checked_add(8)?)?).ok()?;
@@ -586,7 +583,23 @@ fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
         }
     }
     rebuilt_offsets.push(rebuilt_glyf.len());
-    if removed_outline_bytes == 0 {
+
+    let mut bitmap_gids = requested_gids.clone();
+    bitmap_gids.insert(0);
+    let ebdt_record = sfnt_table_record(bytes, *b"EBDT");
+    let eblc_record = sfnt_table_record(bytes, *b"EBLC");
+    let bitmap_subset = match (ebdt_record, eblc_record) {
+        (Some((ebdt_offset, ebdt_len)), Some((eblc_offset, eblc_len))) => {
+            let ebdt = bytes.get(ebdt_offset..ebdt_offset.checked_add(ebdt_len)?)?;
+            let eblc = bytes.get(eblc_offset..eblc_offset.checked_add(eblc_len)?)?;
+            crate::sfnt_bitmap::subset_ebdt_eblc(ebdt, eblc, &bitmap_gids)
+        }
+        (None, None) => None,
+        _ => return None,
+    };
+    let removed_bitmap_bytes = bitmap_subset.as_ref().map_or(0, |(_, _, removed)| *removed);
+    let removed_glyph_bytes = removed_outline_bytes.checked_add(removed_bitmap_bytes)?;
+    if removed_glyph_bytes == 0 {
         return None;
     }
 
@@ -617,6 +630,10 @@ fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
             rebuilt_glyf.clone()
         } else if tag == *b"loca" {
             rebuilt_loca.clone()
+        } else if tag == *b"EBDT" {
+            bitmap_subset.as_ref()?.0.clone()
+        } else if tag == *b"EBLC" {
+            bitmap_subset.as_ref()?.1.clone()
         } else {
             let (offset, length) = sfnt_table_record(bytes, tag)?;
             let mut data = bytes.get(offset..offset.checked_add(length)?)?.to_vec();
@@ -639,7 +656,7 @@ fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
     let range_shift = u16::try_from(new_count.checked_mul(16)?)
         .ok()?
         .checked_sub(search_range)?;
-    let mut output = Vec::with_capacity(bytes.len().saturating_sub(removed_outline_bytes));
+    let mut output = Vec::with_capacity(bytes.len().saturating_sub(removed_glyph_bytes));
     output.extend_from_slice(&bytes[..4]);
     output.extend_from_slice(&u16::try_from(new_count).ok()?.to_be_bytes());
     output.extend_from_slice(&search_range.to_be_bytes());
@@ -671,7 +688,7 @@ fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
         let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
         output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
     }
-    Some((output, removed_outline_bytes))
+    Some((output, removed_glyph_bytes))
 }
 
 fn subset_base_font_name(name: &[u8]) -> Vec<u8> {

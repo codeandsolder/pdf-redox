@@ -24,6 +24,7 @@ mod raster_layout;
 mod repeated_page_objects;
 mod report;
 mod scrub;
+mod sfnt_bitmap;
 mod source;
 mod structure_compact;
 mod vector_compact;
