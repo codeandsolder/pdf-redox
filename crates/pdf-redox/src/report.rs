@@ -417,6 +417,30 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Estimated encoded bytes saved by path-coordinate canonicalization.
     pub vector_path_coordinate_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by optional-content boundary coalescing.
+    #[serde(default)]
+    pub marked_content_pages_rewritten: usize,
+    /// Number of redundant adjacent optional-content boundary pairs coalesced.
+    #[serde(default)]
+    pub marked_content_boundaries_coalesced: usize,
+    /// Decoded page-content bytes removed by optional-content boundary coalescing.
+    #[serde(default)]
+    pub marked_content_decoded_bytes_removed: usize,
+    /// Estimated encoded bytes saved by optional-content boundary coalescing.
+    #[serde(default)]
+    pub marked_content_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by exact collinear path compaction.
+    #[serde(default)]
+    pub collinear_path_pages_rewritten: usize,
+    /// Number of exact forward-collinear line vertices removed.
+    #[serde(default)]
+    pub collinear_path_vertices_removed: usize,
+    /// Decoded page-content bytes removed by exact collinear path compaction.
+    #[serde(default)]
+    pub collinear_path_decoded_bytes_removed: usize,
+    /// Estimated encoded bytes saved by exact collinear path compaction.
+    #[serde(default)]
+    pub collinear_path_estimated_flate_bytes_saved: usize,
     /// Number of pages rewritten by outlined-glyph Type3 factoring.
     #[serde(default)]
     pub outlined_glyph_pages_rewritten: usize,

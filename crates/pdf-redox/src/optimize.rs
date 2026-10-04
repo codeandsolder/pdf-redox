@@ -29,7 +29,8 @@ use crate::{
     jpeg_optimize::optimize_jpeg_entropy_hayro,
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     paint_batch::{
-        OutlinedGlyphFactorStats, PaintBatchStats, batch_page_paints_hayro,
+        CollinearPathStats, MarkedContentCoalesceStats, OutlinedGlyphFactorStats, PaintBatchStats,
+        batch_page_paints_hayro, coalesce_optional_content_hayro, compact_collinear_paths_hayro,
         factor_outlined_glyphs_hayro,
     },
     preservation::{PreservationStats, apply_preservation_policy_hayro},
@@ -501,6 +502,24 @@ fn optimize_pdf_with_document(
         }
     })?;
 
+    let marked_content = timed(&mut timings, "marked-content-coalesce", || {
+        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        {
+            coalesce_optional_content_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(MarkedContentCoalesceStats::default())
+        }
+    })?;
+
+    let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
+        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        {
+            compact_collinear_paths_hayro(&mut document, cfg.flate_level)
+        } else {
+            Ok(CollinearPathStats::default())
+        }
+    })?;
+
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
@@ -820,6 +839,24 @@ fn optimize_pdf_with_document(
             vector_compaction.path_coordinate_estimated_flate_bytes_saved
         ));
     }
+    if marked_content.boundaries_coalesced > 0 {
+        notes.push(format!(
+            "Coalesced {} redundant adjacent optional-content boundary pair(s) across {} page(s), removing about {} decoded bytes and saving about {} encoded bytes while preserving the OCG layer scopes.",
+            marked_content.boundaries_coalesced,
+            marked_content.pages_rewritten,
+            marked_content.decoded_bytes_removed,
+            marked_content.estimated_flate_bytes_saved
+        ));
+    }
+    if collinear_paths.vertices_removed > 0 {
+        notes.push(format!(
+            "Removed {} exact forward-collinear line vertex/vertices across {} page(s), removing about {} decoded bytes and saving about {} encoded bytes without changing path geometry.",
+            collinear_paths.vertices_removed,
+            collinear_paths.pages_rewritten,
+            collinear_paths.decoded_bytes_removed,
+            collinear_paths.estimated_flate_bytes_saved
+        ));
+    }
     if outlined_glyphs.occurrences_replaced > 0 {
         notes.push(format!(
             "Recovered {} reusable outlined glyph shape(s) in {} synthetic Type3 font(s), replacing {} glyph occurrence(s) spanning {} source paint operation(s), removing about {} decoded bytes and saving about {} encoded bytes.",
@@ -941,6 +978,14 @@ fn optimize_pdf_with_document(
             .path_coordinate_decoded_bytes_removed,
         vector_path_coordinate_estimated_flate_bytes_saved: vector_compaction
             .path_coordinate_estimated_flate_bytes_saved,
+        marked_content_pages_rewritten: marked_content.pages_rewritten,
+        marked_content_boundaries_coalesced: marked_content.boundaries_coalesced,
+        marked_content_decoded_bytes_removed: marked_content.decoded_bytes_removed,
+        marked_content_estimated_flate_bytes_saved: marked_content.estimated_flate_bytes_saved,
+        collinear_path_pages_rewritten: collinear_paths.pages_rewritten,
+        collinear_path_vertices_removed: collinear_paths.vertices_removed,
+        collinear_path_decoded_bytes_removed: collinear_paths.decoded_bytes_removed,
+        collinear_path_estimated_flate_bytes_saved: collinear_paths.estimated_flate_bytes_saved,
         outlined_glyph_pages_rewritten: outlined_glyphs.pages_rewritten,
         outlined_glyph_fonts_created: outlined_glyphs.fonts_created,
         outlined_glyph_shapes_created: outlined_glyphs.glyphs_created,
