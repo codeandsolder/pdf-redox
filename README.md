@@ -42,6 +42,6 @@ Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unkno
 
 Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB subset remains active optimization work. A corpus-wide scan found that almost all other oversampled non-JPEG images are bilevel, Indexed, masked, or otherwise semantically unsuitable for the current path, and found no safe Form-local-only Print candidates, so broad raster classification and Form-branch cloning are intentionally deferred. The opt-in resource-pruning pass has been corpus-tested and remains default-off because it produced negligible size wins.
 
-## Development handoff
+## Documentation scope
 
-For the Hayro/COW architecture, validation history, and development handoff, see [`docs/THREAD_HANDOFF.md`](docs/THREAD_HANDOFF.md). The preserved minimal Hayro trailer-access patch is in [`docs/hayro-trailer-access.patch`](docs/hayro-trailer-access.patch).
+Repository documentation is limited to material that should version with the code: user/developer behavior, build and test instructions, APIs, and provenance for vendored modifications. Architecture research, validation chronicles, benchmark history, development handoffs, infrastructure paths, and transient project state are maintained in the project Notion workspace instead.
