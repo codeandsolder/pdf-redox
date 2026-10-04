@@ -21,9 +21,9 @@ use std::{
     rc::Rc,
 };
 
-const RENDERING_UNUSED_TABLES: [[u8; 4]; 13] = [
+const RENDERING_UNUSED_TABLES: [[u8; 4]; 16] = [
     *b"BASE", *b"GDEF", *b"GPOS", *b"GSUB", *b"JSTF", *b"MATH", *b"kern", *b"vhea", *b"vmtx",
-    *b"DSIG", *b"name", *b"OS/2", *b"PCLT",
+    *b"DSIG", *b"name", *b"OS/2", *b"PCLT", *b"hdmx", *b"LTSH", *b"VDMX",
 ];
 
 const CIDFONT_TYPE2_UNUSED_TABLES: [[u8; 4]; 2] = [*b"cmap", *b"post"];
@@ -182,7 +182,10 @@ fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
 /// PDF's embedded-TrueType rules require the outline/metric/hinting core and,
 /// for simple fonts, `cmap`. Advanced line-layout tables are not required for
 /// display. PDF also defines vertical metrics through `CIDFont` `/DW2`/`/W2`,
-/// making sfnt `vhea`/`vmtx` irrelevant to PDF rendering.
+/// making sfnt `vhea`/`vmtx` irrelevant to PDF rendering. Device-metric tables
+/// `hdmx`, `LTSH`, and `VDMX` tune hinted advance or line metrics; PDF supplies
+/// text advances and placement independently, so they do not affect the painted
+/// glyph outline.
 fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<u8>, usize)> {
     if bytes.len() < 12 || !is_sfnt_magic(&bytes[..4]) {
         return None;
@@ -3212,6 +3215,9 @@ mod tests {
             (*b"GPOS", b"positioning"),
             (*b"vhea", b"vertical header"),
             (*b"vmtx", b"vertical metrics"),
+            (*b"hdmx", b"device metrics"),
+            (*b"LTSH", b"linear threshold"),
+            (*b"VDMX", b"vertical device metrics"),
         ]);
         let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&source, FontProgramUsage::default())
         else {
@@ -3227,7 +3233,10 @@ mod tests {
         assert!(!remaining.contains(b"GPOS"));
         assert!(!remaining.contains(b"vhea"));
         assert!(!remaining.contains(b"vmtx"));
-        assert_eq!(removed, 12 + 11 + 15 + 16);
+        assert!(!remaining.contains(b"hdmx"));
+        assert!(!remaining.contains(b"LTSH"));
+        assert!(!remaining.contains(b"VDMX"));
+        assert_eq!(removed, 12 + 11 + 15 + 16 + 14 + 16 + 23);
         Ok(())
     }
 
