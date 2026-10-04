@@ -2,12 +2,13 @@ use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData, content::decoded_content_value, source::CurrentObject,
 };
-#[cfg(test)]
-use flpdf::{DecodeLevel, ObjectRef, Pdf};
+use flpdf::DecodeLevel;
 use flpdf::{
     ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl,
     filters::{decode_stream_data, encode_stream_data_with_flate_level},
 };
+#[cfg(test)]
+use flpdf::{ObjectRef, Pdf};
 use hayro_syntax::object::{
     Dict as HayroDict, MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject,
 };
@@ -79,6 +80,98 @@ fn checksum32(data: &[u8]) -> u32 {
 
 const fn is_sfnt_magic(magic: &[u8]) -> bool {
     matches!(magic, [0, 1, 0, 0] | b"OTTO" | b"true" | b"typ1")
+}
+
+/// Unwrap a one-face TrueType Collection into a standalone sfnt without
+/// changing table contents. Multi-face collections remain untouched because
+/// a PDF `FontFile2` reference does not identify which face would be safe to
+/// retain.
+fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.get(..4)? != b"ttcf" || be32(bytes, 8)? != 1 {
+        return None;
+    }
+    let face_offset = usize::try_from(be32(bytes, 12)?).ok()?;
+    let magic = bytes.get(face_offset..face_offset.checked_add(4)?)?;
+    if !is_sfnt_magic(magic) {
+        return None;
+    }
+    let table_count = usize::from(be16(bytes, face_offset.checked_add(4)?)?);
+    if table_count == 0 {
+        return None;
+    }
+    let directory = face_offset.checked_add(12)?;
+    let directory_end = directory.checked_add(table_count.checked_mul(16)?)?;
+    if directory_end > bytes.len() {
+        return None;
+    }
+
+    let mut tables = Vec::<([u8; 4], Vec<u8>)>::with_capacity(table_count);
+    for index in 0..table_count {
+        let record = directory.checked_add(index.checked_mul(16)?)?;
+        let tag: [u8; 4] = bytes.get(record..record.checked_add(4)?)?.try_into().ok()?;
+        if matches!(
+            &tag,
+            b"EBDT" | b"EBLC" | b"EBSC" | b"CBDT" | b"CBLC" | b"sbix" | b"SVG "
+        ) {
+            return None;
+        }
+        let offset = usize::try_from(be32(bytes, record.checked_add(8)?)?).ok()?;
+        let length = usize::try_from(be32(bytes, record.checked_add(12)?)?).ok()?;
+        let end = offset.checked_add(length)?;
+        let mut data = bytes.get(offset..end)?.to_vec();
+        if tag == *b"head" {
+            if data.len() < 12 {
+                return None;
+            }
+            data[8..12].fill(0);
+        }
+        tables.push((tag, data));
+    }
+    tables.sort_unstable_by_key(|(tag, _)| *tag);
+
+    let new_count = tables.len();
+    let max_power = 1_usize << (usize::BITS - 1 - new_count.leading_zeros());
+    let search_range = u16::try_from(max_power.checked_mul(16)?).ok()?;
+    let entry_selector = u16::try_from(max_power.trailing_zeros()).ok()?;
+    let range_shift = u16::try_from(new_count.checked_mul(16)?)
+        .ok()?
+        .checked_sub(search_range)?;
+
+    let mut output = Vec::with_capacity(bytes.len());
+    output.extend_from_slice(magic);
+    output.extend_from_slice(&u16::try_from(new_count).ok()?.to_be_bytes());
+    output.extend_from_slice(&search_range.to_be_bytes());
+    output.extend_from_slice(&entry_selector.to_be_bytes());
+    output.extend_from_slice(&range_shift.to_be_bytes());
+    let directory_offset = output.len();
+    output.resize(directory_offset + new_count * 16, 0);
+
+    let mut head_offset = None;
+    for (index, (tag, data)) in tables.iter().enumerate() {
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+        let offset = output.len();
+        output.extend_from_slice(data);
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+
+        let record = directory_offset + index * 16;
+        output[record..record + 4].copy_from_slice(tag);
+        output[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
+        output[record + 8..record + 12].copy_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
+        output[record + 12..record + 16]
+            .copy_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
+        if tag == b"head" {
+            head_offset = Some(offset);
+        }
+    }
+    if let Some(offset) = head_offset {
+        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
+        output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
+    }
+    Some(output)
 }
 
 /// Rebuild an sfnt while removing tables that PDF consumers do not use to
@@ -1385,12 +1478,67 @@ fn union_fontfile2_program(
     Ok(font_file2)
 }
 
-/// Return the embedded TrueType program and whether this font resource has the
-/// narrow Identity CID semantics required for retain-GID subsetting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CidToGidMapping {
+    Identity,
+    Explicit(Vec<u16>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CidFontGlyphSpec {
+    program: CowObjectHandle,
+    mapping: CidToGidMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PageCidFontProgram {
+    Eligible(CidFontGlyphSpec),
+    Unsafe(CowObjectHandle),
+}
+
+fn cid_to_gid_mapping(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Option<CidToGidMapping>> {
+    let Some(value) = value else {
+        return Ok(Some(CidToGidMapping::Identity));
+    };
+    if owned_name_value(document, Some(value))?.as_deref() == Some(b"Identity") {
+        return Ok(Some(CidToGidMapping::Identity));
+    }
+
+    let decoded = match value {
+        OwnedObject::Reference(handle) => {
+            document.decoded_stream_data(*handle, DecodeLevel::Generalized)
+        }
+        OwnedObject::Stream { .. } => {
+            document.decoded_owned_stream_data(value, DecodeLevel::Generalized)
+        }
+        _ => return Ok(None),
+    };
+    let Ok(decoded) = decoded else {
+        return Ok(None);
+    };
+    if decoded.len() % 2 != 0 {
+        return Ok(None);
+    }
+    Ok(Some(CidToGidMapping::Explicit(
+        decoded
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect(),
+    )))
+}
+
+/// Return the embedded TrueType program and the CID-to-GID mapping required
+/// for retain-GID subsetting. Unsupported mappings remain explicitly unsafe so
+/// a program shared through another eligible font resource cannot be subset.
 fn page_font_program(
     document: &EditDocument,
     value: &OwnedObject,
-) -> Result<Option<(CowObjectHandle, bool)>> {
+) -> Result<Option<PageCidFontProgram>> {
     let Some(font) = resolved_owned_dictionary(document, Some(value))? else {
         return Ok(None);
     };
@@ -1398,7 +1546,7 @@ fn page_font_program(
     if subtype.as_deref() == Some(b"TrueType") {
         return Ok(
             descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
-                .map(|program| (program, false)),
+                .map(PageCidFontProgram::Unsafe),
         );
     }
     if subtype.as_deref() != Some(b"Type0") {
@@ -1423,19 +1571,27 @@ fn page_font_program(
     {
         return Ok(None);
     }
-    let cid_to_gid_identity = match cid_font.get(b"CIDToGIDMap".as_slice()) {
-        None => true,
-        Some(value) => owned_name_value(document, Some(value))?.as_deref() == Some(b"Identity"),
-    };
-    Ok(
+    let Some(program) =
         descriptor_program_ref(document, cid_font.get(b"FontDescriptor".as_slice()))?
-            .map(|program| (program, identity_encoding && cid_to_gid_identity)),
-    )
+    else {
+        return Ok(None);
+    };
+    if !identity_encoding {
+        return Ok(Some(PageCidFontProgram::Unsafe(program)));
+    }
+    let Some(mapping) = cid_to_gid_mapping(document, cid_font.get(b"CIDToGIDMap".as_slice()))?
+    else {
+        return Ok(Some(PageCidFontProgram::Unsafe(program)));
+    };
+    Ok(Some(PageCidFontProgram::Eligible(CidFontGlyphSpec {
+        program,
+        mapping,
+    })))
 }
 
 struct IdentityCidGlyphScanner<'a> {
-    fonts: &'a HashMap<Vec<u8>, CowObjectHandle>,
-    current_program: Option<CowObjectHandle>,
+    fonts: &'a HashMap<Vec<u8>, CidFontGlyphSpec>,
+    current_font: Option<&'a CidFontGlyphSpec>,
     operands: Vec<FlObjectHandle>,
     used: HashMap<CowObjectHandle, BTreeSet<u16>>,
     unsafe_programs: BTreeSet<CowObjectHandle>,
@@ -1443,28 +1599,38 @@ struct IdentityCidGlyphScanner<'a> {
 
 impl IdentityCidGlyphScanner<'_> {
     fn record_string(&mut self, bytes: &[u8]) {
-        let Some(program) = self.current_program else {
+        let Some(font) = self.current_font else {
             return;
         };
         let (pairs, remainder) = bytes.as_chunks::<2>();
         if !remainder.is_empty() {
-            self.unsafe_programs.insert(program);
+            self.unsafe_programs.insert(font.program);
             return;
         }
-        let used = self.used.entry(program).or_default();
         for pair in pairs {
-            used.insert(u16::from_be_bytes(*pair));
+            let cid = u16::from_be_bytes(*pair);
+            let gid = match &font.mapping {
+                CidToGidMapping::Identity => cid,
+                CidToGidMapping::Explicit(mapping) => {
+                    let Some(&gid) = mapping.get(usize::from(cid)) else {
+                        self.unsafe_programs.insert(font.program);
+                        return;
+                    };
+                    gid
+                }
+            };
+            self.used.entry(font.program).or_default().insert(gid);
         }
     }
 
     fn apply_operator(&mut self, operator: &[u8]) {
         match operator {
             b"Tf" => {
-                self.current_program = self
+                self.current_font = self
                     .operands
                     .first()
                     .and_then(FlObjectHandle::as_name)
-                    .and_then(|name| self.fonts.get(&name).copied());
+                    .and_then(|name| self.fonts.get(&name));
             }
             b"Tj" | b"'" => {
                 if let Some(bytes) = self.operands.first().and_then(FlObjectHandle::as_string) {
@@ -1636,7 +1802,7 @@ fn eligible_identity_fonts(
     document: &EditDocument,
     resources: &OwnedDictionary,
     unsafe_programs: &mut BTreeSet<CowObjectHandle>,
-) -> Result<HashMap<Vec<u8>, CowObjectHandle>> {
+) -> Result<HashMap<Vec<u8>, CidFontGlyphSpec>> {
     let Some(font_resources) =
         resolved_owned_dictionary(document, resources.get(b"Font".as_slice()))?
     else {
@@ -1644,16 +1810,19 @@ fn eligible_identity_fonts(
     };
     let mut eligible = HashMap::new();
     for (name, value) in &font_resources {
-        let Some((program, identity)) = page_font_program(document, value)? else {
+        let Some(program) = page_font_program(document, value)? else {
             continue;
         };
-        if identity {
-            eligible.insert(name.clone(), program);
-        } else {
-            // One embedded program can be referenced through multiple font
-            // dictionaries. Any non-Identity use makes retain-GID subsetting
-            // unsafe for the shared program.
-            unsafe_programs.insert(program);
+        match program {
+            PageCidFontProgram::Eligible(spec) => {
+                eligible.insert(name.clone(), spec);
+            }
+            PageCidFontProgram::Unsafe(program) => {
+                // One embedded program can be referenced through multiple font
+                // dictionaries. Any unsupported use makes retain-GID subsetting
+                // unsafe for the shared program.
+                unsafe_programs.insert(program);
+            }
         }
     }
     Ok(eligible)
@@ -1697,7 +1866,7 @@ impl ObjectHandleParserCallbacks for FontUsageScanner<'_> {
 
 fn scan_font_usage_scope(
     content: &[u8],
-    identity_eligible: &HashMap<Vec<u8>, CowObjectHandle>,
+    identity_eligible: &HashMap<Vec<u8>, CidFontGlyphSpec>,
     winansi_eligible: &HashMap<Vec<u8>, CowObjectHandle>,
     identity_used: &mut HashMap<CowObjectHandle, BTreeSet<u16>>,
     identity_unsafe: &mut BTreeSet<CowObjectHandle>,
@@ -1710,7 +1879,7 @@ fn scan_font_usage_scope(
     let mut scanner = FontUsageScanner {
         identity: IdentityCidGlyphScanner {
             fonts: identity_eligible,
-            current_program: None,
+            current_font: None,
             operands: Vec::new(),
             used: HashMap::new(),
             unsafe_programs: BTreeSet::new(),
@@ -1724,7 +1893,7 @@ fn scan_font_usage_scope(
         },
     };
     if flpdf::parse_detached_content_stream(content, "font glyph usage", &mut scanner).is_err() {
-        identity_unsafe.extend(identity_eligible.values().copied());
+        identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
         winansi_unsafe.extend(winansi_eligible.values().copied());
         return;
     }
@@ -1825,7 +1994,7 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
             continue;
         }
         let Ok(content) = document.decoded_content_stream_data(form) else {
-            identity_unsafe.extend(identity_eligible.values().copied());
+            identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
             winansi_unsafe.extend(winansi_eligible.values().copied());
             continue;
         };
@@ -1944,6 +2113,7 @@ fn hayro_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
 fn inspect_hayro_direct_font_dictionary(
     dictionary: &HayroDict<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
+    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) {
     let usage = hayro_dictionary_font_usage(dictionary);
     if usage != FontProgramUsage::default() {
@@ -1951,17 +2121,23 @@ fn inspect_hayro_direct_font_dictionary(
             if name.as_ref() != b"FontDescriptor" {
                 continue;
             }
-            let HayroMaybeRef::NotRef(HayroObject::Dict(descriptor)) = value else {
-                break;
-            };
-            for key in HAYRO_FONT_FILE_KEYS {
-                if let Some(program) = descriptor.get_ref(key) {
-                    merge_program_usage(
-                        program_usage,
-                        CowObjectHandle::Existing(program.into()),
-                        usage,
-                    );
+            match value {
+                HayroMaybeRef::Ref(descriptor) => {
+                    descriptor_usage_edges
+                        .push((CowObjectHandle::Existing(descriptor.into()), usage));
                 }
+                HayroMaybeRef::NotRef(HayroObject::Dict(descriptor)) => {
+                    for key in HAYRO_FONT_FILE_KEYS {
+                        if let Some(program) = descriptor.get_ref(key) {
+                            merge_program_usage(
+                                program_usage,
+                                CowObjectHandle::Existing(program.into()),
+                                usage,
+                            );
+                        }
+                    }
+                }
+                HayroMaybeRef::NotRef(_) => {}
             }
             break;
         }
@@ -1971,27 +2147,32 @@ fn inspect_hayro_direct_font_dictionary(
         let HayroMaybeRef::NotRef(value) = value else {
             continue;
         };
-        inspect_hayro_direct_font_object(&value, program_usage);
+        inspect_hayro_direct_font_object(&value, program_usage, descriptor_usage_edges);
     }
 }
 
 fn inspect_hayro_direct_font_object(
     object: &HayroObject<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
+    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) {
     match object {
         HayroObject::Dict(dictionary) => {
-            inspect_hayro_direct_font_dictionary(dictionary, program_usage);
+            inspect_hayro_direct_font_dictionary(dictionary, program_usage, descriptor_usage_edges);
         }
         HayroObject::Stream(stream) => {
-            inspect_hayro_direct_font_dictionary(stream.dict(), program_usage);
+            inspect_hayro_direct_font_dictionary(
+                stream.dict(),
+                program_usage,
+                descriptor_usage_edges,
+            );
         }
         HayroObject::Array(array) => {
             for value in array.raw_iter() {
                 let HayroMaybeRef::NotRef(value) = value else {
                     continue;
                 };
-                inspect_hayro_direct_font_object(&value, program_usage);
+                inspect_hayro_direct_font_object(&value, program_usage, descriptor_usage_edges);
             }
         }
         HayroObject::Null(_)
@@ -2025,16 +2206,24 @@ fn inspect_owned_direct_font_dictionary(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
+    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) -> Result<()> {
     let usage = owned_dictionary_font_usage(document, dictionary)?;
     if usage != FontProgramUsage::default()
-        && let Some(OwnedObject::Dictionary(descriptor)) =
-            dictionary.get(b"FontDescriptor".as_slice())
+        && let Some(descriptor) = dictionary.get(b"FontDescriptor".as_slice())
     {
-        for key in HAYRO_FONT_FILE_KEYS {
-            if let Some(program) = direct_owned_reference(descriptor.get(key)) {
-                merge_program_usage(program_usage, program, usage);
+        match descriptor {
+            OwnedObject::Reference(descriptor) => {
+                descriptor_usage_edges.push((*descriptor, usage));
             }
+            OwnedObject::Dictionary(descriptor) => {
+                for key in HAYRO_FONT_FILE_KEYS {
+                    if let Some(program) = direct_owned_reference(descriptor.get(key)) {
+                        merge_program_usage(program_usage, program, usage);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2042,7 +2231,7 @@ fn inspect_owned_direct_font_dictionary(
         if matches!(value, OwnedObject::Reference(_)) {
             continue;
         }
-        inspect_owned_direct_font_object(document, value, program_usage)?;
+        inspect_owned_direct_font_object(document, value, program_usage, descriptor_usage_edges)?;
     }
     Ok(())
 }
@@ -2051,17 +2240,28 @@ fn inspect_owned_direct_font_object(
     document: &EditDocument,
     object: &OwnedObject,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
+    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) -> Result<()> {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            inspect_owned_direct_font_dictionary(document, dictionary, program_usage)?;
+            inspect_owned_direct_font_dictionary(
+                document,
+                dictionary,
+                program_usage,
+                descriptor_usage_edges,
+            )?;
         }
         OwnedObject::Array(values) => {
             for value in values {
                 if matches!(value, OwnedObject::Reference(_)) {
                     continue;
                 }
-                inspect_owned_direct_font_object(document, value, program_usage)?;
+                inspect_owned_direct_font_object(
+                    document,
+                    value,
+                    program_usage,
+                    descriptor_usage_edges,
+                )?;
             }
         }
         OwnedObject::Null
@@ -2119,17 +2319,6 @@ fn owned_to_flpdf_resolved(
             "stream object cannot be used as font filter parameter".to_owned(),
         )),
     }
-}
-
-fn is_single_flate_filter_array(document: &EditDocument, value: &OwnedObject) -> Result<bool> {
-    let Some(value) = document.resolve_owned_value(value)? else {
-        return Ok(false);
-    };
-    let OwnedObject::Array(values) = value else {
-        return Ok(false);
-    };
-    Ok(values.len() == 1
-        && owned_name_value(document, values.first())?.as_deref() == Some(b"FlateDecode"))
 }
 
 fn is_lone_flate_filter(document: &EditDocument, value: &OwnedObject) -> Result<bool> {
@@ -2215,7 +2404,11 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
                 ),
                 _ => {}
             }
-            inspect_hayro_direct_font_object(&object, &mut direct_program_usage);
+            inspect_hayro_direct_font_object(
+                &object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            );
             Ok(())
         }
         CurrentObject::Owned(object) => {
@@ -2228,7 +2421,12 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
                     &mut descriptor_program_edges,
                 )?;
             }
-            inspect_owned_direct_font_object(document, object, &mut direct_program_usage)?;
+            inspect_owned_direct_font_object(
+                document,
+                object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            )?;
             Ok(())
         }
     })?;
@@ -2309,7 +2507,11 @@ pub fn strip_font_editing_tables_hayro(
                 ),
                 _ => {}
             }
-            inspect_hayro_direct_font_object(&object, &mut direct_program_usage);
+            inspect_hayro_direct_font_object(
+                &object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            );
             Ok(())
         }
         CurrentObject::Owned(object) => {
@@ -2322,7 +2524,12 @@ pub fn strip_font_editing_tables_hayro(
                     &mut descriptor_program_edges,
                 )?;
             }
-            inspect_owned_direct_font_object(document, object, &mut direct_program_usage)?;
+            inspect_owned_direct_font_object(
+                document,
+                object,
+                &mut direct_program_usage,
+                &mut descriptor_usage_edges,
+            )?;
             Ok(())
         }
     })?;
@@ -2350,24 +2557,7 @@ pub fn strip_font_editing_tables_hayro(
         return Ok(FontOptimizationStats::default());
     }
 
-    let mut outline_subset_programs = BTreeSet::new();
-    for program in legacy_subset_programs {
-        let Some(object) = document.current_owned_object(program)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, .. } = object else {
-            continue;
-        };
-        let filter_is_new_single_array = dictionary
-            .get(b"Filter".as_slice())
-            .map(|filter| is_single_flate_filter_array(document, filter))
-            .transpose()?
-            .unwrap_or(false);
-        if !filter_is_new_single_array {
-            outline_subset_programs.insert(program);
-        }
-    }
-
+    let outline_subset_programs = legacy_subset_programs;
     let (identity_glyph_usage, winansi_code_usage) = if outline_subset_programs.is_empty() {
         (HashMap::new(), HashMap::new())
     } else {
@@ -2393,7 +2583,10 @@ pub fn strip_font_editing_tables_hayro(
         let mut candidate = decoded;
         let mut removed_decoded_bytes = 0usize;
         let mut removed_outline_bytes = 0usize;
-        let mut changed = false;
+        let mut changed = single_font_ttc_to_sfnt(&candidate).is_some_and(|unwrapped| {
+            candidate = unwrapped;
+            true
+        });
         if allow_outline_subset
             && usage.cidfont_type2_only()
             && let Some(gids) = identity_glyph_usage.get(&program)
