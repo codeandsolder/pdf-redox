@@ -7,7 +7,10 @@ use hayro_syntax::{
     object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject},
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    hash::Hash,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TargetedDedupStats {
@@ -20,6 +23,66 @@ pub struct TargetedDedupStats {
 pub struct ExactObjectDedupStats {
     pub duplicate_objects_detected: usize,
     pub references_canonicalized: usize,
+}
+
+struct FingerprintRedirectPlan<K> {
+    canonical_by_fingerprint: HashMap<[u8; 32], CowObjectHandle>,
+    redirects: HashMap<K, CowObjectHandle>,
+    duplicate_refs: HashSet<CowObjectHandle>,
+    duplicate_raw_bytes: usize,
+}
+
+impl<K> FingerprintRedirectPlan<K> {
+    fn new() -> Self {
+        Self {
+            canonical_by_fingerprint: HashMap::new(),
+            redirects: HashMap::new(),
+            duplicate_refs: HashSet::new(),
+            duplicate_raw_bytes: 0,
+        }
+    }
+
+    fn targeted_stats(&self, references_canonicalized: usize) -> TargetedDedupStats {
+        TargetedDedupStats {
+            duplicate_streams_detected: self.duplicate_refs.len(),
+            duplicate_raw_bytes: self.duplicate_raw_bytes,
+            references_canonicalized,
+        }
+    }
+}
+
+impl<K: Eq + Hash> FingerprintRedirectPlan<K> {
+    fn observe(&mut self, redirect_key: K, target: CowObjectHandle, fingerprint: [u8; 32]) -> bool {
+        if let Some(canonical) = self.canonical_by_fingerprint.get(&fingerprint).copied() {
+            if canonical != target {
+                self.redirects.insert(redirect_key, canonical);
+                return true;
+            }
+        } else {
+            self.canonical_by_fingerprint.insert(fingerprint, target);
+        }
+        false
+    }
+
+    fn observe_stream(
+        &mut self,
+        redirect_key: K,
+        target: CowObjectHandle,
+        fingerprint: [u8; 32],
+        raw_bytes: usize,
+    ) {
+        if self.observe(redirect_key, target, fingerprint) && self.duplicate_refs.insert(target) {
+            self.duplicate_raw_bytes += raw_bytes;
+        }
+    }
+
+    fn redirect(&self, key: &K) -> Option<CowObjectHandle> {
+        self.redirects.get(key).copied()
+    }
+
+    fn into_redirects(self) -> HashMap<K, CowObjectHandle> {
+        self.redirects
+    }
 }
 
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
@@ -186,10 +249,7 @@ pub fn canonicalize_font_program_streams_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_font_program_holders(document)?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<(Vec<u8>, CowObjectHandle), CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
@@ -197,21 +257,17 @@ pub fn canonicalize_font_program_streams_hayro(
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.target {
-                redirects.insert((holder.key.clone(), holder.target), canonical);
-                if duplicate_refs.insert(holder.target) {
-                    duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.target);
-        }
+        plan.observe_stream(
+            (holder.key.clone(), holder.target),
+            holder.target,
+            fingerprint,
+            raw_bytes,
+        );
     }
 
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects.get(&(holder.key.clone(), holder.target)).copied() else {
+        let Some(canonical) = plan.redirect(&(holder.key.clone(), holder.target)) else {
             continue;
         };
         if rewrite_direct_reference_holder(document, holder, canonical)? {
@@ -219,11 +275,7 @@ pub fn canonicalize_font_program_streams_hayro(
         }
     }
 
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -417,41 +469,25 @@ fn canonicalize_named_stream_references_hayro(
     domain: &[u8],
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_direct_reference_holders(document, key)?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
             hayro_stream_fingerprint(document, holder.target, domain)?
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.target {
-                redirects.insert(holder.target, canonical);
-                if duplicate_refs.insert(holder.target) {
-                    duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.target);
-        }
+        plan.observe_stream(holder.target, holder.target, fingerprint, raw_bytes);
     }
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects.get(&holder.target).copied() else {
+        let Some(canonical) = plan.redirect(&holder.target) else {
             continue;
         };
         if rewrite_direct_reference_holder(document, holder, canonical)? {
             references_canonicalized += 1;
         }
     }
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 pub fn canonicalize_metadata_streams_hayro(
@@ -615,41 +651,25 @@ fn rewrite_direct_array_reference_holder(
 
 pub fn canonicalize_icc_profiles_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = hayro_icc_array_holders(document)?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
             hayro_stream_fingerprint(document, holder.target, b"icc-profile")?
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.target {
-                redirects.insert(holder.target, canonical);
-                if duplicate_refs.insert(holder.target) {
-                    duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.target);
-        }
+        plan.observe_stream(holder.target, holder.target, fingerprint, raw_bytes);
     }
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects.get(&holder.target).copied() else {
+        let Some(canonical) = plan.redirect(&holder.target) else {
             continue;
         };
         if rewrite_direct_array_reference_holder(document, holder, canonical)? {
             references_canonicalized += 1;
         }
     }
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 fn object_at_direct_path_mut<'a>(
@@ -923,10 +943,7 @@ pub fn canonicalize_type3_charprocs_hayro(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_type3_glyph_holders(document)?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::<CowObjectHandle>::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
@@ -934,21 +951,12 @@ pub fn canonicalize_type3_charprocs_hayro(
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != holder.glyph {
-                redirects.insert(holder.glyph, canonical);
-                if duplicate_refs.insert(holder.glyph) {
-                    duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, holder.glyph);
-        }
+        plan.observe_stream(holder.glyph, holder.glyph, fingerprint, raw_bytes);
     }
 
     let mut references_canonicalized = 0_usize;
     for holder in &holders {
-        let Some(canonical) = redirects.get(&holder.glyph).copied() else {
+        let Some(canonical) = plan.redirect(&holder.glyph) else {
             continue;
         };
         if rewrite_type3_glyph_holder(document, holder, canonical)? {
@@ -956,11 +964,7 @@ pub fn canonicalize_type3_charprocs_hayro(
         }
     }
 
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 fn canonical_cow_redirect(
@@ -1073,8 +1077,7 @@ fn exact_stream_redirects_hayro(
     duplicate_refs: &mut HashSet<CowObjectHandle>,
     duplicate_raw_bytes: &mut usize,
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::new();
+    let mut plan = FingerprintRedirectPlan::new();
     for &stream in streams {
         let Some((fingerprint, raw_bytes)) = hayro_stream_fingerprint_with_redirects(
             document,
@@ -1086,18 +1089,11 @@ fn exact_stream_redirects_hayro(
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != stream {
-                redirects.insert(stream, canonical);
-                if duplicate_refs.insert(stream) {
-                    *duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, stream);
+        if plan.observe(stream, stream, fingerprint) && duplicate_refs.insert(stream) {
+            *duplicate_raw_bytes += raw_bytes;
         }
     }
-    Ok(redirects)
+    Ok(plan.into_redirects())
 }
 
 fn rewrite_dictionary_reference_keys(
@@ -1455,8 +1451,7 @@ fn exact_non_stream_resource_redirects_hayro(
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut redirects = HashMap::new();
     for _ in 0..=handles.len() {
-        let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-        let mut next = HashMap::new();
+        let mut plan = FingerprintRedirectPlan::new();
         for &handle in handles {
             let Some(fingerprint) = hash_non_stream_object_with_redirects(
                 document,
@@ -1467,14 +1462,9 @@ fn exact_non_stream_resource_redirects_hayro(
             else {
                 continue;
             };
-            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-                if canonical != handle {
-                    next.insert(handle, canonical);
-                }
-            } else {
-                canonical_by_fingerprint.insert(fingerprint, handle);
-            }
+            plan.observe(handle, handle, fingerprint);
         }
+        let next = plan.into_redirects();
         if next == redirects {
             return Ok(next);
         }
@@ -1891,8 +1881,7 @@ fn exact_form_font_redirects_hayro(
     document: &EditDocument,
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::new();
+    let mut plan = FingerprintRedirectPlan::new();
     for handle in reachable_dictionaries_with_type(document, b"Font")? {
         let Some(fingerprint) = hash_non_stream_object_with_redirects(
             document,
@@ -1903,15 +1892,9 @@ fn exact_form_font_redirects_hayro(
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != handle {
-                redirects.insert(handle, canonical);
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, handle);
-        }
+        plan.observe(handle, handle, fingerprint);
     }
-    Ok(redirects)
+    Ok(plan.into_redirects())
 }
 
 fn hayro_stream_fingerprint_top_level_redirects(
@@ -1957,8 +1940,7 @@ fn virtual_form_image_redirects_hayro(
     } else {
         &[]
     };
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::new();
+    let mut plan = FingerprintRedirectPlan::new();
     for &image in images {
         let Some(fingerprint) = hayro_stream_fingerprint_top_level_redirects(
             document,
@@ -1970,15 +1952,9 @@ fn virtual_form_image_redirects_hayro(
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != image {
-                redirects.insert(image, canonical);
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, image);
-        }
+        plan.observe(image, image, fingerprint);
     }
-    Ok(redirects)
+    Ok(plan.into_redirects())
 }
 
 fn redirect_reference_value(
@@ -2135,8 +2111,7 @@ fn fixed_point_form_redirects_hayro(
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut redirects = HashMap::new();
     for _ in 0..=forms.len() {
-        let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-        let mut next = HashMap::new();
+        let mut plan = FingerprintRedirectPlan::new();
         for &form in forms {
             let Some((fingerprint, _)) = hayro_form_fingerprint(
                 document,
@@ -2150,14 +2125,9 @@ fn fixed_point_form_redirects_hayro(
             else {
                 continue;
             };
-            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-                if canonical != form {
-                    next.insert(form, canonical);
-                }
-            } else {
-                canonical_by_fingerprint.insert(fingerprint, form);
-            }
+            plan.observe(form, form, fingerprint);
         }
+        let next = plan.into_redirects();
         if next == redirects {
             return Ok(next);
         }
@@ -2430,10 +2400,7 @@ pub fn canonicalize_appearance_streams_hayro(
         return Ok(TargetedDedupStats::default());
     }
     let dependencies = form_dependency_redirects_hayro(document, &[])?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some(snapshot) = document.current_owned_object(holder.root)? else {
             continue;
@@ -2459,25 +2426,12 @@ pub fn canonicalize_appearance_streams_hayro(
             else {
                 continue;
             };
-            if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-                if canonical != *appearance_ref {
-                    redirects.insert(*appearance_ref, canonical);
-                    if duplicate_refs.insert(*appearance_ref) {
-                        duplicate_raw_bytes += raw_bytes;
-                    }
-                }
-            } else {
-                canonical_by_fingerprint.insert(fingerprint, *appearance_ref);
-            }
+            plan.observe_stream(*appearance_ref, *appearance_ref, fingerprint, raw_bytes);
         }
     }
     let references_canonicalized =
-        rewrite_dictionary_target_entries(document, &holders, &redirects)?;
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+        rewrite_dictionary_target_entries(document, &holders, &plan.redirects)?;
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2578,10 +2532,7 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
 
 pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = page_content_holders_hayro(document)?;
-    let mut canonical_by_fingerprint = HashMap::<[u8; 32], CowObjectHandle>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-    let mut duplicate_refs = HashSet::new();
-    let mut duplicate_raw_bytes = 0_usize;
+    let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let stream = holder.target();
         let Some((fingerprint, raw_bytes)) =
@@ -2589,31 +2540,18 @@ pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<T
         else {
             continue;
         };
-        if let Some(canonical) = canonical_by_fingerprint.get(&fingerprint).copied() {
-            if canonical != stream {
-                redirects.insert(stream, canonical);
-                if duplicate_refs.insert(stream) {
-                    duplicate_raw_bytes += raw_bytes;
-                }
-            }
-        } else {
-            canonical_by_fingerprint.insert(fingerprint, stream);
-        }
+        plan.observe_stream(stream, stream, fingerprint, raw_bytes);
     }
     let mut references_canonicalized = 0;
     for holder in &holders {
-        let Some(canonical) = redirects.get(&holder.target()).copied() else {
+        let Some(canonical) = plan.redirect(&holder.target()) else {
             continue;
         };
         if holder.rewrite(document, canonical)? {
             references_canonicalized += 1;
         }
     }
-    Ok(TargetedDedupStats {
-        duplicate_streams_detected: duplicate_refs.len(),
-        duplicate_raw_bytes,
-        references_canonicalized,
-    })
+    Ok(plan.targeted_stats(references_canonicalized))
 }
 
 #[cfg(test)]
@@ -2642,6 +2580,50 @@ mod tests {
         pdf.stream(5, b"", b"0 0 m 10 10 l S")?;
         pdf.stream(6, b"", b"0 0 m 10 10 l S")?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn fingerprint_redirect_plan_keeps_first_target_and_counts_duplicate_once() {
+        let canonical = CowObjectHandle::Existing(crate::ObjectId::new(10, 0));
+        let duplicate = CowObjectHandle::Existing(crate::ObjectId::new(11, 0));
+        let fingerprint = [0x5a; 32];
+        let mut plan = FingerprintRedirectPlan::new();
+
+        plan.observe_stream(
+            (b"FontFile".to_vec(), canonical),
+            canonical,
+            fingerprint,
+            17,
+        );
+        plan.observe_stream(
+            (b"FontFile".to_vec(), duplicate),
+            duplicate,
+            fingerprint,
+            17,
+        );
+        plan.observe_stream(
+            (b"FontFile2".to_vec(), duplicate),
+            duplicate,
+            fingerprint,
+            17,
+        );
+
+        assert_eq!(
+            plan.redirect(&(b"FontFile".to_vec(), duplicate)),
+            Some(canonical)
+        );
+        assert_eq!(
+            plan.redirect(&(b"FontFile2".to_vec(), duplicate)),
+            Some(canonical)
+        );
+        assert_eq!(
+            plan.targeted_stats(2),
+            TargetedDedupStats {
+                duplicate_streams_detected: 1,
+                duplicate_raw_bytes: 17,
+                references_canonicalized: 2,
+            }
+        );
     }
 
     #[test]
