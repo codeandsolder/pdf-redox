@@ -868,6 +868,33 @@ impl EditDocument {
         self.decoded_content_stream_value(&stream)
     }
 
+    /// Borrow the current value of an object handle without materializing an
+    /// untouched source object into the owned COS representation.
+    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+        match handle {
+            ObjectHandle::Existing(id) => match self.overlay.change(id) {
+                Some(ExistingObjectChange::Replace(object)) => {
+                    Ok(Some(CurrentObject::Owned(object)))
+                }
+                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
+                    number: id.number,
+                    generation: id.generation,
+                }),
+                None => match self.source.object(id) {
+                    Ok(object) => Ok(Some(CurrentObject::Source(object))),
+                    Err(Error::MissingSourceObject { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                },
+            },
+            ObjectHandle::New(id) => self
+                .overlay
+                .added(id)
+                .map(CurrentObject::Owned)
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
+                .map(Some),
+        }
+    }
+
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
@@ -1249,30 +1276,8 @@ impl EditDocument {
         F: for<'a> FnMut(ObjectHandle, CurrentObject<'a>) -> Result<()>,
     {
         for handle in self.reachable_output_traversal()? {
-            match handle {
-                ObjectHandle::Existing(id) => match self.overlay.change(id) {
-                    Some(ExistingObjectChange::Replace(object)) => {
-                        visit(handle, CurrentObject::Owned(object))?;
-                    }
-                    Some(ExistingObjectChange::Delete) => {
-                        return Err(Error::DeletedReferencedObject {
-                            number: id.number,
-                            generation: id.generation,
-                        });
-                    }
-                    None => match self.source.object(id) {
-                        Ok(object) => visit(handle, CurrentObject::Source(object))?,
-                        Err(Error::MissingSourceObject { .. }) => {}
-                        Err(error) => return Err(error),
-                    },
-                },
-                ObjectHandle::New(id) => {
-                    let object = self
-                        .overlay
-                        .added(id)
-                        .ok_or_else(|| Error::MissingNewObject { index: id.index() })?;
-                    visit(handle, CurrentObject::Owned(object))?;
-                }
+            if let Some(object) = self.current_object(handle)? {
+                visit(handle, object)?;
             }
         }
         Ok(())
