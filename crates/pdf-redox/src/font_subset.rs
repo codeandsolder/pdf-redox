@@ -175,7 +175,7 @@ pub fn compact_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option
     let original_glyph_count = usize::from(font.maxp().ok()?.num_glyphs());
     let plan = plan_for_pdf_gids(&font, requested_gids, false);
     let old_to_new = plan
-        .glyph_mappings()
+        .old_to_new_glyph_mapping()
         .map(|(old_gid, new_gid)| {
             Some((
                 u16::try_from(old_gid.to_u32()).ok()?,

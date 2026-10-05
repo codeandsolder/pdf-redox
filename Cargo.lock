@@ -246,6 +246,7 @@ dependencies = [
 [[package]]
 name = "font-types"
 version = "0.12.6"
+source = "git+https://github.com/codeandsolder/fontations?branch=main#4afb21ec1e527a3ef442aebf95c26bd6da535105"
 dependencies = [
  "bytemuck",
 ]
@@ -479,6 +480,7 @@ dependencies = [
 [[package]]
 name = "read-fonts"
 version = "0.45.0"
+source = "git+https://github.com/codeandsolder/fontations?branch=main#4afb21ec1e527a3ef442aebf95c26bd6da535105"
 dependencies = [
  "bytemuck",
  "font-types",
@@ -572,6 +574,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 [[package]]
 name = "skera"
 version = "0.8.0"
+source = "git+https://github.com/codeandsolder/fontations?branch=main#4afb21ec1e527a3ef442aebf95c26bd6da535105"
 dependencies = [
  "hashbrown",
  "skrifa",
@@ -582,6 +585,7 @@ dependencies = [
 [[package]]
 name = "skrifa"
 version = "0.48.0"
+source = "git+https://github.com/codeandsolder/fontations?branch=main#4afb21ec1e527a3ef442aebf95c26bd6da535105"
 dependencies = [
  "bytemuck",
  "read-fonts",
@@ -734,6 +738,7 @@ dependencies = [
 [[package]]
 name = "write-fonts"
 version = "0.54.0"
+source = "git+https://github.com/codeandsolder/fontations?branch=main#4afb21ec1e527a3ef442aebf95c26bd6da535105"
 dependencies = [
  "font-types",
  "log",
