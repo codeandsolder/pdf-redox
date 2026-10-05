@@ -25,6 +25,7 @@ fax = "=0.3.0"
 sha2 = "0.11"
 smallvec = "1.16"
 skera = { path = "/home/jan/project-data/fontations-redox-probe/skera" }
+skrifa = { path = "/home/jan/project-data/fontations-redox-probe/skrifa" }
 write-fonts = { path = "/home/jan/project-data/fontations-redox-probe/write-fonts", default-features = false, features = ["read"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

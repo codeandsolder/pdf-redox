@@ -425,6 +425,7 @@ dependencies = [
  "serde",
  "sha2",
  "skera",
+ "skrifa",
  "smallvec",
  "thiserror",
  "write-fonts",

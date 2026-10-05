@@ -49,34 +49,6 @@ pub struct FontOptimizationStats {
     pub glyph_subset_decoded_bytes_removed: usize,
 }
 
-fn be16(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([
-        *bytes.get(offset)?,
-        *bytes.get(offset + 1)?,
-    ]))
-}
-
-fn be32(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_be_bytes([
-        *bytes.get(offset)?,
-        *bytes.get(offset + 1)?,
-        *bytes.get(offset + 2)?,
-        *bytes.get(offset + 3)?,
-    ]))
-}
-
-fn checksum32(data: &[u8]) -> u32 {
-    data.chunks(4).fold(0_u32, |sum, chunk| {
-        let mut word = [0_u8; 4];
-        word[..chunk.len()].copy_from_slice(chunk);
-        sum.wrapping_add(u32::from_be_bytes(word))
-    })
-}
-
-const fn is_sfnt_magic(magic: &[u8]) -> bool {
-    matches!(magic, [0, 1, 0, 0] | b"OTTO" | b"true" | b"typ1")
-}
-
 fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
     crate::font_subset::unwrap_single_face_collection(bytes)
 }
@@ -85,153 +57,18 @@ fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<
     crate::font_subset::strip_pdf_unused_tables(bytes, usage.cidfont_type2_only())
 }
 
-fn sfnt_table_record(bytes: &[u8], wanted: [u8; 4]) -> Option<(usize, usize)> {
-    if bytes.len() < 12 || !is_sfnt_magic(&bytes[..4]) {
-        return None;
-    }
-    let table_count = usize::from(be16(bytes, 4)?);
-    let directory_end = 12usize.checked_add(table_count.checked_mul(16)?)?;
-    if directory_end > bytes.len() {
-        return None;
-    }
-    for index in 0..table_count {
-        let record = 12 + index * 16;
-        if bytes.get(record..record + 4)? != wanted {
-            continue;
-        }
-        let offset = usize::try_from(be32(bytes, record + 8)?).ok()?;
-        let length = usize::try_from(be32(bytes, record + 12)?).ok()?;
-        let end = offset.checked_add(length)?;
-        if end > bytes.len() {
-            return None;
-        }
-        return Some((offset, length));
-    }
-    None
-}
-
-fn sfnt_table(bytes: &[u8], wanted: [u8; 4]) -> Option<&[u8]> {
-    let (offset, length) = sfnt_table_record(bytes, wanted)?;
-    bytes.get(offset..offset.checked_add(length)?)
-}
-
-fn cmap_format4_gid(table: &[u8], codepoint: u16) -> Option<u16> {
-    if be16(table, 0)? != 4 {
-        return None;
-    }
-    let length = usize::from(be16(table, 2)?);
-    if length > table.len() || length < 16 {
-        return None;
-    }
-    let table = &table[..length];
-    let seg_count = usize::from(be16(table, 6)? / 2);
-    if seg_count == 0 {
-        return None;
-    }
-    let end_code = 14usize;
-    let start_code = end_code
-        .checked_add(seg_count.checked_mul(2)?)?
-        .checked_add(2)?;
-    let id_delta = start_code.checked_add(seg_count.checked_mul(2)?)?;
-    let id_range_offset = id_delta.checked_add(seg_count.checked_mul(2)?)?;
-    if id_range_offset.checked_add(seg_count.checked_mul(2)?)? > table.len() {
-        return None;
-    }
-    for index in 0..seg_count {
-        let end = be16(table, end_code + index * 2)?;
-        let start = be16(table, start_code + index * 2)?;
-        if codepoint < start || codepoint > end {
-            continue;
-        }
-        let delta_offset = id_delta + index * 2;
-        let delta = i32::from(i16::from_be_bytes([
-            table[delta_offset],
-            table[delta_offset + 1],
-        ]));
-        let range_word = id_range_offset + index * 2;
-        let range = usize::from(be16(table, range_word)?);
-        if range == 0 {
-            return u16::try_from((i32::from(codepoint) + delta) & 0xffff).ok();
-        }
-        let glyph_offset = range_word
-            .checked_add(range)?
-            .checked_add(usize::from(codepoint - start).checked_mul(2)?)?;
-        let glyph = be16(table, glyph_offset)?;
-        if glyph == 0 {
-            return Some(0);
-        }
-        return u16::try_from((i32::from(glyph) + delta) & 0xffff).ok();
-    }
-    None
-}
-
-fn cmap_format12_gid(table: &[u8], codepoint: u32) -> Option<u16> {
-    if be16(table, 0)? != 12 || table.len() < 16 {
-        return None;
-    }
-    let length = usize::try_from(be32(table, 4)?).ok()?;
-    if length > table.len() || length < 16 {
-        return None;
-    }
-    let groups = usize::try_from(be32(table, 12)?).ok()?;
-    if 16usize.checked_add(groups.checked_mul(12)?)? > length {
-        return None;
-    }
-    for index in 0..groups {
-        let offset = 16 + index * 12;
-        let start = be32(table, offset)?;
-        let end = be32(table, offset + 4)?;
-        if codepoint < start || codepoint > end {
-            continue;
-        }
-        let first_gid = be32(table, offset + 8)?;
-        let gid = first_gid.checked_add(codepoint - start)?;
-        return u16::try_from(gid).ok();
-    }
-    None
-}
-
 fn sfnt_unicode_gid(bytes: &[u8], codepoint: u32) -> Option<u16> {
-    let cmap = sfnt_table(bytes, *b"cmap")?;
-    if cmap.len() < 4 {
+    use skrifa::MetadataProvider;
+
+    let font = skrifa::FontRef::new(bytes).ok()?;
+    let charmap = font.charmap();
+    // PDF WinAnsi text is ordinary Unicode-addressed text. Preserve the old
+    // conservative behavior for symbol/MacRoman-only fonts rather than using
+    // their compatibility remappings.
+    if charmap.is_symbol() {
         return None;
     }
-    let count = usize::from(be16(cmap, 2)?);
-    if 4usize.checked_add(count.checked_mul(8)?)? > cmap.len() {
-        return None;
-    }
-    let mut subtables = Vec::new();
-    for index in 0..count {
-        let record = 4 + index * 8;
-        let platform = be16(cmap, record)?;
-        let encoding = be16(cmap, record + 2)?;
-        let offset = usize::try_from(be32(cmap, record + 4)?).ok()?;
-        if offset >= cmap.len() {
-            continue;
-        }
-        let priority = match (platform, encoding) {
-            (3, 10) => 0,
-            (3, 1) => 1,
-            (0, _) => 2,
-            _ => continue,
-        };
-        subtables.push((priority, offset));
-    }
-    subtables.sort_unstable();
-    for (_, offset) in subtables {
-        let table = &cmap[offset..];
-        let gid = match be16(table, 0)? {
-            4 => u16::try_from(codepoint)
-                .ok()
-                .and_then(|codepoint| cmap_format4_gid(table, codepoint)),
-            12 => cmap_format12_gid(table, codepoint),
-            _ => None,
-        };
-        if let Some(gid) = gid {
-            return Some(gid);
-        }
-    }
-    None
+    u16::try_from(charmap.map(codepoint)?.to_u32()).ok()
 }
 
 fn sfnt_winansi_ascii_glyph_ids(bytes: &[u8], codes: &BTreeSet<u8>) -> Option<BTreeSet<u16>> {
@@ -250,57 +87,18 @@ fn sfnt_winansi_ascii_glyph_ids(bytes: &[u8], codes: &BTreeSet<u8>) -> Option<BT
 }
 
 fn composite_components(glyph: &[u8]) -> Option<Vec<u16>> {
-    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
-    const WE_HAVE_A_SCALE: u16 = 0x0008;
-    const MORE_COMPONENTS: u16 = 0x0020;
-    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
-    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
-    const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
+    use write_fonts::read::{FontData, FontRead, tables::glyf::Glyph};
 
-    if glyph.len() < 10 {
-        return Some(Vec::new());
+    let glyph = Glyph::read(FontData::new(glyph)).ok()?;
+    match glyph {
+        Glyph::Simple(_) => Some(Vec::new()),
+        Glyph::Composite(composite) => Some(
+            composite
+                .component_glyphs_and_flags()
+                .map(|(gid, _)| gid.to_u16())
+                .collect(),
+        ),
     }
-    let contours = i16::from_be_bytes([glyph[0], glyph[1]]);
-    if contours >= 0 {
-        return Some(Vec::new());
-    }
-
-    let mut offset = 10usize;
-    let mut components = Vec::new();
-    loop {
-        let flags = be16(glyph, offset)?;
-        let component = be16(glyph, offset + 2)?;
-        components.push(component);
-        offset = offset.checked_add(4)?;
-        offset = offset.checked_add(if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-            4
-        } else {
-            2
-        })?;
-        offset = offset.checked_add(if flags & WE_HAVE_A_SCALE != 0 {
-            2
-        } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
-            4
-        } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
-            8
-        } else {
-            0
-        })?;
-        if offset > glyph.len() {
-            return None;
-        }
-        if flags & MORE_COMPONENTS == 0 {
-            if flags & WE_HAVE_INSTRUCTIONS != 0 {
-                let instruction_len = usize::from(be16(glyph, offset)?);
-                offset = offset.checked_add(2)?.checked_add(instruction_len)?;
-                if offset > glyph.len() {
-                    return None;
-                }
-            }
-            break;
-        }
-    }
-    Some(components)
 }
 
 fn subset_base_font_name(name: &[u8]) -> Vec<u8> {
@@ -328,18 +126,18 @@ fn descriptor_base_font_name(
 }
 
 fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
-    if bytes.get(..4)? != [0, 1, 0, 0] {
+    use write_fonts::read::{FontRef, TableProvider};
+
+    let font = FontRef::new(bytes).ok()?;
+    if font.table_directory().sfnt_version() != 0x0001_0000 {
         return None;
     }
-    let table_count = usize::from(be16(bytes, 4)?);
-    let mut tables = Vec::<([u8; 4], Vec<u8>)>::with_capacity(table_count);
+    let mut tables = Vec::new();
     let mut required = [false; 6];
-    for index in 0..table_count {
-        let record = 12usize.checked_add(index.checked_mul(16)?)?;
-        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
-        let (offset, length) = sfnt_table_record(bytes, tag)?;
-        let mut data = bytes.get(offset..offset.checked_add(length)?)?.to_vec();
-        match &tag {
+    for record in font.table_directory().table_records() {
+        let tag = record.tag();
+        let mut data = font.data_for_tag(tag)?.as_bytes().to_vec();
+        match &tag.to_be_bytes() {
             b"glyf" => {
                 required[0] = true;
                 continue;
@@ -353,9 +151,6 @@ fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
                 if data.len() < 54 {
                     return None;
                 }
-                // checkSumAdjustment is expected to differ between otherwise
-                // equivalent subset sfnts. Keep every other head field exact,
-                // including the font-wide bbox: some renderers consult it.
                 data[8..12].fill(0);
             }
             b"maxp" => required[3] = true,
@@ -368,12 +163,12 @@ fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     if required.iter().any(|present| !present) {
         return None;
     }
-    tables.sort_unstable_by_key(|(tag, _)| *tag);
+    tables.sort_unstable_by_key(|(tag, _)| tag.to_be_bytes());
     let mut hasher = Sha256::new();
-    hasher.update(bytes.get(..4)?);
+    hasher.update(font.table_directory().sfnt_version().to_be_bytes());
     hasher.update((tables.len() as u64).to_le_bytes());
     for (tag, data) in tables {
-        hasher.update(tag);
+        hasher.update(tag.to_be_bytes());
         hasher.update((data.len() as u64).to_le_bytes());
         hasher.update(data);
     }
@@ -381,61 +176,39 @@ fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 fn sfnt_glyph_offsets(bytes: &[u8]) -> Option<Vec<usize>> {
-    let maxp = sfnt_table(bytes, *b"maxp")?;
-    let head = sfnt_table(bytes, *b"head")?;
-    let loca = sfnt_table(bytes, *b"loca")?;
-    if maxp.len() < 6 || head.len() < 52 {
+    use write_fonts::read::{FontRef, TableProvider};
+
+    let font = FontRef::new(bytes).ok()?;
+    let maxp = font.maxp().ok()?;
+    let glyph_count = usize::from(maxp.num_glyphs());
+    let loca = font.loca(None).ok()?;
+    let glyf = font.glyf().ok()?;
+    if loca.len() != glyph_count || !loca.all_offsets_are_ascending() {
         return None;
     }
-    let glyph_count = usize::from(be16(maxp, 4)?);
-    let loca_format = i16::from_be_bytes([head[50], head[51]]);
+    let glyf_len = glyf.offset_data().as_bytes().len();
     let mut offsets = Vec::with_capacity(glyph_count + 1);
-    match loca_format {
-        0 => {
-            if loca.len() < (glyph_count + 1).checked_mul(2)? {
-                return None;
-            }
-            for index in 0..=glyph_count {
-                offsets.push(usize::from(be16(loca, index * 2)?).checked_mul(2)?);
-            }
-        }
-        1 => {
-            if loca.len() < (glyph_count + 1).checked_mul(4)? {
-                return None;
-            }
-            for index in 0..=glyph_count {
-                offsets.push(usize::try_from(be32(loca, index * 4)?).ok()?);
-            }
-        }
-        _ => return None,
+    for index in 0..=glyph_count {
+        offsets.push(usize::try_from(loca.get_raw(index)?).ok()?);
     }
-    let glyf = sfnt_table(bytes, *b"glyf")?;
-    if offsets.windows(2).any(|pair| pair[0] > pair[1]) || offsets.last().copied()? > glyf.len() {
-        return None;
-    }
-    Some(offsets)
+    (offsets.last().copied()? <= glyf_len).then_some(offsets)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "sfnt union validation and table reconstruction share offset and glyph-identity invariants that are safer to audit together"
-)]
 fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>> {
+    use write_fonts::read::{FontRef, TableProvider};
+
     if fonts.len() < 2 {
         return None;
     }
     let base = fonts.first()?.0;
     let base_hash = sparse_cid_union_skeleton_hash(base)?;
-    let maxp = sfnt_table(base, *b"maxp")?;
-    let head = sfnt_table(base, *b"head")?;
-    let glyph_count = usize::from(be16(maxp, 4)?);
-    let loca_format = i16::from_be_bytes([head[50], head[51]]);
-    let alignment = if loca_format == 0 {
-        2usize
-    } else if loca_format == 1 {
-        4usize
-    } else {
-        return None;
+    let base_font = FontRef::new(base).ok()?;
+    let glyph_count = usize::from(base_font.maxp().ok()?.num_glyphs());
+    let loca_format = base_font.head().ok()?.index_to_loc_format();
+    let alignment = match loca_format {
+        0 => 2usize,
+        1 => 4usize,
+        _ => return None,
     };
 
     let mut union_glyphs = vec![None::<Vec<u8>>; glyph_count];
@@ -447,7 +220,8 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
         if offsets.len() != glyph_count + 1 {
             return None;
         }
-        let glyf = sfnt_table(font, *b"glyf")?;
+        let source_font = FontRef::new(font).ok()?;
+        let glyf = source_font.glyf().ok()?.offset_data().as_bytes();
         for gid in 0..glyph_count {
             let glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
             if glyph.is_empty() {
@@ -469,7 +243,8 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
     // GID appearing literally in the content stream.
     for (font, used_gids) in fonts {
         let offsets = sfnt_glyph_offsets(font)?;
-        let glyf = sfnt_table(font, *b"glyf")?;
+        let source_font = FontRef::new(font).ok()?;
+        let glyf = source_font.glyf().ok()?.offset_data().as_bytes();
         let mut pending = VecDeque::new();
         pending.push_back(0usize);
         pending.extend(used_gids.iter().map(|gid| usize::from(*gid)));
@@ -524,73 +299,7 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
         _ => return None,
     }
 
-    let table_count = usize::from(be16(base, 4)?);
-    let mut tables = Vec::<([u8; 4], Vec<u8>)>::with_capacity(table_count);
-    for index in 0..table_count {
-        let record = 12 + index * 16;
-        let tag: [u8; 4] = base.get(record..record + 4)?.try_into().ok()?;
-        let data = if tag == *b"glyf" {
-            rebuilt_glyf.clone()
-        } else if tag == *b"loca" {
-            rebuilt_loca.clone()
-        } else {
-            let (offset, length) = sfnt_table_record(base, tag)?;
-            let mut data = base.get(offset..offset.checked_add(length)?)?.to_vec();
-            if tag == *b"head" {
-                if data.len() < 12 {
-                    return None;
-                }
-                // Preserve every rendering-related head field from the
-                // canonical source subset. Only checkSumAdjustment must be
-                // cleared before rebuilding the sfnt checksum below.
-                data[8..12].fill(0);
-            }
-            data
-        };
-        tables.push((tag, data));
-    }
-    tables.sort_unstable_by_key(|(tag, _)| *tag);
-
-    let new_count = tables.len();
-    let max_power = 1_usize << (usize::BITS - 1 - new_count.leading_zeros());
-    let search_range = u16::try_from(max_power.checked_mul(16)?).ok()?;
-    let entry_selector = u16::try_from(max_power.trailing_zeros()).ok()?;
-    let range_shift = u16::try_from(new_count.checked_mul(16)?)
-        .ok()?
-        .checked_sub(search_range)?;
-    let mut output = Vec::new();
-    output.extend_from_slice(base.get(..4)?);
-    output.extend_from_slice(&u16::try_from(new_count).ok()?.to_be_bytes());
-    output.extend_from_slice(&search_range.to_be_bytes());
-    output.extend_from_slice(&entry_selector.to_be_bytes());
-    output.extend_from_slice(&range_shift.to_be_bytes());
-    let directory_offset = output.len();
-    output.resize(directory_offset + new_count * 16, 0);
-    let mut head_offset = None;
-    for (index, (tag, data)) in tables.iter().enumerate() {
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let offset = output.len();
-        output.extend_from_slice(data);
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let record = directory_offset + index * 16;
-        output[record..record + 4].copy_from_slice(tag);
-        output[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
-        output[record + 8..record + 12].copy_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
-        output[record + 12..record + 16]
-            .copy_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
-        if tag == b"head" {
-            head_offset = Some(offset);
-        }
-    }
-    if let Some(offset) = head_offset {
-        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
-        output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
-    }
-    Some(output)
+    crate::font_subset::replace_glyf_and_loca(base, rebuilt_glyf, rebuilt_loca)
 }
 
 fn redirect_font_descriptor_program(
@@ -2759,9 +2468,15 @@ mod tests {
 
         let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
         let decoded_program = document.decoded_stream_data(program)?;
-        let maxp = sfnt_table(decoded_program.as_ref(), *b"maxp")
-            .ok_or_else(|| Error::Invalid("dense fixture lost maxp".to_owned()))?;
-        assert_eq!(be16(maxp, 4), Some(2));
+        {
+            use write_fonts::read::{FontRef, TableProvider};
+            let font = FontRef::new(decoded_program.as_ref())
+                .map_err(|_| Error::Invalid("dense fixture is not a valid font".to_owned()))?;
+            let maxp = font
+                .maxp()
+                .map_err(|_| Error::Invalid("dense fixture lost maxp".to_owned()))?;
+            assert_eq!(maxp.num_glyphs(), 2);
+        }
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
@@ -2804,43 +2519,14 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the test-only SFNT builder uses tiny fixtures far below the u16/u32 format field limits"
-    )]
     fn sfnt(tables: &[([u8; 4], &[u8])]) -> Vec<u8> {
-        let mut owned: Vec<([u8; 4], Vec<u8>)> = tables
-            .iter()
-            .map(|(tag, data)| (*tag, data.to_vec()))
-            .collect();
-        owned.sort_unstable_by_key(|(tag, _)| *tag);
-        let count = owned.len();
-        let max_power = 1_usize << (usize::BITS - 1 - count.leading_zeros());
-        let search_range = (max_power * 16) as u16;
-        let mut out = Vec::new();
-        out.extend_from_slice(&[0, 1, 0, 0]);
-        out.extend_from_slice(&(count as u16).to_be_bytes());
-        out.extend_from_slice(&search_range.to_be_bytes());
-        out.extend_from_slice(&(max_power.trailing_zeros() as u16).to_be_bytes());
-        out.extend_from_slice(&((count * 16) as u16 - search_range).to_be_bytes());
-        let directory = out.len();
-        out.resize(directory + count * 16, 0);
-        for (index, (tag, data)) in owned.iter().enumerate() {
-            while out.len() % 4 != 0 {
-                out.push(0);
-            }
-            let offset = out.len();
-            out.extend_from_slice(data);
-            while out.len() % 4 != 0 {
-                out.push(0);
-            }
-            let record = directory + index * 16;
-            out[record..record + 4].copy_from_slice(tag);
-            out[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
-            out[record + 8..record + 12].copy_from_slice(&(offset as u32).to_be_bytes());
-            out[record + 12..record + 16].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        use write_fonts::{FontBuilder, types::Tag};
+
+        let mut builder = FontBuilder::new();
+        for (tag, data) in tables {
+            builder.add_raw(Tag::new(tag), data.to_vec());
         }
-        out
+        builder.build()
     }
 
     fn sparse_union_test_font(glyphs: &[Option<Vec<u8>>], bbox: [i16; 4]) -> Result<Vec<u8>> {
@@ -2907,6 +2593,8 @@ mod tests {
 
     #[test]
     fn sparse_cid_union_combines_disjoint_gids_and_preserves_head_bbox() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
         let bbox = [-123_i16, -456, 789, 1024];
         let glyph0 = simple_test_glyph(0x10);
         let glyph1 = simple_test_glyph(0x11);
@@ -2924,20 +2612,22 @@ mod tests {
                 "compatible sparse fonts should union".to_owned(),
             ));
         };
-        let Some(head) = sfnt_table(&union, *b"head") else {
-            return Err(Error::Invalid("union should retain head".to_owned()));
-        };
-        assert_eq!(&head[36..38], &bbox[0].to_be_bytes());
-        assert_eq!(&head[38..40], &bbox[1].to_be_bytes());
-        assert_eq!(&head[40..42], &bbox[2].to_be_bytes());
-        assert_eq!(&head[42..44], &bbox[3].to_be_bytes());
+        let font = FontRef::new(&union)
+            .map_err(|_| Error::Invalid("union should be a valid font".to_owned()))?;
+        let head = font
+            .head()
+            .map_err(|_| Error::Invalid("union should retain head".to_owned()))?;
+        assert_eq!(
+            [head.x_min(), head.y_min(), head.x_max(), head.y_max()],
+            bbox
+        );
 
-        let Some(offsets) = sfnt_glyph_offsets(&union) else {
-            return Err(Error::Invalid("union should have valid loca".to_owned()));
-        };
-        let Some(glyf) = sfnt_table(&union, *b"glyf") else {
-            return Err(Error::Invalid("union should retain glyf".to_owned()));
-        };
+        let offsets = sfnt_glyph_offsets(&union)
+            .ok_or_else(|| Error::Invalid("union should have valid loca".to_owned()))?;
+        let glyf = font
+            .glyf()
+            .map_err(|_| Error::Invalid("union should retain glyf".to_owned()))?;
+        let glyf = glyf.offset_data().as_bytes();
         assert_eq!(&glyf[offsets[1]..offsets[2]], glyph1.as_slice());
         assert_eq!(&glyf[offsets[2]..offsets[3]], glyph2.as_slice());
         Ok(())
@@ -2974,11 +2664,13 @@ mod tests {
     }
 
     fn tags(bytes: &[u8]) -> Vec<[u8; 4]> {
-        let Some(count) = be16(bytes, 4).map(usize::from) else {
+        let Ok(font) = write_fonts::read::FontRef::new(bytes) else {
             return Vec::new();
         };
-        (0..count)
-            .filter_map(|index| bytes.get(12 + index * 16..16 + index * 16)?.try_into().ok())
+        font.table_directory()
+            .table_records()
+            .iter()
+            .map(|record| record.tag().to_be_bytes())
             .collect()
     }
 

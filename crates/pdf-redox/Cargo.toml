@@ -19,6 +19,7 @@ fax.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 skera.workspace = true
+skrifa.workspace = true
 write-fonts.workspace = true
 serde.workspace = true
 thiserror.workspace = true

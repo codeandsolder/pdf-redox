@@ -76,6 +76,17 @@ pub fn strip_pdf_unused_tables(bytes: &[u8], cid_type2_only: bool) -> Option<(Ve
     (result.1 > 0).then_some(result)
 }
 
+/// Rebuild an SFNT using replacement `glyf`/`loca` tables while copying every
+/// other table from the canonical source font.
+pub fn replace_glyf_and_loca(bytes: &[u8], glyf: Vec<u8>, loca: Vec<u8>) -> Option<Vec<u8>> {
+    let font = FontRef::new(bytes).ok()?;
+    let mut builder = FontBuilder::new();
+    builder.add_raw(Tag::new(b"glyf"), glyf);
+    builder.add_raw(Tag::new(b"loca"), loca);
+    builder.copy_missing_tables(font);
+    Some(builder.build())
+}
+
 #[derive(Debug)]
 pub struct RetainedGlyphSubset {
     pub bytes: Vec<u8>,
