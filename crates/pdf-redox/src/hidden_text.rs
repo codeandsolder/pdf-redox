@@ -7,7 +7,6 @@ use crate::geometry::{Matrix, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
 };
-use crate::stream_codec::DecodeLevel;
 use crate::{EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -19,7 +18,7 @@ const COVERAGE_THRESHOLD: f64 = 0.97;
 
 type ObjectKey = (i32, i32);
 
-fn flpdf_object_key(reference: ObjectRef) -> ObjectKey {
+fn content_object_key(reference: ObjectRef) -> ObjectKey {
     (
         i32::try_from(reference.number).unwrap_or(i32::MAX),
         i32::from(reference.generation),
@@ -635,9 +634,9 @@ impl<'a> PageScanner<'a> {
                     && let Some(object_ref) = properties.object_ref()
                 {
                     optional_hidden = if self.base_ocg_off {
-                        !self.on_ocgs.contains(&flpdf_object_key(object_ref))
+                        !self.on_ocgs.contains(&content_object_key(object_ref))
                     } else {
-                        self.hidden_ocgs.contains(&flpdf_object_key(object_ref))
+                        self.hidden_ocgs.contains(&content_object_key(object_ref))
                     };
                 }
                 if let Ok(value) = properties.try_get_key(b"/ActualText")
@@ -1719,7 +1718,7 @@ fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<Fo
     if let Some(to_unicode) = font.get(b"ToUnicode".as_slice())
         && let Some(stream) = document.resolve_owned_value(to_unicode)?
         && matches!(stream, OwnedObject::Stream { .. })
-        && let Ok(data) = document.decoded_owned_stream_data(&stream, DecodeLevel::Generalized)
+        && let Ok(data) = document.decoded_owned_stream_data(&stream)
     {
         info.unicode = parse_to_unicode(&data);
         if let Some(max) = info.unicode.keys().map(Vec::len).max() {
@@ -1991,7 +1990,7 @@ fn decoded_content_value_hayro(
     };
     match value {
         OwnedObject::Stream { .. } => {
-            let bytes = document.decoded_owned_stream_data(&value, DecodeLevel::Specialized)?;
+            let bytes = document.decoded_owned_stream_data(&value)?;
             if !output.is_empty() && output.last() != Some(&b'\n') {
                 output.push(b'\n');
             }

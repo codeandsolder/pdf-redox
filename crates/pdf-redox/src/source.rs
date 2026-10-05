@@ -1,4 +1,4 @@
-use crate::stream_codec::{DecodeLevel, decode_stream};
+use crate::stream_codec::decode_stream;
 use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
@@ -787,11 +787,7 @@ impl EditDocument {
     /// detached helper object. Decoding does not need resources, metadata, or
     /// other semantic stream keys, and avoiding them prevents unrelated COS
     /// cycles/deep graphs from being copied merely to inflate a stream.
-    pub(crate) fn decoded_owned_stream_data(
-        &self,
-        stream: &OwnedObject,
-        _level: DecodeLevel,
-    ) -> Result<Vec<u8>> {
+    pub(crate) fn decoded_owned_stream_data(&self, stream: &OwnedObject) -> Result<Vec<u8>> {
         let OwnedObject::Stream { dictionary, data } = stream else {
             return Err(Error::Invalid("object is not a stream".to_owned()));
         };
@@ -810,17 +806,13 @@ impl EditDocument {
     }
 
     /// Decode a current indirect stream through the standalone filter-codec bridge.
-    pub(crate) fn decoded_stream_data(
-        &self,
-        handle: ObjectHandle,
-        level: DecodeLevel,
-    ) -> Result<Vec<u8>> {
+    pub(crate) fn decoded_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
         let Some(stream) = self.current_owned_object(handle)? else {
             return Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
             ));
         };
-        self.decoded_owned_stream_data(&stream, level)
+        self.decoded_owned_stream_data(&stream)
     }
 
     /// Decode page/Form content while memoizing untouched source streams.

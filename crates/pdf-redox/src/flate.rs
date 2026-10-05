@@ -1,4 +1,4 @@
-use crate::stream_codec::{DecodeLevel, encode_flate, set_plain_flate};
+use crate::stream_codec::{encode_flate, set_plain_flate};
 use crate::{FlatePolicy, Result};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub fn apply_flate_policy_hayro(
             continue;
         }
         let raw = data.bytes(document.source())?;
-        let Ok(decoded) = document.decoded_stream_data(handle, DecodeLevel::Generalized) else {
+        let Ok(decoded) = document.decoded_stream_data(handle) else {
             continue;
         };
         let Ok(encoded) = adaptive_flate_encode(&decoded, level, adaptive_high_effort) else {

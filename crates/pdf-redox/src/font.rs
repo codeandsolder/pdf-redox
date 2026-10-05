@@ -2,7 +2,7 @@ use crate::content_stream::{
     ContentObject as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl,
 };
 use crate::stream_codec::{
-    DecodeLevel, decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
+    decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
 };
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
@@ -1745,12 +1745,8 @@ fn cid_to_gid_mapping(
     }
 
     let decoded = match value {
-        OwnedObject::Reference(handle) => {
-            document.decoded_stream_data(*handle, DecodeLevel::Generalized)
-        }
-        OwnedObject::Stream { .. } => {
-            document.decoded_owned_stream_data(value, DecodeLevel::Generalized)
-        }
+        OwnedObject::Reference(handle) => document.decoded_stream_data(*handle),
+        OwnedObject::Stream { .. } => document.decoded_owned_stream_data(value),
         _ => return Ok(None),
     };
     let Ok(decoded) = decoded else {
@@ -3059,9 +3055,7 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
 
 /// Hayro/COW port of [`strip_font_editing_tables`].
 ///
-/// The graph walk and mutation are Hayro-native. flpdf is used only for the
-/// already-tested stream filter codec semantics so `/DecodeParms` behavior
-/// remains identical during the migration.
+/// The graph walk, mutation, and stream filter handling are Hayro-native.
 #[expect(
     clippy::too_many_lines,
     reason = "font usage analysis, table filtering, and encoded-cost gating form one ordered optimization transaction"
@@ -3467,11 +3461,11 @@ mod tests {
         assert_eq!(first.dense_glyph_slots_removed, 2);
 
         let cid_map_stream = CowObjectHandle::Existing(ObjectId::new(9, 0));
-        let decoded_map = document.decoded_stream_data(cid_map_stream, DecodeLevel::Generalized)?;
+        let decoded_map = document.decoded_stream_data(cid_map_stream)?;
         assert_eq!(decoded_map.as_slice(), &[0, 0, 0, 0, 0, 0, 0, 1]);
 
         let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
-        let decoded_program = document.decoded_stream_data(program, DecodeLevel::Generalized)?;
+        let decoded_program = document.decoded_stream_data(program)?;
         let maxp = sfnt_table(decoded_program.as_ref(), *b"maxp")
             .ok_or_else(|| Error::Invalid("dense fixture lost maxp".to_owned()))?;
         assert_eq!(be16(maxp, 4), Some(2));

@@ -4,18 +4,6 @@ use crate::{EditDocument, Error, OwnedDictionary, OwnedObject, Result};
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write as _;
 
-/// Compatibility selector retained while callers are migrated away from flpdf.
-/// Hayro decodes the complete declared filter chain for all variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecodeLevel {
-    /// General non-image stream decoding.
-    Generalized,
-    /// Content/specialized stream decoding.
-    Specialized,
-    /// Full image-capable decoding.
-    All,
-}
-
 fn write_resolved_value(
     document: &EditDocument,
     value: &OwnedObject,

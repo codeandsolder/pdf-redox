@@ -236,8 +236,7 @@ fn cow_content_value(
     };
     match value {
         crate::OwnedObject::Stream { .. } => {
-            let bytes = document
-                .decoded_owned_stream_data(&value, crate::stream_codec::DecodeLevel::Specialized)?;
+            let bytes = document.decoded_owned_stream_data(&value)?;
             if !out.is_empty() && out.last() != Some(&b'\n') {
                 out.push(b'\n');
             }
@@ -446,8 +445,7 @@ fn cow_scan_form(
         if !scope_complete {
             *state.complete = false;
         }
-        let content =
-            document.decoded_stream_data(form, crate::stream_codec::DecodeLevel::Specialized)?;
+        let content = document.decoded_stream_data(form)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
         if crate::content_stream::parse_detached_content_stream(
             &content,

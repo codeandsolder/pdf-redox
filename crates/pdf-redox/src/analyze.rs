@@ -1,7 +1,6 @@
 use crate::content_stream::{
     ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
 };
-use crate::stream_codec::DecodeLevel;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
     RiskKind, content::page_content, hidden_text::analyze_hidden_text_hayro,
@@ -558,7 +557,7 @@ fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize
         if dictionary_name(document, dictionary, b"Subtype")?.as_deref() != Some(b"Form") {
             continue;
         }
-        let content = document.decoded_owned_stream_data(&object, DecodeLevel::Specialized)?;
+        let content = document.decoded_owned_stream_data(&object)?;
         crate::content_stream::parse_detached_content_stream(
             &content,
             "Hayro analysis Form content",
@@ -754,7 +753,7 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             out.font_program_bytes += raw.len();
             if deep {
                 let duplicate_basis = document
-                    .decoded_owned_stream_data(object, DecodeLevel::Generalized)
+                    .decoded_owned_stream_data(object)
                     .unwrap_or_else(|_| raw.as_ref().to_vec());
                 record_payload(&mut font_payloads, &duplicate_basis);
             }
@@ -793,7 +792,7 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             let raw = raw_stream_bytes(document, object)?;
             if deep {
                 let duplicate_basis = document
-                    .decoded_owned_stream_data(object, DecodeLevel::Generalized)
+                    .decoded_owned_stream_data(object)
                     .unwrap_or_else(|_| raw.as_ref().to_vec());
                 record_payload(&mut form_payloads, &duplicate_basis);
             }
@@ -820,9 +819,7 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             }
             if deep {
                 let raw = raw_stream_bytes(document, object)?;
-                if let Ok(decoded) =
-                    document.decoded_owned_stream_data(object, DecodeLevel::Generalized)
-                {
+                if let Ok(decoded) = document.decoded_owned_stream_data(object) {
                     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
                     if encoder.write_all(&decoded).is_ok()
                         && let Ok(repacked) = encoder.finish()
