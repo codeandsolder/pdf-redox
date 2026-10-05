@@ -20,6 +20,5 @@ sha2.workspace = true
 smallvec.workspace = true
 skera.workspace = true
 write-fonts.workspace = true
-oxifont-subset.workspace = true
 serde.workspace = true
 thiserror.workspace = true
