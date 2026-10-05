@@ -246,7 +246,8 @@ fn optimize_pdf_with_document(
     font_rendering.original_encoded_bytes += font_sparse_union.original_encoded_bytes;
     font_rendering.optimized_encoded_bytes += font_sparse_union.optimized_encoded_bytes;
     font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
-    font_rendering.glyph_outline_bytes_removed += font_sparse_union.glyph_outline_bytes_removed;
+    font_rendering.glyph_subset_decoded_bytes_removed +=
+        font_sparse_union.glyph_subset_decoded_bytes_removed;
     let font_dense = timed(&mut timings, "font-dense-gid", || {
         if cfg.preservation.font_editing_support
             || cfg.optimization_goal != crate::OptimizationGoal::Processing
@@ -825,9 +826,8 @@ fn optimize_pdf_with_document(
     }
     if font_rendering.programs_glyph_subset > 0 {
         notes.push(format!(
-            "Retain-GID subset {} CID TrueType font program(s), removing {} decoded glyph-outline bytes.",
-            font_rendering.programs_glyph_subset,
-            font_rendering.glyph_outline_bytes_removed
+            "Subset {} embedded font program(s), removing about {} decoded font-program bytes.",
+            font_rendering.programs_glyph_subset, font_rendering.glyph_subset_decoded_bytes_removed
         ));
     }
     if font_dense.programs_dense_remapped > 0 {
@@ -1091,7 +1091,7 @@ fn optimize_pdf_with_document(
         font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
         font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
         font_programs_glyph_subset: font_rendering.programs_glyph_subset,
-        font_glyph_outline_bytes_removed: font_rendering.glyph_outline_bytes_removed,
+        font_glyph_subset_decoded_bytes_removed: font_rendering.glyph_subset_decoded_bytes_removed,
         font_dense_programs_remapped: font_dense.programs_dense_remapped,
         font_dense_cid_to_gid_maps_rewritten: font_dense.cid_to_gid_maps_rewritten,
         font_dense_glyph_slots_removed: font_dense.dense_glyph_slots_removed,

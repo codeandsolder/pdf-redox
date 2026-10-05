@@ -53,7 +53,7 @@ pub struct FontOptimizationStats {
     pub original_encoded_bytes: usize,
     pub optimized_encoded_bytes: usize,
     pub decoded_table_bytes_removed: usize,
-    pub glyph_outline_bytes_removed: usize,
+    pub glyph_subset_decoded_bytes_removed: usize,
 }
 
 fn be16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -487,527 +487,6 @@ fn composite_components(glyph: &[u8]) -> Option<Vec<u16>> {
         }
     }
     Some(components)
-}
-
-/// Keep original glyph IDs stable while removing outlines for glyphs that the
-/// PDF never addresses. This deliberately leaves `maxp`, metrics, widths, and
-/// all PDF CID machinery untouched; only `glyf` and `loca` are rebuilt.
-/// Composite-glyph dependencies are retained recursively.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sfnt subset reconstruction shares offset, glyph-dependency, and table-layout invariants that are safer to audit together"
-)]
-fn sfnt_retain_glyph_ids(bytes: &[u8], requested_gids: &BTreeSet<u16>) -> Option<(Vec<u8>, usize)> {
-    if bytes.len() < 12 || bytes.get(..4)? != [0, 1, 0, 0] {
-        return None;
-    }
-    let maxp = sfnt_table(bytes, *b"maxp")?;
-    let head = sfnt_table(bytes, *b"head")?;
-    let glyf = sfnt_table(bytes, *b"glyf")?;
-    let loca = sfnt_table(bytes, *b"loca")?;
-    if maxp.len() < 6 || head.len() < 52 {
-        return None;
-    }
-    let glyph_count = usize::from(be16(maxp, 4)?);
-    if glyph_count == 0
-        || requested_gids
-            .iter()
-            .any(|gid| usize::from(*gid) >= glyph_count)
-    {
-        return None;
-    }
-    let loca_format = i16::from_be_bytes([head[50], head[51]]);
-    let mut offsets = Vec::with_capacity(glyph_count + 1);
-    match loca_format {
-        0 => {
-            if loca.len() < (glyph_count + 1).checked_mul(2)? {
-                return None;
-            }
-            for index in 0..=glyph_count {
-                offsets.push(usize::from(be16(loca, index * 2)?).checked_mul(2)?);
-            }
-        }
-        1 => {
-            if loca.len() < (glyph_count + 1).checked_mul(4)? {
-                return None;
-            }
-            for index in 0..=glyph_count {
-                offsets.push(usize::try_from(be32(loca, index * 4)?).ok()?);
-            }
-        }
-        _ => return None,
-    }
-    if offsets.windows(2).any(|pair| pair[0] > pair[1]) || offsets.last().copied()? > glyf.len() {
-        return None;
-    }
-
-    let mut keep = vec![false; glyph_count];
-    keep[0] = true;
-    let mut pending = VecDeque::new();
-    pending.push_back(0usize);
-    for gid in requested_gids {
-        let gid = usize::from(*gid);
-        if !keep[gid] {
-            keep[gid] = true;
-            pending.push_back(gid);
-        }
-    }
-    while let Some(gid) = pending.pop_front() {
-        let glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
-        for component in composite_components(glyph)? {
-            let component = usize::from(component);
-            if component >= glyph_count {
-                return None;
-            }
-            if !keep[component] {
-                keep[component] = true;
-                pending.push_back(component);
-            }
-        }
-    }
-
-    let alignment = if loca_format == 0 { 2usize } else { 4usize };
-    let mut rebuilt_glyf = Vec::new();
-    let mut rebuilt_offsets = Vec::with_capacity(glyph_count + 1);
-    let mut removed_outline_bytes = 0usize;
-    for gid in 0..glyph_count {
-        rebuilt_offsets.push(rebuilt_glyf.len());
-        let glyph = &glyf[offsets[gid]..offsets[gid + 1]];
-        if keep[gid] {
-            rebuilt_glyf.extend_from_slice(glyph);
-            while rebuilt_glyf.len() % alignment != 0 {
-                rebuilt_glyf.push(0);
-            }
-        } else {
-            removed_outline_bytes = removed_outline_bytes.saturating_add(glyph.len());
-        }
-    }
-    rebuilt_offsets.push(rebuilt_glyf.len());
-
-    let mut bitmap_gids = requested_gids.clone();
-    bitmap_gids.insert(0);
-    let ebdt_record = sfnt_table_record(bytes, *b"EBDT");
-    let eblc_record = sfnt_table_record(bytes, *b"EBLC");
-    let bitmap_subset = match (ebdt_record, eblc_record) {
-        (Some((ebdt_offset, ebdt_len)), Some((eblc_offset, eblc_len))) => {
-            let ebdt = bytes.get(ebdt_offset..ebdt_offset.checked_add(ebdt_len)?)?;
-            let eblc = bytes.get(eblc_offset..eblc_offset.checked_add(eblc_len)?)?;
-            crate::sfnt_bitmap::subset_ebdt_eblc(ebdt, eblc, &bitmap_gids)
-        }
-        (None, None) => None,
-        _ => return None,
-    };
-    let removed_bitmap_bytes = bitmap_subset.as_ref().map_or(0, |(_, _, removed)| *removed);
-    let removed_glyph_bytes = removed_outline_bytes.checked_add(removed_bitmap_bytes)?;
-    if removed_glyph_bytes == 0 {
-        return None;
-    }
-
-    let mut rebuilt_loca = Vec::with_capacity(loca.len());
-    match loca_format {
-        0 => {
-            for offset in &rebuilt_offsets {
-                if offset % 2 != 0 || offset / 2 > usize::from(u16::MAX) {
-                    return None;
-                }
-                rebuilt_loca.extend_from_slice(&u16::try_from(offset / 2).ok()?.to_be_bytes());
-            }
-        }
-        1 => {
-            for offset in &rebuilt_offsets {
-                rebuilt_loca.extend_from_slice(&u32::try_from(*offset).ok()?.to_be_bytes());
-            }
-        }
-        _ => unreachable!(),
-    }
-
-    let table_count = usize::from(be16(bytes, 4)?);
-    let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(table_count);
-    for index in 0..table_count {
-        let record = 12 + index * 16;
-        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
-        let data = if tag == *b"glyf" {
-            rebuilt_glyf.clone()
-        } else if tag == *b"loca" {
-            rebuilt_loca.clone()
-        } else if tag == *b"EBDT" {
-            bitmap_subset.as_ref()?.0.clone()
-        } else if tag == *b"EBLC" {
-            bitmap_subset.as_ref()?.1.clone()
-        } else {
-            let (offset, length) = sfnt_table_record(bytes, tag)?;
-            let mut data = bytes.get(offset..offset.checked_add(length)?)?.to_vec();
-            if tag == *b"head" {
-                if data.len() < 12 {
-                    return None;
-                }
-                data[8..12].fill(0);
-            }
-            data
-        };
-        tables.push((tag, data));
-    }
-    tables.sort_unstable_by_key(|(tag, _)| *tag);
-
-    let new_count = tables.len();
-    let max_power = 1_usize << (usize::BITS - 1 - new_count.leading_zeros());
-    let search_range = u16::try_from(max_power.checked_mul(16)?).ok()?;
-    let entry_selector = u16::try_from(max_power.trailing_zeros()).ok()?;
-    let range_shift = u16::try_from(new_count.checked_mul(16)?)
-        .ok()?
-        .checked_sub(search_range)?;
-    let mut output = Vec::with_capacity(bytes.len().saturating_sub(removed_glyph_bytes));
-    output.extend_from_slice(&bytes[..4]);
-    output.extend_from_slice(&u16::try_from(new_count).ok()?.to_be_bytes());
-    output.extend_from_slice(&search_range.to_be_bytes());
-    output.extend_from_slice(&entry_selector.to_be_bytes());
-    output.extend_from_slice(&range_shift.to_be_bytes());
-    let directory_offset = output.len();
-    output.resize(directory_offset + new_count * 16, 0);
-    let mut head_offset = None;
-    for (index, (tag, data)) in tables.iter().enumerate() {
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let offset = output.len();
-        output.extend_from_slice(data);
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let record = directory_offset + index * 16;
-        output[record..record + 4].copy_from_slice(tag);
-        output[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
-        output[record + 8..record + 12].copy_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
-        output[record + 12..record + 16]
-            .copy_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
-        if tag == b"head" {
-            head_offset = Some(offset);
-        }
-    }
-    if let Some(offset) = head_offset {
-        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
-        output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
-    }
-    Some((output, removed_glyph_bytes))
-}
-
-#[derive(Debug, Clone)]
-struct DenseGlyphSubset {
-    bytes: Vec<u8>,
-    old_to_new: Vec<Option<u16>>,
-    removed_decoded_bytes: usize,
-}
-
-fn trivial_merg_is_gid_invariant(table: &[u8]) -> bool {
-    // MERG with zero ClassDef tables contains no glyph IDs. The merge-entry
-    // matrix is indexed only by merge class and can therefore survive a GID
-    // renumber unchanged.
-    table.len() >= 10 && be16(table, 0) == Some(0) && be16(table, 6) == Some(0)
-}
-
-fn remap_composite_components(glyph: &mut [u8], old_to_new: &[Option<u16>]) -> Option<()> {
-    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
-    const WE_HAVE_A_SCALE: u16 = 0x0008;
-    const MORE_COMPONENTS: u16 = 0x0020;
-    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
-    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
-    const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
-
-    if glyph.len() < 10 {
-        return Some(());
-    }
-    let contours = i16::from_be_bytes([glyph[0], glyph[1]]);
-    if contours >= 0 {
-        return Some(());
-    }
-
-    let mut offset = 10usize;
-    loop {
-        let flags = be16(glyph, offset)?;
-        let old_gid = usize::from(be16(glyph, offset + 2)?);
-        let new_gid = old_to_new.get(old_gid).copied().flatten()?;
-        glyph[offset + 2..offset + 4].copy_from_slice(&new_gid.to_be_bytes());
-
-        offset = offset.checked_add(4)?;
-        offset = offset.checked_add(if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-            4
-        } else {
-            2
-        })?;
-        offset = offset.checked_add(if flags & WE_HAVE_A_SCALE != 0 {
-            2
-        } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
-            4
-        } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
-            8
-        } else {
-            0
-        })?;
-        if offset > glyph.len() {
-            return None;
-        }
-        if flags & MORE_COMPONENTS == 0 {
-            if flags & WE_HAVE_INSTRUCTIONS != 0 {
-                let instruction_len = usize::from(be16(glyph, offset)?);
-                offset = offset.checked_add(2)?.checked_add(instruction_len)?;
-                if offset > glyph.len() {
-                    return None;
-                }
-            }
-            break;
-        }
-    }
-    Some(())
-}
-
-fn sfnt_hmetric(
-    hmtx: &[u8],
-    glyph_count: usize,
-    long_metric_count: usize,
-    gid: usize,
-) -> Option<(u16, [u8; 2])> {
-    if long_metric_count == 0 || long_metric_count > glyph_count || gid >= glyph_count {
-        return None;
-    }
-    let long_bytes = long_metric_count.checked_mul(4)?;
-    let trailing_count = glyph_count.checked_sub(long_metric_count)?;
-    let required = long_bytes.checked_add(trailing_count.checked_mul(2)?)?;
-    if hmtx.len() < required {
-        return None;
-    }
-
-    let advance_offset = if gid < long_metric_count {
-        gid.checked_mul(4)?
-    } else {
-        long_metric_count.checked_sub(1)?.checked_mul(4)?
-    };
-    let advance = be16(hmtx, advance_offset)?;
-    let lsb_offset = if gid < long_metric_count {
-        advance_offset.checked_add(2)?
-    } else {
-        long_bytes.checked_add(gid.checked_sub(long_metric_count)?.checked_mul(2)?)?
-    };
-    Some((
-        advance,
-        [*hmtx.get(lsb_offset)?, *hmtx.get(lsb_offset + 1)?],
-    ))
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "dense SFNT reconstruction shares glyph closure, composite remapping, metrics, loca, and checksum invariants that are safer to audit together"
-)]
-fn sfnt_compact_glyph_ids(
-    bytes: &[u8],
-    requested_gids: &BTreeSet<u16>,
-) -> Option<DenseGlyphSubset> {
-    if bytes.len() < 12 || bytes.get(..4)? != [0, 1, 0, 0] {
-        return None;
-    }
-
-    let table_count = usize::from(be16(bytes, 4)?);
-    for index in 0..table_count {
-        let record = 12usize.checked_add(index.checked_mul(16)?)?;
-        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
-        match &tag {
-            b"head" | b"hhea" | b"maxp" | b"hmtx" | b"glyf" | b"loca" | b"fpgm" | b"prep"
-            | b"cvt " | b"gasp" | b"meta" => {}
-            b"MERG" => {
-                let table = sfnt_table(bytes, tag)?;
-                if !trivial_merg_is_gid_invariant(table) {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-
-    let maxp = sfnt_table(bytes, *b"maxp")?;
-    let head = sfnt_table(bytes, *b"head")?;
-    let hhea = sfnt_table(bytes, *b"hhea")?;
-    let hmtx = sfnt_table(bytes, *b"hmtx")?;
-    let glyf = sfnt_table(bytes, *b"glyf")?;
-    if maxp.len() < 6 || head.len() < 52 || hhea.len() < 36 {
-        return None;
-    }
-    let glyph_count = usize::from(be16(maxp, 4)?);
-    if glyph_count == 0
-        || requested_gids
-            .iter()
-            .any(|gid| usize::from(*gid) >= glyph_count)
-    {
-        return None;
-    }
-    let offsets = sfnt_glyph_offsets(bytes)?;
-    let loca_format = i16::from_be_bytes([head[50], head[51]]);
-    let long_metric_count = usize::from(be16(hhea, 34)?);
-    // Validate the metric table before doing any mutation.
-    let _ = sfnt_hmetric(
-        hmtx,
-        glyph_count,
-        long_metric_count,
-        glyph_count.checked_sub(1)?,
-    )?;
-
-    let mut keep = vec![false; glyph_count];
-    keep[0] = true;
-    let mut pending = VecDeque::from([0usize]);
-    for gid in requested_gids {
-        let gid = usize::from(*gid);
-        if !keep[gid] {
-            keep[gid] = true;
-            pending.push_back(gid);
-        }
-    }
-    while let Some(gid) = pending.pop_front() {
-        let glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
-        for component in composite_components(glyph)? {
-            let component = usize::from(component);
-            if component >= glyph_count {
-                return None;
-            }
-            if !keep[component] {
-                keep[component] = true;
-                pending.push_back(component);
-            }
-        }
-    }
-
-    let kept = keep
-        .iter()
-        .enumerate()
-        .filter_map(|(gid, keep)| keep.then_some(gid))
-        .collect::<Vec<_>>();
-    if kept.len() >= glyph_count {
-        return None;
-    }
-    let new_count = u16::try_from(kept.len()).ok()?;
-    let mut old_to_new = vec![None; glyph_count];
-    for (new_gid, old_gid) in kept.iter().copied().enumerate() {
-        old_to_new[old_gid] = Some(u16::try_from(new_gid).ok()?);
-    }
-
-    let alignment = if loca_format == 0 { 2usize } else { 4usize };
-    let mut rebuilt_glyf = Vec::new();
-    let mut rebuilt_offsets = Vec::with_capacity(kept.len() + 1);
-    for old_gid in &kept {
-        rebuilt_offsets.push(rebuilt_glyf.len());
-        let mut glyph = glyf.get(offsets[*old_gid]..offsets[*old_gid + 1])?.to_vec();
-        remap_composite_components(&mut glyph, &old_to_new)?;
-        rebuilt_glyf.extend_from_slice(&glyph);
-        while rebuilt_glyf.len() % alignment != 0 {
-            rebuilt_glyf.push(0);
-        }
-    }
-    rebuilt_offsets.push(rebuilt_glyf.len());
-
-    let mut rebuilt_loca = Vec::with_capacity(match loca_format {
-        0 => (kept.len() + 1).checked_mul(2)?,
-        1 => (kept.len() + 1).checked_mul(4)?,
-        _ => return None,
-    });
-    match loca_format {
-        0 => {
-            for offset in &rebuilt_offsets {
-                if offset % 2 != 0 || offset / 2 > usize::from(u16::MAX) {
-                    return None;
-                }
-                rebuilt_loca.extend_from_slice(&u16::try_from(offset / 2).ok()?.to_be_bytes());
-            }
-        }
-        1 => {
-            for offset in &rebuilt_offsets {
-                rebuilt_loca.extend_from_slice(&u32::try_from(*offset).ok()?.to_be_bytes());
-            }
-        }
-        _ => return None,
-    }
-
-    let mut rebuilt_hmtx = Vec::with_capacity(kept.len().checked_mul(4)?);
-    for old_gid in &kept {
-        let (advance, lsb) = sfnt_hmetric(hmtx, glyph_count, long_metric_count, *old_gid)?;
-        rebuilt_hmtx.extend_from_slice(&advance.to_be_bytes());
-        rebuilt_hmtx.extend_from_slice(&lsb);
-    }
-    let mut rebuilt_hhea = hhea.to_vec();
-    rebuilt_hhea[34..36].copy_from_slice(&new_count.to_be_bytes());
-
-    let mut rebuilt_maxp = maxp.to_vec();
-    rebuilt_maxp[4..6].copy_from_slice(&new_count.to_be_bytes());
-
-    let mut tables = Vec::<([u8; 4], Vec<u8>)>::with_capacity(table_count);
-    for index in 0..table_count {
-        let record = 12usize.checked_add(index.checked_mul(16)?)?;
-        let tag: [u8; 4] = bytes.get(record..record + 4)?.try_into().ok()?;
-        let data = match &tag {
-            b"glyf" => rebuilt_glyf.clone(),
-            b"loca" => rebuilt_loca.clone(),
-            b"hmtx" => rebuilt_hmtx.clone(),
-            b"hhea" => rebuilt_hhea.clone(),
-            b"maxp" => rebuilt_maxp.clone(),
-            _ => {
-                let (offset, length) = sfnt_table_record(bytes, tag)?;
-                let mut data = bytes.get(offset..offset.checked_add(length)?)?.to_vec();
-                if tag == *b"head" {
-                    if data.len() < 12 {
-                        return None;
-                    }
-                    data[8..12].fill(0);
-                }
-                data
-            }
-        };
-        tables.push((tag, data));
-    }
-    tables.sort_unstable_by_key(|(tag, _)| *tag);
-
-    let new_table_count = tables.len();
-    let max_power = 1_usize << (usize::BITS - 1 - new_table_count.leading_zeros());
-    let search_range = u16::try_from(max_power.checked_mul(16)?).ok()?;
-    let entry_selector = u16::try_from(max_power.trailing_zeros()).ok()?;
-    let range_shift = u16::try_from(new_table_count.checked_mul(16)?)
-        .ok()?
-        .checked_sub(search_range)?;
-
-    let mut output = Vec::with_capacity(bytes.len());
-    output.extend_from_slice(&bytes[..4]);
-    output.extend_from_slice(&u16::try_from(new_table_count).ok()?.to_be_bytes());
-    output.extend_from_slice(&search_range.to_be_bytes());
-    output.extend_from_slice(&entry_selector.to_be_bytes());
-    output.extend_from_slice(&range_shift.to_be_bytes());
-    let directory_offset = output.len();
-    output.resize(directory_offset + new_table_count * 16, 0);
-
-    let mut head_offset = None;
-    for (index, (tag, data)) in tables.iter().enumerate() {
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let offset = output.len();
-        output.extend_from_slice(data);
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        let record = directory_offset + index * 16;
-        output[record..record + 4].copy_from_slice(tag);
-        output[record + 4..record + 8].copy_from_slice(&checksum32(data).to_be_bytes());
-        output[record + 8..record + 12].copy_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
-        output[record + 12..record + 16]
-            .copy_from_slice(&u32::try_from(data.len()).ok()?.to_be_bytes());
-        if tag == b"head" {
-            head_offset = Some(offset);
-        }
-    }
-    if let Some(offset) = head_offset {
-        let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(checksum32(&output));
-        output[offset + 8..offset + 12].copy_from_slice(&adjustment.to_be_bytes());
-    }
-
-    Some(DenseGlyphSubset {
-        removed_decoded_bytes: bytes.len().saturating_sub(output.len()),
-        bytes: output,
-        old_to_new,
-    })
 }
 
 fn subset_base_font_name(name: &[u8]) -> Vec<u8> {
@@ -1501,8 +980,10 @@ fn union_sparse_cid_font_programs_hayro(
                     .copied()
             })
             .collect::<BTreeSet<_>>();
-        if let Some((subset_union, _)) = sfnt_retain_glyph_ids(&union_font, &requested_gids) {
-            union_font = subset_union;
+        if let Some(subset_union) =
+            crate::font_subset::retain_glyph_ids(&union_font, &requested_gids)
+        {
+            union_font = subset_union.bytes;
         }
 
         let canonical_index = indices[0];
@@ -2876,7 +2357,8 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         } else {
             program_raw.as_ref().to_vec()
         };
-        let Some(dense) = sfnt_compact_glyph_ids(&program_decoded, &requested_gids) else {
+        let Some(dense) = crate::font_subset::compact_glyph_ids(&program_decoded, &requested_gids)
+        else {
             continue;
         };
         let Some((encoded_program, program_plain_flate)) =
@@ -2890,12 +2372,7 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         for (map, dictionary, values, raw_len) in map_data {
             let mut decoded = Vec::with_capacity(values.len().saturating_mul(2));
             for old_gid in values {
-                let Some(new_gid) = dense
-                    .old_to_new
-                    .get(usize::from(old_gid))
-                    .copied()
-                    .flatten()
-                else {
+                let Some(new_gid) = dense.old_to_new.get(&old_gid).copied() else {
                     remap_ok = false;
                     break;
                 };
@@ -2944,9 +2421,11 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         stats.cid_to_gid_maps_rewritten = stats
             .cid_to_gid_maps_rewritten
             .saturating_add(program_users.maps.len());
-        stats.dense_glyph_slots_removed = stats
-            .dense_glyph_slots_removed
-            .saturating_add(dense.old_to_new.iter().filter(|gid| gid.is_none()).count());
+        stats.dense_glyph_slots_removed = stats.dense_glyph_slots_removed.saturating_add(
+            dense
+                .original_glyph_count
+                .saturating_sub(dense.old_to_new.len()),
+        );
         stats.dense_decoded_bytes_removed = stats
             .dense_decoded_bytes_removed
             .saturating_add(dense.removed_decoded_bytes);
@@ -3162,7 +2641,7 @@ pub fn strip_font_editing_tables_hayro(
 
         let mut candidate = decoded;
         let mut removed_decoded_bytes = 0usize;
-        let mut removed_outline_bytes = 0usize;
+        let mut glyph_subset_removed_bytes = 0usize;
         let mut changed = single_font_ttc_to_sfnt(&candidate).is_some_and(|unwrapped| {
             candidate = unwrapped;
             true
@@ -3174,26 +2653,26 @@ pub fn strip_font_editing_tables_hayro(
             && let Some((subset, removed)) = crate::cff_cid::subset_cid_font(&candidate, cids)
         {
             candidate = subset;
-            removed_outline_bytes = removed;
+            glyph_subset_removed_bytes = removed;
             changed = true;
         } else if allow_outline_subset
             && usage.cidfont_type2_only()
             && let Some(gids) = identity_glyph_usage.get(&program)
             && !gids.is_empty()
-            && let Some((subset, removed)) = sfnt_retain_glyph_ids(&candidate, gids)
+            && let Some(subset) = crate::font_subset::retain_glyph_ids(&candidate, gids)
         {
-            candidate = subset;
-            removed_outline_bytes = removed;
+            glyph_subset_removed_bytes = subset.removed_decoded_bytes;
+            candidate = subset.bytes;
             changed = true;
         } else if allow_outline_subset
             && usage.simple_truetype_only()
             && let Some(codes) = winansi_code_usage.get(&program)
             && !codes.is_empty()
             && let Some(gids) = sfnt_winansi_ascii_glyph_ids(&candidate, codes)
-            && let Some((subset, removed)) = sfnt_retain_glyph_ids(&candidate, &gids)
+            && let Some(subset) = crate::font_subset::retain_glyph_ids(&candidate, &gids)
         {
-            candidate = subset;
-            removed_outline_bytes = removed;
+            glyph_subset_removed_bytes = subset.removed_decoded_bytes;
+            candidate = subset.bytes;
             changed = true;
         }
         if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate, usage) {
@@ -3212,11 +2691,11 @@ pub fn strip_font_editing_tables_hayro(
         }
 
         stats.programs_optimized += 1;
-        stats.programs_glyph_subset += usize::from(removed_outline_bytes > 0);
+        stats.programs_glyph_subset += usize::from(glyph_subset_removed_bytes > 0);
         stats.original_encoded_bytes += raw.len();
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
-        stats.glyph_outline_bytes_removed += removed_outline_bytes;
+        stats.glyph_subset_decoded_bytes_removed += glyph_subset_removed_bytes;
         replace_current_stream_data(document, program, encoded, true)?;
     }
 
@@ -3374,8 +2853,8 @@ mod tests {
         let font = sparse_union_test_font(
             &[
                 Some(simple_test_glyph(0x10)),
-                None,
-                None,
+                Some(vec![0x44_u8; 4096]),
+                Some(vec![0x55_u8; 4096]),
                 Some(simple_test_glyph(0x13)),
             ],
             [0, 0, 100, 100],
@@ -3825,182 +3304,5 @@ mod tests {
         let head = [0_u8; 54];
         let source = sfnt(&[(*b"head", &head), (*b"glyf", b"glyphs")]);
         assert!(sfnt_for_pdf_rendering(&source, FontProgramUsage::default()).is_none());
-    }
-
-    #[test]
-    fn retain_gids_blanks_unused_outlines_and_keeps_composite_components() -> Result<()> {
-        let mut head = [0_u8; 54];
-        head[50..52].copy_from_slice(&1_i16.to_be_bytes()); // long loca
-        let mut maxp = vec![0, 1, 0, 0, 0, 4];
-        maxp.resize(32, 0);
-
-        let glyph0 = [0_u8; 10];
-        let mut glyph1 = [0_u8; 10];
-        glyph1[2..4].copy_from_slice(&1_i16.to_be_bytes());
-        let mut glyph2 = Vec::new();
-        glyph2.extend_from_slice(&(-1_i16).to_be_bytes());
-        glyph2.extend_from_slice(&[0_u8; 8]);
-        glyph2.extend_from_slice(&1_u16.to_be_bytes()); // ARG_1_AND_2_ARE_WORDS
-        glyph2.extend_from_slice(&1_u16.to_be_bytes()); // component gid 1
-        glyph2.extend_from_slice(&[0_u8; 4]);
-        let glyph3 = vec![0x55_u8; 100];
-
-        let mut glyf = Vec::new();
-        let mut offsets = Vec::new();
-        for glyph in [
-            glyph0.as_slice(),
-            glyph1.as_slice(),
-            glyph2.as_slice(),
-            glyph3.as_slice(),
-        ] {
-            offsets.push(
-                u32::try_from(glyf.len())
-                    .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
-            );
-            glyf.extend_from_slice(glyph);
-        }
-        offsets.push(
-            u32::try_from(glyf.len())
-                .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
-        );
-        let loca = offsets
-            .iter()
-            .flat_map(|offset| offset.to_be_bytes())
-            .collect::<Vec<_>>();
-        let source = sfnt(&[
-            (*b"head", &head),
-            (*b"maxp", &maxp),
-            (*b"loca", &loca),
-            (*b"glyf", &glyf),
-        ]);
-
-        let requested = BTreeSet::from([2_u16]);
-        let Some((subset, removed)) = sfnt_retain_glyph_ids(&source, &requested) else {
-            return Err(Error::Invalid("expected a retain-GID subset".to_owned()));
-        };
-        assert_eq!(removed, glyph3.len());
-        let Some(subset_loca) = sfnt_table(&subset, *b"loca") else {
-            return Err(Error::Invalid("subset should contain loca".to_owned()));
-        };
-        let Some(subset_glyf) = sfnt_table(&subset, *b"glyf") else {
-            return Err(Error::Invalid("subset should contain glyf".to_owned()));
-        };
-        let mut rebuilt = Vec::new();
-        for index in 0..=4 {
-            let Some(offset) = be32(subset_loca, index * 4) else {
-                return Err(Error::Invalid(
-                    "subset loca should contain all entries".to_owned(),
-                ));
-            };
-            rebuilt.push(offset as usize);
-        }
-        assert!(rebuilt[1] > rebuilt[0]); // .notdef retained
-        assert!(rebuilt[2] > rebuilt[1]); // composite dependency retained
-        assert!(rebuilt[3] > rebuilt[2]); // requested composite retained
-        assert_eq!(rebuilt[4], rebuilt[3]); // unused gid 3 has an empty outline
-        assert_eq!(rebuilt[4], subset_glyf.len());
-        Ok(())
-    }
-
-    #[test]
-    fn dense_gids_remap_composites_and_metrics() -> Result<()> {
-        let mut head = [0_u8; 54];
-        head[50..52].copy_from_slice(&1_i16.to_be_bytes()); // long loca
-        let mut hhea = [0_u8; 36];
-        hhea[34..36].copy_from_slice(&4_u16.to_be_bytes());
-        let mut maxp = vec![0, 1, 0, 0, 0, 4];
-        maxp.resize(32, 0);
-
-        let glyph0 = [0_u8; 10];
-        let glyph1 = vec![0x44_u8; 20]; // deliberately unused slot
-        let mut glyph2 = [0_u8; 10];
-        glyph2[2..4].copy_from_slice(&1_i16.to_be_bytes());
-        let mut glyph3 = Vec::new();
-        glyph3.extend_from_slice(&(-1_i16).to_be_bytes());
-        glyph3.extend_from_slice(&[0_u8; 8]);
-        glyph3.extend_from_slice(&1_u16.to_be_bytes()); // ARG_1_AND_2_ARE_WORDS
-        glyph3.extend_from_slice(&2_u16.to_be_bytes()); // component old gid 2
-        glyph3.extend_from_slice(&[0_u8; 4]);
-
-        let mut glyf = Vec::new();
-        let mut offsets = Vec::new();
-        for glyph in [
-            glyph0.as_slice(),
-            glyph1.as_slice(),
-            glyph2.as_slice(),
-            glyph3.as_slice(),
-        ] {
-            offsets.push(
-                u32::try_from(glyf.len())
-                    .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
-            );
-            glyf.extend_from_slice(glyph);
-        }
-        offsets.push(
-            u32::try_from(glyf.len())
-                .map_err(|_| Error::Invalid("test glyph data exceeds u32".to_owned()))?,
-        );
-        let loca = offsets
-            .iter()
-            .flat_map(|offset| offset.to_be_bytes())
-            .collect::<Vec<_>>();
-        let mut hmtx = Vec::new();
-        for advance in [100_u16, 200, 300, 400] {
-            hmtx.extend_from_slice(&advance.to_be_bytes());
-            hmtx.extend_from_slice(&0_i16.to_be_bytes());
-        }
-        let source = sfnt(&[
-            (*b"head", &head),
-            (*b"hhea", &hhea),
-            (*b"maxp", &maxp),
-            (*b"hmtx", &hmtx),
-            (*b"loca", &loca),
-            (*b"glyf", &glyf),
-        ]);
-
-        let Some(dense) = sfnt_compact_glyph_ids(&source, &BTreeSet::from([3_u16])) else {
-            return Err(Error::Invalid("expected a dense GID subset".to_owned()));
-        };
-        assert_eq!(dense.old_to_new, vec![Some(0), None, Some(1), Some(2)]);
-        assert!(dense.removed_decoded_bytes > 0);
-
-        let dense_maxp = sfnt_table(&dense.bytes, *b"maxp")
-            .ok_or_else(|| Error::Invalid("missing maxp".to_owned()))?;
-        assert_eq!(be16(dense_maxp, 4), Some(3));
-        let dense_hhea = sfnt_table(&dense.bytes, *b"hhea")
-            .ok_or_else(|| Error::Invalid("missing hhea".to_owned()))?;
-        assert_eq!(be16(dense_hhea, 34), Some(3));
-        let dense_hmtx = sfnt_table(&dense.bytes, *b"hmtx")
-            .ok_or_else(|| Error::Invalid("missing hmtx".to_owned()))?;
-        assert_eq!(be16(dense_hmtx, 0), Some(100));
-        assert_eq!(be16(dense_hmtx, 4), Some(300));
-        assert_eq!(be16(dense_hmtx, 8), Some(400));
-
-        let dense_loca = sfnt_table(&dense.bytes, *b"loca")
-            .ok_or_else(|| Error::Invalid("missing loca".to_owned()))?;
-        let dense_glyf = sfnt_table(&dense.bytes, *b"glyf")
-            .ok_or_else(|| Error::Invalid("missing glyf".to_owned()))?;
-        let composite_start = usize::try_from(
-            be32(dense_loca, 2 * 4)
-                .ok_or_else(|| Error::Invalid("missing composite loca".to_owned()))?,
-        )
-        .map_err(|_| Error::Invalid("composite loca overflow".to_owned()))?;
-        assert_eq!(be16(dense_glyf, composite_start + 12), Some(1));
-        Ok(())
-    }
-
-    #[test]
-    fn retain_gids_rejects_out_of_range_requests() {
-        let mut head = [0_u8; 54];
-        head[50..52].copy_from_slice(&1_i16.to_be_bytes());
-        let maxp = [0, 1, 0, 0, 0, 1];
-        let loca = [0_u8; 8];
-        let source = sfnt(&[
-            (*b"head", &head),
-            (*b"maxp", &maxp),
-            (*b"loca", &loca),
-            (*b"glyf", b""),
-        ]);
-        assert!(sfnt_retain_glyph_ids(&source, &BTreeSet::from([1_u16])).is_none());
     }
 }

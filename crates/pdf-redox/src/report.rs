@@ -541,8 +541,8 @@ pub struct OptimizationReport {
     /// Number of font programs glyph subset.
     pub font_programs_glyph_subset: usize,
     #[serde(default)]
-    /// Bytes removed by font glyph outline.
-    pub font_glyph_outline_bytes_removed: usize,
+    /// Decoded bytes removed by embedded-font glyph subsetting.
+    pub font_glyph_subset_decoded_bytes_removed: usize,
     /// Number of `CIDFontType2` TrueType programs densely GID-remapped.
     #[serde(default)]
     pub font_dense_programs_remapped: usize,
