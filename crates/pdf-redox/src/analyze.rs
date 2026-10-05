@@ -661,13 +661,17 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             .push(format!("Creator metadata analysis skipped: {error}")),
     }
 
-    let page_content_refs = match collect_page_content_refs(document) {
-        Ok(refs) => refs,
-        Err(error) => {
-            out.warnings
-                .push(format!("page-content role analysis skipped: {error}"));
-            HashSet::new()
+    let page_content_refs = if deep {
+        match collect_page_content_refs(document) {
+            Ok(refs) => refs,
+            Err(error) => {
+                out.warnings
+                    .push(format!("page-content role analysis skipped: {error}"));
+                HashSet::new()
+            }
         }
+    } else {
+        HashSet::new()
     };
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
