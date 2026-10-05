@@ -3,7 +3,7 @@ use crate::content_stream::{
     ContentObject as ObjectHandle, ContentObjectRef as ObjectRef, ContentScalar,
     ObjectHandleParserCallbacks, ParseControl,
 };
-use crate::geometry::{Matrix, Rectangle};
+use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
 };
@@ -29,55 +29,12 @@ const fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Rect {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl Rect {
-    const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
-        Self {
-            x0: x0.min(x1),
-            y0: y0.min(y1),
-            x1: x0.max(x1),
-            y1: y0.max(y1),
-        }
-    }
-
-    const fn from_rectangle(rect: Rectangle) -> Self {
-        Self::new(rect.llx, rect.lly, rect.urx, rect.ury)
-    }
-
-    fn area(self) -> f64 {
-        (self.x1 - self.x0).max(0.0) * (self.y1 - self.y0).max(0.0)
-    }
-
-    fn intersect(self, other: Self) -> Option<Self> {
-        let x0 = self.x0.max(other.x0);
-        let y0 = self.y0.max(other.y0);
-        let x1 = self.x1.min(other.x1);
-        let y1 = self.y1.min(other.y1);
-        (x1 > x0 && y1 > y0).then_some(Self { x0, y0, x1, y1 })
-    }
-
-    fn coverage_of(self, target: Self) -> f64 {
-        let area = target.area();
-        if area <= f64::EPSILON {
-            return 0.0;
-        }
-        self.intersect(target).map_or(0.0, |r| r.area() / area)
-    }
-
-    const fn to_public(self) -> PageRect {
-        PageRect {
-            x0: self.x0,
-            y0: self.y0,
-            x1: self.x1,
-            y1: self.y1,
-        }
+const fn rect_to_public(rect: Rect) -> PageRect {
+    PageRect {
+        x0: rect.x0,
+        y0: rect.y0,
+        x1: rect.x1,
+        y1: rect.y1,
     }
 }
 
@@ -540,9 +497,9 @@ impl<'a> PageScanner<'a> {
             Some(HiddenTextMechanism::OptionalContentHidden)
         } else if bounds.is_none() {
             Some(HiddenTextMechanism::DegenerateTransform)
-        } else if bounds.is_some_and(|rect| self.crop.intersect(rect).is_none()) {
+        } else if bounds.is_some_and(|rect| self.crop.intersection(rect).is_none()) {
             Some(HiddenTextMechanism::OutsideCropBox)
-        } else if bounds.is_some_and(|rect| self.graphics.clip.intersect(rect).is_none()) {
+        } else if bounds.is_some_and(|rect| self.graphics.clip.intersection(rect).is_none()) {
             Some(HiddenTextMechanism::ClippedOut)
         } else {
             None
@@ -654,7 +611,7 @@ impl<'a> PageScanner<'a> {
         if self.pending_clip {
             if self.path.only_single_rect
                 && let Some(rect) = self.path.single_rect
-                && let Some(intersection) = self.graphics.clip.intersect(rect)
+                && let Some(intersection) = self.graphics.clip.intersection(rect)
             {
                 self.graphics.clip = intersection;
             }
@@ -999,7 +956,7 @@ impl<'a> PageScanner<'a> {
                     suggested_action,
                     text: display_text,
                     raw_hex: hex(&text.raw),
-                    bounds: text.bounds.map(Rect::to_public),
+                    bounds: text.bounds.map(rect_to_public),
                     confidence,
                     artifact: text.artifact,
                 },

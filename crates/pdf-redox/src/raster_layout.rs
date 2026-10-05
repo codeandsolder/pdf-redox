@@ -1,7 +1,7 @@
 use crate::content_stream::{
     ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
 };
-use crate::geometry::Matrix;
+use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
     StreamData,
@@ -4135,79 +4135,6 @@ fn find_stripe_plans(
         index += 1;
     }
     plans
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Rect {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl Rect {
-    fn from_ctm(ctm: Matrix) -> Self {
-        let points = [
-            ctm.transform(0.0, 0.0),
-            ctm.transform(1.0, 0.0),
-            ctm.transform(0.0, 1.0),
-            ctm.transform(1.0, 1.0),
-        ];
-        Self {
-            x0: points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-            y0: points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-            x1: points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-            y1: points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-        }
-    }
-
-    const fn union(self, other: Self) -> Self {
-        Self {
-            x0: self.x0.min(other.x0),
-            y0: self.y0.min(other.y0),
-            x1: self.x1.max(other.x1),
-            y1: self.y1.max(other.y1),
-        }
-    }
-
-    fn gap(self, other: Self) -> f64 {
-        let dx = if self.x1 < other.x0 {
-            other.x0 - self.x1
-        } else if other.x1 < self.x0 {
-            self.x0 - other.x1
-        } else {
-            0.0
-        };
-        let dy = if self.y1 < other.y0 {
-            other.y0 - self.y1
-        } else if other.y1 < self.y0 {
-            self.y0 - other.y1
-        } else {
-            0.0
-        };
-        dx.hypot(dy)
-    }
-
-    fn intersects(self, other: Self) -> bool {
-        self.x0 < other.x1 && self.x1 > other.x0 && self.y0 < other.y1 && self.y1 > other.y0
-    }
-
-    fn intersection(self, other: Self) -> Option<Self> {
-        let out = Self {
-            x0: self.x0.max(other.x0),
-            y0: self.y0.max(other.y0),
-            x1: self.x1.min(other.x1),
-            y1: self.y1.min(other.y1),
-        };
-        (out.x1 > out.x0 && out.y1 > out.y0).then_some(out)
-    }
-
-    fn contains(self, other: Self, epsilon: f64) -> bool {
-        self.x0 <= other.x0 + epsilon
-            && self.y0 <= other.y0 + epsilon
-            && self.x1 + epsilon >= other.x1
-            && self.y1 + epsilon >= other.y1
-    }
 }
 
 #[derive(Debug)]

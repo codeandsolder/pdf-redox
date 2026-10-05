@@ -1,7 +1,7 @@
 use crate::content_stream::{
     ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
 };
-use crate::geometry::Matrix;
+use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
@@ -113,33 +113,6 @@ fn operand_numbers(operands: &[Operand]) -> Option<SmallVec<[f64; 6]>> {
         values.push(operand.value.number()?);
     }
     Some(values)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Rect {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl Rect {
-    fn from_xywh(x: f64, y: f64, width: f64, height: f64) -> Option<Self> {
-        if ![x, y, width, height].into_iter().all(f64::is_finite)
-            || width.abs() <= f64::EPSILON
-            || height.abs() <= f64::EPSILON
-        {
-            return None;
-        }
-        let x1 = x + width;
-        let y1 = y + height;
-        Some(Self {
-            x0: x.min(x1),
-            y0: y.min(y1),
-            x1: x.max(x1),
-            y1: y.max(y1),
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
