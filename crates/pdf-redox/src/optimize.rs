@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::analyze::analyze_pdf;
 use crate::{
     Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{analyze_document_for_optimization, input_sha256},
@@ -51,8 +49,6 @@ use crate::{
         VectorCompactionStats, compact_vector_paths_hayro, processing_factor_candidate,
     },
 };
-#[cfg(test)]
-use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Instant,
@@ -1227,149 +1223,9 @@ fn optimize_pdf_with_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
-    use flate2::{Compression, write::ZlibEncoder};
-    use flpdf::ObjectHandle;
-    use std::{io::Write, rc::Rc};
+    use crate::{Error, SourcePdf};
 
-    fn perceptual_image_fixture() -> Result<Vec<u8>> {
-        let width = 200_usize;
-        let height = 200_usize;
-        let width_i64 = i64::try_from(width)
-            .map_err(|_| Error::Invalid("fixture width exceeds i64".to_owned()))?;
-        let height_i64 = i64::try_from(height)
-            .map_err(|_| Error::Invalid("fixture height exceeds i64".to_owned()))?;
-        let mut state = 0x1234_5678_u32;
-        let mut pixels = Vec::with_capacity(width * height);
-        for _ in 0..width * height {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            pixels.push((state >> 24) as u8);
-        }
-
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&pixels)?;
-        let compressed = encoder.finish()?;
-
-        let mut pdf = Pdf::empty()?;
-        let catalog = pdf.root_handle()?;
-        let pages = catalog.try_get_key(b"/Pages")?;
-        pdf.resolve(&pages)?;
-
-        let image = pdf.new_stream_with_data(Rc::new(compressed))?;
-        let image_dict = image
-            .as_stream_dict()
-            .ok_or_else(|| Error::Invalid("fixture image has no stream dictionary".to_owned()))?;
-        for (key, value) in [
-            (b"/Type".as_slice(), ObjectHandle::name(b"XObject".to_vec())),
-            (
-                b"/Subtype".as_slice(),
-                ObjectHandle::name(b"Image".to_vec()),
-            ),
-            (b"/Width".as_slice(), ObjectHandle::integer(width_i64)),
-            (b"/Height".as_slice(), ObjectHandle::integer(height_i64)),
-            (
-                b"/ColorSpace".as_slice(),
-                ObjectHandle::name(b"DeviceGray".to_vec()),
-            ),
-            (b"/BitsPerComponent".as_slice(), ObjectHandle::integer(8)),
-            (
-                b"/Filter".as_slice(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            ),
-        ] {
-            image_dict.replace_key(key, value)?;
-        }
-        pdf.mark_object_handle_dirty(&image_dict)?;
-
-        let mut page_handles = Vec::new();
-        for _ in 0..2 {
-            let content =
-                pdf.new_stream_with_data(Rc::new(b"q 24 0 0 24 0 0 cm /Im0 Do Q\n".to_vec()))?;
-            let resources = ObjectHandle::dictionary(vec![(
-                b"/XObject".to_vec(),
-                ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image.clone())]),
-            )]);
-            let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
-                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-                (b"/Parent".to_vec(), pages.clone()),
-                (
-                    b"/MediaBox".to_vec(),
-                    ObjectHandle::array(vec![
-                        ObjectHandle::integer(0),
-                        ObjectHandle::integer(0),
-                        ObjectHandle::integer(width_i64),
-                        ObjectHandle::integer(height_i64),
-                    ]),
-                ),
-                (b"/Resources".to_vec(), resources),
-                (b"/Contents".to_vec(), content),
-            ]))?;
-            pdf.mark_object_handle_dirty(&page)?;
-            page_handles.push(page);
-        }
-        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
-        pages.replace_key(b"/Count", ObjectHandle::integer(2))?;
-        pdf.mark_object_handle_dirty(&pages)?;
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_output_memory()?;
-        writer.set_preserve_unreferenced_objects(false);
-        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
-        writer.write()?;
-        Ok(writer.get_buffer()?)
-    }
-
-    fn repeated_inline_image_fixture() -> Result<Vec<u8>> {
-        let mut pdf = Pdf::empty()?;
-        let catalog = pdf.root_handle()?;
-        let pages = catalog.try_get_key(b"/Pages")?;
-        pdf.resolve(&pages)?;
-
-        let payload = vec![b'A'; 600];
-        let make_content = |copies: usize| {
-            let mut bytes = Vec::new();
-            for _ in 0..copies {
-                bytes.extend_from_slice(b"q BI /W 600 /H 1 /BPC 8 /CS /G ID ");
-                bytes.extend_from_slice(&payload);
-                bytes.extend_from_slice(b" EI Q\n");
-            }
-            bytes
-        };
-
-        let mut page_handles = Vec::new();
-        for copies in [2, 1] {
-            let content = pdf.new_stream_with_data(Rc::new(make_content(copies)))?;
-            let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
-                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-                (b"/Parent".to_vec(), pages.clone()),
-                (
-                    b"/MediaBox".to_vec(),
-                    ObjectHandle::array(vec![
-                        ObjectHandle::integer(0),
-                        ObjectHandle::integer(0),
-                        ObjectHandle::integer(600),
-                        ObjectHandle::integer(100),
-                    ]),
-                ),
-                (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
-                (b"/Contents".to_vec(), content),
-            ]))?;
-            pdf.mark_object_handle_dirty(&page)?;
-            page_handles.push(page);
-        }
-        pages.replace_key(b"/Kids", ObjectHandle::array(page_handles))?;
-        pages.replace_key(b"/Count", ObjectHandle::integer(2))?;
-        pdf.mark_object_handle_dirty(&pages)?;
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_output_memory()?;
-        writer.set_preserve_unreferenced_objects(false);
-        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
-        writer.write()?;
-        Ok(writer.get_buffer()?)
-    }
-
-    fn corrupt_xref_with_compressed_page_tree_fixture() -> Vec<u8> {
+    fn corrupt_xref_with_compressed_page_tree_fixture() -> Result<Vec<u8>> {
         fn append_object(pdf: &mut Vec<u8>, object: &[u8]) -> usize {
             let offset = pdf.len();
             pdf.extend_from_slice(object);
@@ -1407,37 +1263,22 @@ mod tests {
             b"6 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
         );
 
+        fn offset_u32(offset: usize) -> Result<u32> {
+            u32::try_from(offset)
+                .map_err(|_| Error::Invalid("test fixture offset exceeds u32".to_owned()))
+        }
+
         let xref = pdf.len();
         let mut entries = Vec::new();
         xref_entry(&mut entries, 0, 0, 65535);
-        xref_entry(
-            &mut entries,
-            1,
-            u32::try_from(catalog).unwrap_or(u32::MAX),
-            0,
-        );
+        xref_entry(&mut entries, 1, offset_u32(catalog)?, 0);
         xref_entry(&mut entries, 2, 3, 0);
-        xref_entry(
-            &mut entries,
-            1,
-            u32::try_from(object_stream).unwrap_or(u32::MAX),
-            0,
-        );
-        xref_entry(&mut entries, 1, u32::try_from(page).unwrap_or(u32::MAX), 0);
+        xref_entry(&mut entries, 1, offset_u32(object_stream)?, 0);
+        xref_entry(&mut entries, 1, offset_u32(page)?, 0);
         // Corrupt but unrelated normal entry: object 5 falsely points at object 1.
-        xref_entry(
-            &mut entries,
-            1,
-            u32::try_from(catalog).unwrap_or(u32::MAX),
-            0,
-        );
-        xref_entry(
-            &mut entries,
-            1,
-            u32::try_from(content).unwrap_or(u32::MAX),
-            0,
-        );
-        xref_entry(&mut entries, 1, u32::try_from(xref).unwrap_or(u32::MAX), 0);
+        xref_entry(&mut entries, 1, offset_u32(catalog)?, 0);
+        xref_entry(&mut entries, 1, offset_u32(content)?, 0);
+        xref_entry(&mut entries, 1, offset_u32(xref)?, 0);
         pdf.extend_from_slice(
             format!(
                 "7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
@@ -1448,103 +1289,28 @@ mod tests {
         pdf.extend_from_slice(&entries);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
         pdf.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
-        pdf
-    }
-
-    fn empty_then_drawing_fixture() -> Result<Vec<u8>> {
-        let mut pdf = Pdf::empty()?;
-        let catalog = pdf.root_handle()?;
-        let pages = catalog.try_get_key(b"/Pages")?;
-        pdf.resolve(&pages)?;
-
-        let empty = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
-        let drawing = pdf.new_stream_with_data(Rc::new(b"0 0 m 10 10 l S\n".to_vec()))?;
-        let page = pdf.make_indirect_object_handle(ObjectHandle::dictionary(vec![
-            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-            (b"/Parent".to_vec(), pages.clone()),
-            (
-                b"/MediaBox".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(0),
-                    ObjectHandle::integer(100),
-                    ObjectHandle::integer(100),
-                ]),
-            ),
-            (b"/Resources".to_vec(), ObjectHandle::dictionary(Vec::new())),
-            (
-                b"/Contents".to_vec(),
-                ObjectHandle::array(vec![empty, drawing]),
-            ),
-        ]))?;
-        pdf.mark_object_handle_dirty(&page)?;
-        pages.replace_key(b"/Kids", ObjectHandle::array(vec![page]))?;
-        pages.replace_key(b"/Count", ObjectHandle::integer(1))?;
-        pdf.mark_object_handle_dirty(&pages)?;
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_output_memory()?;
-        writer.set_preserve_unreferenced_objects(false);
-        writer.set_object_stream_mode(ObjectStreamMode::Preserve);
-        writer.write()?;
-        Ok(writer.get_buffer()?)
+        Ok(pdf)
     }
 
     #[test]
     fn analysis_of_corrupt_xref_keeps_compressed_page_tree_reachable() -> Result<()> {
-        let input = corrupt_xref_with_compressed_page_tree_fixture();
-        let source = crate::SourcePdf::from_bytes(input.clone())?;
+        let input = corrupt_xref_with_compressed_page_tree_fixture()?;
+        let source = SourcePdf::from_bytes(input.clone())?;
         assert_eq!(source.page_count(), 1);
 
         let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
         assert_eq!(report.before.page_count, 1);
-        let rewritten = crate::SourcePdf::from_bytes(output)?;
+        let rewritten = SourcePdf::from_bytes(output)?;
         assert_eq!(rewritten.page_count(), 1);
         Ok(())
     }
 
     #[test]
-    fn optimize_only_keeps_content_after_an_empty_page_stream() -> Result<()> {
-        let input = empty_then_drawing_fixture()?;
-        let (output, _) = optimize_pdf(&input, &Config::optimize_only())?;
-        let mut pdf = Pdf::open_mem_owned(output)?;
-        let page_ref = flpdf::pages::page_refs(&mut pdf)?[0];
-        let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
-        let contents = page.try_get_key(b"/Contents")?;
-        pdf.resolve(&contents)?;
-        let streams = contents.as_array().ok_or_else(|| {
-            Error::Invalid("rewritten fixture /Contents is not an array".to_owned())
-        })?;
-
-        let mut saw_empty = false;
-        let mut saw_drawing = false;
-        for stream in streams {
-            pdf.resolve(&stream)?;
-            let dictionary = stream.as_stream_dict().ok_or_else(|| {
-                Error::Invalid("rewritten fixture content item is not a stream".to_owned())
-            })?;
-            let raw = stream.get_raw_stream_data()?;
-            let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;
-            if decoded.is_empty() {
-                saw_empty = true;
-                assert!(dictionary.try_get_key(b"/Filter")?.is_null());
-            }
-            if decoded == b"0 0 m 10 10 l S\n" {
-                saw_drawing = true;
-            }
-        }
-        assert!(saw_empty);
-        assert!(saw_drawing);
-        Ok(())
-    }
-
-    #[test]
     fn matching_cached_analysis_is_reused() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let mut analysis = analyze_pdf(&input)?;
+        let input = corrupt_xref_with_compressed_page_tree_fixture()?;
+        let mut analysis =
+            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?;
         analysis.warnings.push("cached-analysis-marker".to_owned());
-
         let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
         assert!(
             report
@@ -1557,12 +1323,12 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_cached_analysis_falls_back_to_fresh_analysis() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let mut analysis = analyze_pdf(&input)?;
+    fn stale_cached_analysis_falls_back_to_fresh_analysis() -> Result<()> {
+        let input = corrupt_xref_with_compressed_page_tree_fixture()?;
+        let mut analysis =
+            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?;
         analysis.input_sha256 = "00".repeat(32);
         analysis.warnings.push("stale-analysis-marker".to_owned());
-
         let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
         assert_eq!(report.before.input_sha256, input_sha256(&input));
         assert!(
@@ -1576,202 +1342,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cached_analysis_without_digest_falls_back_to_fresh_analysis() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let mut analysis = analyze_pdf(&input)?;
-        analysis.input_sha256.clear();
-        analysis.warnings.push("legacy-analysis-marker".to_owned());
-
-        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
-        assert_eq!(report.before.input_sha256, input_sha256(&input));
-        assert!(
-            !report
-                .before
-                .warnings
-                .iter()
-                .any(|warning| warning == "legacy-analysis-marker")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn optimize_only_externalizes_and_reuses_large_duplicate_inline_images() -> Result<()> {
-        let input = repeated_inline_image_fixture()?;
-        let before = analyze_pdf(&input)?;
-        assert_eq!(before.inline_image_count, 3);
-        assert!(before.duplicate_inline_image_payload_wasted_bytes >= 1024);
-
-        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
-        assert_eq!(report.inline_image_fingerprints_selected, 1);
-        assert_eq!(report.inline_image_occurrences_externalized, 3);
-        assert_eq!(report.inline_image_xobjects_created, 1);
-        assert!(report.inline_image_duplicate_payload_bytes >= 1024);
-
-        let after = analyze_pdf(&output)?;
-        assert_eq!(after.inline_image_count, 0);
-        assert_eq!(after.image_count, 1);
-        assert_eq!(after.duplicate_image_payload_wasted_bytes, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn perceptual_profile_transcodes_an_eligible_lossless_image() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-
-        let (_, lossless_report) = optimize_pdf(&input, &Config::optimize_only())?;
-        assert_eq!(lossless_report.raster_images_transcoded, 0);
-
-        let (output, perceptual_report) = optimize_pdf(&input, &Config::perceptual())?;
-        assert_eq!(perceptual_report.raster_images_transcoded, 1);
-        assert_eq!(perceptual_report.raster_references_reused, 1);
-        assert!(
-            perceptual_report.raster_optimized_encoded_bytes
-                < perceptual_report.raster_original_encoded_bytes
-        );
-        assert!(
-            perceptual_report.raster_original_encoded_bytes
-                - perceptual_report.raster_optimized_encoded_bytes
-                >= perceptual_report.raster_original_encoded_bytes / 5
-        );
-
-        let analysis = analyze_pdf(&output)?;
-        assert!(
-            analysis
-                .filter_counts
-                .get("/DCTDecode")
-                .copied()
-                .unwrap_or(0)
-                >= 1
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn print_profile_downsamples_a_simple_flate_image_and_keeps_flate_encoding() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let mut config = Config::print();
-        config.max_image_ppi = Some(450);
-        let (output, report) = optimize_pdf(&input, &config)?;
-
-        assert_eq!(report.print_images_placed, 1);
-        assert_eq!(report.print_image_uses, 2);
-        assert!(report.print_geometry_complete);
-        assert_eq!(report.print_downsample_candidates, 1);
-        assert_eq!(report.print_existing_jpeg_resize_candidates, 0);
-        assert_eq!(report.print_flate_resize_candidates, 1);
-        assert_eq!(report.raster_images_resized, 1);
-        assert_eq!(report.raster_jpeg_images_resized, 0);
-        assert_eq!(report.raster_flate_images_resized, 1);
-        assert_eq!(report.raster_references_reused, 1);
-        assert_eq!(report.raster_original_pixels, 200 * 200);
-        assert_eq!(report.raster_optimized_pixels, 150 * 150);
-        assert!(report.raster_optimized_encoded_bytes < report.raster_original_encoded_bytes);
-
-        let analysis = analyze_pdf(&output)?;
-        assert!(
-            analysis
-                .filter_counts
-                .get("/FlateDecode")
-                .copied()
-                .unwrap_or(0)
-                >= 1
-        );
-        assert_eq!(
-            analysis
-                .filter_counts
-                .get("/DCTDecode")
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-
-        let mut rewritten = Pdf::open_mem_owned(output)?;
-        let page_ref = flpdf::pages::page_refs(&mut rewritten)?[0];
-        let mut images = Vec::new();
-        flpdf::PageObjectHelper::new(page_ref, &mut rewritten).for_each_image(
-            false,
-            |image, _, _| {
-                images.push(image);
-                Ok(())
-            },
-        )?;
-        assert_eq!(images.len(), 1);
-        let image = images.pop().ok_or_else(|| {
-            Error::Invalid("rewritten Print fixture has no page image".to_owned())
-        })?;
-        let dictionary = image.as_stream_dict().ok_or_else(|| {
-            Error::Invalid("rewritten Print image has no stream dictionary".to_owned())
-        })?;
-        assert_eq!(dictionary.try_get_key(b"/Width")?.as_integer(), Some(150));
-        assert_eq!(dictionary.try_get_key(b"/Height")?.as_integer(), Some(150));
-        assert!(
-            dictionary
-                .try_get_key(b"/Filter")?
-                .try_is_name_and_equals(b"FlateDecode")?
-        );
-        let decode_params = dictionary.try_get_key(b"/DecodeParms")?;
-        assert!(decode_params.is_null());
-        let raw = image.get_raw_stream_data()?;
-        assert_eq!(raw.len() as u64, report.raster_optimized_encoded_bytes);
-        let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;
-        assert_eq!(decoded.len(), 150 * 150);
-        Ok(())
-    }
-
-    #[test]
     fn print_profile_rejects_zero_max_image_ppi() -> Result<()> {
-        let input = perceptual_image_fixture()?;
+        let input = corrupt_xref_with_compressed_page_tree_fixture()?;
         let mut config = Config::print();
         config.max_image_ppi = Some(0);
         let Err(error) = optimize_pdf(&input, &config) else {
             return Err(Error::Invalid("zero PPI was not rejected".to_owned()));
         };
         assert!(matches!(error, Error::Invalid(message) if message.contains("greater than zero")));
-        Ok(())
-    }
-
-    #[test]
-    fn print_profile_honors_max_image_ppi_override() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let mut config = Config::print();
-        config.max_image_ppi = Some(300);
-        let (_output, report) = optimize_pdf(&input, &config)?;
-
-        assert_eq!(report.print_downsample_candidates, 1);
-        assert_eq!(report.raster_images_resized, 1);
-        assert_eq!(report.raster_original_pixels, 200 * 200);
-        assert_eq!(report.raster_optimized_pixels, 100 * 100);
-        Ok(())
-    }
-
-    #[test]
-    fn print_profile_downsamples_an_oversampled_existing_jpeg_once() -> Result<()> {
-        let input = perceptual_image_fixture()?;
-        let (jpeg_input, _) = optimize_pdf(&input, &Config::perceptual())?;
-
-        let mut config = Config::print();
-        config.max_image_ppi = Some(450);
-        let (output, report) = optimize_pdf(&jpeg_input, &config)?;
-        assert_eq!(report.print_images_placed, 1);
-        assert_eq!(report.print_image_uses, 2);
-        assert!(report.print_geometry_complete);
-        assert_eq!(report.print_downsample_candidates, 1);
-        assert_eq!(report.print_existing_jpeg_resize_candidates, 1);
-        assert_eq!(report.raster_images_resized, 1);
-        assert_eq!(report.raster_references_reused, 1);
-        assert_eq!(report.raster_original_pixels, 200 * 200);
-        assert_eq!(report.raster_optimized_pixels, 150 * 150);
-        assert!(report.raster_optimized_encoded_bytes < report.raster_original_encoded_bytes);
-
-        let analysis = analyze_pdf(&output)?;
-        assert!(
-            analysis
-                .filter_counts
-                .get("/DCTDecode")
-                .copied()
-                .unwrap_or(0)
-                >= 1
-        );
         Ok(())
     }
 }

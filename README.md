@@ -12,7 +12,7 @@ Design goals:
 - never require uploading the document to a server;
 - preserve unsupported/opaque streams rather than damaging them.
 
-Hayro is the production source parser. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. flpdf remains vendored for detached COS/content/filter/image codec utilities and compatibility tests, not as the production mutable document graph. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision.
+Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision.
 
 ## Workspace
 
@@ -20,7 +20,6 @@ Hayro is the production source parser. Source bytes stay immutable and lazily pa
 - `pdf-redox-cli`: native CLI
 - `pdf-redox-wasm`: WASM bindings
 - `web/`: static no-framework site
-- `third_party/flpdf/`: minimal vendored `flpdf` 0.5.1 fork used by the core; provenance and local API extensions are documented in `third_party/flpdf/PATCHES.md`
 
 ## Status
 
@@ -38,7 +37,7 @@ Early but functional. The core currently provides:
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
 - a client-side WASM review UI that analyzes first and asks the user what invisible text to remove before rewriting; the WASM layer keeps that exact-byte analysis in memory and reuses it for the subsequent rewrite after a SHA-256 identity check, avoiding a second full structural scan.
 
-Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates. The WASM crate enables `getrandom`'s browser JS backend because `flpdf` uses randomness for PDF encryption IV generation.
+Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates.
 
 Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB subset remains active optimization work. A corpus-wide scan found that almost all other oversampled non-JPEG images are bilevel, Indexed, masked, or otherwise semantically unsuitable for the current path, and found no safe Form-local-only Print candidates, so broad raster classification and Form-branch cloning are intentionally deferred. The opt-in resource-pruning pass has been corpus-tested and remains default-off because it produced negligible size wins.
 

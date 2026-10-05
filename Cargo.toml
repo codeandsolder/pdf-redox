@@ -5,7 +5,7 @@ members = [
   "crates/pdf-redox-cli",
   "crates/pdf-redox-wasm",
 ]
-exclude = ["third_party/flpdf", "third_party/hayro-syntax"]
+exclude = ["third_party/hayro-syntax"]
 
 [workspace.package]
 edition = "2024"
@@ -15,7 +15,6 @@ repository = "https://github.com/codeandsolder/pdf-redox"
 version = "0.1.0"
 
 [workspace.dependencies]
-flpdf = { version = "0.5.1", path = "third_party/flpdf/crates/flpdf" }
 hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "c073f251c0a5b8c889a610a72cee6e79e3d4b941", default-features = false, features = ["std", "images"] }
 # Keep flate2's default miniz_oxide backend. zlib-rs levels 3-6 can hit a severe
 # ratio cliff on large repetitive PDF content without an end-to-end speed win.

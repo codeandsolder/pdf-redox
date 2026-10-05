@@ -1,3 +1,0 @@
-one-page.pdf 1
-two-page.pdf 2
-three-page.pdf 3
