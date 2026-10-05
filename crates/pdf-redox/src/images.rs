@@ -269,8 +269,11 @@ fn resolved_number(document: &EditDocument, value: Option<&OwnedObject>) -> Resu
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
     reason = "PDF dimensions are clamped to the complete u32 range before conversion"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "PDF dimensions are clamped to the nonnegative u32 range before conversion"
 )]
 fn dimension(
     document: &EditDocument,

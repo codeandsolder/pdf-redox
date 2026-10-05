@@ -684,3 +684,56 @@ fn scrub_catalog_javascript_name_tree(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    fn privacy_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R /OpenAction 6 0 R >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /PieceInfo << /Private true >> /LastModified (today) >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
+        pdf.object(6, b"<< /S /JavaScript /JS (app.alert('x')) >>")?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn best_effort_scrub_removes_metadata_and_dangerous_open_action() -> Result<()> {
+        let mut document = EditDocument::from_bytes(privacy_fixture()?)?;
+        let stats = scrub_edit_document_cos_privacy(
+            &mut document,
+            &PrivacyConfig {
+                level: PrivacyLevel::BestEffort,
+                remove_active_content: true,
+                ..PrivacyConfig::default()
+            },
+        )?;
+        assert!(!stats.removed.is_empty());
+        let source = SourcePdf::from_bytes(document.write_compact()?)?;
+        let catalog = source.materialize(source.catalog_id())?;
+        let catalog = catalog
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten catalog is not a dictionary".to_owned()))?;
+        assert!(!catalog.contains_key(b"Metadata".as_slice()));
+        assert!(!catalog.contains_key(b"OpenAction".as_slice()));
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"PieceInfo".as_slice()));
+        assert!(!page.contains_key(b"LastModified".as_slice()));
+        Ok(())
+    }
+}

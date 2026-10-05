@@ -32,6 +32,8 @@ mod sfnt_bitmap;
 pub(crate) mod source;
 pub(crate) mod stream_codec;
 mod structure_compact;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod vector_compact;
 pub(crate) mod writer;
 

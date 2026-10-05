@@ -1277,3 +1277,54 @@ pub fn apply_preservation_policy_hayro(
     )?;
     Ok(stats)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SourcePdf, test_support::ClassicPdfBuilder};
+
+    fn auxiliary_state_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R /UnknownCatalog 7 0 R >>",
+        )?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /UnknownTree 7 0 R >>",
+        )?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /UnknownPage 7 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0])?;
+        pdf.stream(6, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
+        pdf.object(7, b"<< /Private true >>")?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn visible_surface_drops_metadata_and_unknown_auxiliary_state() -> Result<()> {
+        let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
+        let stats =
+            apply_preservation_policy_hayro(&mut document, &PreservationConfig::visible_surface())?;
+        assert_eq!(stats.pages, 1);
+        let source = SourcePdf::from_bytes(document.write_compact()?)?;
+        let catalog = source.materialize(source.catalog_id())?;
+        let catalog = catalog
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten catalog is not a dictionary".to_owned()))?;
+        assert!(!catalog.contains_key(b"Metadata".as_slice()));
+        assert!(!catalog.contains_key(b"UnknownCatalog".as_slice()));
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(!page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
+    }
+}

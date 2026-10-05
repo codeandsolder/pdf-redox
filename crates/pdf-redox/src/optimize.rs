@@ -1226,6 +1226,11 @@ mod tests {
     use crate::{Error, SourcePdf};
 
     fn corrupt_xref_with_compressed_page_tree_fixture() -> Result<Vec<u8>> {
+        fn offset_u32(offset: usize) -> Result<u32> {
+            u32::try_from(offset)
+                .map_err(|_| Error::Invalid("test fixture offset exceeds u32".to_owned()))
+        }
+
         fn append_object(pdf: &mut Vec<u8>, object: &[u8]) -> usize {
             let offset = pdf.len();
             pdf.extend_from_slice(object);
@@ -1262,11 +1267,6 @@ mod tests {
             &mut pdf,
             b"6 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
         );
-
-        fn offset_u32(offset: usize) -> Result<u32> {
-            u32::try_from(offset)
-                .map_err(|_| Error::Invalid("test fixture offset exceeds u32".to_owned()))
-        }
 
         let xref = pdf.len();
         let mut entries = Vec::new();

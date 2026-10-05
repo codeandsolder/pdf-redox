@@ -2615,3 +2615,54 @@ pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<T
         references_canonicalized,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SourcePdf, test_support::ClassicPdfBuilder};
+
+    fn duplicate_image_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /A 5 0 R /B 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q /A Do /B Do Q")?;
+        let image = b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+        pdf.stream(5, image, &[0x80])?;
+        pdf.stream(6, image, &[0x80])?;
+        pdf.finish(1)
+    }
+
+    fn duplicate_page_content_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 5 0 R >>")?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 6 0 R >>")?;
+        pdf.stream(5, b"", b"0 0 m 10 10 l S")?;
+        pdf.stream(6, b"", b"0 0 m 10 10 l S")?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn hayro_image_dedup_canonicalizes_exact_resource_duplicates() -> Result<()> {
+        let mut document = EditDocument::from_bytes(duplicate_image_fixture()?)?;
+        let stats = canonicalize_image_xobjects_hayro(&mut document)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        let output = document.write_compact()?;
+        assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn hayro_page_content_dedup_canonicalizes_exact_streams() -> Result<()> {
+        let mut document = EditDocument::from_bytes(duplicate_page_content_fixture()?)?;
+        let stats = canonicalize_page_contents_hayro(&mut document)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.references_canonicalized, 1);
+        let output = document.write_compact()?;
+        assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 2);
+        Ok(())
+    }
+}
