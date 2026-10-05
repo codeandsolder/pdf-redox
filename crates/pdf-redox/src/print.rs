@@ -3,7 +3,9 @@ use crate::content_stream::{
     ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
 };
 use crate::geometry::Matrix;
-use flpdf::ImageResizeTarget;
+#[cfg(test)]
+use crate::images::ImageResizeEncoding;
+use crate::images::ImageResizeTarget;
 #[cfg(test)]
 use flpdf::{ObjectRef, PageObjectHelper, Pdf};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -618,10 +620,10 @@ pub fn plan_print_downsampling<R: Read + Seek + 'static>(
                     .collect::<Vec<_>>();
                 if !binding_pages.is_empty() {
                     match target.encoding {
-                        flpdf::ImageResizeEncoding::Jpeg => {
+                        ImageResizeEncoding::Jpeg => {
                             plan.stats.existing_jpeg_resize_candidates += 1;
                         }
-                        flpdf::ImageResizeEncoding::Flate => {
+                        ImageResizeEncoding::Flate => {
                             plan.stats.flate_resize_candidates += 1;
                         }
                     }

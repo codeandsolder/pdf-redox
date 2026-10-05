@@ -1,7 +1,8 @@
-use crate::stream_codec::DecodeLevel;
+use crate::stream_codec::{DecodeLevel, encode_flate, set_plain_flate};
 use crate::{FlatePolicy, Result};
 #[cfg(test)]
 use flpdf::Pdf;
+#[cfg(test)]
 use flpdf::{ObjectHandle, filters::encode_stream_data_with_flate_level};
 #[cfg(test)]
 use std::{
@@ -29,12 +30,11 @@ struct AdaptiveFlateEncoding {
 }
 
 fn adaptive_flate_encode(
-    dictionary: &ObjectHandle,
     decoded: &[u8],
     level: i32,
     adaptive_high_effort: bool,
 ) -> crate::Result<AdaptiveFlateEncoding> {
-    let baseline = encode_stream_data_with_flate_level(dictionary, decoded, level)?;
+    let baseline = encode_flate(decoded, level)?;
     if !adaptive_high_effort
         || level >= 9
         || decoded.len() < ADAPTIVE_FLATE_MIN_DECODED_BYTES
@@ -51,7 +51,7 @@ fn adaptive_flate_encode(
         });
     }
 
-    let high_effort = encode_stream_data_with_flate_level(dictionary, decoded, 9)?;
+    let high_effort = encode_flate(decoded, 9)?;
     if high_effort.len() < baseline.len() {
         let extra = baseline.len().saturating_sub(high_effort.len());
         Ok(AdaptiveFlateEncoding {
@@ -135,19 +135,7 @@ pub fn apply_flate_policy_hayro(
         let Ok(decoded) = document.decoded_stream_data(handle, DecodeLevel::Generalized) else {
             continue;
         };
-        // Re-encoding only consults /Filter and /DecodeParms. Do not detach the
-        // whole stream dictionary: image/resource dictionaries may contain very
-        // deep or cyclic semantic graphs that are irrelevant to the codec.
-        let mut codec_dictionary = crate::OwnedDictionary::new();
-        for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
-            if let Some(value) = dictionary.get(key) {
-                codec_dictionary.insert(key.to_vec(), value.clone());
-            }
-        }
-        let detached =
-            document.detached_flpdf_object(&crate::OwnedObject::Dictionary(codec_dictionary))?;
-        let Ok(encoded) = adaptive_flate_encode(&detached, &decoded, level, adaptive_high_effort)
-        else {
+        let Ok(encoded) = adaptive_flate_encode(&decoded, level, adaptive_high_effort) else {
             continue;
         };
         if encoded.high_effort_tested {
@@ -175,7 +163,8 @@ pub fn apply_flate_policy_hayro(
             crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
             crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
         };
-        if let crate::OwnedObject::Stream { data, .. } = object {
+        if let crate::OwnedObject::Stream { dictionary, data } = object {
+            set_plain_flate(dictionary);
             *data = crate::StreamData::Owned(repacked);
             stats.streams_selected += 1;
             stats.estimated_savings_bytes += saving;
@@ -224,12 +213,7 @@ pub fn compress_unfiltered_streams_hayro(
         }
         // The writer's historical StreamDataMode::Compress behavior always
         // applies Flate to non-empty unfiltered streams, even when a tiny stream grows.
-        let encoding_dictionary = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"FlateDecode".to_vec()),
-        )]);
-        let encoded =
-            adaptive_flate_encode(&encoding_dictionary, &raw, level, adaptive_high_effort)?;
+        let encoded = adaptive_flate_encode(&raw, level, adaptive_high_effort)?;
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }

@@ -1,5 +1,4 @@
 use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
-use flpdf::ObjectHandle as FlObjectHandle;
 use libjpeg_turbo_rs::{
     MarkerCopyMode, TransformOp, TransformOptions, transform_jpeg_with_options,
 };
@@ -45,12 +44,8 @@ fn is_safe_lone_dct(document: &EditDocument, dictionary: &OwnedDictionary) -> Re
     ))
 }
 
-fn qpdf_compatible_decode(data: &[u8]) -> Option<Vec<u8>> {
-    let dictionary = FlObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        FlObjectHandle::name(b"DCTDecode".to_vec()),
-    )]);
-    flpdf::filters::decode_stream_data(&dictionary, data).ok()
+fn compatible_decode(data: &[u8]) -> Option<Vec<u8>> {
+    hayro_syntax::object::stream::decode_standalone_stream(b"<< /Filter /DCTDecode >>", data).ok()
 }
 
 fn is_app_or_com_marker(marker: u8) -> bool {
@@ -165,11 +160,11 @@ fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let optimized = restore_source_app_com_markers(data, &optimized)?;
 
     // libjpeg-turbo-rs's coefficient reader accepts some entropy streams that
-    // qpdf's Pl_DCT compatibility path rejects. Require the before/after JPEGs
-    // to decode through the qpdf-compatible flpdf pipeline and to produce the
+    // Hayro's DCT compatibility path rejects. Require the before/after JPEGs
+    // to decode through the Hayro DCT pipeline and to produce the
     // exact same pixels before considering the rewrite.
-    let before = qpdf_compatible_decode(data)?;
-    let after = qpdf_compatible_decode(&optimized)?;
+    let before = compatible_decode(data)?;
+    let after = compatible_decode(&optimized)?;
     (before == after).then_some(optimized)
 }
 

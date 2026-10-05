@@ -21,6 +21,7 @@ hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "387240b5
 # ratio cliff on large repetitive PDF content without an end-to-end speed win.
 flate2 = "1.1"
 libjpeg-turbo-rs = "=0.8.0"
+fast_image_resize = "6.1"
 fax = "=0.3.0"
 sha2 = "0.11"
 smallvec = "1.16"

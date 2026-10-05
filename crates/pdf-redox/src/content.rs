@@ -126,9 +126,9 @@ pub fn normalize_page_contents_hayro(document: &mut EditDocument) -> Result<()> 
         };
         let mut decoded = Vec::new();
         decoded_content_value(document, contents, &mut decoded)?;
-        let normalized = flpdf::normalize_content_stream(&decoded);
-        if normalized.as_bytes() != decoded.as_slice() {
-            replace_page_content(document, page, normalized.as_bytes().to_vec())?;
+        let normalized = crate::content_stream::normalize_content_stream(&decoded);
+        if normalized.as_slice() != decoded.as_slice() {
+            replace_page_content(document, page, normalized)?;
         }
     }
     Ok(())

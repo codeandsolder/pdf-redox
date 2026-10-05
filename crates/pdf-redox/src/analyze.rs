@@ -62,9 +62,12 @@ fn document_info_text(document: &EditDocument, key: &[u8]) -> Result<Option<Stri
     let Some(value) = document.resolve_owned_value(value)? else {
         return Ok(None);
     };
-    let handle = document.detached_flpdf_object(&value)?;
-    let bytes = handle.try_get_utf8_value()?;
-    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    let OwnedObject::String(bytes) = value else {
+        return Ok(None);
+    };
+    let text = crate::hidden_text::decode_pdf_text_string(&bytes)
+        .trim()
+        .to_owned();
     Ok((!text.is_empty()).then_some(text))
 }
 
@@ -582,6 +585,24 @@ fn raw_stream_bytes<'a>(
     data.bytes(document.source())
 }
 
+fn filter_value_name(document: &EditDocument, value: &OwnedObject) -> Result<String> {
+    let Some(value) = document.resolve_owned_value(value)? else {
+        return Ok("null".to_owned());
+    };
+    Ok(match value {
+        OwnedObject::Name(name) => format!("/{}", String::from_utf8_lossy(&name)),
+        OwnedObject::Array(values) => {
+            let mut parts = Vec::with_capacity(values.len());
+            for value in &values {
+                parts.push(filter_value_name(document, value)?);
+            }
+            format!("[{}]", parts.join(" "))
+        }
+        OwnedObject::Null => "null".to_owned(),
+        other => format!("{other:?}"),
+    })
+}
+
 fn filter_name(
     document: &EditDocument,
     dictionary: &BTreeMap<Vec<u8>, OwnedObject>,
@@ -589,11 +610,7 @@ fn filter_name(
     let Some(value) = dictionary.get(b"Filter".as_slice()) else {
         return Ok("null".to_owned());
     };
-    let Some(value) = document.resolve_owned_value(value)? else {
-        return Ok("null".to_owned());
-    };
-    let detached = document.detached_flpdf_object(&value)?;
-    Ok(String::from_utf8_lossy(&detached.unparse_resolved()).into_owned())
+    filter_value_name(document, value)
 }
 
 /// Analyze a PDF without modifying it.

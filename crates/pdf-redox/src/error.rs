@@ -35,7 +35,8 @@ impl From<hayro_syntax::LoadPdfError> for SourceLoadError {
 /// Errors produced while parsing, transforming, or serializing a PDF.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A vendored flpdf helper rejected or failed to process PDF data.
+    #[cfg(test)]
+    /// A legacy flpdf test oracle rejected or failed to process PDF data.
     #[error("pdf error: {0}")]
     Pdf(#[from] flpdf::Error),
     /// An underlying I/O operation failed.

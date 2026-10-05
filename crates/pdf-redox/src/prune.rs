@@ -1,11 +1,72 @@
+use crate::content_stream::{
+    ContentObject, ObjectHandleParserCallbacks, ParseControl, parse_detached_content_stream,
+};
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
 };
-use flpdf::{DetachedResourceUsage, find_resources_detached};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
+
+#[derive(Debug, Clone, Default)]
+struct DetachedResourceUsage {
+    names: BTreeSet<Vec<u8>>,
+    names_by_resource_type: ResourceNamesByType,
+    pending_operands: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResourceFinder {
+    last_name: Option<Vec<u8>>,
+    usage: DetachedResourceUsage,
+}
+
+const fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
+    match operator {
+        b"CS" | b"cs" => Some(b"ColorSpace"),
+        b"gs" => Some(b"ExtGState"),
+        b"Tf" => Some(b"Font"),
+        b"SCN" | b"scn" => Some(b"Pattern"),
+        b"BDC" | b"DP" => Some(b"Properties"),
+        b"sh" => Some(b"Shading"),
+        b"Do" => Some(b"XObject"),
+        _ => None,
+    }
+}
+
+impl ObjectHandleParserCallbacks for ResourceFinder {
+    fn handle_object(
+        &mut self,
+        object: ContentObject,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        if let Some(name) = object.as_name() {
+            self.usage.pending_operands = true;
+            self.last_name = Some(name);
+        } else if let Some(operator) = object.as_operator() {
+            self.usage.pending_operands = false;
+            if let Some(resource_type) = operator_resource_type(&operator)
+                && let Some(name) = self.last_name.as_ref()
+            {
+                self.usage.names.insert(name.clone());
+                self.usage
+                    .names_by_resource_type
+                    .entry(resource_type.to_vec())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        } else if object.as_inline_image().is_none() {
+            self.usage.pending_operands = true;
+        }
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[expect(
@@ -97,9 +158,9 @@ fn is_form(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
 }
 
 fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
-    find_resources_detached(content)
-        .ok()
-        .filter(|usage| !usage.pending_operands)
+    let mut finder = ResourceFinder::default();
+    parse_detached_content_stream(content, "resource scan", &mut finder).ok()?;
+    (!finder.usage.pending_operands).then_some(finder.usage)
 }
 
 fn extend_names_by_type(target: &mut ResourceNamesByType, source: &ResourceNamesByType) {

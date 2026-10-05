@@ -24,8 +24,11 @@ use crate::{
         remove_large_diagonal_text_hayro,
     },
     icc_alternate::{IccAlternateElisionStats, elide_icc_profiles_to_alternates_hayro},
-    images::{optimize_images_hayro, optimize_images_with_resize_targets_hayro},
-    inline_images::externalize_duplicate_inline_images_hayro,
+    images::{
+        ImageOptimizationOptions, ImageOptimizationStats, optimize_images_hayro,
+        optimize_images_with_resize_targets_hayro,
+    },
+    inline_images::{DuplicateInlineImageStats, externalize_duplicate_inline_images_hayro},
     jpeg_optimize::optimize_jpeg_entropy_hayro,
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
     paint_batch::{
@@ -48,7 +51,6 @@ use crate::{
         VectorCompactionStats, compact_vector_paths_hayro, processing_factor_candidate,
     },
 };
-use flpdf::{DuplicateInlineImageStats, ImageOptimizationOptions, ImageOptimizationStats};
 #[cfg(test)]
 use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
 use std::{

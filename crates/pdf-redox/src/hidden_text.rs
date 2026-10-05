@@ -2413,7 +2413,7 @@ fn decode_utf16be(bytes: &[u8]) -> String {
         .to_owned()
 }
 
-fn decode_pdf_text_string(bytes: &[u8]) -> String {
+pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16be(rest);
     }

@@ -11,12 +11,15 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-flpdf.workspace = true
 hayro-syntax.workspace = true
 flate2.workspace = true
 libjpeg-turbo-rs.workspace = true
+fast_image_resize.workspace = true
 fax.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+flpdf.workspace = true

@@ -1,6 +1,5 @@
 use crate::stream_codec::{DecodeLevel, decode_stream};
 use crate::{Error, Result, SourceLoadError};
-use flpdf::ObjectHandle as FlObjectHandle;
 use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream},
@@ -9,7 +8,6 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
-    rc::Rc,
     sync::Arc,
 };
 
@@ -268,8 +266,6 @@ impl SourcePdf {
     }
 }
 
-const MAX_TRAILER_NESTING: usize = 256;
-
 const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
     matches!(name, b"Size" | b"Root" | b"Encrypt" | b"Prev" | b"XRefStm")
         || xref_stream
@@ -286,80 +282,6 @@ const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
                     | b"FFilter"
                     | b"FDecodeParms"
             )
-}
-
-pub fn owned_from_flpdf(handle: &FlObjectHandle, depth: usize) -> Result<OwnedObject> {
-    if depth > MAX_TRAILER_NESTING {
-        return Err(Error::Invalid(
-            "trailer direct-object nesting exceeds the supported limit".to_owned(),
-        ));
-    }
-
-    if let Some(reference) = handle.object_ref() {
-        let number = i32::try_from(reference.number).map_err(|_| {
-            Error::Invalid("trailer object number exceeds the supported range".to_owned())
-        })?;
-        return Ok(OwnedObject::Reference(ObjectHandle::Existing(
-            ObjectId::new(number, i32::from(reference.generation)),
-        )));
-    }
-
-    // Detached flpdf helper results may carry lazily provided direct values.
-    // Force only those non-reference handles to materialize before inspecting
-    // their concrete type; source indirect references have already returned.
-    let _ = handle.type_name()?;
-    if handle.is_null() {
-        return Ok(OwnedObject::Null);
-    }
-    if let Some(value) = handle.as_boolean() {
-        return Ok(OwnedObject::Boolean(value));
-    }
-    if let Some(value) = handle.as_integer() {
-        return Ok(OwnedObject::Integer(value));
-    }
-    if let Some(value) = handle.as_real() {
-        return Ok(OwnedObject::Real(value));
-    }
-    if let Some(value) = handle.as_name() {
-        return Ok(OwnedObject::Name(value));
-    }
-    if let Some(value) = handle.as_string() {
-        return Ok(OwnedObject::String(value));
-    }
-    if let Some(values) = handle.as_array() {
-        let values = values
-            .iter()
-            .map(|value| owned_from_flpdf(value, depth + 1))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(OwnedObject::Array(values));
-    }
-    if let Some(stream_dictionary) = handle.as_stream_dict() {
-        let mut dictionary = OwnedDictionary::new();
-        let entries = stream_dictionary.as_dictionary().ok_or_else(|| {
-            Error::Invalid("direct trailer stream dictionary is not a dictionary".to_owned())
-        })?;
-        for (key, value) in entries {
-            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
-            dictionary.insert(name.to_vec(), owned_from_flpdf(&value, depth + 1)?);
-        }
-        return Ok(OwnedObject::Stream {
-            dictionary,
-            data: StreamData::Owned(handle.get_raw_stream_data()?.as_ref().clone()),
-        });
-    }
-    if let Some(entries) = handle.as_dictionary() {
-        let mut dictionary = OwnedDictionary::new();
-        for (key, value) in entries {
-            let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
-            dictionary.insert(name.to_vec(), owned_from_flpdf(&value, depth + 1)?);
-        }
-        return Ok(OwnedObject::Dictionary(dictionary));
-    }
-
-    Err(Error::Invalid(format!(
-        "unsupported direct trailer object type {}",
-        handle.type_name()?
-    )))
 }
 
 /// Stable identifier of an existing indirect PDF object.
@@ -859,69 +781,7 @@ impl EditDocument {
 
     /// Materialize the current value of an object handle from either the source
     /// graph or the COW overlay without mutating the document.
-    pub(crate) fn detached_flpdf_object(&self, value: &OwnedObject) -> Result<FlObjectHandle> {
-        self.owned_to_flpdf_detached(value, 0)
-    }
-
-    fn owned_to_flpdf_detached(&self, value: &OwnedObject, depth: usize) -> Result<FlObjectHandle> {
-        if depth > 256 {
-            return Err(Error::Invalid(
-                "detached COS conversion nesting exceeds supported depth".to_owned(),
-            ));
-        }
-        match value {
-            OwnedObject::Reference(handle) => {
-                let Some(value) = self.current_owned_object(*handle)? else {
-                    return Ok(FlObjectHandle::null());
-                };
-                self.owned_to_flpdf_detached(&value, depth + 1)
-            }
-            OwnedObject::Null => Ok(FlObjectHandle::null()),
-            OwnedObject::Boolean(value) => Ok(FlObjectHandle::boolean(*value)),
-            OwnedObject::Integer(value) => Ok(FlObjectHandle::integer(*value)),
-            OwnedObject::Real(value) => Ok(FlObjectHandle::real(*value)),
-            OwnedObject::Name(value) => Ok(FlObjectHandle::name(value.clone())),
-            OwnedObject::String(value) => Ok(FlObjectHandle::string(value.clone())),
-            OwnedObject::Array(values) => Ok(FlObjectHandle::array(
-                values
-                    .iter()
-                    .map(|value| self.owned_to_flpdf_detached(value, depth + 1))
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-            OwnedObject::Dictionary(dictionary) => Ok(FlObjectHandle::dictionary(
-                dictionary
-                    .iter()
-                    .map(|(key, value)| {
-                        Ok((
-                            [b"/".as_slice(), key.as_slice()].concat(),
-                            self.owned_to_flpdf_detached(value, depth + 1)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-            OwnedObject::Stream { dictionary, data } => {
-                let bytes = data.bytes(self.source())?.into_owned();
-                let mut entries = dictionary
-                    .iter()
-                    .filter(|(key, _)| key.as_slice() != b"Length")
-                    .map(|(key, value)| {
-                        Ok((
-                            [b"/".as_slice(), key.as_slice()].concat(),
-                            self.owned_to_flpdf_detached(value, depth + 1)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let length = i64::try_from(bytes.len()).map_err(|_| {
-                    Error::Invalid("stream length exceeds the supported range".to_owned())
-                })?;
-                entries.push((b"/Length".to_vec(), FlObjectHandle::integer(length)));
-                let dictionary = FlObjectHandle::dictionary(entries);
-                Ok(FlObjectHandle::stream(dictionary, Rc::new(bytes)))
-            }
-        }
-    }
-
-    /// Decode a current stream value through flpdf's standalone filter codecs.
+    /// Decode a current stream value through Hayro's standalone filter codecs.
     ///
     /// Only filter-related dictionary entries are materialized into the
     /// detached helper object. Decoding does not need resources, metadata, or
@@ -1612,7 +1472,7 @@ fn owned_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
         .collect()
 }
 
-fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
+pub(crate) fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
     dictionary
         .entries()
         .filter(|(name, _)| name.as_ref() != b"Length")

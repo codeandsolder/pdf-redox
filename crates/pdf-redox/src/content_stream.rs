@@ -328,3 +328,37 @@ pub(crate) fn parse_detached_content_stream_recovering<C: ObjectHandleParserCall
 ) -> Result<bool> {
     parse_internal(input, callbacks)
 }
+
+/// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
+///
+/// Streams with inline images or malformed trailing input are left unchanged so
+/// arbitrary inline payload bytes and recovery cases remain byte-for-byte stable.
+pub(crate) fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
+    let mut iter = UntypedIter::new(input);
+    let mut output = Vec::with_capacity(input.len());
+    while let Some(instruction) = iter.next() {
+        if &instruction.operator[..] == b"BI" {
+            return input.to_vec();
+        }
+        if !output.is_empty() {
+            output.push(b'\n');
+        }
+        let mut first = true;
+        for span in instruction.operand_spans() {
+            if !first {
+                output.push(b' ');
+            }
+            first = false;
+            output.extend_from_slice(input.get(span).unwrap_or_default());
+        }
+        if !first {
+            output.push(b' ');
+        }
+        output.extend_from_slice(&instruction.operator[..]);
+    }
+    if iter.is_at_end() {
+        output
+    } else {
+        input.to_vec()
+    }
+}

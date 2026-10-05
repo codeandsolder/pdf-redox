@@ -3417,7 +3417,7 @@ fn prepare_image(
         && !encoding.binary_packed
         && matches!(info.components, 1 | 3 | 4)
     {
-        let jpeg_q85 = flpdf::job::encode_jpeg_raster(
+        let jpeg_q85 = crate::images::encode_jpeg_raster(
             width,
             height,
             info.components,
@@ -3429,8 +3429,13 @@ fn prepare_image(
             && q85.len() > budget
         {
             for quality in [82, 80, 78, 75] {
-                let jpeg =
-                    flpdf::job::encode_jpeg_raster(width, height, info.components, data, quality)?;
+                let jpeg = crate::images::encode_jpeg_raster(
+                    width,
+                    height,
+                    info.components,
+                    data,
+                    quality,
+                )?;
                 if jpeg.len() < best_jpeg.as_ref().map_or(usize::MAX, Vec::len) {
                     let fits_source = jpeg.len() <= budget;
                     best_jpeg = Some(jpeg);
