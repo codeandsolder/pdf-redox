@@ -613,10 +613,7 @@ fn scrub_jpeg_metadata_hayro(
         let Some((clean, removed)) = strip_jpeg_metadata(raw.as_ref(), aggressive) else {
             continue;
         };
-        let object = match handle {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let object = document.edit_handle(handle)?;
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(clean);
             stats.bump("jpeg-metadata-stream");

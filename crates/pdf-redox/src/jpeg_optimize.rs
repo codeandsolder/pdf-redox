@@ -1,4 +1,4 @@
-use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
+use crate::{EditDocument, OwnedDictionary, OwnedObject, Result, StreamData};
 use libjpeg_turbo_rs::{
     MarkerCopyMode, TransformOp, TransformOptions, transform_jpeg_with_options,
 };
@@ -206,10 +206,7 @@ pub fn optimize_jpeg_entropy_hayro(
 
         let original_len = raw.len();
         let optimized_len = optimized.len();
-        let object = match handle {
-            ObjectHandle::Existing(id) => document.edit_object(id)?,
-            ObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let object = document.edit_handle(handle)?;
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(optimized);
             stats.streams_optimized += 1;

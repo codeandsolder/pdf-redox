@@ -1421,10 +1421,7 @@ fn replace_page_content_hayro(
         dictionary: OwnedDictionary::new(),
         data: crate::StreamData::Owned(decoded),
     }));
-    let object = match page {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(page)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
     }

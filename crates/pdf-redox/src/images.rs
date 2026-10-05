@@ -344,10 +344,7 @@ fn install_transform(
     handle: ObjectHandle,
     transform: ImageTransform,
 ) -> Result<()> {
-    let object = match handle {
-        ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(handle)?;
     let OwnedObject::Stream { dictionary, data } = object else {
         return Ok(());
     };

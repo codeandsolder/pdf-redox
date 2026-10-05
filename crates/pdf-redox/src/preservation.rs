@@ -82,10 +82,7 @@ fn preservation_target_mut<'a>(
     document: &'a mut EditDocument,
     target: &PreservationDictionaryTarget,
 ) -> Result<Option<&'a mut OwnedDictionary>> {
-    let root = match target.root {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let root = document.edit_handle(target.root)?;
     Ok(
         preservation_object_at_path_mut(root, &target.path)
             .and_then(OwnedObject::as_dictionary_mut),
@@ -535,10 +532,7 @@ fn drop_authoring_metadata_hayro(
     }
 
     for (target, keys) in removals {
-        let root = match target.root {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let root = document.edit_handle(target.root)?;
         let Some(dictionary) = preservation_object_at_path_mut(root, &target.path)
             .and_then(OwnedObject::as_dictionary_mut)
         else {
@@ -795,10 +789,7 @@ fn appearance_as_form_hayro(
 ) -> Result<CowObjectHandle> {
     match source {
         AppearanceSource::Handle(handle) => {
-            let object = match handle {
-                CowObjectHandle::Existing(id) => document.edit_object(id)?,
-                CowObjectHandle::New(id) => document.edit_added_object(id)?,
-            };
+            let object = document.edit_handle(handle)?;
             let Some(dictionary) = object.as_dictionary_mut() else {
                 return Err(Error::Invalid(
                     "annotation appearance is not a stream".to_owned(),

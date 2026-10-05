@@ -308,10 +308,7 @@ fn redirect_font_descriptor_program(
     from: CowObjectHandle,
     to: CowObjectHandle,
 ) -> Result<bool> {
-    let object = match descriptor {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(descriptor)?;
     let Some(dictionary) = object.as_dictionary_mut() else {
         return Ok(false);
     };
@@ -568,10 +565,7 @@ fn union_sparse_cid_font_programs_hayro(
         // Keep Length1 truthful for the newly synthesized program. Existing
         // single-program table stripping intentionally preserves candidate-32
         // behavior; this only applies to the union stream.
-        let object = match canonical.program {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let object = document.edit_handle(canonical.program)?;
         if let Some(dictionary) = object.as_dictionary_mut() {
             dictionary.insert(
                 b"Length1".to_vec(),
@@ -1574,10 +1568,7 @@ fn replace_current_stream_data(
     encoded: Vec<u8>,
     plain_flate: bool,
 ) -> Result<()> {
-    let object = match handle {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(handle)?;
     match object {
         OwnedObject::Stream { dictionary, data } => {
             if plain_flate {
@@ -1787,10 +1778,7 @@ fn set_font_program_length1(
 ) -> Result<()> {
     let decoded_len = i64::try_from(decoded_len)
         .map_err(|_| Error::Invalid("dense font program length exceeds i64".to_owned()))?;
-    let object = match handle {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(handle)?;
     let OwnedObject::Stream { dictionary, .. } = object else {
         return Err(Error::Invalid(
             "dense font program reference does not resolve to a stream".to_owned(),

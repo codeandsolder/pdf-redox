@@ -135,10 +135,7 @@ pub fn apply_flate_policy_hayro(
                 .high_effort_extra_savings_bytes
                 .saturating_add(high_effort_extra_savings_bytes);
         }
-        let object = match handle {
-            crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-            crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let object = document.edit_handle(handle)?;
         if let crate::OwnedObject::Stream { dictionary, data } = object {
             set_plain_flate(dictionary);
             *data = crate::StreamData::Owned(repacked);
@@ -171,10 +168,7 @@ pub fn compress_unfiltered_streams_hayro(
         });
         if raw.is_empty() {
             if has_filter {
-                let object = match handle {
-                    crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
-                };
+                let object = document.edit_handle(handle)?;
                 if let crate::OwnedObject::Stream { dictionary, data } = object {
                     dictionary.remove(b"Filter".as_slice());
                     dictionary.remove(b"DecodeParms".as_slice());
@@ -200,10 +194,7 @@ pub fn compress_unfiltered_streams_hayro(
                 .high_effort_extra_savings_bytes
                 .saturating_add(encoded.high_effort_extra_savings_bytes);
         }
-        let object = match handle {
-            crate::ObjectHandle::Existing(id) => document.edit_object(id)?,
-            crate::ObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let object = document.edit_handle(handle)?;
         if let crate::OwnedObject::Stream { dictionary, data } = object {
             dictionary.insert(
                 b"Filter".to_vec(),

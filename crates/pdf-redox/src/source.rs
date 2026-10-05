@@ -779,6 +779,20 @@ impl EditDocument {
         self.overlay.edit(&self.source, id)
     }
 
+    /// Materialize and return a mutable object regardless of whether it came
+    /// from the source PDF or was allocated in the copy-on-write overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reachability bookkeeping fails or the referenced
+    /// source/new object is missing or deleted.
+    pub fn edit_handle(&mut self, handle: ObjectHandle) -> Result<&mut OwnedObject> {
+        match handle {
+            ObjectHandle::Existing(id) => self.edit_object(id),
+            ObjectHandle::New(id) => self.edit_added_object(id),
+        }
+    }
+
     /// Materialize the current value of an object handle from either the source
     /// graph or the COW overlay without mutating the document.
     /// Decode a current stream value through Hayro's standalone filter codecs.

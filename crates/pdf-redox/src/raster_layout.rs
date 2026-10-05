@@ -5075,10 +5075,7 @@ fn install_target_resources(
         ContentTarget::Page(page) => page,
         ContentTarget::Form(form) => form,
     };
-    let object = match handle {
-        ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(handle)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
     }
@@ -5097,20 +5094,14 @@ fn install_target(
                 dictionary: OwnedDictionary::new(),
                 data: StreamData::Owned(content),
             }));
-            let object = match page {
-                ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document.edit_added_object(id)?,
-            };
+            let object = document.edit_handle(page)?;
             if let Some(dictionary) = object.as_dictionary_mut() {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
             }
         }
         ContentTarget::Form(form) => {
-            let object = match form {
-                ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document.edit_added_object(id)?,
-            };
+            let object = document.edit_handle(form)?;
             if let OwnedObject::Stream { dictionary, data } = object {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 dictionary.remove(b"Filter".as_slice());

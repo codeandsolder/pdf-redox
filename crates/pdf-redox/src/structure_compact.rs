@@ -17,13 +17,6 @@ pub struct StructureCompactionStats {
     pub named_destination_wrappers_inlined: usize,
 }
 
-fn edit_handle(document: &mut EditDocument, handle: ObjectHandle) -> Result<&mut OwnedObject> {
-    match handle {
-        ObjectHandle::Existing(id) => document.edit_object(id),
-        ObjectHandle::New(id) => document.edit_added_object(id),
-    }
-}
-
 fn dictionary_reference(dictionary: &OwnedDictionary, key: &[u8]) -> Option<ObjectHandle> {
     match dictionary.get(key) {
         Some(OwnedObject::Reference(handle)) => Some(*handle),
@@ -105,7 +98,7 @@ fn compact_page_tree(
         child: ObjectHandle,
         parent: ObjectHandle,
     ) -> Result<()> {
-        let Some(dictionary) = edit_handle(document, child)?.as_dictionary_mut() else {
+        let Some(dictionary) = document.edit_handle(child)?.as_dictionary_mut() else {
             return Err(Error::Invalid(
                 "page-tree child is not a dictionary".to_owned(),
             ));
@@ -161,7 +154,7 @@ fn compact_page_tree(
     }
 
     for (page, values) in &inherited {
-        let Some(dictionary) = edit_handle(document, *page)?.as_dictionary_mut() else {
+        let Some(dictionary) = document.edit_handle(*page)?.as_dictionary_mut() else {
             return Ok(());
         };
         for (key, value) in values {
@@ -212,7 +205,7 @@ fn compact_page_tree(
         set_parent(document, child.handle, root)?;
     }
 
-    let Some(root_dictionary) = edit_handle(document, root)?.as_dictionary_mut() else {
+    let Some(root_dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
         return Ok(());
     };
     root_dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec()));
@@ -381,7 +374,7 @@ struct NameChild {
 )]
 fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -> Result<usize> {
     if snapshot.pairs.is_empty() {
-        let Some(root) = edit_handle(document, snapshot.root)?.as_dictionary_mut() else {
+        let Some(root) = document.edit_handle(snapshot.root)?.as_dictionary_mut() else {
             return Err(Error::Invalid(
                 "name-tree root is not a dictionary".to_owned(),
             ));
@@ -392,7 +385,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -
     }
 
     if snapshot.pairs.len() <= NAME_TREE_FANOUT {
-        let Some(root) = edit_handle(document, snapshot.root)?.as_dictionary_mut() else {
+        let Some(root) = document.edit_handle(snapshot.root)?.as_dictionary_mut() else {
             return Err(Error::Invalid(
                 "name-tree root is not a dictionary".to_owned(),
             ));
@@ -469,7 +462,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -
         level = next;
     }
 
-    let Some(root) = edit_handle(document, snapshot.root)?.as_dictionary_mut() else {
+    let Some(root) = document.edit_handle(snapshot.root)?.as_dictionary_mut() else {
         return Err(Error::Invalid(
             "name-tree root is not a dictionary".to_owned(),
         ));
@@ -489,7 +482,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -
 
 fn apply_leaf_inlining(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -> Result<()> {
     for leaf in &snapshot.leaves {
-        let Some(dictionary) = edit_handle(document, leaf.handle)?.as_dictionary_mut() else {
+        let Some(dictionary) = document.edit_handle(leaf.handle)?.as_dictionary_mut() else {
             return Err(Error::Invalid(
                 "name-tree leaf is not a dictionary".to_owned(),
             ));

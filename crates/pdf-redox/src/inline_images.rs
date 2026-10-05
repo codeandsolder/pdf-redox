@@ -455,20 +455,14 @@ fn install_rewrite(
                 dictionary: OwnedDictionary::new(),
                 data: StreamData::Owned(rewrite.content),
             }));
-            let object = match page {
-                ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document.edit_added_object(id)?,
-            };
+            let object = document.edit_handle(page)?;
             if let Some(dictionary) = object.as_dictionary_mut() {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
             }
         }
         ContentTarget::Form(form) => {
-            let object = match form {
-                ObjectHandle::Existing(id) => document.edit_object(id)?,
-                ObjectHandle::New(id) => document.edit_added_object(id)?,
-            };
+            let object = document.edit_handle(form)?;
             if let OwnedObject::Stream { dictionary, data } = object {
                 dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 dictionary.remove(b"Filter".as_slice());
@@ -697,19 +691,13 @@ pub fn cleanup_fragmented_inline_staging_hayro(
         resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
         match target {
             ContentTarget::Page(page) => {
-                let object = match page {
-                    ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    ObjectHandle::New(id) => document.edit_added_object(id)?,
-                };
+                let object = document.edit_handle(page)?;
                 if let Some(dictionary) = object.as_dictionary_mut() {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 }
             }
             ContentTarget::Form(form) => {
-                let object = match form {
-                    ObjectHandle::Existing(id) => document.edit_object(id)?,
-                    ObjectHandle::New(id) => document.edit_added_object(id)?,
-                };
+                let object = document.edit_handle(form)?;
                 if let Some(dictionary) = object.as_dictionary_mut() {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
                 }

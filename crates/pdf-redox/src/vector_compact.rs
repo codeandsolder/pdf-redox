@@ -1809,10 +1809,7 @@ fn install_page_xobject(
         resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
     xobjects.insert(name, OwnedObject::Reference(target));
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
-    let object = match page {
-        ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(page)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
     }

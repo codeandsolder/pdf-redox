@@ -298,10 +298,7 @@ fn install_page_resources(
     page: ObjectHandle,
     resources: OwnedDictionary,
 ) -> Result<()> {
-    let object = match page {
-        ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(page)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
     }
@@ -313,10 +310,7 @@ fn install_form_resources(
     form: ObjectHandle,
     resources: OwnedDictionary,
 ) -> Result<()> {
-    let object = match form {
-        ObjectHandle::Existing(id) => document.edit_object(id)?,
-        ObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(form)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
     }

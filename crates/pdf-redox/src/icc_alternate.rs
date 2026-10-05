@@ -76,10 +76,7 @@ fn replace_object(
     handle: ObjectHandle,
     value: OwnedObject,
 ) -> Result<()> {
-    match handle {
-        ObjectHandle::Existing(id) => *document.edit_object(id)? = value,
-        ObjectHandle::New(id) => *document.edit_added_object(id)? = value,
-    }
+    *document.edit_handle(handle)? = value;
     Ok(())
 }
 

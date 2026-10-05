@@ -443,10 +443,7 @@ fn rewrite_direct_reference_holder(
     holder: &DirectReferenceHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = match holder.root {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let root = document.edit_handle(holder.root)?;
     let Some(holder_object) = object_at_direct_path_mut(root, &holder.path) else {
         return Ok(false);
     };
@@ -629,10 +626,7 @@ fn rewrite_direct_array_reference_holder(
     holder: &DirectArrayReferenceHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = match holder.root {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let root = document.edit_handle(holder.root)?;
     let Some(array_object) = object_at_direct_path_mut(root, &holder.path) else {
         return Ok(false);
     };
@@ -919,10 +913,7 @@ fn rewrite_type3_glyph_holder(
     holder: &HayroType3GlyphHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = match holder.target.root {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let root = document.edit_handle(holder.target.root)?;
     let Some(charprocs) = object_at_direct_path_mut(root, &holder.target.path) else {
         return Ok(false);
     };
@@ -1121,10 +1112,7 @@ fn rewrite_dictionary_reference_keys(
     if changes.is_empty() {
         return Ok(0);
     }
-    let object = match handle {
-        CowObjectHandle::Existing(id) => document.edit_object(id)?,
-        CowObjectHandle::New(id) => document.edit_added_object(id)?,
-    };
+    let object = document.edit_handle(handle)?;
     let Some(dictionary) = object.as_dictionary_mut() else {
         return Ok(0);
     };
@@ -1302,10 +1290,7 @@ fn rewrite_dictionary_target_entries(
         if changes.is_empty() {
             continue;
         }
-        let root = match target.root {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let root = document.edit_handle(target.root)?;
         let Some(dictionary) =
             object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
         else {
@@ -1640,10 +1625,7 @@ fn rewrite_all_references_hayro(
         if canonical == holder.target {
             continue;
         }
-        let root = match holder.root {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let root = document.edit_handle(holder.root)?;
         let Some(value) = object_at_direct_path_mut(root, &holder.path) else {
             continue;
         };
@@ -2234,10 +2216,7 @@ fn rewrite_selected_dictionary_entries(
         if changes.is_empty() {
             continue;
         }
-        let root = match target.root {
-            CowObjectHandle::Existing(id) => document.edit_object(id)?,
-            CowObjectHandle::New(id) => document.edit_added_object(id)?,
-        };
+        let root = document.edit_handle(target.root)?;
         let Some(dictionary) =
             object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
         else {
