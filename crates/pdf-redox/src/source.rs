@@ -1464,7 +1464,7 @@ fn owned_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
         .collect()
 }
 
-pub(crate) fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
+pub fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
     dictionary
         .entries()
         .filter(|(name, _)| name.as_ref() != b"Length")

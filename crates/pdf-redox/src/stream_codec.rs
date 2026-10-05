@@ -30,7 +30,7 @@ fn write_resolved_value(
     match value {
         OwnedObject::Null => output.extend_from_slice(b"null"),
         OwnedObject::Boolean(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" })
+            output.extend_from_slice(if *value { b"true" } else { b"false" });
         }
         OwnedObject::Integer(value) => output.extend_from_slice(value.to_string().as_bytes()),
         OwnedObject::Real(value) => crate::writer::write_pdf_real(output, *value)?,
@@ -95,7 +95,7 @@ fn standalone_filter_dictionary(
 }
 
 /// Decode bytes using the stream's current `/Filter` and `/DecodeParms`.
-pub(crate) fn decode_stream(
+pub fn decode_stream(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     encoded: &[u8],
@@ -109,7 +109,7 @@ pub(crate) fn decode_stream(
 }
 
 /// Decode image-stream bytes with the image metadata required by DCT/JPX/etc.
-pub(crate) fn decode_image_stream(
+pub fn decode_image_stream(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     encoded: &[u8],
@@ -139,7 +139,7 @@ pub(crate) fn decode_image_stream(
 }
 
 /// Encode ordinary zlib/Flate data at an explicit PDF compression level.
-pub(crate) fn encode_flate(decoded: &[u8], level: i32) -> Result<Vec<u8>> {
+pub fn encode_flate(decoded: &[u8], level: i32) -> Result<Vec<u8>> {
     let level = u32::try_from(level)
         .ok()
         .filter(|level| *level <= 9)
@@ -153,7 +153,7 @@ pub(crate) fn encode_flate(decoded: &[u8], level: i32) -> Result<Vec<u8>> {
 ///
 /// This intentionally accepts `/Filter /FlateDecode`, `/Filter /Fl`, and
 /// one-element arrays containing either name.
-pub(crate) fn is_unfiltered_or_lone_flate(
+pub fn is_unfiltered_or_lone_flate(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
 ) -> Result<bool> {
@@ -181,7 +181,7 @@ pub(crate) fn is_unfiltered_or_lone_flate(
 }
 
 /// Normalize a rewritten stream to plain Flate with no predictor parameters.
-pub(crate) fn set_plain_flate(dictionary: &mut OwnedDictionary) {
+pub fn set_plain_flate(dictionary: &mut OwnedDictionary) {
     dictionary.insert(
         b"Filter".to_vec(),
         OwnedObject::Name(b"FlateDecode".to_vec()),

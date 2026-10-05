@@ -1423,7 +1423,7 @@ fn union_sparse_cid_font_programs_hayro(
         let OwnedObject::Stream { dictionary, data } = object else {
             continue;
         };
-        if dictionary.get(b"Filter".as_slice()).is_none()
+        if !dictionary.contains_key(b"Filter".as_slice())
             || !is_unfiltered_or_lone_flate(document, &dictionary)?
         {
             continue;
@@ -2765,7 +2765,7 @@ fn encode_like_stream(
     decoded: &[u8],
     flate_level: i32,
 ) -> Result<Option<(Vec<u8>, bool)>> {
-    if dictionary.get(b"Filter".as_slice()).is_none() {
+    if !dictionary.contains_key(b"Filter".as_slice()) {
         return Ok(Some((decoded.to_vec(), false)));
     }
     if !is_unfiltered_or_lone_flate(document, dictionary)? {
@@ -3149,7 +3149,7 @@ pub fn strip_font_editing_tables_hayro(
         let OwnedObject::Stream { dictionary, data } = object else {
             continue;
         };
-        if dictionary.get(b"Filter".as_slice()).is_none()
+        if !dictionary.contains_key(b"Filter".as_slice())
             || !is_unfiltered_or_lone_flate(document, &dictionary)?
         {
             continue;

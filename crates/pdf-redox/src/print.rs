@@ -560,6 +560,10 @@ fn cow_image_resize_safe(
     Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "placement collection and conservative resize selection form one ordered geometry pass"
+)]
 pub fn plan_print_downsampling_hayro(
     document: &crate::EditDocument,
     target_ppi: u32,

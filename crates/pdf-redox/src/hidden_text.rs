@@ -18,11 +18,8 @@ const COVERAGE_THRESHOLD: f64 = 0.97;
 
 type ObjectKey = (i32, i32);
 
-fn content_object_key(reference: ObjectRef) -> ObjectKey {
-    (
-        i32::try_from(reference.number).unwrap_or(i32::MAX),
-        i32::from(reference.generation),
-    )
+const fn content_object_key(reference: ObjectRef) -> ObjectKey {
+    (reference.number, reference.generation)
 }
 
 const fn cow_object_key(handle: CowObjectHandle) -> Option<ObjectKey> {
@@ -287,14 +284,14 @@ enum OperandObject {
 }
 
 impl OperandObject {
-    fn as_integer(&self) -> Option<i64> {
+    const fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Scalar(value) => value.as_integer(),
             Self::Handle(value) => value.as_integer(),
         }
     }
 
-    fn as_real(&self) -> Option<f64> {
+    const fn as_real(&self) -> Option<f64> {
         match self {
             Self::Scalar(value) => value.as_real(),
             Self::Handle(value) => value.as_real(),
@@ -2412,7 +2409,7 @@ fn decode_utf16be(bytes: &[u8]) -> String {
         .to_owned()
 }
 
-pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> String {
+pub fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16be(rest);
     }

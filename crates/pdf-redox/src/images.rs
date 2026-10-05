@@ -101,7 +101,7 @@ struct ImageTransform {
     encoding: ImageResizeEncoding,
 }
 
-pub(crate) fn encode_jpeg_raster(
+pub fn encode_jpeg_raster(
     width: u32,
     height: u32,
     components: usize,
@@ -267,6 +267,11 @@ fn resolved_number(document: &EditDocument, value: Option<&OwnedObject>) -> Resu
     })
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "PDF dimensions are clamped to the complete u32 range before conversion"
+)]
 fn dimension(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
@@ -380,7 +385,7 @@ fn decoded_pixels(
     let encoded = data.bytes(document.source())?;
     let components_u8 = u8::try_from(components)
         .map_err(|_| Error::Invalid("image component count exceeds u8".to_owned()))?;
-    let decoded = match decode_image_stream(
+    let Ok(decoded) = decode_image_stream(
         document,
         dictionary,
         encoded.as_ref(),
@@ -388,9 +393,8 @@ fn decoded_pixels(
         height,
         8,
         components_u8,
-    ) {
-        Ok(decoded) => decoded,
-        Err(_) => return Ok(None),
+    ) else {
+        return Ok(None);
     };
     let expected = usize::try_from(width)
         .ok()
@@ -588,10 +592,10 @@ fn transform_one(
         stats.images_resized = stats.images_resized.saturating_add(1);
         match transform.encoding {
             ImageResizeEncoding::Jpeg => {
-                stats.jpeg_images_resized = stats.jpeg_images_resized.saturating_add(1)
+                stats.jpeg_images_resized = stats.jpeg_images_resized.saturating_add(1);
             }
             ImageResizeEncoding::Flate => {
-                stats.flate_images_resized = stats.flate_images_resized.saturating_add(1)
+                stats.flate_images_resized = stats.flate_images_resized.saturating_add(1);
             }
         }
     }

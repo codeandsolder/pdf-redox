@@ -308,6 +308,10 @@ fn next_inline_name(resource_names: &mut BTreeSet<Vec<u8>>, suffix: &mut usize) 
     }
 }
 
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the cache-miss branch atomically updates the generated name and staged image collections"
+)]
 fn rewrite_inline_images(
     document: &EditDocument,
     resources: &OwnedDictionary,

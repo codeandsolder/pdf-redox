@@ -8,7 +8,7 @@ use hayro_syntax::{
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ContentScalar {
+pub enum ContentScalar {
     Null,
     Boolean(bool),
     Integer(i64),
@@ -19,35 +19,35 @@ pub(crate) enum ContentScalar {
 }
 
 impl ContentScalar {
-    pub(crate) fn as_integer(&self) -> Option<i64> {
+    pub const fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Integer(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_real(&self) -> Option<f64> {
+    pub const fn as_real(&self) -> Option<f64> {
         match self {
             Self::Real(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_name(&self) -> Option<&[u8]> {
+    pub fn as_name(&self) -> Option<&[u8]> {
         match self {
             Self::Name(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_string(&self) -> Option<&[u8]> {
+    pub fn as_string(&self) -> Option<&[u8]> {
         match self {
             Self::String(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_operator(&self) -> Option<&[u8]> {
+    pub fn as_operator(&self) -> Option<&[u8]> {
         match self {
             Self::Operator(value) => Some(value),
             _ => None,
@@ -56,13 +56,13 @@ impl ContentScalar {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ContentObjectRef {
-    pub(crate) number: i32,
-    pub(crate) generation: i32,
+pub struct ContentObjectRef {
+    pub number: i32,
+    pub generation: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ContentObject {
+pub enum ContentObject {
     Null,
     Boolean(bool),
     Integer(i64),
@@ -77,70 +77,70 @@ pub(crate) enum ContentObject {
 }
 
 impl ContentObject {
-    pub(crate) fn as_integer(&self) -> Option<i64> {
+    pub const fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Integer(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_real(&self) -> Option<f64> {
+    pub const fn as_real(&self) -> Option<f64> {
         match self {
             Self::Real(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_name(&self) -> Option<Vec<u8>> {
+    pub fn as_name(&self) -> Option<Vec<u8>> {
         match self {
             Self::Name(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_string(&self) -> Option<Vec<u8>> {
+    pub fn as_string(&self) -> Option<Vec<u8>> {
         match self {
             Self::String(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_operator(&self) -> Option<Vec<u8>> {
+    pub fn as_operator(&self) -> Option<Vec<u8>> {
         match self {
             Self::Operator(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub(crate) fn as_array(&self) -> Option<Vec<Self>> {
+    pub fn as_array(&self) -> Option<Vec<Self>> {
         match self {
             Self::Array(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub(crate) const fn as_dictionary(&self) -> Option<&BTreeMap<Vec<u8>, Self>> {
+    pub const fn as_dictionary(&self) -> Option<&BTreeMap<Vec<u8>, Self>> {
         match self {
             Self::Dictionary(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_inline_image(&self) -> Option<Vec<u8>> {
+    pub fn as_inline_image(&self) -> Option<Vec<u8>> {
         match self {
             Self::InlineImage(value) => Some(value.clone()),
             _ => None,
         }
     }
 
-    pub(crate) const fn object_ref(&self) -> Option<ContentObjectRef> {
+    pub const fn object_ref(&self) -> Option<ContentObjectRef> {
         match self {
             Self::Reference(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<Self> {
+    pub fn try_get_key(&self, key: &[u8]) -> Result<Self> {
         let key = key.strip_prefix(b"/").unwrap_or(key);
         self.as_dictionary()
             .and_then(|dictionary| dictionary.get(key))
@@ -150,12 +150,12 @@ impl ContentObject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ParseControl {
+pub enum ParseControl {
     Continue,
     Stop,
 }
 
-pub(crate) trait ObjectHandleParserCallbacks {
+pub trait ObjectHandleParserCallbacks {
     const HANDLES_CONTENT_SCALARS: bool = false;
 
     fn content_size(&mut self, _size: usize) -> Result<()> {
@@ -218,18 +218,18 @@ fn scalar_from_hayro(object: &HayroObject<'_>, raw: &[u8]) -> Option<ContentScal
     })
 }
 
-fn object_from_maybe_ref(value: MaybeRef<HayroObject<'_>>) -> Option<ContentObject> {
+fn object_from_maybe_ref(value: MaybeRef<HayroObject<'_>>) -> ContentObject {
     match value {
-        MaybeRef::Ref(reference) => Some(ContentObject::Reference(ContentObjectRef {
+        MaybeRef::Ref(reference) => ContentObject::Reference(ContentObjectRef {
             number: reference.obj_number,
             generation: reference.gen_number,
-        })),
+        }),
         MaybeRef::NotRef(value) => object_from_hayro(&value, None),
     }
 }
 
-fn object_from_hayro(object: &HayroObject<'_>, raw: Option<&[u8]>) -> Option<ContentObject> {
-    Some(match object {
+fn object_from_hayro(object: &HayroObject<'_>, raw: Option<&[u8]>) -> ContentObject {
+    match object {
         HayroObject::Null(_) => ContentObject::Null,
         HayroObject::Boolean(value) => ContentObject::Boolean(*value),
         HayroObject::Number(number) => raw.map_or_else(
@@ -239,19 +239,16 @@ fn object_from_hayro(object: &HayroObject<'_>, raw: Option<&[u8]>) -> Option<Con
         HayroObject::String(value) => ContentObject::String(value.as_bytes().to_vec()),
         HayroObject::Name(value) => ContentObject::Name(value.as_ref().to_vec()),
         HayroObject::Array(value) => {
-            ContentObject::Array(value.raw_iter().filter_map(object_from_maybe_ref).collect())
+            ContentObject::Array(value.raw_iter().map(object_from_maybe_ref).collect())
         }
-        HayroObject::Dict(value) => {
-            let mut dictionary = BTreeMap::new();
-            for (key, item) in value.entries() {
-                if let Some(item) = object_from_maybe_ref(item) {
-                    dictionary.insert(key.as_ref().to_vec(), item);
-                }
-            }
-            ContentObject::Dictionary(dictionary)
-        }
+        HayroObject::Dict(value) => ContentObject::Dictionary(
+            value
+                .entries()
+                .map(|(key, item)| (key.as_ref().to_vec(), object_from_maybe_ref(item)))
+                .collect(),
+        ),
         HayroObject::Stream(value) => ContentObject::InlineImage(value.raw_data().into_owned()),
-    })
+    }
 }
 
 const fn stopped(control: ParseControl) -> bool {
@@ -279,15 +276,19 @@ fn parse_internal<C: ObjectHandleParserCallbacks>(input: &[u8], callbacks: &mut 
             let control = if C::HANDLES_CONTENT_SCALARS {
                 if let Some(scalar) = scalar_from_hayro(object, raw) {
                     callbacks.handle_scalar(scalar, span.start, span.len())?
-                } else if let Some(object) = object_from_hayro(object, Some(raw)) {
-                    callbacks.handle_object(object, span.start, span.len())?
                 } else {
-                    ParseControl::Continue
+                    callbacks.handle_object(
+                        object_from_hayro(object, Some(raw)),
+                        span.start,
+                        span.len(),
+                    )?
                 }
-            } else if let Some(object) = object_from_hayro(object, Some(raw)) {
-                callbacks.handle_object(object, span.start, span.len())?
             } else {
-                ParseControl::Continue
+                callbacks.handle_object(
+                    object_from_hayro(object, Some(raw)),
+                    span.start,
+                    span.len(),
+                )?
             };
             if stopped(control) {
                 return Ok(false);
@@ -313,7 +314,7 @@ fn parse_internal<C: ObjectHandleParserCallbacks>(input: &[u8], callbacks: &mut 
     Ok(incomplete)
 }
 
-pub(crate) fn parse_detached_content_stream<C: ObjectHandleParserCallbacks>(
+pub fn parse_detached_content_stream<C: ObjectHandleParserCallbacks>(
     input: &[u8],
     _source_description: &str,
     callbacks: &mut C,
@@ -321,7 +322,7 @@ pub(crate) fn parse_detached_content_stream<C: ObjectHandleParserCallbacks>(
     parse_internal(input, callbacks).map(|_| ())
 }
 
-pub(crate) fn parse_detached_content_stream_recovering<C: ObjectHandleParserCallbacks>(
+pub fn parse_detached_content_stream_recovering<C: ObjectHandleParserCallbacks>(
     input: &[u8],
     _source_description: &str,
     callbacks: &mut C,
@@ -333,7 +334,7 @@ pub(crate) fn parse_detached_content_stream_recovering<C: ObjectHandleParserCall
 ///
 /// Streams with inline images or malformed trailing input are left unchanged so
 /// arbitrary inline payload bytes and recovery cases remain byte-for-byte stable.
-pub(crate) fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
+pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
     let mut iter = UntypedIter::new(input);
     let mut output = Vec::with_capacity(input.len());
     while let Some(instruction) = iter.next() {
