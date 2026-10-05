@@ -6,9 +6,75 @@
 use skera::{DEFAULT_DROP_TABLES, Plan, SubsetFlags, subset_font};
 use std::collections::{BTreeMap, BTreeSet};
 use write_fonts::{
-    read::{FontRef, TableProvider, collections::IntSet},
+    FontBuilder,
+    read::{FileRef, FontRef, TableProvider, collections::IntSet},
     types::{GlyphId, NameId, Tag},
 };
+
+const PDF_RENDERING_UNUSED_TABLES: [Tag; 16] = [
+    Tag::new(b"BASE"),
+    Tag::new(b"GDEF"),
+    Tag::new(b"GPOS"),
+    Tag::new(b"GSUB"),
+    Tag::new(b"JSTF"),
+    Tag::new(b"MATH"),
+    Tag::new(b"kern"),
+    Tag::new(b"vhea"),
+    Tag::new(b"vmtx"),
+    Tag::new(b"DSIG"),
+    Tag::new(b"name"),
+    Tag::new(b"OS/2"),
+    Tag::new(b"PCLT"),
+    Tag::new(b"hdmx"),
+    Tag::new(b"LTSH"),
+    Tag::new(b"VDMX"),
+];
+const CID_TYPE2_UNUSED_TABLES: [Tag; 2] = [Tag::new(b"cmap"), Tag::new(b"post")];
+
+fn rebuild_font(
+    font: &FontRef<'_>,
+    mut retain: impl FnMut(Tag) -> bool,
+) -> Option<(Vec<u8>, usize)> {
+    let mut builder = FontBuilder::new();
+    let mut removed = 0_usize;
+    let mut retained = 0_usize;
+    for record in font.table_directory().table_records() {
+        let tag = record.tag();
+        let data = font.data_for_tag(tag)?;
+        if retain(tag) {
+            builder.add_raw_with_checksum(tag, data, record.checksum());
+            retained = retained.saturating_add(1);
+        } else {
+            removed = removed.saturating_add(data.len());
+        }
+    }
+    (retained > 0).then(|| (builder.build(), removed))
+}
+
+/// Extract the sole face of a TrueType/OpenType collection into a standalone
+/// SFNT. Multi-face collections are intentionally left untouched because a PDF
+/// `FontFile2` stream does not identify which face is semantically selected.
+pub fn unwrap_single_face_collection(bytes: &[u8]) -> Option<Vec<u8>> {
+    let FileRef::Collection(collection) = FileRef::new(bytes).ok()? else {
+        return None;
+    };
+    if collection.len() != 1 {
+        return None;
+    }
+    let font = collection.get(0).ok()?;
+    rebuild_font(&font, |_| true).map(|(bytes, _)| bytes)
+}
+
+/// Rebuild a standalone OpenType font while omitting tables that an already-
+/// positioned PDF text stream does not use for rendering.
+pub fn strip_pdf_unused_tables(bytes: &[u8], cid_type2_only: bool) -> Option<(Vec<u8>, usize)> {
+    let font = FontRef::new(bytes).ok()?;
+    let result = rebuild_font(&font, |tag| {
+        !(PDF_RENDERING_UNUSED_TABLES.contains(&tag)
+            || cid_type2_only && CID_TYPE2_UNUSED_TABLES.contains(&tag))
+    })?;
+    (result.1 > 0).then_some(result)
+}
 
 #[derive(Debug)]
 pub struct RetainedGlyphSubset {
