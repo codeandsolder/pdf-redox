@@ -1,10 +1,12 @@
+use crate::content_stream::{
+    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
 };
-use flpdf::content_stream::ContentScalar;
-use flpdf::{Matrix, ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -543,7 +545,7 @@ impl ObjectHandleParserCallbacks for MicroStrokeScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             self.process_operator(operator, offset, length);
         } else {
@@ -559,7 +561,7 @@ impl ObjectHandleParserCallbacks for MicroStrokeScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -569,7 +571,7 @@ impl ObjectHandleParserCallbacks for MicroStrokeScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -583,7 +585,7 @@ impl ObjectHandleParserCallbacks for MicroStrokeScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -1170,7 +1172,11 @@ pub fn rasterize_pathological_microstrokes_hayro(
             None => 1.0,
         };
         let mut scanner = MicroStrokeScanner::new(ext_gstate_patches(document, &resources)?);
-        flpdf::parse_detached_content_stream(&decoded, "microstroke rasterization", &mut scanner)?;
+        crate::content_stream::parse_detached_content_stream(
+            &decoded,
+            "microstroke rasterization",
+            &mut scanner,
+        )?;
         let runs = grouped_runs(&decoded, &scanner.blocks);
         if runs.is_empty() {
             continue;
@@ -1297,7 +1303,11 @@ mod tests {
     fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
         let input = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q q 1 0 0 1 10.1 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        flpdf::parse_detached_content_stream(input, "microstroke test", &mut scanner)?;
+        crate::content_stream::parse_detached_content_stream(
+            input,
+            "microstroke test",
+            &mut scanner,
+        )?;
         assert_eq!(scanner.blocks.len(), 2);
         let runs = grouped_runs(input, &scanner.blocks);
         assert!(runs.is_empty());
@@ -1310,7 +1320,11 @@ mod tests {
     fn fractional_line_cap_is_not_silently_truncated() -> Result<()> {
         let input = b"1.5 J q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        flpdf::parse_detached_content_stream(input, "microstroke fractional cap", &mut scanner)?;
+        crate::content_stream::parse_detached_content_stream(
+            input,
+            "microstroke fractional cap",
+            &mut scanner,
+        )?;
         assert_eq!(scanner.blocks.len(), 1);
         assert!(!scanner.blocks[0].state.raster_safe());
         Ok(())

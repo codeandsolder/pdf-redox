@@ -1,7 +1,8 @@
+use crate::stream_codec::DecodeLevel;
 use crate::{FlatePolicy, Result};
 #[cfg(test)]
 use flpdf::Pdf;
-use flpdf::{DecodeLevel, ObjectHandle, filters::encode_stream_data_with_flate_level};
+use flpdf::{ObjectHandle, filters::encode_stream_data_with_flate_level};
 #[cfg(test)]
 use std::{
     io::{Read, Seek},
@@ -32,7 +33,7 @@ fn adaptive_flate_encode(
     decoded: &[u8],
     level: i32,
     adaptive_high_effort: bool,
-) -> flpdf::Result<AdaptiveFlateEncoding> {
+) -> crate::Result<AdaptiveFlateEncoding> {
     let baseline = encode_stream_data_with_flate_level(dictionary, decoded, level)?;
     if !adaptive_high_effort
         || level >= 9

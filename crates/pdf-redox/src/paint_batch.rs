@@ -1,10 +1,11 @@
+use crate::content_stream::{
+    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
+};
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
 };
 use flate2::{Compression, write::ZlibEncoder};
-use flpdf::content_stream::ContentScalar;
-use flpdf::{ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -200,7 +201,7 @@ impl ObjectHandleParserCallbacks for EventScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             self.push_operator(operator, offset, length);
         } else {
@@ -214,7 +215,7 @@ impl ObjectHandleParserCallbacks for EventScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.push_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -224,7 +225,7 @@ impl ObjectHandleParserCallbacks for EventScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.push_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -245,7 +246,7 @@ impl ObjectHandleParserCallbacks for EventScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -277,7 +278,7 @@ fn adjacent(input: &[u8], left: &Event, right: &Event) -> bool {
 
 fn events_for(input: &[u8], context: &str) -> Option<Vec<Event>> {
     let mut scanner = EventScanner::default();
-    flpdf::parse_detached_content_stream(input, context, &mut scanner).ok()?;
+    crate::content_stream::parse_detached_content_stream(input, context, &mut scanner).ok()?;
     Some(scanner.events)
 }
 

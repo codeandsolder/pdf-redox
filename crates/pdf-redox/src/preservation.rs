@@ -1,8 +1,8 @@
+use crate::geometry::{Matrix, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
     OwnedObject, PreservationConfig, Result, StreamData,
 };
-use flpdf::{Matrix, Rectangle};
 #[cfg(test)]
 use flpdf::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
 use std::collections::{BTreeMap, BTreeSet};

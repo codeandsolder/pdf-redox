@@ -1,5 +1,6 @@
+use crate::stream_codec::{DecodeLevel, decode_stream};
 use crate::{Error, Result, SourceLoadError};
-use flpdf::{DecodeLevel, ObjectHandle as FlObjectHandle};
+use flpdf::ObjectHandle as FlObjectHandle;
 use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream},
@@ -929,33 +930,13 @@ impl EditDocument {
     pub(crate) fn decoded_owned_stream_data(
         &self,
         stream: &OwnedObject,
-        level: DecodeLevel,
+        _level: DecodeLevel,
     ) -> Result<Vec<u8>> {
         let OwnedObject::Stream { dictionary, data } = stream else {
             return Err(Error::Invalid("object is not a stream".to_owned()));
         };
-        let bytes = data.bytes(self.source())?.into_owned();
-        let mut entries = Vec::new();
-        for key in [
-            b"Filter".as_slice(),
-            b"DecodeParms".as_slice(),
-            b"F".as_slice(),
-            b"FFilter".as_slice(),
-            b"FDecodeParms".as_slice(),
-        ] {
-            let Some(value) = dictionary.get(key) else {
-                continue;
-            };
-            entries.push((
-                [b"/".as_slice(), key].concat(),
-                self.owned_to_flpdf_detached(value, 0)?,
-            ));
-        }
-        let length = i64::try_from(bytes.len())
-            .map_err(|_| Error::Invalid("stream length exceeds the supported range".to_owned()))?;
-        entries.push((b"/Length".to_vec(), FlObjectHandle::integer(length)));
-        let handle = FlObjectHandle::stream(FlObjectHandle::dictionary(entries), Rc::new(bytes));
-        Ok(handle.get_stream_data(level)?.as_ref().clone())
+        let bytes = data.bytes(self.source())?;
+        decode_stream(self, dictionary, bytes.as_ref())
     }
 
     /// Decode page/Form content while accepting codec warnings that preserve
@@ -964,31 +945,8 @@ impl EditDocument {
         let OwnedObject::Stream { dictionary, data } = stream else {
             return Err(Error::Invalid("object is not a stream".to_owned()));
         };
-        let bytes = data.bytes(self.source())?.into_owned();
-        let mut entries = Vec::new();
-        for key in [
-            b"Filter".as_slice(),
-            b"DecodeParms".as_slice(),
-            b"F".as_slice(),
-            b"FFilter".as_slice(),
-            b"FDecodeParms".as_slice(),
-        ] {
-            let Some(value) = dictionary.get(key) else {
-                continue;
-            };
-            entries.push((
-                [b"/".as_slice(), key].concat(),
-                self.owned_to_flpdf_detached(value, 0)?,
-            ));
-        }
-        let filter_dictionary = FlObjectHandle::dictionary(entries);
-        let outcome = flpdf::filters::decode_stream_data_recovering(&filter_dictionary, &bytes)?;
-        for event in outcome.events {
-            if let flpdf::filters::StreamDecodeEvent::Error(error) = event {
-                return Err(error.into());
-            }
-        }
-        Ok(outcome.data)
+        let bytes = data.bytes(self.source())?;
+        decode_stream(self, dictionary, bytes.as_ref())
     }
 
     /// Decode a current indirect stream through the standalone filter-codec bridge.

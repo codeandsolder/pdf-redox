@@ -1,11 +1,12 @@
+use crate::content_stream::{
+    ContentObject as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::stream_codec::{
+    DecodeLevel, decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
+};
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData, content::decoded_content_value, source::CurrentObject,
-};
-use flpdf::DecodeLevel;
-use flpdf::{
-    ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl,
-    filters::{decode_stream_data, encode_stream_data_with_flate_level},
 };
 #[cfg(test)]
 use flpdf::{ObjectRef, Pdf};
@@ -1430,11 +1431,13 @@ fn union_sparse_cid_font_programs_hayro(
         let OwnedObject::Stream { dictionary, data } = object else {
             continue;
         };
-        let Some(filter_dictionary) = flpdf_filter_dictionary(document, &dictionary)? else {
+        if dictionary.get(b"Filter".as_slice()).is_none()
+            || !is_unfiltered_or_lone_flate(document, &dictionary)?
+        {
             continue;
-        };
+        }
         let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream_data(&filter_dictionary, raw.as_ref()) else {
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
             continue;
         };
         if decoded.get(..4) != Some(&[0, 1, 0, 0]) {
@@ -1551,12 +1554,10 @@ fn union_sparse_cid_font_programs_hayro(
         let OwnedObject::Stream { dictionary, .. } = object else {
             continue;
         };
-        let Some(filter_dictionary) = flpdf_filter_dictionary(document, &dictionary)? else {
+        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
             continue;
-        };
-        let Ok(encoded) =
-            encode_stream_data_with_flate_level(&filter_dictionary, &union_font, flate_level)
-        else {
+        }
+        let Ok(encoded) = encode_flate(&union_font, flate_level) else {
             continue;
         };
         let original_encoded = indices
@@ -1567,7 +1568,7 @@ fn union_sparse_cid_font_programs_hayro(
             continue;
         }
 
-        replace_current_stream_data(document, canonical.program, encoded.clone())?;
+        replace_current_stream_data(document, canonical.program, encoded.clone(), true)?;
         // Keep Length1 truthful for the newly synthesized program. Existing
         // single-program table stripping intentionally preserves candidate-32
         // behavior; this only applies to the union stream.
@@ -2048,7 +2049,7 @@ impl ObjectHandleParserCallbacks for IdentityCidGlyphScanner<'_> {
         object: FlObjectHandle,
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.apply_operator(&operator);
             self.operands.clear();
@@ -2058,7 +2059,7 @@ impl ObjectHandleParserCallbacks for IdentityCidGlyphScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -2145,7 +2146,7 @@ impl ObjectHandleParserCallbacks for WinAnsiCodeScanner<'_> {
         object: FlObjectHandle,
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.apply_operator(&operator);
             self.operands.clear();
@@ -2155,7 +2156,7 @@ impl ObjectHandleParserCallbacks for WinAnsiCodeScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -2220,7 +2221,7 @@ struct FontUsageScanner<'a> {
 }
 
 impl ObjectHandleParserCallbacks for FontUsageScanner<'_> {
-    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+    fn content_size(&mut self, size: usize) -> crate::Result<()> {
         self.identity.content_size(size)?;
         self.winansi.content_size(size)
     }
@@ -2230,7 +2231,7 @@ impl ObjectHandleParserCallbacks for FontUsageScanner<'_> {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let identity = self
             .identity
             .handle_object(object.clone(), offset, length)?;
@@ -2244,7 +2245,7 @@ impl ObjectHandleParserCallbacks for FontUsageScanner<'_> {
         )
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         self.identity.handle_eof()?;
         self.winansi.handle_eof()
     }
@@ -2278,7 +2279,13 @@ fn scan_font_usage_scope(
             unsafe_programs: BTreeSet::new(),
         },
     };
-    if flpdf::parse_detached_content_stream(content, "font glyph usage", &mut scanner).is_err() {
+    if crate::content_stream::parse_detached_content_stream(
+        content,
+        "font glyph usage",
+        &mut scanner,
+    )
+    .is_err()
+    {
         identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
         winansi_unsafe.extend(winansi_eligible.values().copied());
         return;
@@ -2690,100 +2697,21 @@ fn inspect_owned_direct_font_object(
     Ok(())
 }
 
-fn owned_to_flpdf_resolved(
-    document: &EditDocument,
-    value: &OwnedObject,
-    depth: usize,
-) -> Result<FlObjectHandle> {
-    if depth > 64 {
-        return Err(Error::Invalid(
-            "font stream filter object nesting exceeds supported depth".to_owned(),
-        ));
-    }
-    match value {
-        OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(FlObjectHandle::null());
-            };
-            owned_to_flpdf_resolved(document, &value, depth + 1)
-        }
-        OwnedObject::Null => Ok(FlObjectHandle::null()),
-        OwnedObject::Boolean(value) => Ok(FlObjectHandle::boolean(*value)),
-        OwnedObject::Integer(value) => Ok(FlObjectHandle::integer(*value)),
-        OwnedObject::Real(value) => Ok(FlObjectHandle::real(*value)),
-        OwnedObject::Name(value) => Ok(FlObjectHandle::name(value.clone())),
-        OwnedObject::String(value) => Ok(FlObjectHandle::string(value.clone())),
-        OwnedObject::Array(values) => Ok(FlObjectHandle::array(
-            values
-                .iter()
-                .map(|value| owned_to_flpdf_resolved(document, value, depth + 1))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        OwnedObject::Dictionary(dictionary) => Ok(FlObjectHandle::dictionary(
-            dictionary
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        [b"/".as_slice(), key.as_slice()].concat(),
-                        owned_to_flpdf_resolved(document, value, depth + 1)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        OwnedObject::Stream { .. } => Err(Error::Invalid(
-            "stream object cannot be used as font filter parameter".to_owned(),
-        )),
-    }
-}
-
-fn is_lone_flate_filter(document: &EditDocument, value: &OwnedObject) -> Result<bool> {
-    let Some(value) = document.resolve_owned_value(value)? else {
-        return Ok(false);
-    };
-    match value {
-        OwnedObject::Name(name) => Ok(name == b"FlateDecode"),
-        OwnedObject::Array(values) if values.len() == 1 => {
-            Ok(owned_name_value(document, values.first())?.as_deref() == Some(b"FlateDecode"))
-        }
-        _ => Ok(false),
-    }
-}
-
-fn flpdf_filter_dictionary(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
-) -> Result<Option<FlObjectHandle>> {
-    let Some(filter) = dictionary.get(b"Filter".as_slice()) else {
-        return Ok(None);
-    };
-    if !is_lone_flate_filter(document, filter)? || dictionary.contains_key(b"F".as_slice()) {
-        return Ok(None);
-    }
-
-    let mut entries = vec![(
-        b"/Filter".to_vec(),
-        owned_to_flpdf_resolved(document, filter, 0)?,
-    )];
-    if let Some(params) = dictionary.get(b"DecodeParms".as_slice()) {
-        entries.push((
-            b"/DecodeParms".to_vec(),
-            owned_to_flpdf_resolved(document, params, 0)?,
-        ));
-    }
-    Ok(Some(FlObjectHandle::dictionary(entries)))
-}
-
 fn replace_current_stream_data(
     document: &mut EditDocument,
     handle: CowObjectHandle,
     encoded: Vec<u8>,
+    plain_flate: bool,
 ) -> Result<()> {
     let object = match handle {
         CowObjectHandle::Existing(id) => document.edit_object(id)?,
         CowObjectHandle::New(id) => document.edit_added_object(id)?,
     };
     match object {
-        OwnedObject::Stream { data, .. } => {
+        OwnedObject::Stream { dictionary, data } => {
+            if plain_flate {
+                set_plain_flate(dictionary);
+            }
             *data = StreamData::Owned(encoded);
             Ok(())
         }
@@ -2942,10 +2870,10 @@ fn decoded_u16_mapping(
     };
     let raw = data.bytes(document.source())?;
     let decoded = if dictionary.contains_key(b"Filter".as_slice()) {
-        let Some(filter_dictionary) = flpdf_filter_dictionary(document, &dictionary)? else {
+        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
             return Ok(None);
-        };
-        let Ok(decoded) = decode_stream_data(&filter_dictionary, raw.as_ref()) else {
+        }
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
             return Ok(None);
         };
         decoded
@@ -2969,14 +2897,16 @@ fn encode_like_stream(
     dictionary: &OwnedDictionary,
     decoded: &[u8],
     flate_level: i32,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, bool)>> {
     if dictionary.get(b"Filter".as_slice()).is_none() {
-        return Ok(Some(decoded.to_vec()));
+        return Ok(Some((decoded.to_vec(), false)));
     }
-    let Some(filter_dictionary) = flpdf_filter_dictionary(document, dictionary)? else {
+    if !is_unfiltered_or_lone_flate(document, dictionary)? {
         return Ok(None);
-    };
-    Ok(encode_stream_data_with_flate_level(&filter_dictionary, decoded, flate_level).ok())
+    }
+    Ok(encode_flate(decoded, flate_level)
+        .ok()
+        .map(|encoded| (encoded, true)))
 }
 
 fn set_font_program_length1(
@@ -3068,11 +2998,11 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         };
         let program_raw = program_data.bytes(document.source())?;
         let program_decoded = if program_dictionary.contains_key(b"Filter".as_slice()) {
-            let Some(filter_dictionary) = flpdf_filter_dictionary(document, &program_dictionary)?
-            else {
+            if !is_unfiltered_or_lone_flate(document, &program_dictionary)? {
                 continue;
-            };
-            let Ok(decoded) = decode_stream_data(&filter_dictionary, program_raw.as_ref()) else {
+            }
+            let Ok(decoded) = decode_stream(document, &program_dictionary, program_raw.as_ref())
+            else {
                 continue;
             };
             decoded
@@ -3082,13 +3012,13 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         let Some(dense) = sfnt_compact_glyph_ids(&program_decoded, &requested_gids) else {
             continue;
         };
-        let Some(encoded_program) =
+        let Some((encoded_program, program_plain_flate)) =
             encode_like_stream(document, &program_dictionary, &dense.bytes, flate_level)?
         else {
             continue;
         };
 
-        let mut encoded_maps = Vec::<(CowObjectHandle, Vec<u8>, usize)>::new();
+        let mut encoded_maps = Vec::<(CowObjectHandle, Vec<u8>, usize, bool)>::new();
         let mut remap_ok = true;
         for (map, dictionary, values, raw_len) in map_data {
             let mut decoded = Vec::with_capacity(values.len().saturating_mul(2));
@@ -3107,12 +3037,13 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
             if !remap_ok {
                 break;
             }
-            let Some(encoded) = encode_like_stream(document, &dictionary, &decoded, flate_level)?
+            let Some((encoded, plain_flate)) =
+                encode_like_stream(document, &dictionary, &decoded, flate_level)?
             else {
                 remap_ok = false;
                 break;
             };
-            encoded_maps.push((map, encoded, raw_len));
+            encoded_maps.push((map, encoded, raw_len, plain_flate));
         }
         if !remap_ok {
             continue;
@@ -3121,23 +3052,23 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
         let before_encoded = program_raw.len().saturating_add(
             encoded_maps
                 .iter()
-                .map(|(_, _, raw_len)| *raw_len)
+                .map(|(_, _, raw_len, _)| *raw_len)
                 .sum::<usize>(),
         );
         let after_encoded = encoded_program.len().saturating_add(
             encoded_maps
                 .iter()
-                .map(|(_, encoded, _)| encoded.len())
+                .map(|(_, encoded, _, _)| encoded.len())
                 .sum::<usize>(),
         );
         if after_encoded >= before_encoded {
             continue;
         }
 
-        replace_current_stream_data(document, program, encoded_program)?;
+        replace_current_stream_data(document, program, encoded_program, program_plain_flate)?;
         set_font_program_length1(document, program, dense.bytes.len())?;
-        for (map, encoded, _) in encoded_maps {
-            replace_current_stream_data(document, map, encoded)?;
+        for (map, encoded, _, plain_flate) in encoded_maps {
+            replace_current_stream_data(document, map, encoded, plain_flate)?;
         }
 
         stats.programs_optimized = stats.programs_optimized.saturating_add(1);
@@ -3353,11 +3284,13 @@ pub fn strip_font_editing_tables_hayro(
         let OwnedObject::Stream { dictionary, data } = object else {
             continue;
         };
-        let Some(filter_dictionary) = flpdf_filter_dictionary(document, &dictionary)? else {
+        if dictionary.get(b"Filter".as_slice()).is_none()
+            || !is_unfiltered_or_lone_flate(document, &dictionary)?
+        {
             continue;
-        };
+        }
         let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream_data(&filter_dictionary, raw.as_ref()) else {
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
             continue;
         };
         let allow_outline_subset = outline_subset_programs.contains(&program);
@@ -3406,9 +3339,7 @@ pub fn strip_font_editing_tables_hayro(
         if !changed {
             continue;
         }
-        let Ok(encoded) =
-            encode_stream_data_with_flate_level(&filter_dictionary, &candidate, flate_level)
-        else {
+        let Ok(encoded) = encode_flate(&candidate, flate_level) else {
             continue;
         };
         if encoded.len() >= raw.len() {
@@ -3421,7 +3352,7 @@ pub fn strip_font_editing_tables_hayro(
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
         stats.glyph_outline_bytes_removed += removed_outline_bytes;
-        replace_current_stream_data(document, program, encoded)?;
+        replace_current_stream_data(document, program, encoded, true)?;
     }
 
     Ok(stats)

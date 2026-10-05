@@ -1,9 +1,11 @@
+use crate::content_stream::{
+    ContentObject as ObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, Result,
     content::{page_content, replace_page_content, resolved_dictionary},
 };
-use flpdf::content_stream::ContentScalar;
-use flpdf::{Matrix, ObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -371,7 +373,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             let span_start = self
                 .operands
@@ -393,7 +395,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         object: ObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             let span_start = self
                 .operands
@@ -410,7 +412,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -554,7 +556,7 @@ pub fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> R
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if flpdf::parse_detached_content_stream(
+        if crate::content_stream::parse_detached_content_stream(
             &content,
             "repeated page object cache preflight",
             &mut scanner,
@@ -583,7 +585,7 @@ pub fn remove_repeated_page_objects_hayro(
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if flpdf::parse_detached_content_stream(
+        if crate::content_stream::parse_detached_content_stream(
             &content,
             "repeated page object removal seed",
             &mut scanner,
@@ -605,7 +607,7 @@ pub fn remove_repeated_page_objects_hayro(
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if flpdf::parse_detached_content_stream(
+        if crate::content_stream::parse_detached_content_stream(
             &content,
             "repeated page object removal",
             &mut scanner,
@@ -728,8 +730,12 @@ mod tests {
         let mut scanner = PageScanner::new(2, &xobjects);
         let content = b"q 2 0 0 3 101 699 cm /Im0 Do Q";
         assert!(
-            flpdf::parse_detached_content_stream(content, "repeated xobject test", &mut scanner)
-                .is_ok()
+            crate::content_stream::parse_detached_content_stream(
+                content,
+                "repeated xobject test",
+                &mut scanner
+            )
+            .is_ok()
         );
         assert_eq!(scanner.candidates.len(), 1);
         let candidate = &scanner.candidates[0];

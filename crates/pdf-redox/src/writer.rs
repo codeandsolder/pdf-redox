@@ -322,7 +322,7 @@ fn write_hayro_number(output: &mut Vec<u8>, value: &hayro_syntax::object::Number
     Ok(())
 }
 
-fn write_pdf_real(output: &mut Vec<u8>, value: f64) -> Result<()> {
+pub(crate) fn write_pdf_real(output: &mut Vec<u8>, value: f64) -> Result<()> {
     if !value.is_finite() {
         return Err(Error::InvalidReal);
     }
@@ -381,7 +381,7 @@ fn expand_scientific(value: &str) -> Result<String> {
     Ok(expanded)
 }
 
-fn write_pdf_name(output: &mut Vec<u8>, name: &[u8]) {
+pub(crate) fn write_pdf_name(output: &mut Vec<u8>, name: &[u8]) {
     output.push(b'/');
     for &byte in name {
         if is_direct_name_byte(byte) {
@@ -401,7 +401,7 @@ const fn is_direct_name_byte(byte: u8) -> bool {
         )
 }
 
-fn write_pdf_string(output: &mut Vec<u8>, value: &[u8]) {
+pub(crate) fn write_pdf_string(output: &mut Vec<u8>, value: &[u8]) {
     if value.iter().all(|byte| matches!(byte, b' '..=b'~')) {
         output.push(b'(');
         for &byte in value {

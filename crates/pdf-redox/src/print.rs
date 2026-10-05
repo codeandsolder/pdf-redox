@@ -1,5 +1,9 @@
 use crate::Result;
-use flpdf::{ImageResizeTarget, Matrix, ObjectHandle, ObjectHandleParserCallbacks, ParseControl};
+use crate::content_stream::{
+    ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::Matrix;
+use flpdf::ImageResizeTarget;
 #[cfg(test)]
 use flpdf::{ObjectRef, PageObjectHelper, Pdf};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -151,7 +155,7 @@ impl ObjectHandleParserCallbacks for PlacementScanner {
         object: ObjectHandle,
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.operator(&operator);
             self.operands.clear();
@@ -161,7 +165,7 @@ impl ObjectHandleParserCallbacks for PlacementScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         if !self.stack.is_empty() {
             self.complete = false;
         }
@@ -725,7 +729,7 @@ impl ObjectHandleParserCallbacks for CowPlacementScanner {
         object: ObjectHandle,
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.operator(&operator);
             self.operands.clear();
@@ -734,7 +738,7 @@ impl ObjectHandleParserCallbacks for CowPlacementScanner {
         }
         Ok(ParseControl::Continue)
     }
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         if !self.stack.is_empty() {
             self.complete = false;
         }
@@ -799,8 +803,8 @@ fn cow_content_value(
     };
     match value {
         crate::OwnedObject::Stream { .. } => {
-            let bytes =
-                document.decoded_owned_stream_data(&value, flpdf::DecodeLevel::Specialized)?;
+            let bytes = document
+                .decoded_owned_stream_data(&value, crate::stream_codec::DecodeLevel::Specialized)?;
             if !out.is_empty() && out.last() != Some(&b'\n') {
                 out.push(b'\n');
             }
@@ -1009,10 +1013,15 @@ fn cow_scan_form(
         if !scope_complete {
             *state.complete = false;
         }
-        let content = document.decoded_stream_data(form, flpdf::DecodeLevel::Specialized)?;
+        let content =
+            document.decoded_stream_data(form, crate::stream_codec::DecodeLevel::Specialized)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
-        if flpdf::parse_detached_content_stream(&content, "Hayro/COW form placement", &mut scanner)
-            .is_err()
+        if crate::content_stream::parse_detached_content_stream(
+            &content,
+            "Hayro/COW form placement",
+            &mut scanner,
+        )
+        .is_err()
             || !scanner.complete
         {
             *state.complete = false;
@@ -1153,8 +1162,12 @@ pub fn plan_print_downsampling_hayro(
         base_ctm.scale(user_unit, user_unit);
         let content = cow_page_content(document, page)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
-        if flpdf::parse_detached_content_stream(&content, "Hayro/COW page placement", &mut scanner)
-            .is_err()
+        if crate::content_stream::parse_detached_content_stream(
+            &content,
+            "Hayro/COW page placement",
+            &mut scanner,
+        )
+        .is_err()
             || !scanner.complete
         {
             complete = false;

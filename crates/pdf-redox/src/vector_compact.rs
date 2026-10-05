@@ -1,10 +1,12 @@
+use crate::content_stream::{
+    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
 };
 use flate2::{Compression, write::ZlibEncoder};
-use flpdf::content_stream::ContentScalar;
-use flpdf::{Matrix, ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -386,7 +388,7 @@ impl ObjectHandleParserCallbacks for FillScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -402,7 +404,7 @@ impl ObjectHandleParserCallbacks for FillScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -412,7 +414,7 @@ impl ObjectHandleParserCallbacks for FillScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -426,7 +428,7 @@ impl ObjectHandleParserCallbacks for FillScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -696,7 +698,7 @@ fn compact_content_from_fill_scan(
         initial_fills
     } else {
         let mut scanner = FillScanner::new(ext_gstates.clone());
-        if flpdf::parse_detached_content_stream(
+        if crate::content_stream::parse_detached_content_stream(
             &covered_pruned,
             "vector rectangle compaction after covered-fill pruning",
             &mut scanner,
@@ -746,8 +748,12 @@ fn compact_content_with_ext_gstates(
     ext_gstates: &BTreeMap<Vec<u8>, ExtGStatePatch>,
 ) -> (Vec<u8>, VectorCompactionStats) {
     let mut scanner = FillScanner::new(ext_gstates.clone());
-    if flpdf::parse_detached_content_stream(input, "vector rectangle compaction", &mut scanner)
-        .is_err()
+    if crate::content_stream::parse_detached_content_stream(
+        input,
+        "vector rectangle compaction",
+        &mut scanner,
+    )
+    .is_err()
     {
         return (input.to_vec(), VectorCompactionStats::default());
     }
@@ -1025,7 +1031,7 @@ impl ObjectHandleParserCallbacks for PathBlockScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -1041,7 +1047,7 @@ impl ObjectHandleParserCallbacks for PathBlockScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -1051,7 +1057,7 @@ impl ObjectHandleParserCallbacks for PathBlockScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -1065,7 +1071,7 @@ impl ObjectHandleParserCallbacks for PathBlockScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -1343,7 +1349,7 @@ impl ObjectHandleParserCallbacks for TransformedBlockScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -1359,7 +1365,7 @@ impl ObjectHandleParserCallbacks for TransformedBlockScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -1369,7 +1375,7 @@ impl ObjectHandleParserCallbacks for TransformedBlockScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -1386,15 +1392,19 @@ impl ObjectHandleParserCallbacks for TransformedBlockScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
 
 fn factorable_transformed_blocks(input: &[u8]) -> Vec<TransformedBlock> {
     let mut scanner = TransformedBlockScanner::new();
-    if flpdf::parse_detached_content_stream(input, "transformed block form factoring", &mut scanner)
-        .is_err()
+    if crate::content_stream::parse_detached_content_stream(
+        input,
+        "transformed block form factoring",
+        &mut scanner,
+    )
+    .is_err()
     {
         return Vec::new();
     }
@@ -1404,8 +1414,12 @@ fn factorable_transformed_blocks(input: &[u8]) -> Vec<TransformedBlock> {
 #[cfg(test)]
 fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
     let mut scanner = PathBlockScanner::new();
-    if flpdf::parse_detached_content_stream(input, "repeated path form factoring", &mut scanner)
-        .is_err()
+    if crate::content_stream::parse_detached_content_stream(
+        input,
+        "repeated path form factoring",
+        &mut scanner,
+    )
+    .is_err()
     {
         return Vec::new();
     }
@@ -1447,7 +1461,7 @@ impl ProcessingFactorScanner {
 impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
     const HANDLES_CONTENT_SCALARS: bool = true;
 
-    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+    fn content_size(&mut self, size: usize) -> crate::Result<()> {
         self.path.content_size(size)?;
         self.transformed.content_size(size)
     }
@@ -1457,7 +1471,7 @@ impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             self.process_operator(operator, offset, length);
         } else {
@@ -1474,7 +1488,7 @@ impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator, offset, length);
         Ok(ParseControl::Continue)
     }
@@ -1484,7 +1498,7 @@ impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator, offset, length);
         } else if object.as_inline_image().is_some() {
@@ -1498,15 +1512,19 @@ impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
 
 fn factorable_processing_blocks(input: &[u8]) -> (Vec<PathBlock>, Vec<TransformedBlock>) {
     let mut scanner = ProcessingFactorScanner::new();
-    if flpdf::parse_detached_content_stream(input, "processing form factoring", &mut scanner)
-        .is_err()
+    if crate::content_stream::parse_detached_content_stream(
+        input,
+        "processing form factoring",
+        &mut scanner,
+    )
+    .is_err()
     {
         return (Vec::new(), Vec::new());
     }
@@ -1672,7 +1690,7 @@ impl ProcessingPageScanner {
 impl ObjectHandleParserCallbacks for ProcessingPageScanner {
     const HANDLES_CONTENT_SCALARS: bool = true;
 
-    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+    fn content_size(&mut self, size: usize) -> crate::Result<()> {
         self.factor.content_size(size)
     }
 
@@ -1681,7 +1699,7 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             self.path_coordinates.process_operator(operator);
         } else {
@@ -1701,7 +1719,7 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.path_coordinates.process_operator(operator);
         let fill = self.fill.handle_operator(operator, offset, length)?;
         let factor = self.factor.handle_operator(operator, offset, length)?;
@@ -1717,7 +1735,7 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.path_coordinates.process_operator(&operator);
         } else if object.as_inline_image().is_some() {
@@ -1736,7 +1754,7 @@ impl ObjectHandleParserCallbacks for ProcessingPageScanner {
         )
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         self.fill.handle_eof()?;
         self.factor.handle_eof()
     }
@@ -1747,7 +1765,12 @@ fn scan_processing_page(
     ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>,
 ) -> Option<ProcessingVectorAnalysis> {
     let mut scanner = ProcessingPageScanner::new(ext_gstates);
-    flpdf::parse_detached_content_stream(input, "processing vector analysis", &mut scanner).ok()?;
+    crate::content_stream::parse_detached_content_stream(
+        input,
+        "processing vector analysis",
+        &mut scanner,
+    )
+    .ok()?;
     Some(scanner.finish())
 }
 
@@ -2722,7 +2745,7 @@ impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             let operands = std::mem::take(&mut self.operands);
             self.process_operator(operator, offset, length, &operands);
@@ -2741,7 +2764,7 @@ impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let operands = std::mem::take(&mut self.operands);
         self.process_operator(operator, offset, length, &operands);
         Ok(ParseControl::Continue)
@@ -2752,7 +2775,7 @@ impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             let operands = std::mem::take(&mut self.operands);
             self.process_operator(&operator, offset, length, &operands);
@@ -2771,15 +2794,19 @@ impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
 
 fn factorable_shared_q_blocks(input: &[u8], targets: &SharedResourceTargets) -> Vec<SharedQBlock> {
     let mut scanner = SharedQBlockScanner::new(input, targets);
-    if flpdf::parse_detached_content_stream(input, "shared q-block factoring", &mut scanner)
-        .is_err()
+    if crate::content_stream::parse_detached_content_stream(
+        input,
+        "shared q-block factoring",
+        &mut scanner,
+    )
+    .is_err()
     {
         return Vec::new();
     }
@@ -3393,7 +3420,7 @@ impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             self.process_operator(operator);
         } else {
@@ -3415,7 +3442,7 @@ impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
         operator: &[u8],
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.process_operator(operator);
         Ok(ParseControl::Continue)
     }
@@ -3425,7 +3452,7 @@ impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.process_operator(&operator);
         } else if object.as_inline_image().is_some() {
@@ -3444,7 +3471,7 @@ impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -3454,7 +3481,7 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
         return None;
     }
     let mut scanner = PathCoordinateScanner::new(input, user_unit);
-    let parsed = flpdf::parse_detached_content_stream(
+    let parsed = crate::content_stream::parse_detached_content_stream(
         input,
         "path coordinate canonicalization",
         &mut scanner,

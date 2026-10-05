@@ -1,3 +1,7 @@
+use crate::content_stream::{
+    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::Matrix;
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
     StreamData,
@@ -18,8 +22,6 @@ use crate::{
     },
 };
 use flate2::{Compression, write::ZlibEncoder};
-use flpdf::content_stream::ContentScalar;
-use flpdf::{Matrix, ObjectHandle as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -936,7 +938,7 @@ impl ObjectHandleParserCallbacks for RasterScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -956,7 +958,7 @@ impl ObjectHandleParserCallbacks for RasterScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         self.operator(operator, offset, length);
         self.operands.clear();
         Ok(ParseControl::Continue)
@@ -967,7 +969,7 @@ impl ObjectHandleParserCallbacks for RasterScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             self.operator(&operator, offset, length);
             self.operands.clear();
@@ -988,7 +990,7 @@ impl ObjectHandleParserCallbacks for RasterScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         if self.analysis_only_no_images {
             if self.analysis_q_depth != 0 {
                 self.complete = false;
@@ -1025,7 +1027,7 @@ impl RasterVectorScanner {
 impl ObjectHandleParserCallbacks for RasterVectorScanner {
     const HANDLES_CONTENT_SCALARS: bool = true;
 
-    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+    fn content_size(&mut self, size: usize) -> crate::Result<()> {
         self.vector.content_size(size)
     }
 
@@ -1034,7 +1036,7 @@ impl ObjectHandleParserCallbacks for RasterVectorScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let raster = self.raster.handle_scalar(scalar.clone(), offset, length)?;
         let vector = self.vector.handle_scalar(scalar, offset, length)?;
         if matches!(raster, ParseControl::Stop) || matches!(vector, ParseControl::Stop) {
@@ -1049,7 +1051,7 @@ impl ObjectHandleParserCallbacks for RasterVectorScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let raster = self.raster.handle_operator(operator, offset, length)?;
         let vector = self.vector.handle_operator(operator, offset, length)?;
         if matches!(raster, ParseControl::Stop) || matches!(vector, ParseControl::Stop) {
@@ -1064,7 +1066,7 @@ impl ObjectHandleParserCallbacks for RasterVectorScanner {
         object: FlObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let raster = self.raster.handle_object(object.clone(), offset, length)?;
         let vector = self.vector.handle_object(object, offset, length)?;
         Ok(
@@ -1076,7 +1078,7 @@ impl ObjectHandleParserCallbacks for RasterVectorScanner {
         )
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         self.raster.handle_eof()?;
         self.vector.handle_eof()
     }
@@ -1296,7 +1298,7 @@ fn scan_target(
     content: &[u8],
 ) -> Result<Option<RasterScanner>> {
     let mut scanner = new_raster_scanner(document, resources)?;
-    let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
+    let stopped_on_container_eof = crate::content_stream::parse_detached_content_stream_recovering(
         content,
         "raster-layout normalization",
         &mut scanner,
@@ -1350,11 +1352,12 @@ fn scan_target_shared(
             };
             Some(hidden_ranges)
         } else {
-            let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
-                content,
-                "shared raster/vector page content",
-                &mut scanner,
-            )?;
+            let stopped_on_container_eof =
+                crate::content_stream::parse_detached_content_stream_recovering(
+                    content,
+                    "shared raster/vector page content",
+                    &mut scanner,
+                )?;
             if stopped_on_container_eof {
                 return Ok(None);
             }
@@ -1386,11 +1389,12 @@ fn scan_target_shared(
         };
         Some(hidden_ranges)
     } else {
-        let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
-            content,
-            "raster-layout normalization",
-            &mut scanner,
-        )?;
+        let stopped_on_container_eof =
+            crate::content_stream::parse_detached_content_stream_recovering(
+                content,
+                "raster-layout normalization",
+                &mut scanner,
+            )?;
         if stopped_on_container_eof {
             return Ok(None);
         }
@@ -1834,7 +1838,8 @@ fn decode_mask_stream(
     if !matches!(bpc, 1 | 2 | 4 | 8) {
         return Ok(None);
     }
-    let decoded = match document.decoded_owned_stream_data(&stream, flpdf::DecodeLevel::Specialized)
+    let decoded = match document
+        .decoded_owned_stream_data(&stream, crate::stream_codec::DecodeLevel::Specialized)
     {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -1952,7 +1957,9 @@ fn indexed_palette(
     let bytes = match lookup {
         OwnedObject::String(bytes) => bytes,
         OwnedObject::Stream { .. } => {
-            match document.decoded_owned_stream_data(&lookup, flpdf::DecodeLevel::Specialized) {
+            match document
+                .decoded_owned_stream_data(&lookup, crate::stream_codec::DecodeLevel::Specialized)
+            {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(None),
             }
@@ -2311,15 +2318,16 @@ fn image_info(
     if bpc != 8 && !indexed && !device_gray {
         return Ok(None);
     }
-    let raw_decoded = match document.decoded_owned_stream_data(&object, flpdf::DecodeLevel::All) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            if *DEBUG_RASTER {
-                eprintln!("raster-layout: skipping undecodable image {handle:?}: {error}");
+    let raw_decoded =
+        match document.decoded_owned_stream_data(&object, crate::stream_codec::DecodeLevel::All) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                if *DEBUG_RASTER {
+                    eprintln!("raster-layout: skipping undecodable image {handle:?}: {error}");
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-    };
+        };
     let mut decoded = if (indexed || device_gray) && bpc != 8 {
         let Some(samples) = unpack_packed_samples(&raw_decoded, width, height, bpc) else {
             return Ok(None);
@@ -6341,7 +6349,7 @@ mod tests {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/GS0 gs 0 0 2 2 re f 0 0 10 10 re f";
         assert!(
-            flpdf::parse_detached_content_stream(
+            crate::content_stream::parse_detached_content_stream(
                 input,
                 "vector inventory containment",
                 &mut scanner,
@@ -6356,7 +6364,7 @@ mod tests {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"0 0 10 10 re f 2 2 1 1 re f";
         assert!(
-            flpdf::parse_detached_content_stream(
+            crate::content_stream::parse_detached_content_stream(
                 input,
                 "vector inventory contained repaint",
                 &mut scanner,
@@ -6371,8 +6379,12 @@ mod tests {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/Shared gs /Shared scn /Sh0 sh";
         assert!(
-            flpdf::parse_detached_content_stream(input, "typed resource inventory", &mut scanner)
-                .is_ok()
+            crate::content_stream::parse_detached_content_stream(
+                input,
+                "typed resource inventory",
+                &mut scanner
+            )
+            .is_ok()
         );
         let usage = scanner.resource_usage_after_removing(&HashSet::new());
         assert_eq!(
@@ -6394,8 +6406,12 @@ mod tests {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/Im0 Do 1 Do";
         assert!(
-            flpdf::parse_detached_content_stream(input, "stale resource name", &mut scanner)
-                .is_ok()
+            crate::content_stream::parse_detached_content_stream(
+                input,
+                "stale resource name",
+                &mut scanner
+            )
+            .is_ok()
         );
         let usage = scanner.resource_usage_after_removing(&HashSet::new());
         assert_eq!(
@@ -6629,8 +6645,12 @@ mod tests {
         );
         let input = b"/Im1 Do (overlay) Tj /Im2 Do";
         assert!(
-            flpdf::parse_detached_content_stream(input, "stripe text z-order", &mut scanner)
-                .is_ok()
+            crate::content_stream::parse_detached_content_stream(
+                input,
+                "stripe text z-order",
+                &mut scanner
+            )
+            .is_ok()
         );
         assert_eq!(scanner.draws.len(), 2);
         assert_ne!(

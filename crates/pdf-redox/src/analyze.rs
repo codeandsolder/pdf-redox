@@ -1,10 +1,13 @@
+use crate::content_stream::{
+    ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::stream_codec::DecodeLevel;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
     RiskKind, content::page_content, hidden_text::analyze_hidden_text_hayro,
     prune::should_prune_resources_hayro,
 };
 use flate2::{Compression, write::ZlibEncoder};
-use flpdf::{DecodeLevel, ObjectHandle, ObjectHandleParserCallbacks, ParseControl};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -513,7 +516,7 @@ impl ObjectHandleParserCallbacks for InlineImageCounter {
         object: ObjectHandle,
         _offset: usize,
         _length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(bytes) = object.as_inline_image() {
             self.count += 1;
             self.bytes += bytes.len();
@@ -522,7 +525,7 @@ impl ObjectHandleParserCallbacks for InlineImageCounter {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -531,7 +534,7 @@ fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize
     let mut counter = InlineImageCounter::default();
     for page in document.page_handles()? {
         let content = page_content(document, page)?;
-        flpdf::parse_detached_content_stream(
+        crate::content_stream::parse_detached_content_stream(
             &content,
             "Hayro analysis page content",
             &mut counter,
@@ -553,7 +556,7 @@ fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize
             continue;
         }
         let content = document.decoded_owned_stream_data(&object, DecodeLevel::Specialized)?;
-        flpdf::parse_detached_content_stream(
+        crate::content_stream::parse_detached_content_stream(
             &content,
             "Hayro analysis Form content",
             &mut counter,

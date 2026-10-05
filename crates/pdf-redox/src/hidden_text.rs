@@ -1,13 +1,14 @@
 use crate::config::HiddenTextPolicy;
+use crate::content_stream::{
+    ContentObject as ObjectHandle, ContentObjectRef as ObjectRef, ContentScalar,
+    ObjectHandleParserCallbacks, ParseControl,
+};
+use crate::geometry::{Matrix, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
 };
+use crate::stream_codec::DecodeLevel;
 use crate::{EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result};
-use flpdf::content_stream::ContentScalar;
-use flpdf::{
-    DecodeLevel, Matrix, ObjectHandle, ObjectHandleParserCallbacks, ObjectRef, ParseControl,
-    Rectangle,
-};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1022,7 +1023,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -1038,7 +1039,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let span_start = self
             .operands
             .first()
@@ -1055,7 +1056,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         object: ObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             let span_start = self
                 .operands
@@ -1074,7 +1075,7 @@ impl ObjectHandleParserCallbacks for PageScanner<'_> {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -1354,7 +1355,7 @@ impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = scalar.as_operator() {
             return self.handle_operator(operator, offset, length);
         }
@@ -1370,7 +1371,7 @@ impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let span_start = self
             .operands
             .first()
@@ -1386,7 +1387,7 @@ impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
         object: ObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         if let Some(operator) = object.as_operator() {
             let span_start = self
                 .operands
@@ -1404,7 +1405,7 @@ impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
         Ok(ParseControl::Continue)
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -1586,7 +1587,7 @@ pub fn remove_large_diagonal_text_hayro(
             continue;
         }
         let mut scanner = LargeDiagonalTextScanner::default();
-        flpdf::parse_detached_content_stream(
+        crate::content_stream::parse_detached_content_stream(
             &decoded,
             "large diagonal text removal",
             &mut scanner,
@@ -2084,7 +2085,7 @@ where
 {
     const HANDLES_CONTENT_SCALARS: bool = A::HANDLES_CONTENT_SCALARS && B::HANDLES_CONTENT_SCALARS;
 
-    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+    fn content_size(&mut self, size: usize) -> crate::Result<()> {
         self.first.content_size(size)?;
         self.second.content_size(size)
     }
@@ -2094,7 +2095,7 @@ where
         scalar: ContentScalar,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         debug_assert!(Self::HANDLES_CONTENT_SCALARS);
         let first = self.first.handle_scalar(scalar.clone(), offset, length)?;
         let second = self.second.handle_scalar(scalar, offset, length)?;
@@ -2110,7 +2111,7 @@ where
         operator: &[u8],
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let first = self.first.handle_operator(operator, offset, length)?;
         let second = self.second.handle_operator(operator, offset, length)?;
         if matches!(first, ParseControl::Stop) || matches!(second, ParseControl::Stop) {
@@ -2125,7 +2126,7 @@ where
         object: ObjectHandle,
         offset: usize,
         length: usize,
-    ) -> flpdf::Result<ParseControl> {
+    ) -> crate::Result<ParseControl> {
         let first = self.first.handle_object(object.clone(), offset, length)?;
         let second = self.second.handle_object(object, offset, length)?;
         Ok(
@@ -2137,7 +2138,7 @@ where
         )
     }
 
-    fn handle_eof(&mut self) -> flpdf::Result<()> {
+    fn handle_eof(&mut self) -> crate::Result<()> {
         self.first.handle_eof()?;
         self.second.handle_eof()
     }
@@ -2205,7 +2206,7 @@ where
         first: other,
         second: &mut scanner,
     };
-    let stopped_on_container_eof = flpdf::parse_detached_content_stream_recovering(
+    let stopped_on_container_eof = crate::content_stream::parse_detached_content_stream_recovering(
         content,
         "shared raster/hidden-text page content",
         &mut tee,
@@ -2237,7 +2238,11 @@ fn scan_page_hayro(
         ocg.base_off,
         &ocg.on,
     );
-    flpdf::parse_detached_content_stream(&content, "Hayro/COW page content", &mut scanner)?;
+    crate::content_stream::parse_detached_content_stream(
+        &content,
+        "Hayro/COW page content",
+        &mut scanner,
+    )?;
     Ok(scanner.finish())
 }
 
@@ -2443,8 +2448,12 @@ mod tests {
     fn large_diagonal_ranges(input: &[u8]) -> Vec<(usize, usize)> {
         let mut scanner = LargeDiagonalTextScanner::default();
         assert!(
-            flpdf::parse_detached_content_stream(input, "large diagonal text test", &mut scanner)
-                .is_ok()
+            crate::content_stream::parse_detached_content_stream(
+                input,
+                "large diagonal text test",
+                &mut scanner
+            )
+            .is_ok()
         );
         scanner.selected_ranges()
     }

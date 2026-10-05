@@ -354,28 +354,27 @@ dependencies = [
 [[package]]
 name = "hayro-ccitt"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2866f0d976e76497480b853d5e258dab6e4b89ecfe991124e08f15dfa8fd03ad"
+source = "git+https://github.com/codeandsolder/hayro?rev=387240b51fb3f53d5249921565e718ee1a75507b#387240b51fb3f53d5249921565e718ee1a75507b"
 
 [[package]]
 name = "hayro-jbig2"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "000e025850f4592ddcaee85640db70704151f2bafd43b6f431aa5b6a2c6a35a9"
+source = "git+https://github.com/codeandsolder/hayro?rev=387240b51fb3f53d5249921565e718ee1a75507b#387240b51fb3f53d5249921565e718ee1a75507b"
 dependencies = [
  "hayro-ccitt",
 ]
 
 [[package]]
 name = "hayro-jpeg2000"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bab0c77d09c0d9b144d429d0bf0fcd4c63c01d5f6c33f9b8ed501283e0f1ef76"
+version = "0.4.1"
+source = "git+https://github.com/codeandsolder/hayro?rev=387240b51fb3f53d5249921565e718ee1a75507b#387240b51fb3f53d5249921565e718ee1a75507b"
 
 [[package]]
 name = "hayro-syntax"
-version = "0.7.2"
+version = "0.8.0"
+source = "git+https://github.com/codeandsolder/hayro?rev=387240b51fb3f53d5249921565e718ee1a75507b#387240b51fb3f53d5249921565e718ee1a75507b"
 dependencies = [
+ "hayro-ccitt",
  "hayro-jbig2",
  "hayro-jpeg2000",
  "rustc-hash",
