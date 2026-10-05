@@ -1369,6 +1369,88 @@ mod tests {
         Ok(writer.get_buffer()?)
     }
 
+    fn corrupt_xref_with_compressed_page_tree_fixture() -> Vec<u8> {
+        fn append_object(pdf: &mut Vec<u8>, object: &[u8]) -> usize {
+            let offset = pdf.len();
+            pdf.extend_from_slice(object);
+            offset
+        }
+
+        fn xref_entry(out: &mut Vec<u8>, kind: u8, field2: u32, field3: u16) {
+            out.push(kind);
+            out.extend_from_slice(&field2.to_be_bytes());
+            out.extend_from_slice(&field3.to_be_bytes());
+        }
+
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let catalog = append_object(
+            &mut pdf,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+
+        let object_stream_data = b"2 0 << /Type /Pages /Kids [4 0 R] /Count 1 >>";
+        let object_stream_header = format!(
+            "3 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            object_stream_data.len()
+        );
+        let object_stream = pdf.len();
+        pdf.extend_from_slice(object_stream_header.as_bytes());
+        pdf.extend_from_slice(object_stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let page = append_object(
+            &mut pdf,
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 6 0 R >>\nendobj\n",
+        );
+        let content = append_object(
+            &mut pdf,
+            b"6 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+
+        let xref = pdf.len();
+        let mut entries = Vec::new();
+        xref_entry(&mut entries, 0, 0, 65535);
+        xref_entry(
+            &mut entries,
+            1,
+            u32::try_from(catalog).unwrap_or(u32::MAX),
+            0,
+        );
+        xref_entry(&mut entries, 2, 3, 0);
+        xref_entry(
+            &mut entries,
+            1,
+            u32::try_from(object_stream).unwrap_or(u32::MAX),
+            0,
+        );
+        xref_entry(&mut entries, 1, u32::try_from(page).unwrap_or(u32::MAX), 0);
+        // Corrupt but unrelated normal entry: object 5 falsely points at object 1.
+        xref_entry(
+            &mut entries,
+            1,
+            u32::try_from(catalog).unwrap_or(u32::MAX),
+            0,
+        );
+        xref_entry(
+            &mut entries,
+            1,
+            u32::try_from(content).unwrap_or(u32::MAX),
+            0,
+        );
+        xref_entry(&mut entries, 1, u32::try_from(xref).unwrap_or(u32::MAX), 0);
+        pdf.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&entries);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
     fn empty_then_drawing_fixture() -> Result<Vec<u8>> {
         let mut pdf = Pdf::empty()?;
         let catalog = pdf.root_handle()?;
@@ -1406,6 +1488,19 @@ mod tests {
         writer.set_object_stream_mode(ObjectStreamMode::Preserve);
         writer.write()?;
         Ok(writer.get_buffer()?)
+    }
+
+    #[test]
+    fn analysis_of_corrupt_xref_keeps_compressed_page_tree_reachable() -> Result<()> {
+        let input = corrupt_xref_with_compressed_page_tree_fixture();
+        let source = crate::SourcePdf::from_bytes(input.clone())?;
+        assert_eq!(source.page_count(), 1);
+
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(report.before.page_count, 1);
+        let rewritten = crate::SourcePdf::from_bytes(output)?;
+        assert_eq!(rewritten.page_count(), 1);
+        Ok(())
     }
 
     #[test]
