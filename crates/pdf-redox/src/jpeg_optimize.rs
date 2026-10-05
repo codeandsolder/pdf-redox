@@ -45,7 +45,9 @@ fn is_safe_lone_dct(document: &EditDocument, dictionary: &OwnedDictionary) -> Re
 }
 
 fn compatible_decode(data: &[u8]) -> Option<Vec<u8>> {
-    hayro_syntax::object::stream::decode_standalone_stream(b"<< /Filter /DCTDecode >>", data).ok()
+    libjpeg_turbo_rs::decompress(data)
+        .ok()
+        .map(|image| image.data)
 }
 
 fn is_app_or_com_marker(marker: u8) -> bool {

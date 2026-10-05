@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    stream_codec::{DecodeLevel, encode_flate},
+    stream_codec::{decode_image_stream, encode_flate},
 };
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
@@ -374,7 +374,21 @@ fn decoded_pixels(
     height: u32,
     components: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let decoded = match document.decoded_owned_stream_data(image, DecodeLevel::Specialized) {
+    let OwnedObject::Stream { dictionary, data } = image else {
+        return Ok(None);
+    };
+    let encoded = data.bytes(document.source())?;
+    let components_u8 = u8::try_from(components)
+        .map_err(|_| Error::Invalid("image component count exceeds u8".to_owned()))?;
+    let decoded = match decode_image_stream(
+        document,
+        dictionary,
+        encoded.as_ref(),
+        width,
+        height,
+        8,
+        components_u8,
+    ) {
         Ok(decoded) => decoded,
         Err(_) => return Ok(None),
     };

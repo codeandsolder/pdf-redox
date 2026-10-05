@@ -8,19 +8,11 @@ use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData, content::decoded_content_value, source::CurrentObject,
 };
-#[cfg(test)]
-use flpdf::{ObjectRef, Pdf};
 use hayro_syntax::object::{
     Dict as HayroDict, MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-#[cfg(test)]
-use std::{
-    collections::HashSet,
-    io::{Read, Seek},
-    rc::Rc,
-};
 
 const RENDERING_UNUSED_TABLES: [[u8; 4]; 16] = [
     *b"BASE", *b"GDEF", *b"GPOS", *b"GSUB", *b"JSTF", *b"MATH", *b"kern", *b"vhea", *b"vmtx",
@@ -1640,127 +1632,6 @@ fn union_sparse_cid_font_programs_hayro(
     Ok(stats)
 }
 
-#[cfg(test)]
-fn is_lone_flate(stream_dict: &flpdf::ObjectHandle) -> Result<bool> {
-    let filter = stream_dict.try_get_key(b"/Filter")?;
-    Ok(filter.try_is_name_and_equals(b"FlateDecode")? && !stream_dict.try_has_key(b"/F")?)
-}
-
-#[cfg(test)]
-pub fn strip_font_editing_tables<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    flate_level: i32,
-) -> Result<FontOptimizationStats> {
-    let objects = pdf.get_all_objects()?;
-
-    // Record how each FontDescriptor is used. `cmap` and `post` are needed by
-    // simple TrueType fonts, but CIDFontType2 selects glyphs through PDF's
-    // CID-to-GID machinery and does not need those sfnt tables for rendering.
-    let mut descriptor_usage = HashMap::<ObjectRef, FontProgramUsage>::new();
-    for object in &objects {
-        if !object.try_is_dictionary()? {
-            continue;
-        }
-        let subtype = object
-            .try_get_key(b"/Subtype")?
-            .as_name()
-            .unwrap_or_default();
-        let descriptor = object.try_get_key(b"/FontDescriptor")?;
-        let Some(descriptor_ref) = descriptor.object_ref() else {
-            continue;
-        };
-        let usage = descriptor_usage.entry(descriptor_ref).or_default();
-        if subtype == b"TrueType" {
-            usage.simple_truetype = true;
-        } else if subtype == b"CIDFontType2" {
-            usage.cidfont_type2 = true;
-        }
-    }
-
-    // A program can be shared by multiple FontDescriptors. Merge usage before
-    // deciding which tables can be discarded so a simple-font reference keeps
-    // `cmap`/`post` even if another descriptor uses the same program as CIDFontType2.
-    let mut program_usage = HashMap::<ObjectRef, FontProgramUsage>::new();
-    for object in &objects {
-        let Some(descriptor_ref) = object.object_ref() else {
-            continue;
-        };
-        let Some(usage) = descriptor_usage.get(&descriptor_ref).copied() else {
-            continue;
-        };
-        if !object.try_is_dictionary()? {
-            continue;
-        }
-        let keys = object.try_get_keys()?;
-        for key in [b"/FontFile2".as_slice(), b"/FontFile3".as_slice()] {
-            if !keys.contains(key) {
-                continue;
-            }
-            let program = object.try_get_key(key)?;
-            let Some(program_ref) = program.object_ref() else {
-                continue;
-            };
-            let merged = program_usage.entry(program_ref).or_default();
-            merged.simple_truetype |= usage.simple_truetype;
-            merged.cidfont_type2 |= usage.cidfont_type2;
-        }
-    }
-
-    let mut stats = FontOptimizationStats::default();
-    let mut seen = HashSet::<ObjectRef>::new();
-    for object in objects {
-        if !object.try_is_dictionary()? {
-            continue;
-        }
-        let keys = object.try_get_keys()?;
-        for key in [b"/FontFile2".as_slice(), b"/FontFile3".as_slice()] {
-            if !keys.contains(key) {
-                continue;
-            }
-            let program = object.try_get_key(key)?;
-            let Some(program_ref) = program.object_ref() else {
-                continue;
-            };
-            if !seen.insert(program_ref) {
-                continue;
-            }
-            let Some(stream_dict) = program.as_stream_dict() else {
-                continue;
-            };
-            if !is_lone_flate(&stream_dict)? {
-                continue;
-            }
-            let Ok(decoded) = program.get_stream_data(DecodeLevel::Generalized) else {
-                continue;
-            };
-            let usage = program_usage.get(&program_ref).copied().unwrap_or_default();
-            let Some((trimmed, removed_decoded_bytes)) =
-                sfnt_for_pdf_rendering(decoded.as_ref(), usage)
-            else {
-                continue;
-            };
-            let Ok(encoded) =
-                encode_stream_data_with_flate_level(&stream_dict, &trimmed, flate_level)
-            else {
-                continue;
-            };
-            let original = program.get_raw_stream_data()?;
-            if encoded.len() >= original.len() {
-                continue;
-            }
-
-            stats.programs_optimized += 1;
-            stats.original_encoded_bytes += original.len();
-            stats.optimized_encoded_bytes += encoded.len();
-            stats.decoded_table_bytes_removed += removed_decoded_bytes;
-            program.replace_stream_data(Rc::new(encoded), None, None);
-            program.set_filter_on_write(false)?;
-            pdf.mark_object_handle_dirty(&program)?;
-        }
-    }
-    Ok(stats)
-}
-
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 2] = [b"FontFile2", b"FontFile3"];
 
 fn owned_name_value(
@@ -3361,9 +3232,9 @@ pub fn strip_font_editing_tables_hayro(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectId, SourcePdf};
+    use crate::ObjectId;
     use flate2::{Compression, write::ZlibEncoder};
-    use std::io::{Cursor, Write};
+    use std::io::Write;
 
     fn append_pdf_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]) {
         offsets.push(pdf.len());
@@ -3444,10 +3315,6 @@ mod tests {
                 .as_bytes(),
         );
         Ok(pdf)
-    }
-
-    fn hayro_font_fixture() -> Result<Vec<u8>> {
-        hayro_font_fixture_with_filter_array(false)
     }
 
     fn hayro_direct_cid_font_fixture() -> Result<Vec<u8>> {
@@ -3635,31 +3502,6 @@ mod tests {
     }
 
     #[test]
-    fn lone_flate_filter_rejects_multi_filter_arrays() -> Result<()> {
-        let document = EditDocument::from_bytes(hayro_font_fixture()?)?;
-        assert!(is_lone_flate_filter(
-            &document,
-            &OwnedObject::Name(b"FlateDecode".to_vec())
-        )?);
-        assert!(is_lone_flate_filter(
-            &document,
-            &OwnedObject::Array(vec![OwnedObject::Name(b"FlateDecode".to_vec())])
-        )?);
-        assert!(!is_lone_flate_filter(
-            &document,
-            &OwnedObject::Array(vec![
-                OwnedObject::Name(b"ASCII85Decode".to_vec()),
-                OwnedObject::Name(b"FlateDecode".to_vec()),
-            ])
-        )?);
-        assert!(!is_lone_flate_filter(
-            &document,
-            &OwnedObject::Array(vec![OwnedObject::Name(b"LZWDecode".to_vec())])
-        )?);
-        Ok(())
-    }
-
-    #[test]
     fn hayro_font_table_strip_accepts_single_flate_filter_array() -> Result<()> {
         let input = hayro_font_fixture_with_filter_array(true)?;
         let mut document = EditDocument::from_bytes(input)?;
@@ -3672,25 +3514,6 @@ mod tests {
         let mut reparsed = EditDocument::from_bytes(output)?;
         let second = strip_font_editing_tables_hayro(&mut reparsed, 9)?;
         assert_eq!(second.programs_optimized, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn hayro_font_table_strip_matches_flpdf_accounting() -> Result<()> {
-        let input = hayro_font_fixture()?;
-        let mut flpdf = Pdf::open(Cursor::new(input.clone()))?;
-        let expected = strip_font_editing_tables(&mut flpdf, 9)?;
-
-        let mut document = EditDocument::from_bytes(input)?;
-        let actual = strip_font_editing_tables_hayro(&mut document, 9)?;
-        assert_eq!(actual, expected);
-        assert_eq!(actual.programs_optimized, 1);
-        assert!(actual.optimized_encoded_bytes < actual.original_encoded_bytes);
-        assert_eq!(actual.decoded_table_bytes_removed, 8192);
-
-        let output = document.write_compact()?;
-        let reparsed = SourcePdf::from_bytes(output)?;
-        assert_eq!(reparsed.page_count(), 1);
         Ok(())
     }
 

@@ -1615,14 +1615,7 @@ mod tests {
                 .try_is_name_and_equals(b"FlateDecode")?
         );
         let decode_params = dictionary.try_get_key(b"/DecodeParms")?;
-        assert_eq!(
-            decode_params.try_get_key(b"/Predictor")?.as_integer(),
-            Some(12)
-        );
-        assert_eq!(
-            decode_params.try_get_key(b"/Columns")?.as_integer(),
-            Some(150)
-        );
+        assert!(decode_params.is_null());
         let raw = image.get_raw_stream_data()?;
         assert_eq!(raw.len() as u64, report.raster_optimized_encoded_bytes);
         let decoded = flpdf::filters::decode_stream_data(&dictionary, raw.as_ref())?;

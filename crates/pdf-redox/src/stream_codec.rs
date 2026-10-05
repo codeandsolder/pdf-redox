@@ -120,6 +120,36 @@ pub(crate) fn decode_stream(
         .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
 }
 
+/// Decode image-stream bytes with the image metadata required by DCT/JPX/etc.
+pub(crate) fn decode_image_stream(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    encoded: &[u8],
+    width: u32,
+    height: u32,
+    bits_per_component: u8,
+    components: u8,
+) -> Result<Vec<u8>> {
+    if !dictionary.contains_key(b"Filter".as_slice()) {
+        return Ok(encoded.to_vec());
+    }
+    let filter_dictionary = standalone_filter_dictionary(document, dictionary)?;
+    let params = hayro_syntax::object::stream::ImageDecodeParams {
+        is_indexed: false,
+        bpc: Some(bits_per_component),
+        num_components: Some(components),
+        target_dimension: None,
+        width,
+        height,
+    };
+    hayro_syntax::object::stream::decode_standalone_image_stream(
+        &filter_dictionary,
+        encoded,
+        &params,
+    )
+    .map_err(|error| Error::Invalid(format!("failed to decode image stream filters: {error:?}")))
+}
+
 /// Encode ordinary zlib/Flate data at an explicit PDF compression level.
 pub(crate) fn encode_flate(decoded: &[u8], level: i32) -> Result<Vec<u8>> {
     let level = u32::try_from(level)
