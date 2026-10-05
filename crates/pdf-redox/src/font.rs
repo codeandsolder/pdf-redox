@@ -1604,10 +1604,9 @@ fn collect_dense_cidfont_users_from_object(
                 let entry = users.entry(program).or_default();
                 match dictionary.get(b"CIDToGIDMap".as_slice()) {
                     Some(OwnedObject::Reference(map))
-                        if matches!(
-                            document.current_owned_object(*map)?,
-                            Some(OwnedObject::Stream { .. })
-                        ) =>
+                        if document
+                            .current_object(*map)?
+                            .is_some_and(|object| object.is_stream()) =>
                     {
                         entry.maps.insert(*map);
                     }

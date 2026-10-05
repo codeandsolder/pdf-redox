@@ -2346,10 +2346,10 @@ fn appearance_dictionary_targets(
             };
             match value {
                 OwnedObject::Reference(handle) => {
-                    if matches!(
-                        document.current_owned_object(*handle)?,
-                        Some(OwnedObject::Dictionary(_))
-                    ) {
+                    if document
+                        .current_object(*handle)?
+                        .is_some_and(|object| object.is_dictionary())
+                    {
                         targets.insert(DirectDictionaryTarget {
                             root: *handle,
                             path: Vec::new(),
@@ -2470,10 +2470,10 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
                         let OwnedObject::Reference(stream) = value else {
                             continue;
                         };
-                        if matches!(
-                            document.current_owned_object(*stream)?,
-                            Some(OwnedObject::Stream { .. })
-                        ) {
+                        if document
+                            .current_object(*stream)?
+                            .is_some_and(|object| object.is_stream())
+                        {
                             holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
                                 root: *target,
                                 path: Vec::new(),
@@ -2490,10 +2490,10 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
                     let OwnedObject::Reference(stream) = value else {
                         continue;
                     };
-                    if matches!(
-                        document.current_owned_object(*stream)?,
-                        Some(OwnedObject::Stream { .. })
-                    ) {
+                    if document
+                        .current_object(*stream)?
+                        .is_some_and(|object| object.is_stream())
+                    {
                         holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
                             root: page,
                             path: vec![DirectPathStep::DictKey(b"Contents".to_vec())],

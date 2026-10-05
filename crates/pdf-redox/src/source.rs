@@ -554,6 +554,24 @@ pub enum CurrentObject<'a> {
     Owned(&'a OwnedObject),
 }
 
+impl CurrentObject<'_> {
+    /// Returns whether this current object is a stream in either representation.
+    pub(crate) const fn is_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(Object::Stream(_)) | Self::Owned(OwnedObject::Stream { .. })
+        )
+    }
+
+    /// Returns whether this current object is a plain dictionary in either representation.
+    pub(crate) const fn is_dictionary(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(Object::Dict(_)) | Self::Owned(OwnedObject::Dictionary(_))
+        )
+    }
+}
+
 fn contains_indirect_reference(value: &OwnedObject) -> bool {
     match value {
         OwnedObject::Reference(_) => true,
