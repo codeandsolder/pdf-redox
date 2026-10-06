@@ -1,5 +1,5 @@
+use crate::Result;
 use crate::stream_codec::{encode_flate, set_plain_flate};
-use crate::{FlatePolicy, Result};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlateOptimizationStats {
@@ -10,6 +10,8 @@ pub struct FlateOptimizationStats {
     pub high_effort_extra_savings_bytes: usize,
 }
 
+const MIN_FLATE_SAVINGS_BYTES: usize = 1024;
+const MIN_FLATE_SAVINGS_PERCENT: usize = 5;
 const ADAPTIVE_FLATE_MIN_DECODED_BYTES: usize = 1024 * 1024;
 const ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT: usize = 10;
 
@@ -81,19 +83,10 @@ fn is_safe_lone_flate(
     Ok(true)
 }
 
-pub fn apply_flate_policy(
+pub fn optimize_flate_streams(
     document: &mut crate::EditDocument,
-    policy: FlatePolicy,
     level: crate::FlateLevel,
 ) -> Result<FlateOptimizationStats> {
-    let (min_savings_bytes, min_savings_percent, force) = match policy {
-        FlatePolicy::Preserve => return Ok(FlateOptimizationStats::default()),
-        FlatePolicy::Selective {
-            min_savings_bytes,
-            min_savings_percent,
-        } => (min_savings_bytes, min_savings_percent, false),
-        FlatePolicy::RecompressAll => (0, 0, true),
-    };
     let mut stats = FlateOptimizationStats::default();
     for handle in document.reachable_streams()? {
         let Some(crate::OwnedObject::Stream { dictionary, data }) =
@@ -118,10 +111,8 @@ pub fn apply_flate_policy(
         let high_effort_extra_savings_bytes = encoded.high_effort_extra_savings_bytes;
         let repacked = encoded.bytes;
         let saving = raw.len().saturating_sub(repacked.len());
-        if !force
-            && (saving < min_savings_bytes
-                || saving.saturating_mul(100)
-                    < raw.len().saturating_mul(usize::from(min_savings_percent)))
+        if saving < MIN_FLATE_SAVINGS_BYTES
+            || saving.saturating_mul(100) < raw.len().saturating_mul(MIN_FLATE_SAVINGS_PERCENT)
         {
             continue;
         }

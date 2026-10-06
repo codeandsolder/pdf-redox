@@ -2,8 +2,8 @@ mod corpus;
 
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
-    AnnotationPolicy, Config, FlatePolicy, OptimizationGoal, PrivacyLevel,
-    analyze_microstroke_rasterization, analyze_pdf, optimize_pdf,
+    AnnotationPolicy, Config, OptimizationGoal, PrivacyLevel, analyze_microstroke_rasterization,
+    analyze_pdf, optimize_pdf,
 };
 use std::{
     io::{self, Write},
@@ -21,13 +21,6 @@ enum PrivacyArg {
     None,
     Metadata,
     BestEffort,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FlatePolicyArg {
-    Preserve,
-    Selective,
-    RecompressAll,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -121,15 +114,9 @@ struct Args {
     max_image_ppi: Option<u16>,
     #[arg(long, value_enum, default_value = "none")]
     privacy: PrivacyArg,
-    /// Existing Flate stream policy. Selective is the optimize-only default.
-    #[arg(long, value_enum, default_value = "selective")]
-    flate_policy: FlatePolicyArg,
     /// Choose whether conflicting rewrites favor encoded bytes or a simpler display list.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
-    /// Normalize page-content token syntax. This can increase file size.
-    #[arg(long)]
-    normalize_content: bool,
     /// Compact compatible vector path paints without rasterizing them.
     #[arg(long)]
     compact_vector_paths: bool,
@@ -178,12 +165,6 @@ struct Args {
     remove_active_content: bool,
     #[arg(long)]
     remove_signatures: bool,
-    /// Remove unused Font/XObject and typed ExtGState/Pattern/Properties/Shading resource entries. Enabled automatically in processing mode.
-    #[arg(long)]
-    prune_resources: bool,
-    /// Minimum duplicated encoded payload bytes for one cross-scope inline-image fingerprint.
-    #[arg(long, default_value_t = 1024)]
-    inline_image_dedup_min_waste: usize,
     /// Replace eligible large `ICCBased` color spaces with their declared Device alternate.
     /// Enabled automatically by --optimize-for processing.
     #[arg(long, conflicts_with = "keep_icc_color_management")]
@@ -206,10 +187,6 @@ struct Args {
     json: bool,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeping the one-to-one CLI flag-to-config mapping linear makes omissions and precedence easier to audit"
-)]
 fn config_from_args(args: &Args) -> Config {
     let mut cfg = match args.profile {
         ProfileArg::Optimize => Config::optimize_only(),
@@ -272,16 +249,10 @@ fn config_from_args(args: &Args) -> Config {
     if let Some(max_image_ppi) = args.max_image_ppi {
         cfg.max_image_ppi = Some(max_image_ppi);
     }
-    cfg.flate_policy = match args.flate_policy {
-        FlatePolicyArg::Preserve => FlatePolicy::Preserve,
-        FlatePolicyArg::Selective => FlatePolicy::default(),
-        FlatePolicyArg::RecompressAll => FlatePolicy::RecompressAll,
-    };
     cfg.optimization_goal = match args.optimize_for {
         OptimizeForArg::Size => OptimizationGoal::Size,
         OptimizeForArg::Processing => OptimizationGoal::Processing,
     };
-    cfg.normalize_content_streams = args.normalize_content;
     cfg.compact_vector_paths =
         args.compact_vector_paths || matches!(args.optimize_for, OptimizeForArg::Processing);
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
@@ -308,9 +279,6 @@ fn config_from_args(args: &Args) -> Config {
     cfg.privacy.remove_attachments = args.remove_attachments;
     cfg.privacy.remove_active_content = args.remove_active_content;
     cfg.privacy.remove_signatures = args.remove_signatures;
-    cfg.prune_resources =
-        args.prune_resources || matches!(args.optimize_for, OptimizeForArg::Processing);
-    cfg.inline_image_min_duplicate_payload_bytes = args.inline_image_dedup_min_waste;
     cfg.elide_icc_profiles_to_alternate = args.elide_icc_to_alternate
         || (matches!(args.optimize_for, OptimizeForArg::Processing)
             && !args.keep_icc_color_management);
@@ -468,6 +436,23 @@ mod tests {
             "--no-icc-dedup",
         ] {
             assert!(Args::try_parse_from(["pdf-redox", "input.pdf", flag]).is_err());
+        }
+    }
+
+    #[test]
+    fn removed_optimizer_policy_overrides_are_rejected() {
+        for args in [
+            &["pdf-redox", "input.pdf", "--flate-policy", "preserve"][..],
+            &["pdf-redox", "input.pdf", "--normalize-content"][..],
+            &["pdf-redox", "input.pdf", "--prune-resources"][..],
+            &[
+                "pdf-redox",
+                "input.pdf",
+                "--inline-image-dedup-min-waste",
+                "4096",
+            ][..],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
         }
     }
 

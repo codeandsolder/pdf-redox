@@ -264,32 +264,6 @@ impl Default for RasterLayoutConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "mode")]
-/// Policy for preserving or recompressing streams that use a lone Flate filter.
-pub enum FlatePolicy {
-    /// Preserve unmodified lone-Flate streams byte-for-byte.
-    Preserve,
-    /// Recompress only lone-Flate streams that clear explicit size gates.
-    Selective {
-        /// Minimum absolute encoded-byte reduction required to accept recompression.
-        min_savings_bytes: usize,
-        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
-        min_savings_percent: u8,
-    },
-    /// Ask the writer to recompress every eligible Flate stream.
-    RecompressAll,
-}
-
-impl Default for FlatePolicy {
-    fn default() -> Self {
-        Self::Selective {
-            min_savings_bytes: 1024,
-            min_savings_percent: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 /// Requested depth of privacy-oriented metadata and active-content cleanup.
 pub enum PrivacyLevel {
@@ -437,8 +411,6 @@ pub struct Config {
     /// Primary optimization objective used when size and display-list simplicity conflict.
     #[serde(default)]
     pub optimization_goal: OptimizationGoal,
-    /// Normalize lexical representation of page content streams.
-    pub normalize_content_streams: bool,
     /// Batch semantically equivalent vector path paints while preserving vector geometry.
     #[serde(default)]
     pub compact_vector_paths: bool,
@@ -447,14 +419,6 @@ pub struct Config {
     /// normal optimize/processing policies and enabled by default only for Print.
     #[serde(default)]
     pub rasterize_excessive_small_vectors: bool,
-    /// Policy for preserving or recompressing existing Flate streams.
-    pub flate_policy: FlatePolicy,
-    /// Remove unused `/Font` and `/XObject` entries plus typed `/ExtGState`, `/Pattern`,
-    /// `/Properties`, and `/Shading` entries using the parse-gated Hayro/COW pruning pass.
-    pub prune_resources: bool,
-    /// Minimum duplicated encoded payload bytes for one exact inline-image fingerprint.
-    /// Inline-image header savings are deliberately ignored by this gate.
-    pub inline_image_min_duplicate_payload_bytes: usize,
     /// Replace eligible large `/ICCBased` color spaces with their declared Device alternate.
     /// This intentionally drops embedded color-management transforms and is therefore lossy.
     #[serde(default)]
@@ -475,12 +439,8 @@ impl Config {
             remove_large_diagonal_text: false,
             remove_repeated_page_objects: false,
             optimization_goal: OptimizationGoal::Size,
-            normalize_content_streams: false,
             compact_vector_paths: false,
             rasterize_excessive_small_vectors: false,
-            flate_policy: FlatePolicy::default(),
-            prune_resources: false,
-            inline_image_min_duplicate_payload_bytes: 1024,
             elide_icc_profiles_to_alternate: false,
         }
     }
@@ -676,12 +636,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets whether page content streams are lexically normalized.
-    pub const fn normalize_content_streams(mut self, value: bool) -> Self {
-        self.config.normalize_content_streams = value;
-        self
-    }
-
     /// Sets whether semantically equivalent vector paints are compacted.
     pub const fn compact_vector_paths(mut self, value: bool) -> Self {
         self.config.compact_vector_paths = value;
@@ -691,24 +645,6 @@ impl ConfigBuilder {
     /// Sets whether pathological fields of tiny opaque vector strokes may be rasterized.
     pub const fn rasterize_excessive_small_vectors(mut self, value: bool) -> Self {
         self.config.rasterize_excessive_small_vectors = value;
-        self
-    }
-
-    /// Sets the policy for lone-Flate stream recompression.
-    pub const fn flate_policy(mut self, value: FlatePolicy) -> Self {
-        self.config.flate_policy = value;
-        self
-    }
-
-    /// Sets whether unused typed resource entries are pruned.
-    pub const fn prune_resources(mut self, value: bool) -> Self {
-        self.config.prune_resources = value;
-        self
-    }
-
-    /// Sets the minimum duplicated encoded inline-image payload required before externalization.
-    pub const fn inline_image_min_duplicate_payload_bytes(mut self, value: usize) -> Self {
-        self.config.inline_image_min_duplicate_payload_bytes = value;
         self
     }
 
@@ -755,6 +691,10 @@ mod tests {
             r#"{"deduplicate_metadata_streams":false}"#,
             r#"{"deduplicate_inline_images":false}"#,
             r#"{"generate_object_streams":false}"#,
+            r#"{"normalize_content_streams":true}"#,
+            r#"{"flate_policy":{"mode":"preserve"}}"#,
+            r#"{"prune_resources":false}"#,
+            r#"{"inline_image_min_duplicate_payload_bytes":4096}"#,
         ] {
             assert!(serde_json::from_str::<Config>(stale).is_err());
         }
@@ -811,10 +751,6 @@ mod tests {
             .annotation_policy(AnnotationPolicy::AppearanceOnly)
             .preserve_unknown_objects(false)
             .max_image_ppi(Some(300))
-            .normalize_content_streams(true)
-            .flate_policy(FlatePolicy::Preserve)
-            .prune_resources(true)
-            .inline_image_min_duplicate_payload_bytes(4096)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
                 strip_jpeg_metadata: true,
@@ -837,10 +773,6 @@ mod tests {
         );
         assert!(!config.preservation.unknown_objects);
         assert_eq!(config.max_image_ppi, Some(300));
-        assert!(config.normalize_content_streams);
-        assert_eq!(config.flate_policy, FlatePolicy::Preserve);
-        assert!(config.prune_resources);
-        assert_eq!(config.inline_image_min_duplicate_payload_bytes, 4096);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);
     }

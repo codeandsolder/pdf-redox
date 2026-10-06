@@ -1,7 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
     RiskKind, content::page_content, hidden_text::analyze_hidden_text,
-    prune::should_prune_resources,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -884,12 +883,6 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             Err(error) => out
                 .warnings
                 .push(format!("inline-image analysis skipped: {error}")),
-        }
-        match should_prune_resources(document) {
-            Ok(candidate) => out.resource_pruning_auto_triggered = candidate,
-            Err(error) => out
-                .warnings
-                .push(format!("resource-pruning preflight skipped: {error}")),
         }
     }
 

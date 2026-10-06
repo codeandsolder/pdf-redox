@@ -27,7 +27,6 @@ pub struct CorpusFileSummary {
     inline_images: usize,
     inline_image_bytes: usize,
     duplicate_inline_image_wasted_bytes: usize,
-    resource_pruning_auto_triggered: bool,
     flate_recompress_potential_saving_bytes: usize,
     non_image_flate_recompress_potential_saving_bytes: usize,
     hidden_text_findings: usize,
@@ -56,7 +55,6 @@ impl CorpusFileSummary {
             inline_image_bytes: analysis.inline_image_bytes,
             duplicate_inline_image_wasted_bytes: analysis
                 .duplicate_inline_image_payload_wasted_bytes,
-            resource_pruning_auto_triggered: analysis.resource_pruning_auto_triggered,
             flate_recompress_potential_saving_bytes: analysis
                 .flate_recompress_potential_saving_bytes,
             non_image_flate_recompress_potential_saving_bytes: analysis
@@ -125,7 +123,6 @@ struct CorpusTotals {
     documents_with_duplicate_images: u64,
     documents_with_duplicate_forms: u64,
     documents_with_duplicate_fonts: u64,
-    resource_pruning_auto_triggered_documents: u64,
     flate_streams: u64,
     flate_recompress_candidates: u64,
     flate_recompress_potential_saving_bytes: u64,
@@ -394,8 +391,6 @@ fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
         u64::from(analysis.duplicate_image_payload_groups > 0);
     totals.documents_with_duplicate_forms += u64::from(analysis.duplicate_form_payload_groups > 0);
     totals.documents_with_duplicate_fonts += u64::from(analysis.duplicate_font_payload_groups > 0);
-    totals.resource_pruning_auto_triggered_documents +=
-        u64::from(analysis.resource_pruning_auto_triggered);
     totals.flate_streams += analysis.flate_stream_count as u64;
     totals.flate_recompress_candidates += analysis.flate_recompress_candidate_count as u64;
     totals.flate_recompress_potential_saving_bytes +=

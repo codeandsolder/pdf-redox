@@ -9,7 +9,7 @@ use crate::{
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
         canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
     },
-    flate::{apply_flate_policy, compress_unfiltered_streams},
+    flate::{compress_unfiltered_streams, optimize_flate_streams},
     font::{
         FontOptimizationStats, dense_compact_cidfont_type2_programs, strip_font_editing_tables,
         union_sparse_cid_font_programs_after_dedup,
@@ -33,7 +33,7 @@ use crate::{
     },
     preservation::{PreservationStats, apply_preservation_policy},
     print::{PrintPlanHayro, plan_print_downsampling},
-    prune::{ResourcePruneStats, prune_resources, prune_resources_with_usage},
+    prune::{prune_resources, prune_resources_with_usage},
     raster_layout::normalize_raster_layout,
     repeated_page_objects::{
         RepeatedPageObjectStats, remove_repeated_page_objects,
@@ -305,11 +305,7 @@ fn optimize_pdf_with_document(
         if raster_proved_no_inline {
             Ok(DuplicateInlineImageStats::default())
         } else {
-            externalize_duplicate_inline_images(
-                &mut document,
-                0,
-                cfg.inline_image_min_duplicate_payload_bytes,
-            )
+            externalize_duplicate_inline_images(&mut document)
         }
     })?;
 
@@ -497,9 +493,6 @@ fn optimize_pdf_with_document(
     })?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
-        if !cfg.prune_resources {
-            return Ok(ResourcePruneStats::default());
-        }
         let shared_usage_is_exact = cfg.raster_layout.enabled
             && raster_layout.resource_inventory_complete
             && physically_hidden_text.removed == 0
@@ -527,10 +520,10 @@ fn optimize_pdf_with_document(
         }
     })?;
     let flate = timed(&mut timings, "flate-policy", || {
-        apply_flate_policy(&mut document, cfg.flate_policy, flate_level)
+        optimize_flate_streams(&mut document, flate_level)
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
-        if cfg.normalize_content_streams {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             normalize_page_contents(&mut document)?;
         }
         Ok(())

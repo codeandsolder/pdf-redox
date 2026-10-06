@@ -23,6 +23,8 @@ pub struct DuplicateInlineImageStats {
     pub duplicate_payload_bytes: usize,
 }
 
+const MIN_DUPLICATE_INLINE_IMAGE_WASTE_BYTES: usize = 1024;
+
 #[derive(Debug, Clone)]
 struct DetachedInlineImage {
     name: Vec<u8>,
@@ -266,7 +268,6 @@ fn inspect_inline_images(
     document: &EditDocument,
     resources: &OwnedDictionary,
     content: &[u8],
-    min_size: usize,
 ) -> Result<HashMap<InlineImageFingerprint, (usize, usize)>> {
     let mut counts = HashMap::new();
     let mut iter = UntypedIter::new(content);
@@ -278,9 +279,6 @@ fn inspect_inline_images(
             continue;
         };
         let data = stream.raw_data();
-        if data.len() < min_size {
-            continue;
-        }
         let (dictionary, color_space_resolved) =
             converted_inline_dictionary(document, resources, stream.dict())?;
         if !color_space_resolved {
@@ -312,7 +310,6 @@ fn rewrite_inline_images(
     document: &EditDocument,
     resources: &OwnedDictionary,
     content: &[u8],
-    min_size: usize,
     mut resource_names: BTreeSet<Vec<u8>>,
     selected: Option<&HashSet<InlineImageFingerprint>>,
 ) -> Result<DetachedInlineImageRewrite> {
@@ -332,9 +329,6 @@ fn rewrite_inline_images(
             continue;
         };
         let data = stream.raw_data();
-        if data.len() < min_size {
-            continue;
-        }
         let (dictionary, color_space_resolved) =
             converted_inline_dictionary(document, resources, stream.dict())?;
         let fingerprint = if selected.is_none() || color_space_resolved {
@@ -383,7 +377,6 @@ fn rewrite_inline_images(
 fn summary_for_target(
     document: &EditDocument,
     target: ContentTarget,
-    min_size: usize,
 ) -> Result<Option<TargetSummary>> {
     let resources = match target {
         ContentTarget::Page(page) => page_resources(document, page)?,
@@ -396,7 +389,7 @@ fn summary_for_target(
         ContentTarget::Page(page) => page_content(document, page)?,
         ContentTarget::Form(form) => form_content(document, form)?,
     };
-    let counts = inspect_inline_images(document, &resources, &content, min_size)?;
+    let counts = inspect_inline_images(document, &resources, &content)?;
     Ok(Some(TargetSummary {
         target,
         resources,
@@ -476,13 +469,11 @@ fn install_rewrite(
 
 pub fn externalize_duplicate_inline_images(
     document: &mut EditDocument,
-    min_size: usize,
-    min_duplicate_payload_bytes: usize,
 ) -> Result<DuplicateInlineImageStats> {
     let mut summaries = Vec::new();
     let mut aggregate: HashMap<InlineImageFingerprint, (usize, usize, usize)> = HashMap::new();
     for target in collect_targets(document)? {
-        let Some(summary) = summary_for_target(document, target, min_size)? else {
+        let Some(summary) = summary_for_target(document, target)? else {
             continue;
         };
         for (&fingerprint, &(count, bytes)) in &summary.counts {
@@ -497,7 +488,7 @@ pub fn externalize_duplicate_inline_images(
         .iter()
         .filter_map(|(fingerprint, &(count, bytes, scopes))| {
             let wasted = count.saturating_sub(1).saturating_mul(bytes);
-            (count >= 2 && scopes >= 2 && wasted >= min_duplicate_payload_bytes)
+            (count >= 2 && scopes >= 2 && wasted >= MIN_DUPLICATE_INLINE_IMAGE_WASTE_BYTES)
                 .then_some(*fingerprint)
         })
         .collect();
@@ -527,7 +518,6 @@ pub fn externalize_duplicate_inline_images(
             document,
             &summary.resources,
             &summary.content,
-            min_size,
             names,
             Some(&selected),
         )?;
@@ -576,7 +566,7 @@ pub fn externalize_fragmented_inline_target(
         ContentTarget::Form(form) => form_content(document, form)?,
     };
     let names = direct_resource_names(document, &resources)?;
-    let rewrite = rewrite_inline_images(document, &resources, &content, 0, names, None)?;
+    let rewrite = rewrite_inline_images(document, &resources, &content, names, None)?;
     if debug && rewrite.externalized_occurrences > 0 {
         eprintln!(
             "raster-inline {target:?}: content={} inline={} unique={}",

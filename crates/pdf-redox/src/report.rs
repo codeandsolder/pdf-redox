@@ -248,8 +248,6 @@ pub struct PdfAnalysis {
     pub duplicate_inline_image_payload_groups: usize,
     /// Inline-image payload bytes wasted by exact duplicate occurrences.
     pub duplicate_inline_image_payload_wasted_bytes: usize,
-    /// Whether analysis found enough evidence to auto-trigger resource pruning.
-    pub resource_pruning_auto_triggered: bool,
     /// Number of Flate stream entries.
     pub flate_stream_count: usize,
     /// Number of Flate recompress candidate entries.
