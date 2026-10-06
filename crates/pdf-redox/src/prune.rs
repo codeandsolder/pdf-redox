@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject, ObjectHandleParserCallbacks, ParseControl, parse_detached_content_stream,
-};
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
@@ -13,13 +10,6 @@ type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 struct DetachedResourceUsage {
     names: BTreeSet<Vec<u8>>,
     names_by_resource_type: ResourceNamesByType,
-    pending_operands: bool,
-}
-
-#[derive(Debug, Default)]
-struct ResourceFinder {
-    last_name: Option<Vec<u8>>,
-    usage: DetachedResourceUsage,
 }
 
 const fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
@@ -35,37 +25,31 @@ const fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
-impl ObjectHandleParserCallbacks for ResourceFinder {
-    fn handle_object(
-        &mut self,
-        object: ContentObject,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<ParseControl> {
-        if let Some(name) = object.as_name() {
-            self.usage.pending_operands = true;
-            self.last_name = Some(name);
-        } else if let Some(operator) = object.as_operator() {
-            self.usage.pending_operands = false;
-            if let Some(resource_type) = operator_resource_type(&operator)
-                && let Some(name) = self.last_name.as_ref()
-            {
-                self.usage.names.insert(name.clone());
-                self.usage
-                    .names_by_resource_type
-                    .entry(resource_type.to_vec())
-                    .or_default()
-                    .insert(name.clone());
+fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
+    let mut usage = DetachedResourceUsage::default();
+    let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+        let Some(resource_type) = operator_resource_type(&instruction.operator[..]) else {
+            return Ok(());
+        };
+        let mut last_name = None;
+        for operand in instruction.operands() {
+            if let Some(name) = crate::content_stream::operand_name(operand) {
+                last_name = Some(name);
             }
-        } else if object.as_inline_image().is_none() {
-            self.usage.pending_operands = true;
         }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> Result<()> {
+        if let Some(name) = last_name {
+            let name = name.to_vec();
+            usage.names.insert(name.clone());
+            usage
+                .names_by_resource_type
+                .entry(resource_type.to_vec())
+                .or_default()
+                .insert(name);
+        }
         Ok(())
-    }
+    })
+    .ok()?;
+    (!incomplete).then_some(usage)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -155,12 +139,6 @@ fn is_form(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
     Ok(
         matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Form"),
     )
-}
-
-fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
-    let mut finder = ResourceFinder::default();
-    parse_detached_content_stream(content, "resource scan", &mut finder).ok()?;
-    (!finder.usage.pending_operands).then_some(finder.usage)
 }
 
 fn extend_names_by_type(target: &mut ResourceNamesByType, source: &ResourceNamesByType) {

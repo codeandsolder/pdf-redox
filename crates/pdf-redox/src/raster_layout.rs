@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
@@ -8,8 +5,7 @@ use crate::{
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
     hidden_text::{
-        HiddenTextSharedContext, hidden_text_shared_context_hayro,
-        scan_physical_hidden_text_with_callback_hayro,
+        HiddenTextSharedContext, hidden_text_shared_context_hayro, scan_physical_hidden_text_hayro,
     },
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
@@ -24,7 +20,6 @@ use crate::{
 use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Write,
@@ -116,42 +111,32 @@ enum ContentTarget {
 }
 
 #[derive(Debug, Clone)]
-enum ParsedOperandValue {
-    Scalar(ContentScalar),
-    Handle(FlObjectHandle),
-}
-
-impl ParsedOperandValue {
-    fn number(&self) -> Option<f64> {
-        match self {
-            Self::Scalar(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-            Self::Handle(value) => parsed_number(value),
-        }
-    }
-
-    fn name(&self) -> Option<Cow<'_, [u8]>> {
-        match self {
-            Self::Scalar(value) => value.as_name().map(Cow::Borrowed),
-            Self::Handle(value) => value.as_name().map(Cow::Owned),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct ParsedOperand {
-    value: ParsedOperandValue,
+    number: Option<f64>,
+    name: Option<Vec<u8>>,
     offset: usize,
 }
 
+fn parsed_operands(
+    input: &[u8],
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+) -> Vec<ParsedOperand> {
+    instruction
+        .operands()
+        .zip(instruction.operand_spans())
+        .map(|(object, span)| ParsedOperand {
+            number: crate::content_stream::operand_number(
+                object,
+                input.get(span.clone()).unwrap_or_default(),
+            ),
+            name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
+            offset: span.start,
+        })
+        .collect()
+}
+
 fn parsed_operand_numbers(operands: &[ParsedOperand]) -> Option<SmallVec<[f64; 6]>> {
-    let mut values = SmallVec::new();
-    for operand in operands {
-        values.push(operand.value.number()?);
-    }
-    Some(values)
+    operands.iter().map(|operand| operand.number).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -279,8 +264,6 @@ struct RasterScanner {
     vector_merge_candidate: bool,
     resource_counts: BTreeMap<Vec<u8>, usize>,
     resource_counts_by_type: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, usize>>,
-    resource_last_name: Option<Vec<u8>>,
-    resource_pending_operands: bool,
     analysis_only_no_images: bool,
     analysis_q_depth: usize,
 }
@@ -323,8 +306,6 @@ impl RasterScanner {
             vector_merge_candidate: false,
             resource_counts: BTreeMap::new(),
             resource_counts_by_type: BTreeMap::new(),
-            resource_last_name: None,
-            resource_pending_operands: false,
             analysis_only_no_images: false,
             analysis_q_depth: 0,
         }
@@ -344,8 +325,12 @@ impl RasterScanner {
     }
 
     fn record_resource_operator(&mut self, operator: &[u8]) {
-        self.resource_pending_operands = false;
-        let name = self.resource_last_name.take();
+        let name = self
+            .operands
+            .iter()
+            .filter_map(|operand| operand.name.as_ref())
+            .next_back()
+            .cloned();
         if let Some(resource_type) = Self::resource_type_for_operator(operator)
             && let Some(name) = name
         {
@@ -678,18 +663,18 @@ impl RasterScanner {
             }
             b"Do" => {
                 if self.operands.len() != 1
-                    || self.operands[0].value.name().is_none()
+                    || self.operands[0].name.as_deref().is_none()
                     || self.operands[0]
-                        .value
-                        .name()
-                        .is_some_and(|name| !self.xobjects.contains_key(name.as_ref()))
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !self.xobjects.contains_key(name))
                 {
                     self.complete = false;
                 }
             }
             b"gs" => {
                 if self.operands.len() == 1 {
-                    self.gs_name = self.operands[0].value.name().map(Cow::into_owned);
+                    self.gs_name = self.operands[0].name.as_deref().map(ToOwned::to_owned);
                     if self.gs_name.is_none() {
                         self.complete = false;
                     }
@@ -779,21 +764,21 @@ impl RasterScanner {
                     self.barrier();
                     return;
                 }
-                let Some(name) = self.operands[0].value.name() else {
+                let Some(name) = self.operands[0].name.as_deref() else {
                     self.complete = false;
                     self.barrier();
                     return;
                 };
-                let Some(target) = self.xobjects.get(name.as_ref()).copied() else {
+                let Some(target) = self.xobjects.get(name).copied() else {
                     self.complete = false;
                     self.barrier();
                     return;
                 };
-                if self.image_names.contains(name.as_ref()) {
+                if self.image_names.contains(name) {
                     let draw_index = self.draws.len();
                     self.draws.push(RasterDraw {
                         target,
-                        resource_name: name.into_owned(),
+                        resource_name: name.to_vec(),
                         ctm: self.ctm,
                         replace_ctm: self.ctm,
                         range_start: self.operands[0].offset,
@@ -826,7 +811,7 @@ impl RasterScanner {
             // merge plan is applied, not by requiring operator adjacency.
             b"gs" => {
                 if self.operands.len() == 1 {
-                    self.gs_name = self.operands[0].value.name().map(Cow::into_owned);
+                    self.gs_name = self.operands[0].name.as_deref().map(ToOwned::to_owned);
                     if self.gs_name.is_none() {
                         self.complete = false;
                     }
@@ -836,7 +821,7 @@ impl RasterScanner {
             }
             b"ri" => {
                 if self.operands.len() == 1 {
-                    self.rendering_intent = self.operands[0].value.name().map(Cow::into_owned);
+                    self.rendering_intent = self.operands[0].name.as_deref().map(ToOwned::to_owned);
                     if self.rendering_intent.is_none() {
                         self.complete = false;
                     }
@@ -928,69 +913,25 @@ impl RasterScanner {
             _ => self.mark_semantic_boundary(),
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for RasterScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
+    pub(crate) fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
-        }
-        self.resource_pending_operands = true;
-        if let Some(name) = scalar.as_name() {
-            self.resource_last_name = Some(name.to_vec());
-        }
-        self.operands.push(ParsedOperand {
-            value: ParsedOperandValue::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.operator(operator, offset, length);
-        self.operands.clear();
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.operator(&operator, offset, length);
-            self.operands.clear();
-        } else if object.as_inline_image().is_some() {
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
             self.inline_occurrences = self.inline_occurrences.saturating_add(1);
             self.mark_other_paint();
             self.barrier();
-        } else {
-            self.resource_pending_operands = true;
-            if let Some(name) = object.as_name() {
-                self.resource_last_name = Some(name);
-            }
-            self.operands.push(ParsedOperand {
-                value: ParsedOperandValue::Handle(object),
-                offset,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = parsed_operands(input, instruction);
+        let span = instruction.operator_span();
+        self.operator(&instruction.operator[..], span.start, span.len());
+        self.operands.clear();
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
+    const fn finish_scan(&mut self) {
         if self.analysis_only_no_images {
             if self.analysis_q_depth != 0 {
                 self.complete = false;
@@ -998,7 +939,15 @@ impl ObjectHandleParserCallbacks for RasterScanner {
         } else if !self.stack.is_empty() || !self.frames.is_empty() {
             self.complete = false;
         }
-        Ok(())
+    }
+
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })?;
+        self.finish_scan();
+        Ok(incomplete)
     }
 }
 
@@ -1019,68 +968,18 @@ impl RasterVectorScanner {
         })
     }
 
+    fn scan(&mut self, content: &[u8]) -> Result<bool> {
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            self.raster.instruction(content, instruction);
+            self.vector.instruction(content, instruction);
+            Ok(())
+        })?;
+        self.raster.finish_scan();
+        Ok(incomplete)
+    }
+
     fn finish(self) -> (RasterScanner, ProcessingVectorAnalysis) {
         (self.raster, self.vector.finish())
-    }
-}
-
-impl ObjectHandleParserCallbacks for RasterVectorScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn content_size(&mut self, size: usize) -> crate::Result<()> {
-        self.vector.content_size(size)
-    }
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let raster = self.raster.handle_scalar(scalar.clone(), offset, length)?;
-        let vector = self.vector.handle_scalar(scalar, offset, length)?;
-        if matches!(raster, ParseControl::Stop) || matches!(vector, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let raster = self.raster.handle_operator(operator, offset, length)?;
-        let vector = self.vector.handle_operator(operator, offset, length)?;
-        if matches!(raster, ParseControl::Stop) || matches!(vector, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let raster = self.raster.handle_object(object.clone(), offset, length)?;
-        let vector = self.vector.handle_object(object, offset, length)?;
-        Ok(
-            if matches!(raster, ParseControl::Stop) || matches!(vector, ParseControl::Stop) {
-                ParseControl::Stop
-            } else {
-                ParseControl::Continue
-            },
-        )
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        self.raster.handle_eof()?;
-        self.vector.handle_eof()
     }
 }
 
@@ -1225,13 +1124,6 @@ fn convex_polygon_intersects_rect(points: &[(f64, f64)], rect: Rect) -> bool {
     false
 }
 
-fn parsed_number(object: &FlObjectHandle) -> Option<f64> {
-    object
-        .as_integer()
-        .and_then(crate::source::exact_i64_to_f64)
-        .or_else(|| object.as_real())
-}
-
 fn target_content(document: &EditDocument, target: ContentTarget) -> Result<Vec<u8>> {
     match target {
         ContentTarget::Page(page) => page_content(document, page),
@@ -1298,11 +1190,7 @@ fn scan_target(
     content: &[u8],
 ) -> Result<Option<RasterScanner>> {
     let mut scanner = new_raster_scanner(document, resources)?;
-    let stopped_on_container_eof = crate::content_stream::parse_detached_content_stream_recovering(
-        content,
-        "raster-layout normalization",
-        &mut scanner,
-    )?;
+    let stopped_on_container_eof = scanner.scan(content)?;
     if stopped_on_container_eof || !scanner.complete {
         return Ok(None);
     }
@@ -1339,25 +1227,17 @@ fn scan_target_shared(
     if collect_vector {
         let mut scanner = RasterVectorScanner::new(document, resources)?;
         let hidden_ranges = if let Some(context) = hidden_context {
-            let Some(hidden_ranges) = scan_physical_hidden_text_with_callback_hayro(
-                document,
-                page,
-                page_number,
-                context,
-                content,
-                &mut scanner,
-            )?
+            let Some(hidden_ranges) =
+                scan_physical_hidden_text_hayro(document, page, page_number, context, content)?
             else {
                 return Ok(None);
             };
+            if scanner.scan(content)? {
+                return Ok(None);
+            }
             Some(hidden_ranges)
         } else {
-            let stopped_on_container_eof =
-                crate::content_stream::parse_detached_content_stream_recovering(
-                    content,
-                    "shared raster/vector page content",
-                    &mut scanner,
-                )?;
+            let stopped_on_container_eof = scanner.scan(content)?;
             if stopped_on_container_eof {
                 return Ok(None);
             }
@@ -1376,25 +1256,17 @@ fn scan_target_shared(
 
     let mut scanner = new_raster_scanner(document, resources)?;
     let hidden_ranges = if let Some(context) = hidden_context {
-        let Some(hidden_ranges) = scan_physical_hidden_text_with_callback_hayro(
-            document,
-            page,
-            page_number,
-            context,
-            content,
-            &mut scanner,
-        )?
+        let Some(hidden_ranges) =
+            scan_physical_hidden_text_hayro(document, page, page_number, context, content)?
         else {
             return Ok(None);
         };
+        if scanner.scan(content)? {
+            return Ok(None);
+        }
         Some(hidden_ranges)
     } else {
-        let stopped_on_container_eof =
-            crate::content_stream::parse_detached_content_stream_recovering(
-                content,
-                "raster-layout normalization",
-                &mut scanner,
-            )?;
+        let stopped_on_container_eof = scanner.scan(content)?;
         if stopped_on_container_eof {
             return Ok(None);
         }
@@ -6041,9 +5913,7 @@ pub fn normalize_raster_layout_hayro(
             &mut stats,
         )?;
 
-        if scanner.resource_pending_operands {
-            stats.resource_inventory_complete = false;
-        } else if plans.is_empty() {
+        if plans.is_empty() {
             let usage = scanner.resource_usage_after_removing(&pruned_draws);
             match target {
                 ContentTarget::Page(page) => {
@@ -6189,9 +6059,7 @@ pub fn normalize_raster_layout_hayro(
             }
         }
 
-        if scanner.resource_pending_operands {
-            stats.resource_inventory_complete = false;
-        } else {
+        {
             let mut consumed = pruned_draws.clone();
             consumed.extend(applied.consumed_draws.iter().copied());
             let mut usage = scanner.resource_usage_after_removing(&consumed);
@@ -6264,14 +6132,7 @@ mod tests {
     fn vector_inventory_flags_contained_fill_candidate_after_ext_gstate() {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/GS0 gs 0 0 2 2 re f 0 0 10 10 re f";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "vector inventory containment",
-                &mut scanner,
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         assert!(scanner.vector_merge_candidate);
     }
 
@@ -6279,14 +6140,7 @@ mod tests {
     fn vector_inventory_flags_redundant_contained_repaint() {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"0 0 10 10 re f 2 2 1 1 re f";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "vector inventory contained repaint",
-                &mut scanner,
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         assert!(scanner.vector_merge_candidate);
     }
 
@@ -6294,14 +6148,7 @@ mod tests {
     fn resource_inventory_tracks_namespaces_separately() {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/Shared gs /Shared scn /Sh0 sh";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "typed resource inventory",
-                &mut scanner
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         let usage = scanner.resource_usage_after_removing(&HashSet::new());
         assert_eq!(
             usage.by_type.get(b"ExtGState".as_slice()),
@@ -6321,14 +6168,7 @@ mod tests {
     fn resource_inventory_does_not_reuse_a_stale_name() {
         let mut scanner = RasterScanner::new(BTreeMap::new(), HashSet::new());
         let input = b"/Im0 Do 1 Do";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "stale resource name",
-                &mut scanner
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         let usage = scanner.resource_usage_after_removing(&HashSet::new());
         assert_eq!(
             usage.by_type.get(b"XObject".as_slice()),
@@ -6560,14 +6400,7 @@ mod tests {
             HashSet::from([b"Im1".to_vec(), b"Im2".to_vec()]),
         );
         let input = b"/Im1 Do (overlay) Tj /Im2 Do";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "stripe text z-order",
-                &mut scanner
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         assert_eq!(scanner.draws.len(), 2);
         assert_ne!(
             scanner.draws[0].paint_generation,

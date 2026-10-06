@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
@@ -9,7 +6,6 @@ use crate::{
 use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Write as _,
@@ -74,45 +70,32 @@ pub struct VectorCompactionStats {
 }
 
 #[derive(Debug, Clone)]
-enum OperandValue {
-    Scalar(ContentScalar),
-    Handle(FlObjectHandle),
-}
-
-impl OperandValue {
-    fn number(&self) -> Option<f64> {
-        match self {
-            Self::Scalar(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-            Self::Handle(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-        }
-    }
-
-    fn name(&self) -> Option<Cow<'_, [u8]>> {
-        match self {
-            Self::Scalar(value) => value.as_name().map(Cow::Borrowed),
-            Self::Handle(value) => value.as_name().map(Cow::Owned),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Operand {
-    value: OperandValue,
+    number: Option<f64>,
+    name: Option<Vec<u8>>,
     offset: usize,
 }
 
+fn instruction_operands(
+    input: &[u8],
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+) -> Vec<Operand> {
+    instruction
+        .operands()
+        .zip(instruction.operand_spans())
+        .map(|(object, span)| Operand {
+            number: crate::content_stream::operand_number(
+                object,
+                input.get(span.clone()).unwrap_or_default(),
+            ),
+            name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
+            offset: span.start,
+        })
+        .collect()
+}
+
 fn operand_numbers(operands: &[Operand]) -> Option<SmallVec<[f64; 6]>> {
-    let mut values = SmallVec::new();
-    for operand in operands {
-        values.push(operand.value.number()?);
-    }
-    Some(values)
+    operands.iter().map(|operand| operand.number).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +267,7 @@ impl FillScanner {
             && self
                 .operands
                 .iter()
-                .all(|operand| operand.value.number().is_some_and(f64::is_finite));
+                .all(|operand| operand.number.is_some_and(f64::is_finite));
         self.barrier();
     }
 
@@ -295,9 +278,9 @@ impl FillScanner {
 
     fn apply_ext_gstate(&mut self) {
         let patch = (self.operands.len() == 1)
-            .then(|| self.operands[0].value.name())
+            .then(|| self.operands[0].name.as_deref())
             .flatten()
-            .and_then(|name| self.ext_gstates.get(name.as_ref()).copied());
+            .and_then(|name| self.ext_gstates.get(name).copied());
         if let Some(patch) = patch {
             self.fill_safety.apply_ext_gstate(patch);
         } else {
@@ -351,58 +334,26 @@ impl FillScanner {
             _ => self.barrier(),
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for FillScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
+    fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
-        }
-        self.operands.push(Operand {
-            value: OperandValue::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
             self.barrier();
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Handle(object),
-                offset,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction_operands(input, instruction);
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
@@ -671,13 +622,7 @@ fn compact_content_from_fill_scan(
         initial_fills
     } else {
         let mut scanner = FillScanner::new(ext_gstates.clone());
-        if crate::content_stream::parse_detached_content_stream(
-            &covered_pruned,
-            "vector rectangle compaction after covered-fill pruning",
-            &mut scanner,
-        )
-        .is_err()
-        {
+        if !matches!(scanner.scan(&covered_pruned), Ok(false)) {
             return (input.to_vec(), VectorCompactionStats::default());
         }
         rescanned_fills = scanner.fills;
@@ -721,13 +666,7 @@ fn compact_content_with_ext_gstates(
     ext_gstates: &BTreeMap<Vec<u8>, ExtGStatePatch>,
 ) -> (Vec<u8>, VectorCompactionStats) {
     let mut scanner = FillScanner::new(ext_gstates.clone());
-    if crate::content_stream::parse_detached_content_stream(
-        input,
-        "vector rectangle compaction",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    if !matches!(scanner.scan(input), Ok(false)) {
         return (input.to_vec(), VectorCompactionStats::default());
     }
     compact_content_from_fill_scan(input, ext_gstates, &scanner.fills)
@@ -819,7 +758,6 @@ struct PathBlock {
 }
 
 struct PathBlockScanner {
-    operands: Vec<Operand>,
     path_start: Option<usize>,
     path_valid: bool,
     bounds: Option<Rect>,
@@ -832,7 +770,6 @@ struct PathBlockScanner {
 impl PathBlockScanner {
     const fn new() -> Self {
         Self {
-            operands: Vec::new(),
             path_start: None,
             path_valid: true,
             bounds: None,
@@ -975,77 +912,12 @@ impl PathBlockScanner {
         }
     }
 
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
-        let operands = std::mem::take(&mut self.operands);
-        self.process_operator_with_operands(operator, offset, length, &operands);
-        self.operands = operands;
-        self.operands.clear();
-    }
-
     fn unsupported_operator_state(&mut self, clears_path: bool) {
         if clears_path {
             self.reset_path_state();
         } else if self.path_start.is_some() {
             self.path_valid = false;
         }
-    }
-
-    fn unsupported_operator(&mut self, clears_path: bool) {
-        self.unsupported_operator_state(clears_path);
-        self.operands.clear();
-    }
-}
-
-impl ObjectHandleParserCallbacks for PathBlockScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
-        }
-        self.operands.push(Operand {
-            value: OperandValue::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
-            self.unsupported_operator(false);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Handle(object),
-                offset,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
     }
 }
 
@@ -1312,73 +1184,35 @@ impl TransformedBlockScanner {
             });
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for TransformedBlockScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
+    fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
-        }
-        self.operands.push(Operand {
-            value: OperandValue::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
             if let Some(frame) = self.frames.last_mut() {
                 frame.valid = false;
             }
             self.operands.clear();
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Handle(object),
-                offset,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction_operands(input, instruction);
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
 fn factorable_transformed_blocks(input: &[u8]) -> Vec<TransformedBlock> {
     let mut scanner = TransformedBlockScanner::new();
-    if crate::content_stream::parse_detached_content_stream(
-        input,
-        "transformed block form factoring",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    if !matches!(scanner.scan(input), Ok(false)) {
         return Vec::new();
     }
     scanner.blocks
@@ -1387,13 +1221,22 @@ fn factorable_transformed_blocks(input: &[u8]) -> Vec<TransformedBlock> {
 #[cfg(test)]
 fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
     let mut scanner = PathBlockScanner::new();
-    if crate::content_stream::parse_detached_content_stream(
-        input,
-        "repeated path form factoring",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    let parsed = crate::content_stream::visit_instructions(input, |instruction| {
+        if &instruction.operator[..] == b"BI" {
+            scanner.unsupported_operator_state(false);
+        } else {
+            let operands = instruction_operands(input, instruction);
+            let span = instruction.operator_span();
+            scanner.process_operator_with_operands(
+                &instruction.operator[..],
+                span.start,
+                span.len(),
+                &operands,
+            );
+        }
+        Ok(())
+    });
+    if !matches!(parsed, Ok(false)) {
         return Vec::new();
     }
     scanner.blocks
@@ -1429,76 +1272,32 @@ impl ProcessingFactorScanner {
         }
         self.operands.clear();
     }
-}
 
-impl ObjectHandleParserCallbacks for ProcessingFactorScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn content_size(&mut self, size: usize) -> crate::Result<()> {
-        self.path.content_size(size)?;
-        self.transformed.content_size(size)
-    }
-
-    fn handle_scalar(
+    fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            self.process_operator(operator, offset, length);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Scalar(scalar),
-                offset,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
             self.inline_image();
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Handle(object),
-                offset,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction_operands(input, instruction);
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
 fn factorable_processing_blocks(input: &[u8]) -> (Vec<PathBlock>, Vec<TransformedBlock>) {
     let mut scanner = ProcessingFactorScanner::new();
-    if crate::content_stream::parse_detached_content_stream(
-        input,
-        "processing form factoring",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    if !matches!(scanner.scan(input), Ok(false)) {
         return (Vec::new(), Vec::new());
     }
     (scanner.path.blocks, scanner.transformed.blocks)
@@ -1562,24 +1361,29 @@ impl PathCoordinateCandidateScanner {
         self.operands.clear();
     }
 
-    fn handle_scalar_value(&mut self, scalar: &ContentScalar, length: usize) {
-        self.operands.push((
-            scalar
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| scalar.as_real()),
-            length,
-        ));
-    }
-
-    fn handle_object_value(&mut self, object: &FlObjectHandle, length: usize) {
-        self.operands.push((
-            object
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| object.as_real()),
-            length,
-        ));
+    fn instruction(
+        &mut self,
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
+            self.operands.clear();
+            return;
+        }
+        self.operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, span)| {
+                (
+                    crate::content_stream::operand_number(
+                        object,
+                        input.get(span.clone()).unwrap_or_default(),
+                    ),
+                    span.len(),
+                )
+            })
+            .collect();
+        self.process_operator(&instruction.operator[..]);
     }
 }
 
@@ -1658,78 +1462,22 @@ impl ProcessingPageScanner {
             path_coordinate_candidate: self.path_coordinates.candidate,
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for ProcessingPageScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn content_size(&mut self, size: usize) -> crate::Result<()> {
-        self.factor.content_size(size)
-    }
-
-    fn handle_scalar(
+    pub(crate) fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            self.path_coordinates.process_operator(operator);
-        } else {
-            self.path_coordinates.handle_scalar_value(&scalar, length);
-        }
-        let fill = self.fill.handle_scalar(scalar.clone(), offset, length)?;
-        let factor = self.factor.handle_scalar(scalar, offset, length)?;
-        if matches!(fill, ParseControl::Stop) || matches!(factor, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        self.path_coordinates.instruction(input, instruction);
+        self.fill.instruction(input, instruction);
+        self.factor.instruction(input, instruction);
     }
 
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.path_coordinates.process_operator(operator);
-        let fill = self.fill.handle_operator(operator, offset, length)?;
-        let factor = self.factor.handle_operator(operator, offset, length)?;
-        if matches!(fill, ParseControl::Stop) || matches!(factor, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.path_coordinates.process_operator(&operator);
-        } else if object.as_inline_image().is_some() {
-            self.path_coordinates.operands.clear();
-        } else {
-            self.path_coordinates.handle_object_value(&object, length);
-        }
-        let fill = self.fill.handle_object(object.clone(), offset, length)?;
-        let factor = self.factor.handle_object(object, offset, length)?;
-        Ok(
-            if matches!(fill, ParseControl::Stop) || matches!(factor, ParseControl::Stop) {
-                ParseControl::Stop
-            } else {
-                ParseControl::Continue
-            },
-        )
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        self.fill.handle_eof()?;
-        self.factor.handle_eof()
+    pub(crate) fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
@@ -1738,13 +1486,7 @@ fn scan_processing_page(
     ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>,
 ) -> Option<ProcessingVectorAnalysis> {
     let mut scanner = ProcessingPageScanner::new(ext_gstates);
-    crate::content_stream::parse_detached_content_stream(
-        input,
-        "processing vector analysis",
-        &mut scanner,
-    )
-    .ok()?;
-    Some(scanner.finish())
+    matches!(scanner.scan(input), Ok(false)).then(|| scanner.finish())
 }
 
 #[derive(Debug, Clone)]
@@ -2705,79 +2447,40 @@ impl<'a> SharedQBlockScanner<'a> {
             _ => self.block_valid = false,
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for SharedQBlockScanner<'_> {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            let operands = std::mem::take(&mut self.operands);
-            self.process_operator(operator, offset, length, &operands);
-        } else {
-            self.operands.push(SharedOperand {
-                name: scalar.as_name().map(ToOwned::to_owned),
-                offset,
-                length,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let operands = std::mem::take(&mut self.operands);
-        self.process_operator(operator, offset, length, &operands);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            let operands = std::mem::take(&mut self.operands);
-            self.process_operator(&operator, offset, length, &operands);
-        } else if object.as_inline_image().is_some() {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        if &instruction.operator[..] == b"BI" {
             if self.depth > 0 {
                 self.block_valid = false;
             }
             self.operands.clear();
-        } else {
-            self.operands.push(SharedOperand {
-                name: object.as_name(),
-                offset,
-                length,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, span)| SharedOperand {
+                name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
+                offset: span.start,
+                length: span.len(),
+            })
+            .collect();
+        let operands = std::mem::take(&mut self.operands);
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len(), &operands);
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(self.input, |instruction| {
+            self.instruction(instruction);
+            Ok(())
+        })
     }
 }
 
 fn factorable_shared_q_blocks(input: &[u8], targets: &SharedResourceTargets) -> Vec<SharedQBlock> {
     let mut scanner = SharedQBlockScanner::new(input, targets);
-    if crate::content_stream::parse_detached_content_stream(
-        input,
-        "shared q-block factoring",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    if !matches!(scanner.scan(), Ok(false)) {
         return Vec::new();
     }
     scanner.blocks
@@ -3380,69 +3083,32 @@ impl<'a> PathCoordinateScanner<'a> {
         }
         self.operands.clear();
     }
-}
 
-impl ObjectHandleParserCallbacks for PathCoordinateScanner<'_> {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            self.process_operator(operator);
-        } else {
-            let value = scalar
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| scalar.as_real());
-            self.operands.push(PathCoordinateOperand {
-                value,
-                offset,
-                length,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        _offset: usize,
-        _length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator);
-        } else if object.as_inline_image().is_some() {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        if &instruction.operator[..] == b"BI" {
             self.operands.clear();
-        } else {
-            let value = object
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| object.as_real());
-            self.operands.push(PathCoordinateOperand {
-                value,
-                offset,
-                length,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, span)| PathCoordinateOperand {
+                value: crate::content_stream::operand_number(
+                    object,
+                    self.input.get(span.clone()).unwrap_or_default(),
+                ),
+                offset: span.start,
+                length: span.len(),
+            })
+            .collect();
+        self.process_operator(&instruction.operator[..]);
     }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(self.input, |instruction| {
+            self.instruction(instruction);
+            Ok(())
+        })
     }
 }
 
@@ -3451,22 +3117,20 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
         return None;
     }
     let mut scanner = PathCoordinateScanner::new(input, user_unit);
-    let parsed = crate::content_stream::parse_detached_content_stream(
-        input,
-        "path coordinate canonicalization",
-        &mut scanner,
-    );
+    let parsed = scanner.scan();
     if *DEBUG_VECTOR {
         eprintln!(
             "path-coordinate-scan parsed={} stack={} replacements={} coordinates={}",
-            parsed.is_ok(),
+            matches!(parsed, Ok(false)),
             scanner.state_stack.len(),
             scanner.replacements.len(),
             scanner.coordinates_canonicalized
         );
     }
-    parsed.ok()?;
-    if !scanner.state_stack.is_empty() || scanner.replacements.is_empty() {
+    if !matches!(parsed, Ok(false))
+        || !scanner.state_stack.is_empty()
+        || scanner.replacements.is_empty()
+    {
         return None;
     }
     let output = apply_span_replacements(input, &scanner.replacements)?;

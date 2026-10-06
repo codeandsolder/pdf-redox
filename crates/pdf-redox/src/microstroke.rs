@@ -1,16 +1,10 @@
-use crate::content_stream::{
-    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
 };
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 const MIN_MICROSTROKE_RUN: usize = 500;
 const MIN_RUN_SAVINGS_BYTES: usize = 1024;
@@ -46,47 +40,16 @@ pub struct MicrostrokeRasterStats {
 }
 
 #[derive(Debug, Clone)]
-enum OperandValue {
-    Scalar(ContentScalar),
-    Handle(FlObjectHandle),
-}
-
-impl OperandValue {
-    fn number(&self) -> Option<f64> {
-        match self {
-            Self::Scalar(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-            Self::Handle(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-        }
-    }
-
-    fn name(&self) -> Option<Cow<'_, [u8]>> {
-        match self {
-            Self::Scalar(value) => value.as_name().map(Cow::Borrowed),
-            Self::Handle(value) => value.as_name().map(Cow::Owned),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Operand {
-    value: OperandValue,
+    number: Option<f64>,
+    name: Option<Vec<u8>>,
 }
 
 fn operand_numbers(operands: &[Operand], expected: usize) -> Option<Vec<f64>> {
     if operands.len() != expected {
         return None;
     }
-    let mut values = Vec::with_capacity(expected);
-    for operand in operands {
-        values.push(operand.value.number()?);
-    }
-    Some(values)
+    operands.iter().map(|operand| operand.number).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -353,13 +316,49 @@ impl MicroStrokeScanner {
         let patch = self
             .operands
             .first()
-            .and_then(|operand| operand.value.name())
-            .and_then(|name| self.ext_gstates.get(name.as_ref()).copied());
+            .and_then(|operand| operand.name.as_deref())
+            .and_then(|name| self.ext_gstates.get(name).copied());
         if let Some(patch) = patch {
             self.state.apply_ext_gstate(patch);
         } else {
             self.state.safety.invalidate();
         }
+    }
+
+    fn instruction(
+        &mut self,
+        content: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
+            self.invalidate_frame();
+            self.operands.clear();
+            return;
+        }
+        self.operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, span)| Operand {
+                number: crate::content_stream::operand_number(
+                    object,
+                    content.get(span).unwrap_or_default(),
+                ),
+                name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
+            })
+            .collect();
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len());
+    }
+
+    fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            self.instruction(content, instruction);
+            Ok(())
+        })?;
+        if incomplete {
+            self.invalidate_frame();
+        }
+        Ok(())
     }
 
     #[expect(
@@ -534,59 +533,6 @@ impl MicroStrokeScanner {
             _ => self.invalidate_frame(),
         }
         self.operands.clear();
-    }
-}
-
-impl ObjectHandleParserCallbacks for MicroStrokeScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            self.process_operator(operator, offset, length);
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Scalar(scalar),
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.process_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.process_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
-            self.invalidate_frame();
-            self.operands.clear();
-        } else {
-            self.operands.push(Operand {
-                value: OperandValue::Handle(object),
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
     }
 }
 
@@ -1169,11 +1115,7 @@ pub fn rasterize_pathological_microstrokes_hayro(
             None => 1.0,
         };
         let mut scanner = MicroStrokeScanner::new(ext_gstate_patches(document, &resources)?);
-        crate::content_stream::parse_detached_content_stream(
-            &decoded,
-            "microstroke rasterization",
-            &mut scanner,
-        )?;
+        scanner.scan(&decoded)?;
         let runs = grouped_runs(&decoded, &scanner.blocks);
         if runs.is_empty() {
             continue;
@@ -1300,11 +1242,7 @@ mod tests {
     fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
         let input = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q q 1 0 0 1 10.1 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        crate::content_stream::parse_detached_content_stream(
-            input,
-            "microstroke test",
-            &mut scanner,
-        )?;
+        scanner.scan(input)?;
         assert_eq!(scanner.blocks.len(), 2);
         let runs = grouped_runs(input, &scanner.blocks);
         assert!(runs.is_empty());
@@ -1317,11 +1255,7 @@ mod tests {
     fn fractional_line_cap_is_not_silently_truncated() -> Result<()> {
         let input = b"1.5 J q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        crate::content_stream::parse_detached_content_stream(
-            input,
-            "microstroke fractional cap",
-            &mut scanner,
-        )?;
+        scanner.scan(input)?;
         assert_eq!(scanner.blocks.len(), 1);
         assert!(!scanner.blocks[0].state.raster_safe());
         Ok(())

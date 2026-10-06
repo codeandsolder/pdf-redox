@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject as FlObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
@@ -119,120 +116,14 @@ struct Event {
     two_names: Option<[Vec<u8>; 2]>,
 }
 
-#[derive(Debug, Clone)]
-struct Operand {
-    offset: usize,
-    number: Option<f64>,
-    name: Option<Vec<u8>>,
-}
-
-#[derive(Default)]
-struct EventScanner {
-    operands: Vec<Operand>,
-    events: Vec<Event>,
-}
-
-impl EventScanner {
-    fn push_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
-        let start = self
-            .operands
-            .first()
-            .map_or(offset, |operand| operand.offset);
-        let sole_number = (self.operands.len() == 1)
-            .then(|| self.operands[0].number)
-            .flatten();
-        let all_operands_numeric = self
-            .operands
-            .iter()
-            .all(|operand| operand.number.is_some_and(f64::is_finite));
-        let mut numbers = SmallVec::new();
-        if all_operands_numeric {
-            numbers.extend(self.operands.iter().filter_map(|operand| operand.number));
-        }
-        let two_names = if self.operands.len() == 2 {
-            match (&self.operands[0].name, &self.operands[1].name) {
-                (Some(first), Some(second)) => Some([first.clone(), second.clone()]),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        self.events.push(Event {
-            start,
-            end: offset.saturating_add(length),
-            operator: operator.to_vec(),
-            operand_count: self.operands.len(),
-            sole_number,
-            numbers,
-            all_operands_numeric,
-            two_names,
-        });
-        self.operands.clear();
-    }
-
-    fn push_scalar(&mut self, scalar: &ContentScalar, offset: usize) {
-        self.operands.push(Operand {
-            offset,
-            number: scalar
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| scalar.as_real()),
-            name: scalar.as_name().map(ToOwned::to_owned),
-        });
-    }
-
-    fn push_object(&mut self, object: &FlObjectHandle, offset: usize) {
-        self.operands.push(Operand {
-            offset,
-            number: object
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| object.as_real()),
-            name: object.as_name(),
-        });
-    }
-}
-
-impl ObjectHandleParserCallbacks for EventScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            self.push_operator(operator, offset, length);
-        } else {
-            self.push_scalar(&scalar, offset);
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        self.push_operator(operator, offset, length);
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.push_operator(&operator, offset, length);
-        } else if object.as_inline_image().is_some() {
-            self.operands.clear();
-            self.events.push(Event {
-                start: offset,
-                end: offset.saturating_add(length),
+fn events_for(input: &[u8], _context: &str) -> Option<Vec<Event>> {
+    let mut events = Vec::new();
+    let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
+        if &instruction.operator[..] == b"BI" {
+            let span = instruction.span();
+            events.push(Event {
+                start: span.start,
+                end: span.end,
                 operator: b"__inline_image__".to_vec(),
                 operand_count: 0,
                 sole_number: None,
@@ -240,15 +131,57 @@ impl ObjectHandleParserCallbacks for EventScanner {
                 all_operands_numeric: false,
                 two_names: None,
             });
-        } else {
-            self.push_object(&object, offset);
+            return Ok(());
         }
-        Ok(ParseControl::Continue)
-    }
 
-    fn handle_eof(&mut self) -> crate::Result<()> {
+        let operator_span = instruction.operator_span();
+        let operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, span)| {
+                (
+                    span.start,
+                    crate::content_stream::operand_number(
+                        object,
+                        input.get(span).unwrap_or_default(),
+                    ),
+                    crate::content_stream::operand_name(object).map(ToOwned::to_owned),
+                )
+            })
+            .collect::<Vec<_>>();
+        let start = operands
+            .first()
+            .map_or(operator_span.start, |operand| operand.0);
+        let sole_number = (operands.len() == 1).then(|| operands[0].1).flatten();
+        let all_operands_numeric = operands
+            .iter()
+            .all(|operand| operand.1.is_some_and(f64::is_finite));
+        let mut numbers = SmallVec::new();
+        if all_operands_numeric {
+            numbers.extend(operands.iter().filter_map(|operand| operand.1));
+        }
+        let two_names = if operands.len() == 2 {
+            match (&operands[0].2, &operands[1].2) {
+                (Some(first), Some(second)) => Some([first.clone(), second.clone()]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        events.push(Event {
+            start,
+            end: operator_span.end,
+            operator: instruction.operator[..].to_vec(),
+            operand_count: operands.len(),
+            sole_number,
+            numbers,
+            all_operands_numeric,
+            two_names,
+        });
         Ok(())
-    }
+    })
+    .ok()?;
+    (!incomplete).then_some(events)
 }
 
 const fn trivia_only(bytes: &[u8]) -> bool {
@@ -274,12 +207,6 @@ const fn path_operator(operator: &[u8]) -> bool {
 
 fn adjacent(input: &[u8], left: &Event, right: &Event) -> bool {
     left.end <= right.start && input.get(left.end..right.start).is_some_and(trivia_only)
-}
-
-fn events_for(input: &[u8], context: &str) -> Option<Vec<Event>> {
-    let mut scanner = EventScanner::default();
-    crate::content_stream::parse_detached_content_stream(input, context, &mut scanner).ok()?;
-    Some(scanner.events)
 }
 
 fn page_paint_batching_is_safe(events: &[Event]) -> bool {

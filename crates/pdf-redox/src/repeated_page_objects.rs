@@ -1,13 +1,9 @@
-use crate::content_stream::{
-    ContentObject as ObjectHandle, ContentScalar, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, Result,
     content::{page_content, replace_page_content, resolved_dictionary},
 };
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 const POSITION_TOLERANCE_PT: f64 = 12.0;
@@ -53,42 +49,58 @@ struct Candidate {
 
 #[derive(Debug, Clone)]
 enum OperandValue {
-    Scalar(ContentScalar),
-    Handle(ObjectHandle),
+    Number(f64),
+    Name(Vec<u8>),
+    String(Vec<u8>),
+    ArrayStrings(Vec<Vec<u8>>),
+    Other,
 }
 
 impl OperandValue {
-    fn number(&self) -> Option<f64> {
+    const fn number(&self) -> Option<f64> {
         match self {
-            Self::Scalar(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
-            Self::Handle(value) => value
-                .as_integer()
-                .and_then(crate::source::exact_i64_to_f64)
-                .or_else(|| value.as_real()),
+            Self::Number(value) => Some(*value),
+            _ => None,
         }
     }
 
-    fn as_name(&self) -> Option<Cow<'_, [u8]>> {
+    fn as_name(&self) -> Option<&[u8]> {
         match self {
-            Self::Scalar(value) => value.as_name().map(Cow::Borrowed),
-            Self::Handle(value) => value.as_name().map(Cow::Owned),
+            Self::Name(value) => Some(value),
+            _ => None,
         }
     }
 
-    fn as_string(&self) -> Option<Vec<u8>> {
+    fn as_string(&self) -> Option<&[u8]> {
         match self {
-            Self::Scalar(value) => value.as_string().map(ToOwned::to_owned),
-            Self::Handle(value) => value.as_string(),
+            Self::String(value) => Some(value),
+            _ => None,
         }
     }
 
-    fn as_array(&self) -> Option<Vec<ObjectHandle>> {
+    fn array_strings(&self) -> Option<&[Vec<u8>]> {
         match self {
-            Self::Scalar(_) => None,
-            Self::Handle(value) => value.as_array(),
+            Self::ArrayStrings(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn from_hayro(object: &hayro_syntax::object::Object<'_>) -> Self {
+        use hayro_syntax::object::{MaybeRef, Object};
+        match object {
+            Object::Number(value) => Self::Number(value.as_f64()),
+            Object::Name(value) => Self::Name(value.as_ref().to_vec()),
+            Object::String(value) => Self::String(value.as_bytes().to_vec()),
+            Object::Array(array) => Self::ArrayStrings(
+                array
+                    .raw_iter()
+                    .filter_map(|item| match item {
+                        MaybeRef::NotRef(Object::String(value)) => Some(value.as_bytes().to_vec()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => Self::Other,
         }
     }
 }
@@ -96,7 +108,6 @@ impl OperandValue {
 #[derive(Debug, Clone)]
 struct OperandSpan {
     object: OperandValue,
-    offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +220,7 @@ impl<'a> PageScanner<'a> {
                     .and_then(|operand| operand.object.as_string())
                     && !bytes.is_empty()
                 {
-                    strings.push(bytes);
+                    strings.push(bytes.to_vec());
                 }
             }
             b"\"" => {
@@ -219,20 +230,18 @@ impl<'a> PageScanner<'a> {
                     .and_then(|operand| operand.object.as_string())
                     && !bytes.is_empty()
                 {
-                    strings.push(bytes);
+                    strings.push(bytes.to_vec());
                 }
             }
             b"TJ" => {
                 if let Some(array) = self
                     .operands
                     .first()
-                    .and_then(|operand| operand.object.as_array())
+                    .and_then(|operand| operand.object.array_strings())
                 {
-                    for item in array {
-                        if let Some(bytes) = item.as_string()
-                            && !bytes.is_empty()
-                        {
-                            strings.push(bytes);
+                    for bytes in array {
+                        if !bytes.is_empty() {
+                            strings.push(bytes.clone());
                         }
                     }
                 }
@@ -307,7 +316,7 @@ impl<'a> PageScanner<'a> {
             b"Tf" => {
                 if self.operands.len() >= 2 {
                     if let Some(name) = self.operands[0].object.as_name() {
-                        self.font_name = name.into_owned();
+                        self.font_name = name.to_vec();
                     }
                     if let Some(size) = self.operands[1].object.number() {
                         self.font_size = size;
@@ -344,7 +353,7 @@ impl<'a> PageScanner<'a> {
                 else {
                     return;
                 };
-                let Some(handle) = self.xobjects.get(name.as_ref()).copied() else {
+                let Some(handle) = self.xobjects.get(name).copied() else {
                     return;
                 };
                 self.candidates.push(Candidate {
@@ -365,54 +374,34 @@ impl<'a> PageScanner<'a> {
     }
 }
 
-impl ObjectHandleParserCallbacks for PageScanner<'_> {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            let span_start = self
-                .operands
-                .first()
-                .map_or(offset, |operand| operand.offset);
-            self.apply_operator(operator, span_start, offset.saturating_add(length));
+impl PageScanner<'_> {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        if &instruction.operator[..] == b"BI" {
             self.operands.clear();
-        } else {
-            self.operands.push(OperandSpan {
-                object: OperandValue::Scalar(scalar),
-                offset,
-            });
+            return;
         }
-        Ok(ParseControl::Continue)
+        self.operands = instruction
+            .operands()
+            .zip(instruction.operand_spans())
+            .map(|(object, _span)| OperandSpan {
+                object: OperandValue::from_hayro(object),
+            })
+            .collect();
+        let span = instruction.span();
+        self.apply_operator(&instruction.operator[..], span.start, span.end);
+        self.operands.clear();
     }
 
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            let span_start = self
-                .operands
-                .first()
-                .map_or(offset, |operand| operand.offset);
-            self.apply_operator(&operator, span_start, offset.saturating_add(length));
-            self.operands.clear();
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(OperandSpan {
-                object: OperandValue::Handle(object),
-                offset,
-            });
+    fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            self.instruction(instruction);
+            Ok(())
+        })?;
+        if incomplete {
+            return Err(crate::Error::Invalid(
+                "incomplete repeated-page content stream".to_owned(),
+            ));
         }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -556,13 +545,7 @@ pub fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> R
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if crate::content_stream::parse_detached_content_stream(
-            &content,
-            "repeated page object cache preflight",
-            &mut scanner,
-        )
-        .is_ok()
-        {
+        if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
         }
     }
@@ -585,13 +568,7 @@ pub fn remove_repeated_page_objects_hayro(
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if crate::content_stream::parse_detached_content_stream(
-            &content,
-            "repeated page object removal seed",
-            &mut scanner,
-        )
-        .is_ok()
-        {
+        if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
         }
         contents.push(content);
@@ -607,13 +584,7 @@ pub fn remove_repeated_page_objects_hayro(
         let content = page_content(document, page)?;
         let xobjects = page_xobjects(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
-        if crate::content_stream::parse_detached_content_stream(
-            &content,
-            "repeated page object removal",
-            &mut scanner,
-        )
-        .is_ok()
-        {
+        if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
         }
         contents.push(content);
@@ -729,14 +700,7 @@ mod tests {
         let xobjects = BTreeMap::from([(b"Im0".to_vec(), handle)]);
         let mut scanner = PageScanner::new(2, &xobjects);
         let content = b"q 2 0 0 3 101 699 cm /Im0 Do Q";
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                content,
-                "repeated xobject test",
-                &mut scanner
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(content).is_ok());
         assert_eq!(scanner.candidates.len(), 1);
         let candidate = &scanner.candidates[0];
         assert_eq!(candidate.page_index, 2);

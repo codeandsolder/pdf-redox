@@ -1,15 +1,11 @@
 use crate::config::HiddenTextPolicy;
-use crate::content_stream::{
-    ContentObject as ObjectHandle, ContentObjectRef as ObjectRef, ContentScalar,
-    ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
 };
 use crate::{EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result};
+use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Object as HayroObject};
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const ALPHA_INVISIBLE: f64 = 0.001;
@@ -234,60 +230,136 @@ struct MarkedState {
     artifact: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ObjectRef {
+    number: i32,
+    generation: i32,
+}
+
 #[derive(Debug, Clone)]
 enum OperandObject {
-    Scalar(ContentScalar),
-    Handle(ObjectHandle),
+    Null,
+    Integer(i64),
+    Real(f64),
+    Name(Vec<u8>),
+    String(Vec<u8>),
+    Array(Vec<Self>),
+    Dictionary(BTreeMap<Vec<u8>, Self>),
+    Reference(ObjectRef),
 }
 
 impl OperandObject {
     const fn as_integer(&self) -> Option<i64> {
         match self {
-            Self::Scalar(value) => value.as_integer(),
-            Self::Handle(value) => value.as_integer(),
+            Self::Integer(value) => Some(*value),
+            _ => None,
         }
     }
 
     const fn as_real(&self) -> Option<f64> {
         match self {
-            Self::Scalar(value) => value.as_real(),
-            Self::Handle(value) => value.as_real(),
+            Self::Real(value) => Some(*value),
+            _ => None,
         }
     }
 
-    fn as_name(&self) -> Option<Cow<'_, [u8]>> {
+    fn as_name(&self) -> Option<&[u8]> {
         match self {
-            Self::Scalar(value) => value.as_name().map(Cow::Borrowed),
-            Self::Handle(value) => value.as_name().map(Cow::Owned),
+            Self::Name(value) => Some(value),
+            _ => None,
         }
     }
 
-    fn as_string(&self) -> Option<Vec<u8>> {
+    fn as_string(&self) -> Option<&[u8]> {
         match self {
-            Self::Scalar(value) => value.as_string().map(ToOwned::to_owned),
-            Self::Handle(value) => value.as_string(),
+            Self::String(value) => Some(value),
+            _ => None,
         }
     }
 
-    fn as_array(&self) -> Option<Vec<ObjectHandle>> {
+    fn as_array(&self) -> Option<&[Self]> {
         match self {
-            Self::Scalar(_) => None,
-            Self::Handle(value) => value.as_array(),
+            Self::Array(value) => Some(value),
+            _ => None,
         }
     }
 
-    const fn handle(&self) -> Option<&ObjectHandle> {
+    const fn as_dictionary(&self) -> Option<&BTreeMap<Vec<u8>, Self>> {
         match self {
-            Self::Scalar(_) => None,
-            Self::Handle(value) => Some(value),
+            Self::Dictionary(value) => Some(value),
+            _ => None,
         }
     }
+
+    const fn object_ref(&self) -> Option<ObjectRef> {
+        match self {
+            Self::Reference(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn get_key(&self, key: &[u8]) -> Option<&Self> {
+        let key = key.strip_prefix(b"/").unwrap_or(key);
+        self.as_dictionary()?.get(key)
+    }
+}
+
+fn operand_from_maybe_ref(value: HayroMaybeRef<HayroObject<'_>>) -> OperandObject {
+    match value {
+        HayroMaybeRef::Ref(reference) => OperandObject::Reference(ObjectRef {
+            number: reference.obj_number,
+            generation: reference.gen_number,
+        }),
+        HayroMaybeRef::NotRef(value) => operand_from_hayro(&value, None),
+    }
+}
+
+fn operand_from_hayro(object: &HayroObject<'_>, raw: Option<&[u8]>) -> OperandObject {
+    match object {
+        HayroObject::Null(_) | HayroObject::Boolean(_) | HayroObject::Stream(_) => {
+            OperandObject::Null
+        }
+        HayroObject::Number(number) => {
+            if let Some(raw) = raw
+                && !raw.contains(&b'.')
+                && let Ok(text) = std::str::from_utf8(raw)
+                && let Ok(value) = text.parse::<i64>()
+            {
+                OperandObject::Integer(value)
+            } else {
+                OperandObject::Real(number.as_f64())
+            }
+        }
+        HayroObject::String(value) => OperandObject::String(value.as_bytes().to_vec()),
+        HayroObject::Name(value) => OperandObject::Name(value.as_ref().to_vec()),
+        HayroObject::Array(value) => {
+            OperandObject::Array(value.raw_iter().map(operand_from_maybe_ref).collect())
+        }
+        HayroObject::Dict(value) => OperandObject::Dictionary(
+            value
+                .entries()
+                .map(|(key, value)| (key.as_ref().to_vec(), operand_from_maybe_ref(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn instruction_operands(
+    input: &[u8],
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+) -> Vec<OperandSpan> {
+    instruction
+        .operands()
+        .zip(instruction.operand_spans())
+        .map(|(object, span)| OperandSpan {
+            object: operand_from_hayro(object, input.get(span)),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
 struct OperandSpan {
     object: OperandObject,
-    offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -393,13 +465,6 @@ impl<'a> PageScanner<'a> {
             .or_else(|| object.as_real())
     }
 
-    fn handle_number(object: &ObjectHandle) -> Option<f64> {
-        object
-            .as_integer()
-            .and_then(crate::source::exact_i64_to_f64)
-            .or_else(|| object.as_real())
-    }
-
     fn numbers(&self) -> Option<SmallVec<[f64; 6]>> {
         let mut values = SmallVec::new();
         for operand in &self.operands {
@@ -408,7 +473,7 @@ impl<'a> PageScanner<'a> {
         Some(values)
     }
 
-    fn name_at(&self, index: usize) -> Option<Cow<'_, [u8]>> {
+    fn name_at(&self, index: usize) -> Option<&[u8]> {
         self.operands.get(index)?.object.as_name()
     }
 
@@ -528,7 +593,7 @@ impl<'a> PageScanner<'a> {
         self.show_text(&[bytes], &[], span_start, span_end);
     }
 
-    fn show_tj_array(&mut self, array: &[ObjectHandle], span_start: usize, span_end: usize) {
+    fn show_tj_array(&mut self, array: &[OperandObject], span_start: usize, span_end: usize) {
         let mut strings = Vec::new();
         let mut adjustments = Vec::new();
         let hscale = self.text.horizontal_scale / 100.0;
@@ -539,8 +604,8 @@ impl<'a> PageScanner<'a> {
                     adjustments.push(pending_adjustment);
                 }
                 pending_adjustment = 0.0;
-                strings.push(bytes);
-            } else if let Some(value) = Self::handle_number(item) {
+                strings.push(bytes.to_vec());
+            } else if let Some(value) = Self::number(item) {
                 pending_adjustment =
                     ((-value / 1000.0) * self.text.font_size).mul_add(hscale, pending_adjustment);
             }
@@ -573,18 +638,16 @@ impl<'a> PageScanner<'a> {
 
     fn begin_marked_content(&mut self, with_properties: bool) {
         let tag = self.name_at(0).unwrap_or_default();
-        let artifact = tag.as_ref() == b"Artifact";
+        let artifact = tag == b"Artifact";
         let mut optional_hidden = false;
         let mut actual_text = None;
         if with_properties && let Some(properties) = self.operands.get(1).map(|o| &o.object) {
             if let Some(name) = properties.as_name() {
-                if tag.as_ref() == b"OC" {
-                    optional_hidden = self.property_hidden(&name);
+                if tag == b"OC" {
+                    optional_hidden = self.property_hidden(name);
                 }
-            } else if let Some(properties) = properties.handle()
-                && properties.as_dictionary().is_some()
-            {
-                if tag.as_ref() == b"OC"
+            } else if properties.as_dictionary().is_some() {
+                if tag == b"OC"
                     && let Some(object_ref) = properties.object_ref()
                 {
                     optional_hidden = if self.base_ocg_off {
@@ -593,10 +656,10 @@ impl<'a> PageScanner<'a> {
                         self.hidden_ocgs.contains(&content_object_key(object_ref))
                     };
                 }
-                if let Ok(value) = properties.try_get_key(b"/ActualText")
+                if let Some(value) = properties.get_key(b"/ActualText")
                     && let Some(bytes) = value.as_string()
                 {
-                    actual_text = Some(decode_pdf_text_string(&bytes));
+                    actual_text = Some(decode_pdf_text_string(bytes));
                 }
             }
         }
@@ -661,7 +724,7 @@ impl<'a> PageScanner<'a> {
             b"Tf" => {
                 if self.operands.len() >= 2 {
                     if let Some(font) = self.name_at(0) {
-                        self.text.font = font.into_owned();
+                        self.text.font = font.to_vec();
                     }
                     if let Some(size) = Self::number(&self.operands[1].object) {
                         self.text.font_size = size;
@@ -728,18 +791,19 @@ impl<'a> PageScanner<'a> {
             b"T*" => self.new_line(),
             b"Tj" => {
                 if let Some(bytes) = self.operands.first().and_then(|o| o.object.as_string()) {
-                    self.show_single(bytes, span_start, span_end);
+                    self.show_single(bytes.to_vec(), span_start, span_end);
                 }
             }
             b"TJ" => {
                 if let Some(array) = self.operands.first().and_then(|o| o.object.as_array()) {
+                    let array = array.to_vec();
                     self.show_tj_array(&array, span_start, span_end);
                 }
             }
             b"'" => {
                 self.new_line();
                 if let Some(bytes) = self.operands.first().and_then(|o| o.object.as_string()) {
-                    self.show_single(bytes, span_start, span_end);
+                    self.show_single(bytes.to_vec(), span_start, span_end);
                 }
             }
             b"\"" => {
@@ -752,7 +816,7 @@ impl<'a> PageScanner<'a> {
                     }
                     self.new_line();
                     if let Some(bytes) = self.operands[2].object.as_string() {
-                        self.show_single(bytes, span_start, span_end);
+                        self.show_single(bytes.to_vec(), span_start, span_end);
                     }
                 }
             }
@@ -968,68 +1032,27 @@ impl<'a> PageScanner<'a> {
     }
 }
 
-impl ObjectHandleParserCallbacks for PageScanner<'_> {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
+impl PageScanner<'_> {
+    fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
+            return;
         }
-        self.operands.push(OperandSpan {
-            object: OperandObject::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let span_start = self
-            .operands
-            .first()
-            .map_or(offset, |operand| operand.offset);
-        let span_end = offset.saturating_add(length);
-        self.apply_operator(operator, span_start, span_end);
+        self.operands = instruction_operands(input, instruction);
+        let span = instruction.span();
+        self.apply_operator(&instruction.operator[..], span.start, span.end);
         self.operands.clear();
-        self.operator_index += 1;
-        Ok(ParseControl::Continue)
+        self.operator_index = self.operator_index.saturating_add(1);
     }
 
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            let span_start = self
-                .operands
-                .first()
-                .map_or(offset, |operand| operand.offset);
-            let span_end = offset.saturating_add(length);
-            self.apply_operator(&operator, span_start, span_end);
-            self.operands.clear();
-            self.operator_index += 1;
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(OperandSpan {
-                object: OperandObject::Handle(object),
-                offset,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self, input: &[u8]) -> Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
@@ -1117,7 +1140,7 @@ impl LargeDiagonalTextScanner {
                     .first()
                     .and_then(|operand| operand.object.as_string())
                 {
-                    push(bytes);
+                    push(bytes.to_vec());
                 }
             }
             b"TJ" => {
@@ -1128,7 +1151,7 @@ impl LargeDiagonalTextScanner {
                 {
                     for item in array {
                         if let Some(bytes) = item.as_string() {
-                            push(bytes);
+                            push(bytes.to_vec());
                         }
                     }
                 }
@@ -1139,7 +1162,7 @@ impl LargeDiagonalTextScanner {
                     .get(2)
                     .and_then(|operand| operand.object.as_string())
                 {
-                    push(bytes);
+                    push(bytes.to_vec());
                 }
             }
             _ => {}
@@ -1300,66 +1323,26 @@ impl LargeDiagonalTextScanner {
     }
 }
 
-impl ObjectHandleParserCallbacks for LargeDiagonalTextScanner {
-    const HANDLES_CONTENT_SCALARS: bool = true;
-
-    fn handle_scalar(
+impl LargeDiagonalTextScanner {
+    fn instruction(
         &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = scalar.as_operator() {
-            return self.handle_operator(operator, offset, length);
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        if &instruction.operator[..] == b"BI" {
+            return;
         }
-        self.operands.push(OperandSpan {
-            object: OperandObject::Scalar(scalar),
-            offset,
-        });
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let span_start = self
-            .operands
-            .first()
-            .map_or(offset, |operand| operand.offset);
-        let span_end = offset.saturating_add(length);
-        self.apply_operator(operator, span_start, span_end);
+        self.operands = instruction_operands(input, instruction);
+        let span = instruction.span();
+        self.apply_operator(&instruction.operator[..], span.start, span.end);
         self.operands.clear();
-        Ok(ParseControl::Continue)
     }
 
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            let span_start = self
-                .operands
-                .first()
-                .map_or(offset, |operand| operand.offset);
-            let span_end = offset.saturating_add(length);
-            self.apply_operator(&operator, span_start, span_end);
-            self.operands.clear();
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(OperandSpan {
-                object: OperandObject::Handle(object),
-                offset,
-            });
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
+    fn scan(&mut self, input: &[u8]) -> Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
+            Ok(())
+        })
     }
 }
 
@@ -1537,11 +1520,7 @@ pub fn remove_large_diagonal_text_hayro(
             continue;
         }
         let mut scanner = LargeDiagonalTextScanner::default();
-        crate::content_stream::parse_detached_content_stream(
-            &decoded,
-            "large diagonal text removal",
-            &mut scanner,
-        )?;
+        let _incomplete = scanner.scan(&decoded)?;
         let mut ranges = scanner.selected_ranges();
         if ranges.is_empty() {
             continue;
@@ -2023,77 +2002,6 @@ pub fn hidden_text_shared_context_hayro(
     })
 }
 
-struct TeeCallbacks<'a, A, B> {
-    first: &'a mut A,
-    second: &'a mut B,
-}
-
-impl<A, B> ObjectHandleParserCallbacks for TeeCallbacks<'_, A, B>
-where
-    A: ObjectHandleParserCallbacks,
-    B: ObjectHandleParserCallbacks,
-{
-    const HANDLES_CONTENT_SCALARS: bool = A::HANDLES_CONTENT_SCALARS && B::HANDLES_CONTENT_SCALARS;
-
-    fn content_size(&mut self, size: usize) -> crate::Result<()> {
-        self.first.content_size(size)?;
-        self.second.content_size(size)
-    }
-
-    fn handle_scalar(
-        &mut self,
-        scalar: ContentScalar,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        debug_assert!(Self::HANDLES_CONTENT_SCALARS);
-        let first = self.first.handle_scalar(scalar.clone(), offset, length)?;
-        let second = self.second.handle_scalar(scalar, offset, length)?;
-        if matches!(first, ParseControl::Stop) || matches!(second, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
-    }
-
-    fn handle_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let first = self.first.handle_operator(operator, offset, length)?;
-        let second = self.second.handle_operator(operator, offset, length)?;
-        if matches!(first, ParseControl::Stop) || matches!(second, ParseControl::Stop) {
-            Ok(ParseControl::Stop)
-        } else {
-            Ok(ParseControl::Continue)
-        }
-    }
-
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let first = self.first.handle_object(object.clone(), offset, length)?;
-        let second = self.second.handle_object(object, offset, length)?;
-        Ok(
-            if matches!(first, ParseControl::Stop) || matches!(second, ParseControl::Stop) {
-                ParseControl::Stop
-            } else {
-                ParseControl::Continue
-            },
-        )
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        self.first.handle_eof()?;
-        self.second.handle_eof()
-    }
-}
-
 fn should_prune_physically_hidden(finding: &HiddenTextFinding) -> bool {
     if matches!(
         finding.category,
@@ -2127,17 +2035,13 @@ fn physical_hidden_ranges(scan: PageScan) -> Vec<(usize, usize)> {
     ranges
 }
 
-pub fn scan_physical_hidden_text_with_callback_hayro<C>(
+pub fn scan_physical_hidden_text_hayro(
     document: &EditDocument,
     page: CowObjectHandle,
     page_number: usize,
     shared_context: &HiddenTextSharedContext,
     content: &[u8],
-    other: &mut C,
-) -> Result<Option<Vec<(usize, usize)>>>
-where
-    C: ObjectHandleParserCallbacks,
-{
+) -> Result<Option<Vec<(usize, usize)>>> {
     let crop = page_crop_hayro(document, page)?;
     let resources = build_resources_hayro(
         document,
@@ -2152,15 +2056,7 @@ where
         shared_context.ocg.base_off,
         &shared_context.ocg.on,
     );
-    let mut tee = TeeCallbacks {
-        first: other,
-        second: &mut scanner,
-    };
-    let stopped_on_container_eof = crate::content_stream::parse_detached_content_stream_recovering(
-        content,
-        "shared raster/hidden-text page content",
-        &mut tee,
-    )?;
+    let stopped_on_container_eof = scanner.scan(content)?;
     if stopped_on_container_eof {
         return Ok(None);
     }
@@ -2188,11 +2084,7 @@ fn scan_page_hayro(
         ocg.base_off,
         &ocg.on,
     );
-    crate::content_stream::parse_detached_content_stream(
-        &content,
-        "Hayro/COW page content",
-        &mut scanner,
-    )?;
+    let _incomplete = scanner.scan(&content)?;
     Ok(scanner.finish())
 }
 
@@ -2397,14 +2289,7 @@ mod tests {
 
     fn large_diagonal_ranges(input: &[u8]) -> Vec<(usize, usize)> {
         let mut scanner = LargeDiagonalTextScanner::default();
-        assert!(
-            crate::content_stream::parse_detached_content_stream(
-                input,
-                "large diagonal text test",
-                &mut scanner
-            )
-            .is_ok()
-        );
+        assert!(scanner.scan(input).is_ok());
         scanner.selected_ranges()
     }
 

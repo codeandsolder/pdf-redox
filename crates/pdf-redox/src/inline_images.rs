@@ -1,10 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{form_content, form_resources, page_content, page_resources},
-    content_stream::{
-        ContentObject, ObjectHandleParserCallbacks, ParseControl,
-        parse_detached_content_stream_recovering,
-    },
 };
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
 use sha2::{Digest as _, Sha256};
@@ -612,38 +608,21 @@ pub fn externalize_fragmented_inline_target_hayro(
     Ok(result)
 }
 
-#[derive(Default)]
-struct XObjectUsageScanner {
-    last_name: Option<Vec<u8>>,
-    used: BTreeSet<Vec<u8>>,
-}
-
-impl ObjectHandleParserCallbacks for XObjectUsageScanner {
-    fn handle_object(
-        &mut self,
-        object: ContentObject,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<ParseControl> {
-        if let Some(name) = object.as_name() {
-            self.last_name = Some(name);
-        } else if object.as_operator().as_deref() == Some(b"Do")
-            && let Some(name) = self.last_name.as_ref()
-        {
-            self.used.insert(name.clone());
-        }
-        Ok(ParseControl::Continue)
-    }
-    fn handle_eof(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 fn used_xobject_names(content: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
-    let mut scanner = XObjectUsageScanner::default();
-    let incomplete =
-        parse_detached_content_stream_recovering(content, "xobject usage", &mut scanner).ok()?;
-    (!incomplete).then_some(scanner.used)
+    let mut used = BTreeSet::new();
+    let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+        if &instruction.operator[..] == b"Do"
+            && let Some(name) = instruction
+                .operands()
+                .next()
+                .and_then(crate::content_stream::operand_name)
+        {
+            used.insert(name.to_vec());
+        }
+        Ok(())
+    })
+    .ok()?;
+    (!incomplete).then_some(used)
 }
 
 /// Remove only temporary `XObject` resource entries created by fragmented-inline

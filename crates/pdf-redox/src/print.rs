@@ -1,7 +1,4 @@
 use crate::Result;
-use crate::content_stream::{
-    ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::geometry::Matrix;
 use crate::images::ImageResizeTarget;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -49,13 +46,6 @@ impl ImagePlacement {
     }
 }
 
-fn parsed_number(object: &ObjectHandle) -> Option<f64> {
-    object
-        .as_integer()
-        .and_then(crate::source::exact_i64_to_f64)
-        .or_else(|| object.as_real())
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrintPlacementStats {
     pub images_placed: usize,
@@ -79,7 +69,6 @@ struct CowPlacementScanner {
     xobjects: BTreeMap<Vec<u8>, crate::ObjectHandle>,
     ctm: Matrix,
     stack: Vec<Matrix>,
-    operands: Vec<ObjectHandle>,
     draws: Vec<CowDrawEvent>,
     complete: bool,
 }
@@ -94,22 +83,27 @@ impl CowPlacementScanner {
             xobjects,
             ctm: base_ctm,
             stack: Vec::new(),
-            operands: Vec::new(),
             draws: Vec::new(),
             complete,
         }
     }
 
-    fn operator(&mut self, operator: &[u8]) {
-        match operator {
+    fn instruction(
+        &mut self,
+        content: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        let operands = instruction.operands().collect::<Vec<_>>();
+        let operand_spans = instruction.operand_spans().collect::<Vec<_>>();
+        match &instruction.operator[..] {
             b"q" => {
-                if !self.operands.is_empty() {
+                if !operands.is_empty() {
                     self.complete = false;
                 }
                 self.stack.push(self.ctm);
             }
             b"Q" => {
-                if !self.operands.is_empty() {
+                if !operands.is_empty() {
                     self.complete = false;
                 }
                 if let Some(ctm) = self.stack.pop() {
@@ -119,34 +113,42 @@ impl CowPlacementScanner {
                 }
             }
             b"cm" => {
-                if self.operands.len() == 6 {
-                    let values: Option<Vec<f64>> =
-                        self.operands.iter().map(parsed_number).collect();
-                    if let Some(values) = values {
-                        self.ctm.concat(Matrix::new(
-                            values[0], values[1], values[2], values[3], values[4], values[5],
-                        ));
-                    } else {
-                        self.complete = false;
-                    }
+                if operands.len() != 6 {
+                    self.complete = false;
+                    return;
+                }
+                let values = operands
+                    .iter()
+                    .zip(&operand_spans)
+                    .map(|(operand, span)| {
+                        crate::content_stream::operand_number(
+                            operand,
+                            content.get(span.clone()).unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(values) = values {
+                    self.ctm.concat(Matrix::new(
+                        values[0], values[1], values[2], values[3], values[4], values[5],
+                    ));
                 } else {
                     self.complete = false;
                 }
             }
             b"Do" => {
-                if self.operands.len() == 1 {
-                    if let Some(name) = self.operands[0].as_name() {
-                        if let Some(target) = self.xobjects.get(&name).copied() {
-                            self.draws.push(CowDrawEvent {
-                                target,
-                                ctm: self.ctm,
-                            });
-                        } else {
-                            self.complete = false;
-                        }
-                    } else {
-                        self.complete = false;
-                    }
+                if operands.len() != 1 {
+                    self.complete = false;
+                    return;
+                }
+                let Some(name) = crate::content_stream::operand_name(operands[0]) else {
+                    self.complete = false;
+                    return;
+                };
+                if let Some(target) = self.xobjects.get(name).copied() {
+                    self.draws.push(CowDrawEvent {
+                        target,
+                        ctm: self.ctm,
+                    });
                 } else {
                     self.complete = false;
                 }
@@ -154,25 +156,13 @@ impl CowPlacementScanner {
             _ => {}
         }
     }
-}
 
-impl ObjectHandleParserCallbacks for CowPlacementScanner {
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.operator(&operator);
-            self.operands.clear();
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(object);
-        }
-        Ok(ParseControl::Continue)
-    }
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        if !self.stack.is_empty() {
+    fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            self.instruction(content, instruction);
+            Ok(())
+        })?;
+        if incomplete || !self.stack.is_empty() {
             self.complete = false;
         }
         Ok(())
@@ -447,14 +437,7 @@ fn cow_scan_form(
         }
         let content = document.decoded_stream_data(form)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
-        if crate::content_stream::parse_detached_content_stream(
-            &content,
-            "Hayro/COW form placement",
-            &mut scanner,
-        )
-        .is_err()
-            || !scanner.complete
-        {
+        if scanner.scan(&content).is_err() || !scanner.complete {
             *state.complete = false;
         }
         let current = scanner.xobjects.clone();
@@ -560,10 +543,6 @@ fn cow_image_resize_safe(
     Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "placement collection and conservative resize selection form one ordered geometry pass"
-)]
 pub fn plan_print_downsampling_hayro(
     document: &crate::EditDocument,
     target_ppi: u32,
@@ -597,14 +576,7 @@ pub fn plan_print_downsampling_hayro(
         base_ctm.scale(user_unit, user_unit);
         let content = cow_page_content(document, page)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
-        if crate::content_stream::parse_detached_content_stream(
-            &content,
-            "Hayro/COW page placement",
-            &mut scanner,
-        )
-        .is_err()
-            || !scanner.complete
-        {
+        if scanner.scan(&content).is_err() || !scanner.complete {
             complete = false;
         }
         let current = scanner.xobjects.clone();

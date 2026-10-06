@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject as ObjectHandle, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
     RiskKind, content::page_content, hidden_text::analyze_hidden_text_hayro,
@@ -512,35 +509,27 @@ struct InlineImageCounter {
     payloads: HashMap<[u8; 32], (usize, usize)>,
 }
 
-impl ObjectHandleParserCallbacks for InlineImageCounter {
-    fn handle_object(
-        &mut self,
-        object: ObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(bytes) = object.as_inline_image() {
-            self.count += 1;
-            self.bytes += bytes.len();
-            record_payload(&mut self.payloads, &bytes);
+fn scan_inline_images(content: &[u8], counter: &mut InlineImageCounter) -> Result<()> {
+    crate::content_stream::visit_instructions(content, |instruction| {
+        if &instruction.operator[..] == b"BI"
+            && let Some(hayro_syntax::object::Object::Stream(stream)) =
+                instruction.operands().next()
+        {
+            let bytes = stream.raw_data();
+            counter.count += 1;
+            counter.bytes += bytes.len();
+            record_payload(&mut counter.payloads, bytes.as_ref());
         }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
         Ok(())
-    }
+    })?;
+    Ok(())
 }
 
 fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize, usize)> {
     let mut counter = InlineImageCounter::default();
     for page in document.page_handles()? {
         let content = page_content(document, page)?;
-        crate::content_stream::parse_detached_content_stream(
-            &content,
-            "Hayro analysis page content",
-            &mut counter,
-        )?;
+        scan_inline_images(&content, &mut counter)?;
     }
 
     let mut seen_forms = BTreeSet::new();
@@ -558,11 +547,7 @@ fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize
             continue;
         }
         let content = document.decoded_owned_stream_data(&object)?;
-        crate::content_stream::parse_detached_content_stream(
-            &content,
-            "Hayro analysis Form content",
-            &mut counter,
-        )?;
+        scan_inline_images(&content, &mut counter)?;
     }
 
     let (duplicate_groups, duplicate_wasted_bytes) = duplicate_payload_stats(counter.payloads);

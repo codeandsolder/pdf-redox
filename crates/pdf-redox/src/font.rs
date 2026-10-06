@@ -1,6 +1,3 @@
-use crate::content_stream::{
-    ContentObject as FlObjectHandle, ObjectHandleParserCallbacks, ParseControl,
-};
 use crate::stream_codec::{
     decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
 };
@@ -844,7 +841,6 @@ fn page_font_program(
 struct IdentityCidGlyphScanner<'a> {
     fonts: &'a HashMap<Vec<u8>, CidFontGlyphSpec>,
     current_font: Option<&'a CidFontGlyphSpec>,
-    operands: Vec<FlObjectHandle>,
     used: HashMap<CowObjectHandle, BTreeSet<u16>>,
     unsafe_programs: BTreeSet<CowObjectHandle>,
 }
@@ -875,57 +871,42 @@ impl IdentityCidGlyphScanner<'_> {
         }
     }
 
-    fn apply_operator(&mut self, operator: &[u8]) {
-        match operator {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        let mut operands = instruction.operands();
+        match &instruction.operator[..] {
             b"Tf" => {
-                self.current_font = self
-                    .operands
-                    .first()
-                    .and_then(FlObjectHandle::as_name)
-                    .and_then(|name| self.fonts.get(&name));
+                self.current_font = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_name)
+                    .and_then(|name| self.fonts.get(name));
             }
             b"Tj" | b"'" => {
-                if let Some(bytes) = self.operands.first().and_then(FlObjectHandle::as_string) {
-                    self.record_string(&bytes);
+                if let Some(bytes) = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_string)
+                {
+                    self.record_string(bytes);
                 }
             }
             b"\"" => {
-                if let Some(bytes) = self.operands.get(2).and_then(FlObjectHandle::as_string) {
-                    self.record_string(&bytes);
+                if let Some(bytes) = operands
+                    .nth(2)
+                    .and_then(crate::content_stream::operand_string)
+                {
+                    self.record_string(bytes);
                 }
             }
             b"TJ" => {
-                if let Some(array) = self.operands.first().and_then(FlObjectHandle::as_array) {
-                    for item in array {
-                        if let Some(bytes) = item.as_string() {
-                            self.record_string(&bytes);
+                if let Some(HayroObject::Array(array)) = operands.next() {
+                    for item in array.raw_iter() {
+                        if let HayroMaybeRef::NotRef(HayroObject::String(value)) = item {
+                            self.record_string(value.as_bytes());
                         }
                     }
                 }
             }
             _ => {}
         }
-    }
-}
-
-impl ObjectHandleParserCallbacks for IdentityCidGlyphScanner<'_> {
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.apply_operator(&operator);
-            self.operands.clear();
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(object);
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
     }
 }
 
@@ -952,7 +933,6 @@ fn page_simple_truetype_program(
 struct WinAnsiCodeScanner<'a> {
     fonts: &'a HashMap<Vec<u8>, CowObjectHandle>,
     current_program: Option<CowObjectHandle>,
-    operands: Vec<FlObjectHandle>,
     used: HashMap<CowObjectHandle, BTreeSet<u8>>,
     unsafe_programs: BTreeSet<CowObjectHandle>,
 }
@@ -972,57 +952,42 @@ impl WinAnsiCodeScanner<'_> {
             .extend(bytes.iter().copied());
     }
 
-    fn apply_operator(&mut self, operator: &[u8]) {
-        match operator {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        let mut operands = instruction.operands();
+        match &instruction.operator[..] {
             b"Tf" => {
-                self.current_program = self
-                    .operands
-                    .first()
-                    .and_then(FlObjectHandle::as_name)
-                    .and_then(|name| self.fonts.get(&name).copied());
+                self.current_program = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_name)
+                    .and_then(|name| self.fonts.get(name).copied());
             }
             b"Tj" | b"'" => {
-                if let Some(bytes) = self.operands.first().and_then(FlObjectHandle::as_string) {
-                    self.record_string(&bytes);
+                if let Some(bytes) = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_string)
+                {
+                    self.record_string(bytes);
                 }
             }
             b"\"" => {
-                if let Some(bytes) = self.operands.get(2).and_then(FlObjectHandle::as_string) {
-                    self.record_string(&bytes);
+                if let Some(bytes) = operands
+                    .nth(2)
+                    .and_then(crate::content_stream::operand_string)
+                {
+                    self.record_string(bytes);
                 }
             }
             b"TJ" => {
-                if let Some(array) = self.operands.first().and_then(FlObjectHandle::as_array) {
-                    for item in array {
-                        if let Some(bytes) = item.as_string() {
-                            self.record_string(&bytes);
+                if let Some(HayroObject::Array(array)) = operands.next() {
+                    for item in array.raw_iter() {
+                        if let HayroMaybeRef::NotRef(HayroObject::String(value)) = item {
+                            self.record_string(value.as_bytes());
                         }
                     }
                 }
             }
             _ => {}
         }
-    }
-}
-
-impl ObjectHandleParserCallbacks for WinAnsiCodeScanner<'_> {
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        _offset: usize,
-        _length: usize,
-    ) -> crate::Result<ParseControl> {
-        if let Some(operator) = object.as_operator() {
-            self.apply_operator(&operator);
-            self.operands.clear();
-        } else if object.as_inline_image().is_none() {
-            self.operands.push(object);
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        Ok(())
     }
 }
 
@@ -1080,42 +1045,6 @@ fn eligible_identity_fonts(
     Ok(eligible)
 }
 
-struct FontUsageScanner<'a> {
-    identity: IdentityCidGlyphScanner<'a>,
-    winansi: WinAnsiCodeScanner<'a>,
-}
-
-impl ObjectHandleParserCallbacks for FontUsageScanner<'_> {
-    fn content_size(&mut self, size: usize) -> crate::Result<()> {
-        self.identity.content_size(size)?;
-        self.winansi.content_size(size)
-    }
-
-    fn handle_object(
-        &mut self,
-        object: FlObjectHandle,
-        offset: usize,
-        length: usize,
-    ) -> crate::Result<ParseControl> {
-        let identity = self
-            .identity
-            .handle_object(object.clone(), offset, length)?;
-        let winansi = self.winansi.handle_object(object, offset, length)?;
-        Ok(
-            if matches!(identity, ParseControl::Stop) || matches!(winansi, ParseControl::Stop) {
-                ParseControl::Stop
-            } else {
-                ParseControl::Continue
-            },
-        )
-    }
-
-    fn handle_eof(&mut self) -> crate::Result<()> {
-        self.identity.handle_eof()?;
-        self.winansi.handle_eof()
-    }
-}
-
 fn scan_font_usage_scope(
     content: &[u8],
     identity_eligible: &HashMap<Vec<u8>, CidFontGlyphSpec>,
@@ -1128,39 +1057,34 @@ fn scan_font_usage_scope(
     if identity_eligible.is_empty() && winansi_eligible.is_empty() {
         return;
     }
-    let mut scanner = FontUsageScanner {
-        identity: IdentityCidGlyphScanner {
-            fonts: identity_eligible,
-            current_font: None,
-            operands: Vec::new(),
-            used: HashMap::new(),
-            unsafe_programs: BTreeSet::new(),
-        },
-        winansi: WinAnsiCodeScanner {
-            fonts: winansi_eligible,
-            current_program: None,
-            operands: Vec::new(),
-            used: HashMap::new(),
-            unsafe_programs: BTreeSet::new(),
-        },
+    let mut identity = IdentityCidGlyphScanner {
+        fonts: identity_eligible,
+        current_font: None,
+        used: HashMap::new(),
+        unsafe_programs: BTreeSet::new(),
     };
-    if crate::content_stream::parse_detached_content_stream(
-        content,
-        "font glyph usage",
-        &mut scanner,
-    )
-    .is_err()
-    {
+    let mut winansi = WinAnsiCodeScanner {
+        fonts: winansi_eligible,
+        current_program: None,
+        used: HashMap::new(),
+        unsafe_programs: BTreeSet::new(),
+    };
+    let parsed = crate::content_stream::visit_instructions(content, |instruction| {
+        identity.instruction(instruction);
+        winansi.instruction(instruction);
+        Ok(())
+    });
+    if !matches!(parsed, Ok(false)) {
         identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
         winansi_unsafe.extend(winansi_eligible.values().copied());
         return;
     }
-    identity_unsafe.extend(scanner.identity.unsafe_programs);
-    for (program, gids) in scanner.identity.used {
+    identity_unsafe.extend(identity.unsafe_programs);
+    for (program, gids) in identity.used {
         identity_used.entry(program).or_default().extend(gids);
     }
-    winansi_unsafe.extend(scanner.winansi.unsafe_programs);
-    for (program, codes) in scanner.winansi.used {
+    winansi_unsafe.extend(winansi.unsafe_programs);
+    for (program, codes) in winansi.used {
         winansi_used.entry(program).or_default().extend(codes);
     }
 }
