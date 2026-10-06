@@ -1600,14 +1600,14 @@ fn rewrite_all_references(
 
 fn exact_dictionary_redirects(
     document: &EditDocument,
-    handles: &BTreeSet<CowObjectHandle>,
+    handles: impl IntoIterator<Item = CowObjectHandle>,
     domain: &[u8],
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut canonical_by_fingerprint =
         HashMap::<[u8; 32], Vec<(CowObjectHandle, OwnedObject)>>::new();
     let mut redirects = HashMap::new();
 
-    for &handle in handles {
+    for handle in handles {
         let Some(object) = document.current_owned_object(handle)? else {
             continue;
         };
@@ -1656,7 +1656,11 @@ pub fn canonicalize_exact_extgstate_dictionaries(
         }
     }
 
-    let redirects = exact_dictionary_redirects(document, &handles, b"exact-extgstate-dictionary")?;
+    let redirects = exact_dictionary_redirects(
+        document,
+        handles.iter().copied(),
+        b"exact-extgstate-dictionary",
+    )?;
     let references_canonicalized =
         rewrite_dictionary_target_entries(document, &targets, &redirects)?;
     Ok(ExactObjectDedupStats {
@@ -1725,8 +1729,11 @@ pub fn canonicalize_exact_structure_attribute_dictionaries(
         Ok(())
     })?;
 
-    let redirects =
-        exact_dictionary_redirects(document, &handles, b"exact-structure-attribute-dictionary")?;
+    let redirects = exact_dictionary_redirects(
+        document,
+        handles.iter().copied(),
+        b"exact-structure-attribute-dictionary",
+    )?;
     let mut references_canonicalized = 0usize;
     for holder in &holders {
         let Some(canonical) = redirects.get(&holder.target).copied() else {
@@ -1774,37 +1781,11 @@ fn reachable_dictionaries_with_type(
 pub fn canonicalize_exact_font_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {
-    let handles = reachable_dictionaries_with_type(document, b"Font")?;
-    let mut canonical_by_fingerprint =
-        HashMap::<[u8; 32], Vec<(CowObjectHandle, OwnedObject)>>::new();
-    let mut redirects = HashMap::<CowObjectHandle, CowObjectHandle>::new();
-
-    for handle in handles {
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let OwnedObject::Dictionary(_) = &object else {
-            continue;
-        };
-
-        let mut hasher = Sha256::new();
-        hash_len_prefixed(&mut hasher, b"exact-font-dictionary");
-        hash_owned_object(&mut hasher, &object)?;
-        let fingerprint: [u8; 32] = hasher.finalize().into();
-
-        let candidates = canonical_by_fingerprint.entry(fingerprint).or_default();
-        if let Some((canonical, _)) = candidates
-            .iter()
-            .find(|(_, candidate)| *candidate == object)
-        {
-            if *canonical != handle {
-                redirects.insert(handle, *canonical);
-            }
-        } else {
-            candidates.push((handle, object));
-        }
-    }
-
+    let redirects = exact_dictionary_redirects(
+        document,
+        reachable_dictionaries_with_type(document, b"Font")?,
+        b"exact-font-dictionary",
+    )?;
     let references_canonicalized = rewrite_all_references(document, &redirects)?;
     Ok(ExactObjectDedupStats {
         duplicate_objects_detected: redirects.len(),
