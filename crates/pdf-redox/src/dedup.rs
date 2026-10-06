@@ -1455,6 +1455,43 @@ struct RedirectReferenceHolder {
     target: CowObjectHandle,
 }
 
+fn record_redirect_reference_holder(
+    root: CowObjectHandle,
+    path: &[DirectPathStep],
+    target: CowObjectHandle,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    holders: &mut Vec<RedirectReferenceHolder>,
+) {
+    if redirects.contains_key(&target) {
+        holders.push(RedirectReferenceHolder {
+            root,
+            path: path.to_vec(),
+            target,
+        });
+    }
+}
+
+fn inspect_source_redirect_value(
+    root: CowObjectHandle,
+    value: HayroMaybeRef<HayroObject<'_>>,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    path: &mut Vec<DirectPathStep>,
+    holders: &mut Vec<RedirectReferenceHolder>,
+) {
+    match value {
+        HayroMaybeRef::Ref(target) => record_redirect_reference_holder(
+            root,
+            path,
+            CowObjectHandle::Existing(target.into()),
+            redirects,
+            holders,
+        ),
+        HayroMaybeRef::NotRef(value) => {
+            inspect_source_redirect_reference_holders(root, &value, redirects, path, holders);
+        }
+    }
+}
+
 fn inspect_source_redirect_reference_holders(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
@@ -1466,69 +1503,21 @@ fn inspect_source_redirect_reference_holders(
         HayroObject::Dict(dictionary) => {
             for (name, value) in dictionary.entries() {
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                match value {
-                    HayroMaybeRef::Ref(target) => {
-                        let target = CowObjectHandle::Existing(target.into());
-                        if redirects.contains_key(&target) {
-                            holders.push(RedirectReferenceHolder {
-                                root,
-                                path: path.clone(),
-                                target,
-                            });
-                        }
-                    }
-                    HayroMaybeRef::NotRef(value) => {
-                        inspect_source_redirect_reference_holders(
-                            root, &value, redirects, path, holders,
-                        );
-                    }
-                }
+                inspect_source_redirect_value(root, value, redirects, path, holders);
                 path.pop();
             }
         }
         HayroObject::Stream(stream) => {
             for (name, value) in stream.dict().entries() {
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                match value {
-                    HayroMaybeRef::Ref(target) => {
-                        let target = CowObjectHandle::Existing(target.into());
-                        if redirects.contains_key(&target) {
-                            holders.push(RedirectReferenceHolder {
-                                root,
-                                path: path.clone(),
-                                target,
-                            });
-                        }
-                    }
-                    HayroMaybeRef::NotRef(value) => {
-                        inspect_source_redirect_reference_holders(
-                            root, &value, redirects, path, holders,
-                        );
-                    }
-                }
+                inspect_source_redirect_value(root, value, redirects, path, holders);
                 path.pop();
             }
         }
         HayroObject::Array(array) => {
             for (index, value) in array.raw_iter().enumerate() {
                 path.push(DirectPathStep::ArrayIndex(index));
-                match value {
-                    HayroMaybeRef::Ref(target) => {
-                        let target = CowObjectHandle::Existing(target.into());
-                        if redirects.contains_key(&target) {
-                            holders.push(RedirectReferenceHolder {
-                                root,
-                                path: path.clone(),
-                                target,
-                            });
-                        }
-                    }
-                    HayroMaybeRef::NotRef(value) => {
-                        inspect_source_redirect_reference_holders(
-                            root, &value, redirects, path, holders,
-                        );
-                    }
-                }
+                inspect_source_redirect_value(root, value, redirects, path, holders);
                 path.pop();
             }
         }
@@ -1549,13 +1538,7 @@ fn inspect_owned_redirect_reference_holders(
 ) {
     match object {
         OwnedObject::Reference(target) => {
-            if redirects.contains_key(target) {
-                holders.push(RedirectReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    target: *target,
-                });
-            }
+            record_redirect_reference_holder(root, path, *target, redirects, holders);
         }
         OwnedObject::Array(values) => {
             for (index, value) in values.iter().enumerate() {
