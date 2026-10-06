@@ -12,7 +12,7 @@ Design goals:
 - never require uploading the document to a server;
 - preserve unsupported/opaque streams rather than damaging them.
 
-Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision.
+Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision. OpenType parsing, rebuilding, and glyph subsetting are delegated to Fontations (`skrifa`, `write-fonts`, and `skera`); the maintained `codeandsolder/fontations` fork carries only the small Skera glyph-mapping API needed to rewrite PDF-side glyph addressing and auto-replays that patch onto upstream.
 
 ## Workspace
 
@@ -26,7 +26,7 @@ Hayro is the source parser and codec layer. Source bytes stay immutable and lazi
 Early but functional. The core currently provides:
 
 - whole-document fresh rewrites, garbage collection, object-stream generation, and optional page-content normalization;
-- granular semantic-preservation policy applied directly to the normal parsed object graph, including appearance-only annotation flattening, leaf/intermediate page-tree pruning, Catalog pruning, and a visible-surface font policy that can discard embedded OpenType editing/layout tables unused by PDF rendering; the preset still retains optional-content state and output intents because they can affect rendering;
+- granular semantic-preservation policy applied directly to the normal parsed object graph, including appearance-only annotation flattening, leaf/intermediate page-tree pruning, Catalog pruning, and a visible-surface font policy that can discard embedded OpenType editing/layout tables unused by PDF rendering, subset unused glyph programs while retaining original GIDs when PDF addressing is fixed, and densely remap CIDFontType2 programs only when every explicit `CIDToGIDMap` user can be rewritten atomically; the preset still retains optional-content state and output intents because they can affect rendering;
 - exact duplicate `/Metadata`, embedded font-program, `/ToUnicode` `CMap`, Type3 `/CharProcs`, page `/Contents`, annotation appearance Form streams, Image/Form `XObject`, and `ICCBased` profile canonicalization before garbage collection; metadata references are trusted even when a producer omits the stream's nominal `/Type /Metadata` entry;
 - duplicate-aware inline-image externalization that fingerprints the expanded Image `XObject` dictionary plus exact encoded payload, rewrites only fingerprints repeated across multiple mutable page/Form content scopes whose duplicated payload clears a 1 KiB gate, keeps singleton/marginal or same-stream repeats inline, and shares one indirect Image `XObject` across scopes; the extra two-pass scan is skipped entirely when pre-analysis sees less than 1 KiB of duplicate inline payload;
 - high-level structural/risk profiling plus size-gated selective Flate recompression;
