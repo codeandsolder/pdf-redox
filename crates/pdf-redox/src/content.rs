@@ -133,6 +133,22 @@ pub fn effective_page_resources(
     Ok(page_resources(document, page)?.unwrap_or_default())
 }
 
+pub fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<f64>> {
+    let Some(object) = document.current_owned_object(page)? else {
+        return Ok(None);
+    };
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(None);
+    };
+    let Some(value) = dictionary.get(b"UserUnit".as_slice()) else {
+        return Ok(Some(1.0));
+    };
+    let Some(value) = resolved_number_value(document, value)? else {
+        return Ok(None);
+    };
+    Ok((value.is_finite() && value > 0.0).then_some(value))
+}
+
 pub fn install_page_resource(
     document: &mut EditDocument,
     page: ObjectHandle,

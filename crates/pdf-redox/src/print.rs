@@ -1,6 +1,9 @@
 use crate::geometry::Matrix;
 use crate::images::ImageResizeTarget;
-use crate::{Result, content::resolved_number};
+use crate::{
+    Result,
+    content::{page_user_unit, resolved_number},
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_FORM_DEPTH: usize = 64;
@@ -548,17 +551,7 @@ pub fn plan_print_downsampling(
             }
         }
         let mut base_ctm = Matrix::default();
-        let user_unit = document.current_owned_object(page)?.and_then(|o| {
-            o.as_dictionary()
-                .and_then(|d| d.get(b"UserUnit".as_slice()))
-                .cloned()
-        });
-        let user_unit = match user_unit.as_ref() {
-            Some(value) => resolved_number(document, Some(value))?
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .unwrap_or(1.0),
-            None => 1.0,
-        };
+        let user_unit = page_user_unit(document, page)?.unwrap_or(1.0);
         base_ctm.scale(user_unit, user_unit);
         let content = cow_page_content(document, page)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);

@@ -2,7 +2,7 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource,
+        decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
         replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
@@ -3080,22 +3080,6 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
     }
     let output = apply_span_replacements(input, &scanner.replacements)?;
     Some((output, scanner.coordinates_canonicalized))
-}
-
-fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<f64>> {
-    let Some(object) = document.current_owned_object(page)? else {
-        return Ok(None);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    let Some(value) = dictionary.get(b"UserUnit".as_slice()) else {
-        return Ok(Some(1.0));
-    };
-    let Some(value) = resolved_number_value(document, value)? else {
-        return Ok(None);
-    };
-    Ok((value.is_finite() && value > 0.0).then_some(value))
 }
 
 fn canonicalize_page_path_coordinates(

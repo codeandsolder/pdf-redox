@@ -3,7 +3,7 @@ use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource,
+        decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
         replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
     },
 };
@@ -1057,22 +1057,8 @@ pub fn rasterize_pathological_microstrokes(
         let mut decoded = Vec::new();
         decoded_content_value(document, contents, &mut decoded)?;
         let resources = effective_page_resources(document, page)?;
-        let user_unit = document.current_owned_object(page)?.and_then(|object| {
-            object
-                .as_dictionary()
-                .and_then(|dictionary| dictionary.get(b"UserUnit".as_slice()))
-                .cloned()
-        });
-        let user_unit = match user_unit.as_ref() {
-            Some(value) => {
-                let Some(value) = resolved_number_value(document, value)?
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                else {
-                    continue;
-                };
-                value
-            }
-            None => 1.0,
+        let Some(user_unit) = page_user_unit(document, page)? else {
+            continue;
         };
         let mut scanner = MicroStrokeScanner::new(ext_gstate_patches(document, &resources)?);
         scanner.scan(&decoded)?;

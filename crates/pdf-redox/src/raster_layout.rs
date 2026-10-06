@@ -4,7 +4,7 @@ use crate::{
     StreamData,
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{
-        form_content, form_resources, page_content, page_resources, resolved_bool,
+        form_content, form_resources, page_content, page_resources, page_user_unit, resolved_bool,
         resolved_dictionary, resolved_number,
     },
     content_stream::{InstructionOperand, instruction_operands, operand_numbers},
@@ -4865,20 +4865,6 @@ fn install_target(
     Ok(())
 }
 
-fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<f64> {
-    let Some(page) = document.current_owned_object(page)? else {
-        return Ok(1.0);
-    };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(1.0);
-    };
-    Ok(
-        resolved_number(document, dictionary.get(b"UserUnit".as_slice()))?
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(1.0),
-    )
-}
-
 struct RewriteInput<'a> {
     content: &'a [u8],
     draws: &'a [RasterDraw],
@@ -5849,7 +5835,7 @@ pub fn normalize_raster_layout(
         }
 
         let user_unit = match target {
-            ContentTarget::Page(page) => page_user_unit(document, page)?,
+            ContentTarget::Page(page) => page_user_unit(document, page)?.unwrap_or(1.0),
             ContentTarget::Form(_) => 1.0,
         };
         let mut plans = build_merge_plans_for_scanner(
