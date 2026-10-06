@@ -57,10 +57,6 @@ impl FontProgramUsage {
     const fn cidfont_type0_only(self) -> bool {
         self.cidfont_type0 && !self.simple_truetype && !self.cidfont_type2
     }
-
-    const fn simple_truetype_only(self) -> bool {
-        self.simple_truetype && !self.cidfont_type2 && !self.cidfont_type0
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -83,35 +79,6 @@ fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
 
 fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<u8>, usize)> {
     crate::font_subset::strip_pdf_unused_tables(bytes, usage.cidfont_type2_only())
-}
-
-fn sfnt_unicode_gid(bytes: &[u8], codepoint: u32) -> Option<u16> {
-    use skrifa::MetadataProvider;
-
-    let font = skrifa::FontRef::new(bytes).ok()?;
-    let charmap = font.charmap();
-    // PDF WinAnsi text is ordinary Unicode-addressed text. Preserve the old
-    // conservative behavior for symbol/MacRoman-only fonts rather than using
-    // their compatibility remappings.
-    if charmap.is_symbol() {
-        return None;
-    }
-    u16::try_from(charmap.map(codepoint)?.to_u32()).ok()
-}
-
-fn sfnt_winansi_ascii_glyph_ids(bytes: &[u8], codes: &BTreeSet<u8>) -> Option<BTreeSet<u16>> {
-    let mut gids = BTreeSet::new();
-    for code in codes {
-        if !(0x20..=0x7e).contains(code) {
-            return None;
-        }
-        let gid = sfnt_unicode_gid(bytes, u32::from(*code))?;
-        if gid == 0 {
-            return None;
-        }
-        gids.insert(gid);
-    }
-    Some(gids)
 }
 
 fn composite_components(glyph: &[u8]) -> Option<Vec<u16>> {
@@ -517,23 +484,9 @@ fn union_sparse_cid_font_programs(
                 )
             })
             .collect::<Vec<_>>();
-        let Some(mut union_font) = sfnt_union_sparse_glyphs(&fonts) else {
+        let Some(union_font) = sfnt_union_sparse_glyphs(&fonts) else {
             continue;
         };
-        let requested_gids = indices
-            .iter()
-            .flat_map(|index| {
-                identity_glyph_usage[&candidates[*index].program]
-                    .iter()
-                    .copied()
-            })
-            .collect::<BTreeSet<_>>();
-        if let Some(subset_union) =
-            crate::font_subset::retain_glyph_ids(&union_font, &requested_gids)
-        {
-            union_font = subset_union.bytes;
-        }
-
         let canonical_index = indices[0];
         let canonical = &candidates[canonical_index];
 
@@ -1932,7 +1885,7 @@ pub fn strip_font_editing_tables(
     }
 
     let outline_subset_programs = legacy_subset_programs;
-    let (identity_glyph_usage, winansi_code_usage) = if outline_subset_programs.is_empty() {
+    let (identity_glyph_usage, _) = if outline_subset_programs.is_empty() {
         (HashMap::new(), HashMap::new())
     } else {
         font_glyph_usage(document)?
@@ -1963,7 +1916,7 @@ pub fn strip_font_editing_tables(
             candidate = unwrapped;
             true
         });
-        if allow_outline_subset
+        let outline_subset_changed = if allow_outline_subset
             && usage.cidfont_type0_only()
             && let Some(cids) = identity_glyph_usage.get(&program)
             && !cids.is_empty()
@@ -1971,27 +1924,11 @@ pub fn strip_font_editing_tables(
         {
             candidate = subset;
             glyph_subset_removed_bytes = removed;
-            changed = true;
-        } else if allow_outline_subset
-            && usage.cidfont_type2_only()
-            && let Some(gids) = identity_glyph_usage.get(&program)
-            && !gids.is_empty()
-            && let Some(subset) = crate::font_subset::retain_glyph_ids(&candidate, gids)
-        {
-            glyph_subset_removed_bytes = subset.removed_decoded_bytes;
-            candidate = subset.bytes;
-            changed = true;
-        } else if allow_outline_subset
-            && usage.simple_truetype_only()
-            && let Some(codes) = winansi_code_usage.get(&program)
-            && !codes.is_empty()
-            && let Some(gids) = sfnt_winansi_ascii_glyph_ids(&candidate, codes)
-            && let Some(subset) = crate::font_subset::retain_glyph_ids(&candidate, &gids)
-        {
-            glyph_subset_removed_bytes = subset.removed_decoded_bytes;
-            candidate = subset.bytes;
-            changed = true;
-        }
+            true
+        } else {
+            false
+        };
+        changed |= outline_subset_changed;
         if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate, usage) {
             candidate = trimmed;
             removed_decoded_bytes = removed;
@@ -2460,65 +2397,6 @@ mod tests {
             .iter()
             .map(|record| record.tag().to_be_bytes())
             .collect()
-    }
-
-    fn cmap_table(platform: u16, encoding: u16, subtable: &[u8]) -> Vec<u8> {
-        let mut cmap = Vec::new();
-        cmap.extend_from_slice(&0_u16.to_be_bytes());
-        cmap.extend_from_slice(&1_u16.to_be_bytes());
-        cmap.extend_from_slice(&platform.to_be_bytes());
-        cmap.extend_from_slice(&encoding.to_be_bytes());
-        cmap.extend_from_slice(&12_u32.to_be_bytes());
-        cmap.extend_from_slice(subtable);
-        cmap
-    }
-
-    #[test]
-    fn winansi_ascii_uses_unicode_cmap_format4_without_renumbering_gids() {
-        // Two segments: A-C -> gids 5-7, then the required 0xffff sentinel.
-        let mut format4 = Vec::new();
-        format4.extend_from_slice(&4_u16.to_be_bytes());
-        format4.extend_from_slice(&32_u16.to_be_bytes());
-        format4.extend_from_slice(&0_u16.to_be_bytes());
-        format4.extend_from_slice(&4_u16.to_be_bytes()); // segCountX2
-        format4.extend_from_slice(&4_u16.to_be_bytes()); // searchRange
-        format4.extend_from_slice(&1_u16.to_be_bytes()); // entrySelector
-        format4.extend_from_slice(&0_u16.to_be_bytes()); // rangeShift
-        format4.extend_from_slice(&67_u16.to_be_bytes());
-        format4.extend_from_slice(&u16::MAX.to_be_bytes());
-        format4.extend_from_slice(&0_u16.to_be_bytes()); // reservedPad
-        format4.extend_from_slice(&65_u16.to_be_bytes());
-        format4.extend_from_slice(&u16::MAX.to_be_bytes());
-        format4.extend_from_slice(&(-60_i16).to_be_bytes()); // 65 + (-60) = gid 5
-        format4.extend_from_slice(&1_i16.to_be_bytes());
-        format4.extend_from_slice(&0_u16.to_be_bytes());
-        format4.extend_from_slice(&0_u16.to_be_bytes());
-        let cmap = cmap_table(3, 1, &format4);
-        let font = sfnt(&[(*b"cmap", &cmap)]);
-        assert_eq!(sfnt_unicode_gid(&font, 65), Some(5));
-        assert_eq!(sfnt_unicode_gid(&font, 67), Some(7));
-        assert_eq!(
-            sfnt_winansi_ascii_glyph_ids(&font, &BTreeSet::from(*b"AC")),
-            Some(BTreeSet::from([5_u16, 7_u16]))
-        );
-        assert!(sfnt_winansi_ascii_glyph_ids(&font, &BTreeSet::from([0x80])).is_none());
-    }
-
-    #[test]
-    fn unicode_cmap_format12_maps_supplementary_codepoint() {
-        let mut format12 = Vec::new();
-        format12.extend_from_slice(&12_u16.to_be_bytes());
-        format12.extend_from_slice(&0_u16.to_be_bytes());
-        format12.extend_from_slice(&28_u32.to_be_bytes());
-        format12.extend_from_slice(&0_u32.to_be_bytes());
-        format12.extend_from_slice(&1_u32.to_be_bytes());
-        format12.extend_from_slice(&0x1f600_u32.to_be_bytes());
-        format12.extend_from_slice(&0x1f602_u32.to_be_bytes());
-        format12.extend_from_slice(&42_u32.to_be_bytes());
-        let cmap = cmap_table(3, 10, &format12);
-        let font = sfnt(&[(*b"cmap", &cmap)]);
-        assert_eq!(sfnt_unicode_gid(&font, 0x1f600), Some(42));
-        assert_eq!(sfnt_unicode_gid(&font, 0x1f602), Some(44));
     }
 
     #[test]
