@@ -424,6 +424,7 @@ dependencies = [
  "hayro-syntax",
  "libjpeg-turbo-rs",
  "serde",
+ "serde_json",
  "sha2",
  "skera",
  "skrifa",
