@@ -1,6 +1,9 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::{decoded_content_value, replace_page_content, resolved_dictionary},
+    content::{
+        decoded_content_value, effective_page_resources, install_page_resource,
+        replace_page_content, resolved_dictionary,
+    },
 };
 use flate2::{Compression, write::ZlibEncoder};
 use smallvec::SmallVec;
@@ -1731,31 +1734,6 @@ fn outlined_glyph_placement(
     Some(output)
 }
 
-fn page_resources(document: &EditDocument, page: ObjectHandle) -> Result<OwnedDictionary> {
-    Ok(match document.inherited_page_value(page, b"Resources")? {
-        Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
-        None => OwnedDictionary::default(),
-    })
-}
-
-fn install_page_font(
-    document: &mut EditDocument,
-    page: ObjectHandle,
-    name: Vec<u8>,
-    target: ObjectHandle,
-) -> Result<()> {
-    let mut resources = page_resources(document, page)?;
-    let mut fonts =
-        resolved_dictionary(document, resources.get(b"Font".as_slice()))?.unwrap_or_default();
-    fonts.insert(name, OwnedObject::Reference(target));
-    resources.insert(b"Font".to_vec(), OwnedObject::Dictionary(fonts));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-    }
-    Ok(())
-}
-
 fn outlined_glyph_font_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
     let mut serial = index;
     loop {
@@ -1765,24 +1743,6 @@ fn outlined_glyph_font_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> V
         }
         serial = serial.saturating_add(1);
     }
-}
-
-fn install_page_xobject(
-    document: &mut EditDocument,
-    page: ObjectHandle,
-    name: Vec<u8>,
-    target: ObjectHandle,
-) -> Result<()> {
-    let mut resources = page_resources(document, page)?;
-    let mut xobjects =
-        resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
-    xobjects.insert(name, OwnedObject::Reference(target));
-    resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-    }
-    Ok(())
 }
 
 fn stroke_form_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
@@ -1896,7 +1856,7 @@ pub fn factor_repeated_stroke_forms(
         let Some(occurrences) = stroke_form_occurrences(&decoded) else {
             continue;
         };
-        let resources = page_resources(document, page)?;
+        let resources = effective_page_resources(document, page)?;
         if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
         {
             occupied_names.extend(xobjects.keys().cloned());
@@ -2019,9 +1979,10 @@ pub fn factor_repeated_stroke_forms(
             .map(|item| item.page_index)
             .collect::<BTreeSet<_>>();
         for page_index in pages {
-            install_page_xobject(
+            install_page_resource(
                 document,
                 page_data[page_index].page,
+                b"XObject",
                 plan.name.clone(),
                 form,
             )?;
@@ -2079,7 +2040,7 @@ fn outlined_glyph_plans(
         return Ok(Vec::new());
     }
 
-    let resources = page_resources(document, page)?;
+    let resources = effective_page_resources(document, page)?;
     let mut occupied = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
         .map(|fonts| fonts.keys().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_default();
@@ -2273,7 +2234,7 @@ pub fn factor_outlined_glyphs(
 
         for plan in &plans {
             let font = outlined_glyph_font_dictionary(document, plan);
-            install_page_font(document, page, plan.name.clone(), font)?;
+            install_page_resource(document, page, b"Font", plan.name.clone(), font)?;
         }
         replace_page_content(document, page, rewritten.clone())?;
 

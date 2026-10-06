@@ -3,8 +3,8 @@ use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
     content::{
-        decoded_content_value, replace_page_content, resolved_bool_value, resolved_dictionary,
-        resolved_number_value,
+        decoded_content_value, effective_page_resources, install_page_resource,
+        replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -938,34 +938,6 @@ fn apply_replacements(input: &[u8], replacements: &[(usize, usize, Vec<u8>)]) ->
     Some(out)
 }
 
-fn page_effective_resources(
-    document: &EditDocument,
-    page: ObjectHandle,
-) -> Result<OwnedDictionary> {
-    Ok(match document.inherited_page_value(page, b"Resources")? {
-        Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
-        None => OwnedDictionary::default(),
-    })
-}
-
-fn install_page_xobject(
-    document: &mut EditDocument,
-    page: ObjectHandle,
-    name: Vec<u8>,
-    target: ObjectHandle,
-) -> Result<()> {
-    let mut resources = page_effective_resources(document, page)?;
-    let mut xobjects =
-        resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
-    xobjects.insert(name, OwnedObject::Reference(target));
-    resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-    }
-    Ok(())
-}
-
 fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
     let Some(value) = value else {
         return Ok(None);
@@ -1084,7 +1056,7 @@ pub fn rasterize_pathological_microstrokes(
         };
         let mut decoded = Vec::new();
         decoded_content_value(document, contents, &mut decoded)?;
-        let resources = page_effective_resources(document, page)?;
+        let resources = effective_page_resources(document, page)?;
         let user_unit = document.current_owned_object(page)?.and_then(|object| {
             object
                 .as_dictionary()
@@ -1186,7 +1158,7 @@ pub fn rasterize_pathological_microstrokes(
         }
         replace_page_content(document, page, rewritten)?;
         for (name, handle) in installed {
-            install_page_xobject(document, page, name, handle)?;
+            install_page_resource(document, page, b"XObject", name, handle)?;
         }
 
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);

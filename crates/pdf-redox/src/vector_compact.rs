@@ -2,8 +2,8 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        decoded_content_value, replace_page_content, resolved_bool_value, resolved_dictionary,
-        resolved_number_value,
+        decoded_content_value, effective_page_resources, install_page_resource,
+        replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
 };
@@ -1463,34 +1463,6 @@ struct PagePathData {
     decoded: Vec<u8>,
 }
 
-fn page_effective_resources(
-    document: &EditDocument,
-    page: ObjectHandle,
-) -> Result<OwnedDictionary> {
-    Ok(match document.inherited_page_value(page, b"Resources")? {
-        Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
-        None => OwnedDictionary::default(),
-    })
-}
-
-fn install_page_xobject(
-    document: &mut EditDocument,
-    page: ObjectHandle,
-    name: Vec<u8>,
-    target: ObjectHandle,
-) -> Result<()> {
-    let mut resources = page_effective_resources(document, page)?;
-    let mut xobjects =
-        resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
-    xobjects.insert(name, OwnedObject::Reference(target));
-    resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-    }
-    Ok(())
-}
-
 fn path_form_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
     let mut serial = index;
     loop {
@@ -1682,7 +1654,7 @@ fn factor_repeated_path_forms(
         let blocks = pre_scanned
             .remove(&page)
             .unwrap_or_else(|| factorable_processing_blocks(&decoded));
-        let resources = page_effective_resources(document, page)?;
+        let resources = effective_page_resources(document, page)?;
         if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
         {
             occupied_names.extend(xobjects.keys().cloned());
@@ -1878,7 +1850,13 @@ fn factor_repeated_path_forms(
             .map(|occurrence| occurrence.page_index)
             .collect::<BTreeSet<_>>();
         for page_index in pages {
-            install_page_xobject(document, page_data[page_index].page, name.clone(), handle)?;
+            install_page_resource(
+                document,
+                page_data[page_index].page,
+                b"XObject",
+                name.clone(),
+                handle,
+            )?;
         }
     }
 
@@ -1971,7 +1949,7 @@ fn factor_repeated_transformed_blocks(
                 bounds: block.bounds,
             });
         }
-        let resources = page_effective_resources(document, page)?;
+        let resources = effective_page_resources(document, page)?;
         if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
         {
             occupied_names.extend(xobjects.keys().cloned());
@@ -2107,7 +2085,13 @@ fn factor_repeated_transformed_blocks(
             .map(|occurrence| occurrence.page_index)
             .collect::<BTreeSet<_>>();
         for page_index in pages {
-            install_page_xobject(document, page_data[page_index].page, name.clone(), handle)?;
+            install_page_resource(
+                document,
+                page_data[page_index].page,
+                b"XObject",
+                name.clone(),
+                handle,
+            )?;
         }
     }
 
@@ -2228,7 +2212,7 @@ fn shared_resource_targets(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<SharedResourceTargets> {
-    let resources = page_effective_resources(document, page)?;
+    let resources = effective_page_resources(document, page)?;
     Ok(SharedResourceTargets {
         color_spaces: indirect_resource_targets(document, &resources, b"ColorSpace")?,
         ext_gstates: indirect_resource_targets(document, &resources, b"ExtGState")?,
@@ -2678,7 +2662,7 @@ fn factor_shared_q_prefix_runs(
         if blocks.is_empty() {
             continue;
         }
-        let resources = page_effective_resources(document, page)?;
+        let resources = effective_page_resources(document, page)?;
         if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
         {
             occupied_names.extend(xobjects.keys().cloned());
@@ -2796,9 +2780,10 @@ fn factor_shared_q_prefix_runs(
     }
     for (run, handle) in selected.iter().zip(form_handles) {
         for &page_index in &run.candidate.page_indices {
-            install_page_xobject(
+            install_page_resource(
                 document,
                 page_data[page_index].page,
+                b"XObject",
                 run.name.clone(),
                 handle,
             )?;

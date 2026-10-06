@@ -126,6 +126,32 @@ pub fn form_resources(
     resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))
 }
 
+pub fn effective_page_resources(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<OwnedDictionary> {
+    Ok(page_resources(document, page)?.unwrap_or_default())
+}
+
+pub fn install_page_resource(
+    document: &mut EditDocument,
+    page: ObjectHandle,
+    resource_type: &[u8],
+    name: Vec<u8>,
+    target: ObjectHandle,
+) -> Result<()> {
+    let mut resources = effective_page_resources(document, page)?;
+    let mut entries =
+        resolved_dictionary(document, resources.get(resource_type))?.unwrap_or_default();
+    entries.insert(name, OwnedObject::Reference(target));
+    resources.insert(resource_type.to_vec(), OwnedObject::Dictionary(entries));
+    let object = document.edit_handle(page)?;
+    if let Some(dictionary) = object.as_dictionary_mut() {
+        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+    }
+    Ok(())
+}
+
 pub fn replace_page_content(
     document: &mut EditDocument,
     page: ObjectHandle,

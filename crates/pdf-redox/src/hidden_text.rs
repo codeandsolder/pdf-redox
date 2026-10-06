@@ -1,5 +1,5 @@
 use crate::config::HiddenTextPolicy;
-use crate::content::resolved_number_value;
+use crate::content::{replace_page_content, resolved_dictionary, resolved_number_value};
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
@@ -1353,22 +1353,6 @@ struct OptionalContentState {
     base_off: bool,
 }
 
-fn replace_page_content(
-    document: &mut EditDocument,
-    page: CowObjectHandle,
-    decoded: Vec<u8>,
-) -> Result<()> {
-    let stream = CowObjectHandle::New(document.add_object(OwnedObject::Stream {
-        dictionary: OwnedDictionary::new(),
-        data: crate::StreamData::Owned(decoded),
-    }));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
-    }
-    Ok(())
-}
-
 pub fn analyze_hidden_text(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
     let ocg = optional_content_state(document)?;
     let pages = document.page_handles()?;
@@ -1572,18 +1556,6 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     }
     output.extend_from_slice(&input[cursor..]);
     output
-}
-
-fn resolved_dictionary(
-    document: &EditDocument,
-    value: Option<&OwnedObject>,
-) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|value| value.as_dictionary().cloned()))
 }
 
 fn resolved_array(
