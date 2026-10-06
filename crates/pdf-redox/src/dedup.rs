@@ -85,6 +85,37 @@ impl<K: Eq + Hash> FingerprintRedirectPlan<K> {
     }
 }
 
+fn canonicalize_stream_holders<H, K>(
+    document: &mut EditDocument,
+    holders: &[H],
+    mut target: impl FnMut(&H) -> CowObjectHandle,
+    mut redirect_key: impl FnMut(&H) -> K,
+    mut fingerprint: impl FnMut(&EditDocument, &H) -> Result<Option<([u8; 32], usize)>>,
+    mut rewrite: impl FnMut(&mut EditDocument, &H, CowObjectHandle) -> Result<bool>,
+) -> Result<TargetedDedupStats>
+where
+    K: Eq + Hash,
+{
+    let mut plan = FingerprintRedirectPlan::new();
+    for holder in holders {
+        let Some((fingerprint, raw_bytes)) = fingerprint(document, holder)? else {
+            continue;
+        };
+        plan.observe_stream(redirect_key(holder), target(holder), fingerprint, raw_bytes);
+    }
+
+    let mut references_canonicalized = 0_usize;
+    for holder in holders {
+        let Some(canonical) = plan.redirect(&redirect_key(holder)) else {
+            continue;
+        };
+        if rewrite(document, holder, canonical)? {
+            references_canonicalized += 1;
+        }
+    }
+    Ok(plan.targeted_stats(references_canonicalized))
+}
+
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
 fn font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
@@ -249,33 +280,14 @@ pub fn canonicalize_font_program_streams(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = font_program_holders(document)?;
-    let mut plan = FingerprintRedirectPlan::new();
-
-    for holder in &holders {
-        let Some((fingerprint, raw_bytes)) =
-            source_font_program_fingerprint(document, holder.target, &holder.key)?
-        else {
-            continue;
-        };
-        plan.observe_stream(
-            (holder.key.clone(), holder.target),
-            holder.target,
-            fingerprint,
-            raw_bytes,
-        );
-    }
-
-    let mut references_canonicalized = 0_usize;
-    for holder in &holders {
-        let Some(canonical) = plan.redirect(&(holder.key.clone(), holder.target)) else {
-            continue;
-        };
-        if rewrite_direct_reference_holder(document, holder, canonical)? {
-            references_canonicalized += 1;
-        }
-    }
-
-    Ok(plan.targeted_stats(references_canonicalized))
+    canonicalize_stream_holders(
+        document,
+        &holders,
+        |holder| holder.target,
+        |holder| (holder.key.clone(), holder.target),
+        |document, holder| source_font_program_fingerprint(document, holder.target, &holder.key),
+        rewrite_direct_reference_holder,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -466,25 +478,14 @@ fn canonicalize_named_stream_references(
     domain: &[u8],
 ) -> Result<TargetedDedupStats> {
     let holders = direct_reference_holders(document, key)?;
-    let mut plan = FingerprintRedirectPlan::new();
-    for holder in &holders {
-        let Some((fingerprint, raw_bytes)) =
-            source_stream_fingerprint(document, holder.target, domain)?
-        else {
-            continue;
-        };
-        plan.observe_stream(holder.target, holder.target, fingerprint, raw_bytes);
-    }
-    let mut references_canonicalized = 0_usize;
-    for holder in &holders {
-        let Some(canonical) = plan.redirect(&holder.target) else {
-            continue;
-        };
-        if rewrite_direct_reference_holder(document, holder, canonical)? {
-            references_canonicalized += 1;
-        }
-    }
-    Ok(plan.targeted_stats(references_canonicalized))
+    canonicalize_stream_holders(
+        document,
+        &holders,
+        |holder| holder.target,
+        |holder| holder.target,
+        |document, holder| source_stream_fingerprint(document, holder.target, domain),
+        rewrite_direct_reference_holder,
+    )
 }
 
 pub fn canonicalize_metadata_streams(document: &mut EditDocument) -> Result<TargetedDedupStats> {
@@ -643,25 +644,14 @@ fn rewrite_direct_array_reference_holder(
 
 pub fn canonicalize_icc_profiles(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = icc_array_holders(document)?;
-    let mut plan = FingerprintRedirectPlan::new();
-    for holder in &holders {
-        let Some((fingerprint, raw_bytes)) =
-            source_stream_fingerprint(document, holder.target, b"icc-profile")?
-        else {
-            continue;
-        };
-        plan.observe_stream(holder.target, holder.target, fingerprint, raw_bytes);
-    }
-    let mut references_canonicalized = 0_usize;
-    for holder in &holders {
-        let Some(canonical) = plan.redirect(&holder.target) else {
-            continue;
-        };
-        if rewrite_direct_array_reference_holder(document, holder, canonical)? {
-            references_canonicalized += 1;
-        }
-    }
-    Ok(plan.targeted_stats(references_canonicalized))
+    canonicalize_stream_holders(
+        document,
+        &holders,
+        |holder| holder.target,
+        |holder| holder.target,
+        |document, holder| source_stream_fingerprint(document, holder.target, b"icc-profile"),
+        rewrite_direct_array_reference_holder,
+    )
 }
 
 fn object_at_direct_path_mut<'a>(
@@ -926,28 +916,14 @@ fn rewrite_type3_glyph_holder(
 
 pub fn canonicalize_type3_charprocs(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = type3_glyph_holders(document)?;
-    let mut plan = FingerprintRedirectPlan::new();
-
-    for holder in &holders {
-        let Some((fingerprint, raw_bytes)) =
-            source_stream_fingerprint(document, holder.glyph, b"type3-charproc")?
-        else {
-            continue;
-        };
-        plan.observe_stream(holder.glyph, holder.glyph, fingerprint, raw_bytes);
-    }
-
-    let mut references_canonicalized = 0_usize;
-    for holder in &holders {
-        let Some(canonical) = plan.redirect(&holder.glyph) else {
-            continue;
-        };
-        if rewrite_type3_glyph_holder(document, holder, canonical)? {
-            references_canonicalized += 1;
-        }
-    }
-
-    Ok(plan.targeted_stats(references_canonicalized))
+    canonicalize_stream_holders(
+        document,
+        &holders,
+        |holder| holder.glyph,
+        |holder| holder.glyph,
+        |document, holder| source_stream_fingerprint(document, holder.glyph, b"type3-charproc"),
+        rewrite_type3_glyph_holder,
+    )
 }
 
 fn canonical_cow_redirect(
@@ -2478,26 +2454,14 @@ fn page_content_holders(document: &EditDocument) -> Result<Vec<PageContentHolder
 
 pub fn canonicalize_page_contents(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = page_content_holders(document)?;
-    let mut plan = FingerprintRedirectPlan::new();
-    for holder in &holders {
-        let stream = holder.target();
-        let Some((fingerprint, raw_bytes)) =
-            source_stream_fingerprint(document, stream, b"page-content")?
-        else {
-            continue;
-        };
-        plan.observe_stream(stream, stream, fingerprint, raw_bytes);
-    }
-    let mut references_canonicalized = 0;
-    for holder in &holders {
-        let Some(canonical) = plan.redirect(&holder.target()) else {
-            continue;
-        };
-        if holder.rewrite(document, canonical)? {
-            references_canonicalized += 1;
-        }
-    }
-    Ok(plan.targeted_stats(references_canonicalized))
+    canonicalize_stream_holders(
+        document,
+        &holders,
+        PageContentHolder::target,
+        PageContentHolder::target,
+        |document, holder| source_stream_fingerprint(document, holder.target(), b"page-content"),
+        |document, holder, canonical| holder.rewrite(document, canonical),
+    )
 }
 
 #[cfg(test)]
