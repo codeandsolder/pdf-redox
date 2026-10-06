@@ -1,7 +1,10 @@
 use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::{decoded_content_value, replace_page_content, resolved_dictionary},
+    content::{
+        decoded_content_value, replace_page_content, resolved_bool_value, resolved_dictionary,
+        resolved_number_value,
+    },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
 };
 use flate2::{Compression, write::ZlibEncoder};
@@ -649,21 +652,6 @@ fn compact_content(input: &[u8]) -> (Vec<u8>, VectorCompactionStats) {
     compact_content_with_ext_gstates(input, &BTreeMap::new())
 }
 
-fn current_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
-}
-
-fn current_bool(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Boolean(value)) => Some(value),
-        _ => None,
-    })
-}
-
 fn ext_gstate_patches(
     document: &EditDocument,
     resources: &OwnedDictionary,
@@ -680,7 +668,7 @@ fn ext_gstate_patches(
         let fill_alpha_opaque = match state.get(b"ca".as_slice()) {
             None => None,
             Some(value) => Some(
-                current_number(document, value)?
+                resolved_number_value(document, value)?
                     .is_some_and(|value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12),
             ),
         };
@@ -701,9 +689,9 @@ fn ext_gstate_patches(
         // PDF `op` controls non-stroking overprint. When it is absent, `OP`
         // supplies the value, so either key can make a fill non-idempotent.
         let fill_overprint_disabled = if let Some(value) = state.get(b"op".as_slice()) {
-            Some(current_bool(document, value)? == Some(false))
+            Some(resolved_bool_value(document, value)? == Some(false))
         } else if let Some(value) = state.get(b"OP".as_slice()) {
-            Some(current_bool(document, value)? == Some(false))
+            Some(resolved_bool_value(document, value)? == Some(false))
         } else {
             None
         };
@@ -2489,7 +2477,7 @@ fn shared_page_visible_box(document: &EditDocument, page: ObjectHandle) -> Resul
         let mut numbers = [0.0; 4];
         let mut valid = true;
         for (index, value) in values.iter().enumerate() {
-            let Some(number) = current_number(document, value)? else {
+            let Some(number) = resolved_number_value(document, value)? else {
                 valid = false;
                 break;
             };
@@ -3119,7 +3107,7 @@ fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<
     let Some(value) = dictionary.get(b"UserUnit".as_slice()) else {
         return Ok(Some(1.0));
     };
-    let Some(value) = current_number(document, value)? else {
+    let Some(value) = resolved_number_value(document, value)? else {
         return Ok(None);
     };
     Ok((value.is_finite() && value > 0.0).then_some(value))

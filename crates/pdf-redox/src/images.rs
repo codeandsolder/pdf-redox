@@ -1,5 +1,6 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
+    content::resolved_number,
     stream_codec::{decode_image_stream, encode_flate},
 };
 use fast_image_resize::{
@@ -254,17 +255,6 @@ fn image_binding_counts(document: &EditDocument) -> Result<BTreeMap<ObjectHandle
         }
     }
     Ok(counts)
-}
-
-fn resolved_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<f64>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
 }
 
 #[expect(

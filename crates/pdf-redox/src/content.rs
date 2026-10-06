@@ -40,6 +40,38 @@ pub fn decoded_content_value(
     Ok(())
 }
 
+pub fn resolved_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
+        Some(OwnedObject::Real(value)) => Some(value),
+        _ => None,
+    })
+}
+
+pub fn resolved_number(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Option<f64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    resolved_number_value(document, value)
+}
+
+pub fn resolved_bool_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Boolean(value)) => Some(value),
+        _ => None,
+    })
+}
+
+pub fn resolved_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    resolved_bool_value(document, value)
+}
+
 pub fn resolved_dictionary(
     document: &EditDocument,
     value: Option<&OwnedObject>,

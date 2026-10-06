@@ -1,6 +1,6 @@
-use crate::Result;
 use crate::geometry::Matrix;
 use crate::images::ImageResizeTarget;
+use crate::{Result, content::resolved_number};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_FORM_DEPTH: usize = 64;
@@ -257,20 +257,6 @@ fn cow_page_content(document: &crate::EditDocument, page: crate::ObjectHandle) -
     Ok(out)
 }
 
-fn cow_number(
-    document: &crate::EditDocument,
-    value: Option<&crate::OwnedObject>,
-) -> Result<Option<f64>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(crate::OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(crate::OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
-}
-
 fn cow_number_array<const N: usize>(
     document: &crate::EditDocument,
     value: Option<&crate::OwnedObject>,
@@ -286,7 +272,7 @@ fn cow_number_array<const N: usize>(
     }
     let mut out = [0.0; N];
     for (index, value) in values.iter().enumerate() {
-        let Some(number) = cow_number(document, Some(value))? else {
+        let Some(number) = resolved_number(document, Some(value))? else {
             return Ok(None);
         };
         out[index] = number;
@@ -311,10 +297,10 @@ fn cow_image_dimensions(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
 ) -> Result<Option<(u32, u32)>> {
-    let Some(width) = cow_number(document, dictionary.get(b"Width".as_slice()))? else {
+    let Some(width) = resolved_number(document, dictionary.get(b"Width".as_slice()))? else {
         return Ok(None);
     };
-    let Some(height) = cow_number(document, dictionary.get(b"Height".as_slice()))? else {
+    let Some(height) = resolved_number(document, dictionary.get(b"Height".as_slice()))? else {
         return Ok(None);
     };
     if !width.is_finite()
@@ -568,7 +554,7 @@ pub fn plan_print_downsampling(
                 .cloned()
         });
         let user_unit = match user_unit.as_ref() {
-            Some(value) => cow_number(document, Some(value))?
+            Some(value) => resolved_number(document, Some(value))?
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or(1.0),
             None => 1.0,

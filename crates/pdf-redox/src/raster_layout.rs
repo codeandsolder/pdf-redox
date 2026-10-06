@@ -3,7 +3,10 @@ use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
     StreamData,
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
-    content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
+    content::{
+        form_content, form_resources, page_content, page_resources, resolved_bool,
+        resolved_dictionary, resolved_number,
+    },
     content_stream::{InstructionOperand, instruction_operands, operand_numbers},
     hidden_text::{HiddenTextSharedContext, hidden_text_shared_context, scan_physical_hidden_text},
     inline_images::{
@@ -1252,17 +1255,6 @@ fn scan_target_shared(
     }))
 }
 
-fn current_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<f64>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
-}
-
 fn current_number_array4(document: &EditDocument, value: &OwnedObject) -> Result<Option<[f64; 4]>> {
     let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
         return Ok(None);
@@ -1272,7 +1264,7 @@ fn current_number_array4(document: &EditDocument, value: &OwnedObject) -> Result
     }
     let mut out = [0.0; 4];
     for (index, value) in values.iter().enumerate() {
-        let Some(number) = current_number(document, Some(value))? else {
+        let Some(number) = resolved_number(document, Some(value))? else {
             return Ok(None);
         };
         if !number.is_finite() {
@@ -1302,16 +1294,6 @@ fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Opti
         }
     }
     Ok(None)
-}
-
-fn current_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Boolean(value)) => Some(value),
-        _ => None,
-    })
 }
 
 #[expect(
@@ -1375,10 +1357,10 @@ fn unit_f64_to_u8(value: f64) -> u8 {
 }
 
 fn dimensions(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<Option<(u32, u32)>> {
-    let Some(width) = current_number(document, dictionary.get(b"Width".as_slice()))? else {
+    let Some(width) = resolved_number(document, dictionary.get(b"Width".as_slice()))? else {
         return Ok(None);
     };
-    let Some(height) = current_number(document, dictionary.get(b"Height".as_slice()))? else {
+    let Some(height) = resolved_number(document, dictionary.get(b"Height".as_slice()))? else {
         return Ok(None);
     };
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
@@ -1433,7 +1415,8 @@ fn color_components(document: &EditDocument, value: &OwnedObject) -> Result<Opti
                     let Some(dictionary) = profile.as_dictionary() else {
                         return Ok(None);
                     };
-                    let Some(n) = current_number(document, dictionary.get(b"N".as_slice()))? else {
+                    let Some(n) = resolved_number(document, dictionary.get(b"N".as_slice()))?
+                    else {
                         return Ok(None);
                     };
                     let Some(n) = rounded_u8(n) else {
@@ -1638,10 +1621,10 @@ fn decode_pair(
     if values.len() != 2 {
         return Ok(None);
     }
-    let Some(min) = current_number(document, values.first())? else {
+    let Some(min) = resolved_number(document, values.first())? else {
         return Ok(None);
     };
-    let Some(max) = current_number(document, values.get(1))? else {
+    let Some(max) = resolved_number(document, values.get(1))? else {
         return Ok(None);
     };
     Ok(Some((min, max)))
@@ -1665,9 +1648,9 @@ fn decode_mask_stream(
     let Some((width, height)) = dimensions(document, dictionary)? else {
         return Ok(None);
     };
-    let Some(bpc) = current_number(document, dictionary.get(b"BitsPerComponent".as_slice()))?
+    let Some(bpc) = resolved_number(document, dictionary.get(b"BitsPerComponent".as_slice()))?
         .or_else(|| {
-            current_number(document, dictionary.get(b"BPC".as_slice()))
+            resolved_number(document, dictionary.get(b"BPC".as_slice()))
                 .ok()
                 .flatten()
         })
@@ -1727,10 +1710,10 @@ fn color_key_alpha(
     }
     let mut ranges = Vec::with_capacity(components);
     for pair in values.as_chunks::<2>().0 {
-        let Some(min) = current_number(document, pair.first())? else {
+        let Some(min) = resolved_number(document, pair.first())? else {
             return Ok(None);
         };
-        let Some(max) = current_number(document, pair.get(1))? else {
+        let Some(max) = resolved_number(document, pair.get(1))? else {
             return Ok(None);
         };
         ranges.push((min.round(), max.round()));
@@ -1785,7 +1768,7 @@ fn indexed_palette(
         },
         _ => return Ok(None),
     };
-    let Some(hival) = current_number(document, values.get(2))? else {
+    let Some(hival) = resolved_number(document, values.get(2))? else {
         return Ok(None);
     };
     let Some(hival) = rounded_u8(hival) else {
@@ -2045,7 +2028,7 @@ fn simple_binary_soft_mask_candidate(
         .keys()
         .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
         || dictionary.contains_key(b"Mask".as_slice())
-        || current_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+        || resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
             .is_some_and(|value| value != 0.0)
     {
         return Ok(false);
@@ -2069,8 +2052,8 @@ fn simple_binary_soft_mask_candidate(
     {
         return Ok(false);
     }
-    if current_bool(document, mask_dictionary.get(b"Interpolate".as_slice()))?
-        .or(current_bool(
+    if resolved_bool(document, mask_dictionary.get(b"Interpolate".as_slice()))?
+        .or(resolved_bool(
             document,
             mask_dictionary.get(b"I".as_slice()),
         )?)
@@ -2078,7 +2061,7 @@ fn simple_binary_soft_mask_candidate(
     {
         return Ok(false);
     }
-    let Some(bpc) = current_number(
+    let Some(bpc) = resolved_number(
         document,
         mask_dictionary
             .get(b"BitsPerComponent".as_slice())
@@ -2118,15 +2101,15 @@ fn image_info(
         return Ok(None);
     };
     let encoded_color_bytes = data.bytes(document.source())?.len();
-    if current_bool(document, dictionary.get(b"ImageMask".as_slice()))?.unwrap_or(false)
-        || current_bool(document, dictionary.get(b"IM".as_slice()))?.unwrap_or(false)
+    if resolved_bool(document, dictionary.get(b"ImageMask".as_slice()))?.unwrap_or(false)
+        || resolved_bool(document, dictionary.get(b"IM".as_slice()))?.unwrap_or(false)
     {
         return Ok(None);
     }
     let Some((width, height)) = dimensions(document, dictionary)? else {
         return Ok(None);
     };
-    let Some(bpc) = current_number(document, dictionary.get(b"BitsPerComponent".as_slice()))?
+    let Some(bpc) = resolved_number(document, dictionary.get(b"BitsPerComponent".as_slice()))?
     else {
         return Ok(None);
     };
@@ -2184,7 +2167,7 @@ fn image_info(
     // Some producers append harmless bytes after the declared image sample grid.
     // Renderers ignore those bytes because Width/Height/BPC define the raster payload.
     decoded.truncate(expected);
-    if current_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+    if resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
         .is_some_and(|value| value != 0.0)
     {
         return Ok(None);
@@ -2226,7 +2209,7 @@ fn image_info(
                     alpha = color_key_alpha(document, mask, &decoded, width, height, components)?;
                 }
                 Some(OwnedObject::Stream { ref dictionary, .. }) => {
-                    let stencil = current_bool(document, dictionary.get(b"ImageMask".as_slice()))?
+                    let stencil = resolved_bool(document, dictionary.get(b"ImageMask".as_slice()))?
                         .unwrap_or(false);
                     alpha = decode_mask_stream(document, mask, stencil)?;
                 }
@@ -2258,8 +2241,8 @@ fn image_info(
         decoded = expanded;
     }
 
-    let interpolate = current_bool(document, dictionary.get(b"Interpolate".as_slice()))?
-        .or(current_bool(document, dictionary.get(b"I".as_slice()))?)
+    let interpolate = resolved_bool(document, dictionary.get(b"Interpolate".as_slice()))?
+        .or(resolved_bool(document, dictionary.get(b"I".as_slice()))?)
         .unwrap_or(false);
 
     let mut template = dictionary.clone();
@@ -2345,7 +2328,7 @@ fn image_paint_states(
         let Some(state) = resolved_dictionary(document, Some(&value))? else {
             continue;
         };
-        let alpha = current_number(document, state.get(b"ca".as_slice()))?
+        let alpha = resolved_number(document, state.get(b"ca".as_slice()))?
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         let normal_blend = match state.get(b"BM".as_slice()) {
@@ -4890,7 +4873,7 @@ fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<f64> {
         return Ok(1.0);
     };
     Ok(
-        current_number(document, dictionary.get(b"UserUnit".as_slice()))?
+        resolved_number(document, dictionary.get(b"UserUnit".as_slice()))?
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(1.0),
     )

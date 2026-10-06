@@ -1,7 +1,7 @@
 use crate::geometry::{Matrix, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
-    OwnedObject, PreservationConfig, Result, StreamData,
+    OwnedObject, PreservationConfig, Result, StreamData, content::resolved_number_value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -619,14 +619,6 @@ fn prune_dictionary_target(
     Ok(())
 }
 
-fn resolved_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
-}
-
 fn resolved_number_array<const N: usize>(
     document: &EditDocument,
     value: &OwnedObject,
@@ -639,7 +631,7 @@ fn resolved_number_array<const N: usize>(
     }
     let mut out = [0.0; N];
     for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number(document, value)? else {
+        let Some(number) = resolved_number_value(document, value)? else {
             return Ok(None);
         };
         out[index] = number;

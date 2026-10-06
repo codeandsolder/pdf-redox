@@ -2,7 +2,10 @@ use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
-    content::{decoded_content_value, replace_page_content, resolved_dictionary},
+    content::{
+        decoded_content_value, replace_page_content, resolved_bool_value, resolved_dictionary,
+        resolved_number_value,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -963,26 +966,11 @@ fn install_page_xobject(
     Ok(())
 }
 
-fn current_number(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
-        _ => None,
-    })
-}
-
-fn current_bool(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Boolean(value)) => Some(value),
-        _ => None,
-    })
-}
-
 fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    Ok(Some(current_number(document, value)?.is_some_and(
+    Ok(Some(resolved_number_value(document, value)?.is_some_and(
         |value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12,
     )))
 }
@@ -991,7 +979,7 @@ fn disabled_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result
     let Some(value) = value else {
         return Ok(None);
     };
-    Ok(Some(current_bool(document, value)? == Some(false)))
+    Ok(Some(resolved_bool_value(document, value)? == Some(false)))
 }
 
 fn ext_gstate_patches(
@@ -1029,14 +1017,14 @@ fn ext_gstate_patches(
             .all(|key| SUPPORTED_EXT_GSTATE_KEYS.contains(&key.as_slice()));
         let alpha_is_shape_safe = match state.get(b"AIS".as_slice()) {
             None => true,
-            Some(value) => current_bool(document, value)? == Some(false),
+            Some(value) => resolved_bool_value(document, value)? == Some(false),
         };
         // Stroke adjustment is a device-space rendering hint. Either boolean value is
         // acceptable here because this pass is explicitly freezing the vector field into
         // a raster representation; reject only malformed/non-boolean values.
         let stroke_adjust_supported = match state.get(b"SA".as_slice()) {
             None => true,
-            Some(value) => current_bool(document, value)?.is_some(),
+            Some(value) => resolved_bool_value(document, value)?.is_some(),
         };
         out.insert(
             name,
@@ -1105,7 +1093,7 @@ pub fn rasterize_pathological_microstrokes(
         });
         let user_unit = match user_unit.as_ref() {
             Some(value) => {
-                let Some(value) = current_number(document, value)?
+                let Some(value) = resolved_number_value(document, value)?
                     .filter(|value| value.is_finite() && *value > 0.0)
                 else {
                     continue;
