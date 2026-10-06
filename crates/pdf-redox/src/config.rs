@@ -454,39 +454,9 @@ pub struct Config {
     /// Remove unused `/Font` and `/XObject` entries plus typed `/ExtGState`, `/Pattern`,
     /// `/Properties`, and `/Shading` entries using the parse-gated Hayro/COW pruning pass.
     pub prune_resources: bool,
-    /// Canonicalize byte- and dictionary-identical `/Metadata` streams so a fresh rewrite
-    /// can garbage-collect duplicate XMP objects.
-    pub deduplicate_metadata_streams: bool,
-    /// Canonicalize exact duplicate embedded font-program streams referenced through the
-    /// same `/FontFile`, `/FontFile2`, or `/FontFile3` key kind.
-    pub deduplicate_font_programs: bool,
-    /// Canonicalize byte- and dictionary-identical character maps referenced through
-    /// font `/ToUnicode` entries.
-    pub deduplicate_to_unicode_cmaps: bool,
-    /// Externalize and share only exact inline images repeated across multiple mutable
-    /// content scopes whose duplicated encoded payload clears the configured size gate.
-    pub deduplicate_inline_images: bool,
     /// Minimum duplicated encoded payload bytes for one exact inline-image fingerprint.
     /// Inline-image header savings are deliberately ignored by this gate.
     pub inline_image_min_duplicate_payload_bytes: usize,
-    /// Canonicalize byte- and dictionary-identical Image `XObjects` referenced from
-    /// `/Resources /XObject` dictionaries.
-    pub deduplicate_image_xobjects: bool,
-    /// Canonicalize byte- and dictionary-identical Form `XObjects` referenced from
-    /// `/Resources /XObject` dictionaries.
-    pub deduplicate_form_xobjects: bool,
-    /// Canonicalize byte- and dictionary-identical Form appearance streams referenced from
-    /// annotation `/AP` dictionaries.
-    pub deduplicate_appearance_streams: bool,
-    /// Canonicalize byte- and dictionary-identical page content streams referenced from
-    /// page `/Contents` entries.
-    pub deduplicate_page_contents: bool,
-    /// Canonicalize byte- and dictionary-identical Type3 glyph streams referenced from
-    /// `/CharProcs` dictionaries.
-    pub deduplicate_type3_charprocs: bool,
-    /// Canonicalize byte- and dictionary-identical ICC profile streams referenced from
-    /// `/ICCBased` color-space arrays.
-    pub deduplicate_icc_profiles: bool,
     /// Replace eligible large `/ICCBased` color spaces with their declared Device alternate.
     /// This intentionally drops embedded color-management transforms and is therefore lossy.
     #[serde(default)]
@@ -513,17 +483,7 @@ impl Config {
             rasterize_excessive_small_vectors: false,
             flate_policy: FlatePolicy::default(),
             prune_resources: false,
-            deduplicate_metadata_streams: true,
-            deduplicate_font_programs: true,
-            deduplicate_to_unicode_cmaps: true,
-            deduplicate_inline_images: true,
             inline_image_min_duplicate_payload_bytes: 1024,
-            deduplicate_image_xobjects: true,
-            deduplicate_form_xobjects: true,
-            deduplicate_appearance_streams: true,
-            deduplicate_page_contents: true,
-            deduplicate_type3_charprocs: true,
-            deduplicate_icc_profiles: true,
             elide_icc_profiles_to_alternate: false,
         }
     }
@@ -755,69 +715,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets whether exact duplicate metadata streams are canonicalized.
-    pub const fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
-        self.config.deduplicate_metadata_streams = value;
-        self
-    }
-
-    /// Sets whether exact duplicate embedded font programs are canonicalized.
-    pub const fn deduplicate_font_programs(mut self, value: bool) -> Self {
-        self.config.deduplicate_font_programs = value;
-        self
-    }
-
-    /// Sets whether exact duplicate `ToUnicode` `CMaps` are canonicalized.
-    pub const fn deduplicate_to_unicode_cmaps(mut self, value: bool) -> Self {
-        self.config.deduplicate_to_unicode_cmaps = value;
-        self
-    }
-
-    /// Sets whether repeated inline images may be externalized and shared.
-    pub const fn deduplicate_inline_images(mut self, value: bool) -> Self {
-        self.config.deduplicate_inline_images = value;
-        self
-    }
-
     /// Sets the minimum duplicated encoded inline-image payload required before externalization.
     pub const fn inline_image_min_duplicate_payload_bytes(mut self, value: usize) -> Self {
         self.config.inline_image_min_duplicate_payload_bytes = value;
-        self
-    }
-
-    /// Sets whether exact duplicate Image `XObjects` are canonicalized.
-    pub const fn deduplicate_image_xobjects(mut self, value: bool) -> Self {
-        self.config.deduplicate_image_xobjects = value;
-        self
-    }
-
-    /// Sets whether exact duplicate Form `XObjects` are canonicalized.
-    pub const fn deduplicate_form_xobjects(mut self, value: bool) -> Self {
-        self.config.deduplicate_form_xobjects = value;
-        self
-    }
-
-    /// Sets whether exact duplicate annotation appearance streams are canonicalized.
-    pub const fn deduplicate_appearance_streams(mut self, value: bool) -> Self {
-        self.config.deduplicate_appearance_streams = value;
-        self
-    }
-
-    /// Sets whether exact duplicate page content streams are canonicalized.
-    pub const fn deduplicate_page_contents(mut self, value: bool) -> Self {
-        self.config.deduplicate_page_contents = value;
-        self
-    }
-
-    /// Sets whether exact duplicate Type3 character-procedure streams are canonicalized.
-    pub const fn deduplicate_type3_charprocs(mut self, value: bool) -> Self {
-        self.config.deduplicate_type3_charprocs = value;
-        self
-    }
-
-    /// Sets whether exact duplicate ICC profile streams are canonicalized.
-    pub const fn deduplicate_icc_profiles(mut self, value: bool) -> Self {
-        self.config.deduplicate_icc_profiles = value;
         self
     }
 
@@ -859,7 +759,13 @@ mod tests {
 
     #[test]
     fn removed_config_fields_are_rejected() {
-        assert!(serde_json::from_str::<Config>(r#"{"keep_unused_resources":[]}"#).is_err());
+        for stale in [
+            r#"{"keep_unused_resources":[]}"#,
+            r#"{"deduplicate_metadata_streams":false}"#,
+            r#"{"deduplicate_inline_images":false}"#,
+        ] {
+            assert!(serde_json::from_str::<Config>(stale).is_err());
+        }
     }
 
     #[test]
@@ -917,17 +823,7 @@ mod tests {
             .normalize_content_streams(true)
             .flate_policy(FlatePolicy::Preserve)
             .prune_resources(true)
-            .deduplicate_metadata_streams(false)
-            .deduplicate_font_programs(true)
-            .deduplicate_to_unicode_cmaps(false)
-            .deduplicate_inline_images(false)
             .inline_image_min_duplicate_payload_bytes(4096)
-            .deduplicate_image_xobjects(false)
-            .deduplicate_form_xobjects(false)
-            .deduplicate_appearance_streams(false)
-            .deduplicate_page_contents(false)
-            .deduplicate_type3_charprocs(false)
-            .deduplicate_icc_profiles(false)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
                 strip_jpeg_metadata: true,
@@ -954,17 +850,7 @@ mod tests {
         assert!(config.normalize_content_streams);
         assert_eq!(config.flate_policy, FlatePolicy::Preserve);
         assert!(config.prune_resources);
-        assert!(!config.deduplicate_metadata_streams);
-        assert!(config.deduplicate_font_programs);
-        assert!(!config.deduplicate_to_unicode_cmaps);
-        assert!(!config.deduplicate_inline_images);
         assert_eq!(config.inline_image_min_duplicate_payload_bytes, 4096);
-        assert!(!config.deduplicate_image_xobjects);
-        assert!(!config.deduplicate_form_xobjects);
-        assert!(!config.deduplicate_appearance_streams);
-        assert!(!config.deduplicate_page_contents);
-        assert!(!config.deduplicate_type3_charprocs);
-        assert!(!config.deduplicate_icc_profiles);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);
     }

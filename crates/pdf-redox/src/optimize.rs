@@ -3,12 +3,11 @@ use crate::{
     analyze::analyze_document_for_optimization,
     content::normalize_page_contents,
     dedup::{
-        TargetedDedupStats, canonicalize_appearance_streams,
-        canonicalize_exact_extgstate_dictionaries, canonicalize_exact_font_dictionaries,
-        canonicalize_exact_structure_attribute_dictionaries, canonicalize_font_program_streams,
-        canonicalize_form_xobjects, canonicalize_icc_profiles, canonicalize_image_xobjects,
-        canonicalize_metadata_streams, canonicalize_page_contents, canonicalize_to_unicode_cmaps,
-        canonicalize_type3_charprocs,
+        canonicalize_appearance_streams, canonicalize_exact_extgstate_dictionaries,
+        canonicalize_exact_font_dictionaries, canonicalize_exact_structure_attribute_dictionaries,
+        canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
+        canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
+        canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
     },
     flate::{apply_flate_policy, compress_unfiltered_streams},
     font::{
@@ -198,18 +197,10 @@ fn optimize_pdf_with_document(
         }
     })?;
     let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
-        if cfg.deduplicate_metadata_streams {
-            canonicalize_metadata_streams(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_metadata_streams(&mut document)
     })?;
     let font_dedup = timed(&mut timings, "font-dedup", || {
-        if cfg.deduplicate_font_programs {
-            canonicalize_font_program_streams(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_font_program_streams(&mut document)
     })?;
     let font_sparse_union = timed(&mut timings, "font-sparse-union", || {
         if cfg.preservation.font_editing_support {
@@ -235,11 +226,7 @@ fn optimize_pdf_with_document(
         }
     })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
-        if cfg.deduplicate_to_unicode_cmaps {
-            canonicalize_to_unicode_cmaps(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_to_unicode_cmaps(&mut document)
     })?;
     let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
         canonicalize_exact_font_dictionaries(&mut document)
@@ -251,11 +238,7 @@ fn optimize_pdf_with_document(
         canonicalize_exact_structure_attribute_dictionaries(&mut document)
     })?;
     let icc_dedup = timed(&mut timings, "icc-dedup", || {
-        if cfg.deduplicate_icc_profiles {
-            canonicalize_icc_profiles(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_icc_profiles(&mut document)
     })?;
     let icc_alternate = timed(&mut timings, "icc-alternate-elision", || {
         if cfg.elide_icc_profiles_to_alternate {
@@ -319,14 +302,14 @@ fn optimize_pdf_with_document(
         let raster_proved_no_inline = cfg.raster_layout.enabled
             && raster_layout.inline_inventory_complete
             && raster_layout.inline_occurrences_remaining == 0;
-        if cfg.deduplicate_inline_images && !raster_proved_no_inline {
+        if raster_proved_no_inline {
+            Ok(DuplicateInlineImageStats::default())
+        } else {
             externalize_duplicate_inline_images(
                 &mut document,
                 0,
                 cfg.inline_image_min_duplicate_payload_bytes,
             )
-        } else {
-            Ok(DuplicateInlineImageStats::default())
         }
     })?;
 
@@ -340,32 +323,16 @@ fn optimize_pdf_with_document(
     // Exact image canonicalization follows inline-image externalization and JPEG
     // entropy normalization so both can converge with existing Image XObjects.
     let image_dedup = timed(&mut timings, "image-dedup", || {
-        if cfg.deduplicate_image_xobjects {
-            canonicalize_image_xobjects(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_image_xobjects(&mut document)
     })?;
     let form_dedup = timed(&mut timings, "form-dedup", || {
-        if cfg.deduplicate_form_xobjects {
-            canonicalize_form_xobjects(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_form_xobjects(&mut document)
     })?;
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
-        if cfg.deduplicate_appearance_streams {
-            canonicalize_appearance_streams(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_appearance_streams(&mut document)
     })?;
     let type3_charproc_dedup = timed(&mut timings, "type3-dedup", || {
-        if cfg.deduplicate_type3_charprocs {
-            canonicalize_type3_charprocs(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_type3_charprocs(&mut document)
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
@@ -571,11 +538,7 @@ fn optimize_pdf_with_document(
     // Content streams are canonicalized only after every pass that can mutate
     // them, including lexical normalization.
     let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
-        if cfg.deduplicate_page_contents {
-            canonicalize_page_contents(&mut document)
-        } else {
-            Ok(TargetedDedupStats::default())
-        }
+        canonicalize_page_contents(&mut document)
     })?;
     let structure_compaction = timed(&mut timings, "structure-compaction", || {
         compact_structure(&mut document)

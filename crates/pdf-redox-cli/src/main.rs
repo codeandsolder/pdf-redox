@@ -181,39 +181,9 @@ struct Args {
     /// Remove unused Font/XObject and typed ExtGState/Pattern/Properties/Shading resource entries. Enabled automatically in processing mode.
     #[arg(long)]
     prune_resources: bool,
-    /// Preserve separate byte-identical metadata stream objects instead of canonicalizing them.
-    #[arg(long)]
-    no_metadata_dedup: bool,
-    /// Preserve repeated inline-image syntax instead of externalizing exact duplicates.
-    #[arg(long)]
-    no_inline_image_dedup: bool,
     /// Minimum duplicated encoded payload bytes for one cross-scope inline-image fingerprint.
     #[arg(long, default_value_t = 1024)]
     inline_image_dedup_min_waste: usize,
-    /// Preserve separate exact duplicate embedded font-program stream objects.
-    #[arg(long)]
-    no_font_program_dedup: bool,
-    /// Preserve separate exact duplicate `ToUnicode` `CMap` stream objects.
-    #[arg(long)]
-    no_to_unicode_dedup: bool,
-    /// Preserve separate exact duplicate Image `XObjects` instead of canonicalizing them.
-    #[arg(long)]
-    no_image_dedup: bool,
-    /// Preserve separate exact duplicate Form `XObjects` instead of canonicalizing them.
-    #[arg(long)]
-    no_form_dedup: bool,
-    /// Preserve separate exact duplicate annotation appearance streams instead of canonicalizing them.
-    #[arg(long)]
-    no_appearance_dedup: bool,
-    /// Preserve separate exact duplicate page content streams instead of canonicalizing them.
-    #[arg(long)]
-    no_page_content_dedup: bool,
-    /// Preserve separate exact duplicate Type3 `CharProc` streams instead of canonicalizing them.
-    #[arg(long)]
-    no_type3_charproc_dedup: bool,
-    /// Preserve separate exact duplicate ICC profile streams instead of canonicalizing them.
-    #[arg(long)]
-    no_icc_dedup: bool,
     /// Replace eligible large `ICCBased` color spaces with their declared Device alternate.
     /// Enabled automatically by --optimize-for processing.
     #[arg(long, conflicts_with = "keep_icc_color_management")]
@@ -340,17 +310,7 @@ fn config_from_args(args: &Args) -> Config {
     cfg.privacy.remove_signatures = args.remove_signatures;
     cfg.prune_resources =
         args.prune_resources || matches!(args.optimize_for, OptimizeForArg::Processing);
-    cfg.deduplicate_metadata_streams = !args.no_metadata_dedup;
-    cfg.deduplicate_font_programs = !args.no_font_program_dedup;
-    cfg.deduplicate_to_unicode_cmaps = !args.no_to_unicode_dedup;
-    cfg.deduplicate_inline_images = !args.no_inline_image_dedup;
     cfg.inline_image_min_duplicate_payload_bytes = args.inline_image_dedup_min_waste;
-    cfg.deduplicate_image_xobjects = !args.no_image_dedup;
-    cfg.deduplicate_form_xobjects = !args.no_form_dedup;
-    cfg.deduplicate_appearance_streams = !args.no_appearance_dedup;
-    cfg.deduplicate_page_contents = !args.no_page_content_dedup;
-    cfg.deduplicate_type3_charprocs = !args.no_type3_charproc_dedup;
-    cfg.deduplicate_icc_profiles = !args.no_icc_dedup;
     cfg.elide_icc_profiles_to_alternate = args.elide_icc_to_alternate
         || (matches!(args.optimize_for, OptimizeForArg::Processing)
             && !args.keep_icc_color_management);
@@ -491,6 +451,24 @@ mod tests {
             Args::try_parse_from(["pdf-redox", "input.pdf", "--keep-unused-resources", "*"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn removed_dedup_overrides_are_rejected() {
+        for flag in [
+            "--no-metadata-dedup",
+            "--no-inline-image-dedup",
+            "--no-font-program-dedup",
+            "--no-to-unicode-dedup",
+            "--no-image-dedup",
+            "--no-form-dedup",
+            "--no-appearance-dedup",
+            "--no-page-content-dedup",
+            "--no-type3-charproc-dedup",
+            "--no-icc-dedup",
+        ] {
+            assert!(Args::try_parse_from(["pdf-redox", "input.pdf", flag]).is_err());
+        }
     }
 
     #[test]
