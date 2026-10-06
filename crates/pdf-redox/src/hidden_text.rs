@@ -310,11 +310,11 @@ fn operand_from_maybe_ref(value: HayroMaybeRef<HayroObject<'_>>) -> OperandObjec
             number: reference.obj_number,
             generation: reference.gen_number,
         }),
-        HayroMaybeRef::NotRef(value) => operand_from_hayro(&value, None),
+        HayroMaybeRef::NotRef(value) => operand_from_source(&value, None),
     }
 }
 
-fn operand_from_hayro(object: &HayroObject<'_>, raw: Option<&[u8]>) -> OperandObject {
+fn operand_from_source(object: &HayroObject<'_>, raw: Option<&[u8]>) -> OperandObject {
     match object {
         HayroObject::Null(_) | HayroObject::Boolean(_) | HayroObject::Stream(_) => {
             OperandObject::Null
@@ -352,7 +352,7 @@ fn instruction_operands(
         .operands()
         .zip(instruction.operand_spans())
         .map(|(object, span)| OperandSpan {
-            object: operand_from_hayro(object, input.get(span)),
+            object: operand_from_source(object, input.get(span)),
         })
         .collect()
 }
@@ -1352,7 +1352,7 @@ struct OptionalContentState {
     base_off: bool,
 }
 
-fn replace_page_content_hayro(
+fn replace_page_content(
     document: &mut EditDocument,
     page: CowObjectHandle,
     decoded: Vec<u8>,
@@ -1413,7 +1413,7 @@ pub fn apply_hidden_text_policy(
         }
         ranges.sort_unstable();
         stats.removed += ranges.len();
-        replace_page_content_hayro(document, page, remove_ranges(&decoded, &ranges))?;
+        replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
     Ok(stats)
 }
@@ -1525,7 +1525,7 @@ pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenT
         }
         ranges.sort_unstable();
         stats.removed = stats.removed.saturating_add(ranges.len());
-        replace_page_content_hayro(document, page, remove_ranges(&decoded, &ranges))?;
+        replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
     Ok(stats)
 }
@@ -1554,7 +1554,7 @@ pub fn prune_physically_hidden_text(
         }
         let decoded = page_content_bytes(document, page)?;
         stats.removed += ranges.len();
-        replace_page_content_hayro(document, page, remove_ranges(&decoded, &ranges))?;
+        replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
     Ok(stats)
 }
@@ -1573,7 +1573,7 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
-fn resolved_dictionary_hayro(
+fn resolved_dictionary(
     document: &EditDocument,
     value: Option<&OwnedObject>,
 ) -> Result<Option<OwnedDictionary>> {
@@ -1598,7 +1598,7 @@ fn resolved_array(
     })
 }
 
-fn resolved_name_hayro(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Vec<u8>> {
+fn resolved_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Vec<u8>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1619,13 +1619,12 @@ fn build_fonts(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, FontInfo>> {
-    let Some(fonts) = resolved_dictionary_hayro(document, resources.get(b"Font".as_slice()))?
-    else {
+    let Some(fonts) = resolved_dictionary(document, resources.get(b"Font".as_slice()))? else {
         return Ok(BTreeMap::new());
     };
     let mut out = BTreeMap::new();
     for (key, value) in &fonts {
-        let Some(font) = resolved_dictionary_hayro(document, Some(value))? else {
+        let Some(font) = resolved_dictionary(document, Some(value))? else {
             continue;
         };
         out.insert(key.clone(), font_info(document, &font)?);
@@ -1635,8 +1634,8 @@ fn build_fonts(
 
 fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
     let mut info = FontInfo::default();
-    let subtype = resolved_name_hayro(document, font.get(b"Subtype".as_slice()))?;
-    let encoding = resolved_name_hayro(document, font.get(b"Encoding".as_slice()))?;
+    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?;
+    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?;
     info.identity_two_byte =
         subtype == b"Type0" && matches!(encoding.as_slice(), b"Identity-H" | b"Identity-V");
     if info.identity_two_byte {
@@ -1657,7 +1656,7 @@ fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo
     if subtype == b"Type0" {
         let descendants = resolved_array(document, font.get(b"DescendantFonts".as_slice()))?;
         if let Some(descendant) = descendants.first()
-            && let Some(descendant) = resolved_dictionary_hayro(document, Some(descendant))?
+            && let Some(descendant) = resolved_dictionary(document, Some(descendant))?
         {
             if let Some(dw) = descendant.get(b"DW".as_slice())
                 && let Some(value) = owned_number_value(document, dw)?
@@ -1737,13 +1736,13 @@ fn build_ext_gstates(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStateInfo>> {
-    let Some(states) = resolved_dictionary_hayro(document, resources.get(b"ExtGState".as_slice()))?
+    let Some(states) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
     else {
         return Ok(BTreeMap::new());
     };
     let mut out = BTreeMap::new();
     for (key, value) in &states {
-        let Some(state) = resolved_dictionary_hayro(document, Some(value))? else {
+        let Some(state) = resolved_dictionary(document, Some(value))? else {
             continue;
         };
         let fill_alpha = match state.get(b"ca".as_slice()) {
@@ -1778,7 +1777,7 @@ fn build_images(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, bool>> {
-    let Some(xobjects) = resolved_dictionary_hayro(document, resources.get(b"XObject".as_slice()))?
+    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
     else {
         return Ok(BTreeMap::new());
     };
@@ -1791,8 +1790,7 @@ fn build_images(
             out.insert(key.clone(), false);
             continue;
         };
-        let is_image =
-            resolved_name_hayro(document, dictionary.get(b"Subtype".as_slice()))? == b"Image";
+        let is_image = resolved_name(document, dictionary.get(b"Subtype".as_slice()))? == b"Image";
         let unmasked = is_image
             && !dictionary.contains_key(b"SMask".as_slice())
             && !dictionary.contains_key(b"Mask".as_slice());
@@ -1902,7 +1900,7 @@ fn optional_content_state(document: &EditDocument) -> Result<OptionalContentStat
     Ok(out)
 }
 
-fn decoded_content_value_hayro(
+fn decoded_content_value(
     document: &EditDocument,
     value: &OwnedObject,
     output: &mut Vec<u8>,
@@ -1926,7 +1924,7 @@ fn decoded_content_value_hayro(
         }
         OwnedObject::Array(values) => {
             for value in values {
-                decoded_content_value_hayro(document, &value, output)?;
+                decoded_content_value(document, &value, output)?;
             }
         }
         _ => {}
@@ -1945,7 +1943,7 @@ fn page_content_bytes(document: &EditDocument, page: CowObjectHandle) -> Result<
         return Ok(Vec::new());
     };
     let mut output = Vec::new();
-    decoded_content_value_hayro(document, contents, &mut output)?;
+    decoded_content_value(document, contents, &mut output)?;
     Ok(output)
 }
 

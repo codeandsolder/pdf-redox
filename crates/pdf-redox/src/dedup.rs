@@ -87,10 +87,10 @@ impl<K: Eq + Hash> FingerprintRedirectPlan<K> {
 
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
-fn hayro_font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
+fn font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
     let mut holders = Vec::new();
     for key in HAYRO_FONT_FILE_KEYS {
-        holders.extend(hayro_direct_reference_holders(document, key)?);
+        holders.extend(direct_reference_holders(document, key)?);
     }
     Ok(holders)
 }
@@ -173,7 +173,7 @@ fn hash_owned_object(hasher: &mut Sha256, object: &OwnedObject) -> Result<()> {
     Ok(())
 }
 
-fn hayro_stream_fingerprint_ignoring(
+fn source_stream_fingerprint_ignoring(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
@@ -206,15 +206,15 @@ fn hayro_stream_fingerprint_ignoring(
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
-fn hayro_stream_fingerprint(
+fn source_stream_fingerprint(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
 ) -> Result<Option<([u8; 32], usize)>> {
-    hayro_stream_fingerprint_ignoring(document, stream, domain, &[])
+    source_stream_fingerprint_ignoring(document, stream, domain, &[])
 }
 
-fn hayro_font_program_fingerprint(
+fn source_font_program_fingerprint(
     document: &EditDocument,
     program: CowObjectHandle,
     key: &[u8],
@@ -248,12 +248,12 @@ fn hayro_font_program_fingerprint(
 pub fn canonicalize_font_program_streams(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
-    let holders = hayro_font_program_holders(document)?;
+    let holders = font_program_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_font_program_fingerprint(document, holder.target, &holder.key)?
+            source_font_program_fingerprint(document, holder.target, &holder.key)?
         else {
             continue;
         };
@@ -292,7 +292,7 @@ struct DirectReferenceHolder {
     target: CowObjectHandle,
 }
 
-fn inspect_hayro_direct_reference_holders(
+fn inspect_source_direct_reference_holders(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
     key: &[u8],
@@ -317,7 +317,7 @@ fn inspect_hayro_direct_reference_holders(
                     continue;
                 };
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                inspect_source_direct_reference_holders(root, &value, key, path, holders);
                 path.pop();
             }
         }
@@ -339,7 +339,7 @@ fn inspect_hayro_direct_reference_holders(
                     continue;
                 };
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                inspect_source_direct_reference_holders(root, &value, key, path, holders);
                 path.pop();
             }
         }
@@ -349,7 +349,7 @@ fn inspect_hayro_direct_reference_holders(
                     continue;
                 };
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_hayro_direct_reference_holders(root, &value, key, path, holders);
+                inspect_source_direct_reference_holders(root, &value, key, path, holders);
                 path.pop();
             }
         }
@@ -407,7 +407,7 @@ fn inspect_owned_direct_reference_holders(
     }
 }
 
-fn hayro_direct_reference_holders(
+fn direct_reference_holders(
     document: &EditDocument,
     key: &[u8],
 ) -> Result<Vec<DirectReferenceHolder>> {
@@ -415,7 +415,7 @@ fn hayro_direct_reference_holders(
     document.walk_output_objects(|handle, object| {
         match object {
             CurrentObject::Source(object) => {
-                inspect_hayro_direct_reference_holders(
+                inspect_source_direct_reference_holders(
                     handle,
                     &object,
                     key,
@@ -465,11 +465,11 @@ fn canonicalize_named_stream_references(
     key: &[u8],
     domain: &[u8],
 ) -> Result<TargetedDedupStats> {
-    let holders = hayro_direct_reference_holders(document, key)?;
+    let holders = direct_reference_holders(document, key)?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_stream_fingerprint(document, holder.target, domain)?
+            source_stream_fingerprint(document, holder.target, domain)?
         else {
             continue;
         };
@@ -499,7 +499,7 @@ struct DirectArrayReferenceHolder {
     target: CowObjectHandle,
 }
 
-fn inspect_hayro_icc_arrays(
+fn inspect_source_icc_arrays(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
     path: &mut Vec<DirectPathStep>,
@@ -522,7 +522,7 @@ fn inspect_hayro_icc_arrays(
                     continue;
                 };
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_hayro_icc_arrays(root, &value, path, holders);
+                inspect_source_icc_arrays(root, &value, path, holders);
                 path.pop();
             }
         }
@@ -532,7 +532,7 @@ fn inspect_hayro_icc_arrays(
                     continue;
                 };
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_hayro_icc_arrays(root, &value, path, holders);
+                inspect_source_icc_arrays(root, &value, path, holders);
                 path.pop();
             }
         }
@@ -542,7 +542,7 @@ fn inspect_hayro_icc_arrays(
                     continue;
                 };
                 path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_hayro_icc_arrays(root, &value, path, holders);
+                inspect_source_icc_arrays(root, &value, path, holders);
                 path.pop();
             }
         }
@@ -605,11 +605,11 @@ fn inspect_owned_icc_arrays(
     Ok(())
 }
 
-fn hayro_icc_array_holders(document: &EditDocument) -> Result<Vec<DirectArrayReferenceHolder>> {
+fn icc_array_holders(document: &EditDocument) -> Result<Vec<DirectArrayReferenceHolder>> {
     let mut holders = Vec::new();
     document.walk_output_objects(|handle, object| match object {
         CurrentObject::Source(object) => {
-            inspect_hayro_icc_arrays(handle, &object, &mut Vec::new(), &mut holders);
+            inspect_source_icc_arrays(handle, &object, &mut Vec::new(), &mut holders);
             Ok(())
         }
         CurrentObject::Owned(object) => {
@@ -642,11 +642,11 @@ fn rewrite_direct_array_reference_holder(
 }
 
 pub fn canonicalize_icc_profiles(document: &mut EditDocument) -> Result<TargetedDedupStats> {
-    let holders = hayro_icc_array_holders(document)?;
+    let holders = icc_array_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_stream_fingerprint(document, holder.target, b"icc-profile")?
+            source_stream_fingerprint(document, holder.target, b"icc-profile")?
         else {
             continue;
         };
@@ -719,7 +719,7 @@ fn object_at_direct_path<'a>(
     Some(object)
 }
 
-fn inspect_hayro_type3_dictionary(
+fn inspect_source_type3_dictionary(
     root: CowObjectHandle,
     dictionary: &hayro_syntax::object::Dict<'_>,
     path: &mut Vec<DirectPathStep>,
@@ -755,12 +755,12 @@ fn inspect_hayro_type3_dictionary(
             continue;
         };
         path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-        inspect_hayro_type3_object(root, &value, path, targets);
+        inspect_source_type3_object(root, &value, path, targets);
         path.pop();
     }
 }
 
-fn inspect_hayro_type3_object(
+fn inspect_source_type3_object(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
     path: &mut Vec<DirectPathStep>,
@@ -768,10 +768,10 @@ fn inspect_hayro_type3_object(
 ) {
     match object {
         HayroObject::Dict(dictionary) => {
-            inspect_hayro_type3_dictionary(root, dictionary, path, targets);
+            inspect_source_type3_dictionary(root, dictionary, path, targets);
         }
         HayroObject::Stream(stream) => {
-            inspect_hayro_type3_dictionary(root, stream.dict(), path, targets);
+            inspect_source_type3_dictionary(root, stream.dict(), path, targets);
         }
         HayroObject::Array(array) => {
             for (index, value) in array.raw_iter().enumerate() {
@@ -779,7 +779,7 @@ fn inspect_hayro_type3_object(
                     continue;
                 };
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_hayro_type3_object(root, &value, path, targets);
+                inspect_source_type3_object(root, &value, path, targets);
                 path.pop();
             }
         }
@@ -862,13 +862,11 @@ fn inspect_owned_type3_object(
     Ok(())
 }
 
-fn hayro_type3_charproc_targets(
-    document: &EditDocument,
-) -> Result<BTreeSet<DirectDictionaryTarget>> {
+fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
     let mut targets = BTreeSet::new();
     document.walk_output_objects(|handle, object| match object {
         CurrentObject::Source(object) => {
-            inspect_hayro_type3_object(handle, &object, &mut Vec::new(), &mut targets);
+            inspect_source_type3_object(handle, &object, &mut Vec::new(), &mut targets);
             Ok(())
         }
         CurrentObject::Owned(object) => {
@@ -878,9 +876,9 @@ fn hayro_type3_charproc_targets(
     Ok(targets)
 }
 
-fn hayro_type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
+fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
     let mut holders = Vec::new();
-    for target in hayro_type3_charproc_targets(document)? {
+    for target in type3_charproc_targets(document)? {
         let Some(root) = document.current_owned_object(target.root)? else {
             continue;
         };
@@ -927,12 +925,12 @@ fn rewrite_type3_glyph_holder(
 }
 
 pub fn canonicalize_type3_charprocs(document: &mut EditDocument) -> Result<TargetedDedupStats> {
-    let holders = hayro_type3_glyph_holders(document)?;
+    let holders = type3_glyph_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
 
     for holder in &holders {
         let Some((fingerprint, raw_bytes)) =
-            hayro_stream_fingerprint(document, holder.glyph, b"type3-charproc")?
+            source_stream_fingerprint(document, holder.glyph, b"type3-charproc")?
         else {
             continue;
         };
@@ -1015,7 +1013,7 @@ fn hash_owned_object_with_redirects(
     Ok(())
 }
 
-fn hayro_stream_fingerprint_with_redirects(
+fn source_stream_fingerprint_with_redirects(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
@@ -1064,7 +1062,7 @@ fn exact_stream_redirects(
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut plan = FingerprintRedirectPlan::new();
     for &stream in streams {
-        let Some((fingerprint, raw_bytes)) = hayro_stream_fingerprint_with_redirects(
+        let Some((fingerprint, raw_bytes)) = source_stream_fingerprint_with_redirects(
             document,
             stream,
             domain,
@@ -1117,7 +1115,7 @@ fn rewrite_dictionary_reference_keys(
     Ok(count)
 }
 
-fn inspect_hayro_dictionary_target_dictionary(
+fn inspect_source_dictionary_target_dictionary(
     root: CowObjectHandle,
     dictionary: &hayro_syntax::object::Dict<'_>,
     key: &[u8],
@@ -1149,12 +1147,12 @@ fn inspect_hayro_dictionary_target_dictionary(
             continue;
         };
         path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-        inspect_hayro_dictionary_target(root, &value, key, path, targets);
+        inspect_source_dictionary_target(root, &value, key, path, targets);
         path.pop();
     }
 }
 
-fn inspect_hayro_dictionary_target(
+fn inspect_source_dictionary_target(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
     key: &[u8],
@@ -1163,10 +1161,10 @@ fn inspect_hayro_dictionary_target(
 ) {
     match object {
         HayroObject::Dict(dictionary) => {
-            inspect_hayro_dictionary_target_dictionary(root, dictionary, key, path, targets);
+            inspect_source_dictionary_target_dictionary(root, dictionary, key, path, targets);
         }
         HayroObject::Stream(stream) => {
-            inspect_hayro_dictionary_target_dictionary(root, stream.dict(), key, path, targets);
+            inspect_source_dictionary_target_dictionary(root, stream.dict(), key, path, targets);
         }
         HayroObject::Array(values) => {
             for (index, value) in values.raw_iter().enumerate() {
@@ -1174,7 +1172,7 @@ fn inspect_hayro_dictionary_target(
                     continue;
                 };
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_hayro_dictionary_target(root, &value, key, path, targets);
+                inspect_source_dictionary_target(root, &value, key, path, targets);
                 path.pop();
             }
         }
@@ -1237,7 +1235,7 @@ fn inspect_owned_dictionary_target(
     }
 }
 
-fn hayro_dictionary_targets(
+fn dictionary_targets(
     document: &EditDocument,
     key: &[u8],
 ) -> Result<BTreeSet<DirectDictionaryTarget>> {
@@ -1245,7 +1243,7 @@ fn hayro_dictionary_targets(
     document.walk_output_objects(|root, object| {
         match object {
             CurrentObject::Source(object) => {
-                inspect_hayro_dictionary_target(root, &object, key, &mut Vec::new(), &mut targets);
+                inspect_source_dictionary_target(root, &object, key, &mut Vec::new(), &mut targets);
             }
             CurrentObject::Owned(object) => {
                 inspect_owned_dictionary_target(root, object, key, &mut Vec::new(), &mut targets);
@@ -1338,7 +1336,7 @@ pub fn canonicalize_image_xobjects(document: &mut EditDocument) -> Result<Target
         &mut duplicate_refs,
         &mut duplicate_raw_bytes,
     )?;
-    let xobject_targets = hayro_dictionary_targets(document, b"XObject")?;
+    let xobject_targets = dictionary_targets(document, b"XObject")?;
     references_canonicalized +=
         rewrite_dictionary_target_entries(document, &xobject_targets, &redirects)?;
     Ok(TargetedDedupStats {
@@ -1457,7 +1455,7 @@ struct RedirectReferenceHolder {
     target: CowObjectHandle,
 }
 
-fn inspect_hayro_redirect_reference_holders(
+fn inspect_source_redirect_reference_holders(
     root: CowObjectHandle,
     object: &HayroObject<'_>,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
@@ -1480,7 +1478,7 @@ fn inspect_hayro_redirect_reference_holders(
                         }
                     }
                     HayroMaybeRef::NotRef(value) => {
-                        inspect_hayro_redirect_reference_holders(
+                        inspect_source_redirect_reference_holders(
                             root, &value, redirects, path, holders,
                         );
                     }
@@ -1503,7 +1501,7 @@ fn inspect_hayro_redirect_reference_holders(
                         }
                     }
                     HayroMaybeRef::NotRef(value) => {
-                        inspect_hayro_redirect_reference_holders(
+                        inspect_source_redirect_reference_holders(
                             root, &value, redirects, path, holders,
                         );
                     }
@@ -1526,7 +1524,7 @@ fn inspect_hayro_redirect_reference_holders(
                         }
                     }
                     HayroMaybeRef::NotRef(value) => {
-                        inspect_hayro_redirect_reference_holders(
+                        inspect_source_redirect_reference_holders(
                             root, &value, redirects, path, holders,
                         );
                     }
@@ -1593,7 +1591,7 @@ fn rewrite_all_references(
     let mut holders = Vec::new();
     document.walk_output_objects(|root, object| {
         match object {
-            CurrentObject::Source(object) => inspect_hayro_redirect_reference_holders(
+            CurrentObject::Source(object) => inspect_source_redirect_reference_holders(
                 root,
                 &object,
                 redirects,
@@ -1673,7 +1671,7 @@ fn exact_dictionary_redirects(
 pub fn canonicalize_exact_extgstate_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {
-    let targets = hayro_dictionary_targets(document, b"ExtGState")?;
+    let targets = dictionary_targets(document, b"ExtGState")?;
     let mut handles = BTreeSet::new();
     for target in &targets {
         let Some(snapshot) = document.current_owned_object(target.root)? else {
@@ -1867,7 +1865,7 @@ fn exact_form_font_redirects(
     Ok(plan.into_redirects())
 }
 
-fn hayro_stream_fingerprint_top_level_redirects(
+fn source_stream_fingerprint_top_level_redirects(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
@@ -1912,7 +1910,7 @@ fn virtual_form_image_redirects(
     };
     let mut plan = FingerprintRedirectPlan::new();
     for &image in images {
-        let Some(fingerprint) = hayro_stream_fingerprint_top_level_redirects(
+        let Some(fingerprint) = source_stream_fingerprint_top_level_redirects(
             document,
             image,
             b"form-resource-image",
@@ -2021,7 +2019,7 @@ fn normalized_form_resources(
     Ok(OwnedObject::Dictionary(normalized))
 }
 
-fn hayro_form_fingerprint(
+fn source_form_fingerprint(
     document: &EditDocument,
     form: CowObjectHandle,
     ignored_dictionary_keys: &[&[u8]],
@@ -2083,7 +2081,7 @@ fn fixed_point_form_redirects(
     for _ in 0..=forms.len() {
         let mut plan = FingerprintRedirectPlan::new();
         for &form in forms {
-            let Some((fingerprint, _)) = hayro_form_fingerprint(
+            let Some((fingerprint, _)) = source_form_fingerprint(
                 document,
                 form,
                 ignored_dictionary_keys,
@@ -2297,7 +2295,7 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
             duplicate_raw_bytes += data.bytes(document.source())?.len();
         }
     }
-    let xobject_targets = hayro_dictionary_targets(document, b"XObject")?;
+    let xobject_targets = dictionary_targets(document, b"XObject")?;
     let mut references_canonicalized =
         rewrite_dictionary_target_entries(document, &xobject_targets, &dependencies.forms)?;
     let icon_targets = widget_mk_targets(document)?;
@@ -2317,7 +2315,7 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
 fn appearance_dictionary_targets(
     document: &EditDocument,
 ) -> Result<BTreeSet<DirectDictionaryTarget>> {
-    let mut targets = hayro_dictionary_targets(document, b"AP")?;
+    let mut targets = dictionary_targets(document, b"AP")?;
     let initial = targets.iter().cloned().collect::<Vec<_>>();
     for target in initial {
         let Some(snapshot) = document.current_owned_object(target.root)? else {
@@ -2379,7 +2377,7 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
             let OwnedObject::Reference(appearance_ref) = appearance else {
                 continue;
             };
-            let Some((fingerprint, raw_bytes)) = hayro_form_fingerprint(
+            let Some((fingerprint, raw_bytes)) = source_form_fingerprint(
                 document,
                 *appearance_ref,
                 &[],
@@ -2425,13 +2423,13 @@ impl PageContentHolder {
     }
 }
 
-fn page_handles_hayro(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
+fn page_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
     document.page_handles()
 }
 
 fn page_content_holders(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
     let mut holders = Vec::new();
-    for page in page_handles_hayro(document)? {
+    for page in page_handles(document)? {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2501,7 +2499,7 @@ pub fn canonicalize_page_contents(document: &mut EditDocument) -> Result<Targete
     for holder in &holders {
         let stream = holder.target();
         let Some((fingerprint, raw_bytes)) =
-            hayro_stream_fingerprint(document, stream, b"page-content")?
+            source_stream_fingerprint(document, stream, b"page-content")?
         else {
             continue;
         };

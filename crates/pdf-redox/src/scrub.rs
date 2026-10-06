@@ -97,7 +97,10 @@ fn owned_object_has_active_action_candidate(object: &OwnedObject, cfg: &PrivacyC
     })
 }
 
-fn hayro_object_has_active_action_candidate(object: &HayroObject<'_>, cfg: &PrivacyConfig) -> bool {
+fn source_object_has_active_action_candidate(
+    object: &HayroObject<'_>,
+    cfg: &PrivacyConfig,
+) -> bool {
     let has_candidate = |dictionary: &hayro_syntax::object::Dict<'_>| {
         dictionary_has_active_action_candidate(|key| dictionary.contains_key(key), cfg)
     };
@@ -141,7 +144,7 @@ fn owned_dictionary_needs_cos_privacy_scrub(object: &OwnedObject, cfg: &PrivacyC
     })
 }
 
-fn hayro_object_needs_cos_privacy_scrub(object: &HayroObject<'_>, cfg: &PrivacyConfig) -> bool {
+fn source_object_needs_cos_privacy_scrub(object: &HayroObject<'_>, cfg: &PrivacyConfig) -> bool {
     let needs_scrub = |dictionary: &hayro_syntax::object::Dict<'_>| {
         dictionary_needs_cos_privacy_scrub(|key| dictionary.contains_key(key), cfg)
     };
@@ -254,8 +257,8 @@ pub fn scrub_edit_document_cos_privacy(
                         }
                         Err(error) => return Err(error),
                     };
-                    let needs_edit = hayro_object_needs_cos_privacy_scrub(&object, cfg);
-                    let inspect_actions = hayro_object_has_active_action_candidate(&object, cfg);
+                    let needs_edit = source_object_needs_cos_privacy_scrub(&object, cfg);
+                    let inspect_actions = source_object_has_active_action_candidate(&object, cfg);
                     (
                         references
                             .into_iter()

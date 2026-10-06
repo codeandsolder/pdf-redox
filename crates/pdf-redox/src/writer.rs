@@ -124,7 +124,7 @@ fn write_handle_object(
             }),
             None => {
                 let object = document.source().object(id)?;
-                write_hayro_object(output, &object, document, plan)
+                write_source_object(output, &object, document, plan)
             }
         },
         ObjectHandle::New(id) => {
@@ -137,7 +137,7 @@ fn write_handle_object(
     }
 }
 
-fn write_hayro_object(
+fn write_source_object(
     output: &mut Vec<u8>,
     object: &Object<'_>,
     document: &EditDocument,
@@ -146,11 +146,11 @@ fn write_hayro_object(
     match object {
         Object::Null(_) => output.extend_from_slice(b"null"),
         Object::Boolean(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Object::Number(value) => write_hayro_number(output, value)?,
+        Object::Number(value) => write_source_number(output, value)?,
         Object::String(value) => write_pdf_string(output, value.as_bytes()),
         Object::Name(value) => write_pdf_name(output, value.as_ref()),
         Object::Dict(dictionary) => {
-            write_hayro_dictionary(output, dictionary, document, plan, false)?;
+            write_source_dictionary(output, dictionary, document, plan, false)?;
         }
         Object::Array(array) => {
             output.push(b'[');
@@ -158,16 +158,16 @@ fn write_hayro_object(
                 if index != 0 {
                     output.push(b' ');
                 }
-                write_hayro_maybe_ref(output, value, document, plan)?;
+                write_source_maybe_ref(output, value, document, plan)?;
             }
             output.push(b']');
         }
-        Object::Stream(stream) => write_hayro_stream(output, stream, document, plan)?,
+        Object::Stream(stream) => write_source_stream(output, stream, document, plan)?,
     }
     Ok(())
 }
 
-fn write_hayro_maybe_ref(
+fn write_source_maybe_ref(
     output: &mut Vec<u8>,
     value: MaybeRef<Object<'_>>,
     document: &EditDocument,
@@ -180,11 +180,11 @@ fn write_hayro_maybe_ref(
             plan,
             ObjectHandle::Existing(reference.into()),
         ),
-        MaybeRef::NotRef(object) => write_hayro_object(output, &object, document, plan),
+        MaybeRef::NotRef(object) => write_source_object(output, &object, document, plan),
     }
 }
 
-fn write_hayro_dictionary(
+fn write_source_dictionary(
     output: &mut Vec<u8>,
     dictionary: &Dict<'_>,
     document: &EditDocument,
@@ -199,13 +199,13 @@ fn write_hayro_dictionary(
         output.push(b' ');
         write_pdf_name(output, name.as_ref());
         output.push(b' ');
-        write_hayro_maybe_ref(output, value, document, plan)?;
+        write_source_maybe_ref(output, value, document, plan)?;
     }
     output.extend_from_slice(b" >>");
     Ok(())
 }
 
-fn write_hayro_stream(
+fn write_source_stream(
     output: &mut Vec<u8>,
     stream: &Stream<'_>,
     document: &EditDocument,
@@ -221,7 +221,7 @@ fn write_hayro_stream(
         output.push(b' ');
         write_pdf_name(output, name.as_ref());
         output.push(b' ');
-        write_hayro_maybe_ref(output, value, document, plan)?;
+        write_source_maybe_ref(output, value, document, plan)?;
     }
     output.extend_from_slice(b" >>\nstream\n");
     output.extend_from_slice(data.as_ref());
@@ -312,7 +312,7 @@ fn write_reference(
     }
 }
 
-fn write_hayro_number(output: &mut Vec<u8>, value: &hayro_syntax::object::Number) -> Result<()> {
+fn write_source_number(output: &mut Vec<u8>, value: &hayro_syntax::object::Number) -> Result<()> {
     let representation = value.to_string();
     if representation.contains('e') || representation.contains('E') {
         output.extend_from_slice(expand_scientific(&representation)?.as_bytes());
@@ -1092,7 +1092,7 @@ mod tests {
             return Err(crate::Error::Invalid("integer should parse".to_owned()));
         };
         let mut output = Vec::new();
-        if let Err(error) = write_hayro_number(&mut output, &number) {
+        if let Err(error) = write_source_number(&mut output, &number) {
             return Err(crate::Error::Invalid(format!(
                 "integer should serialize: {error}"
             )));

@@ -1200,7 +1200,7 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
     Ok((identity_used, winansi_used))
 }
 
-fn inspect_hayro_font_dictionary(
+fn inspect_source_font_dictionary(
     holder: CowObjectHandle,
     dictionary: &HayroDict<'_>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
@@ -1289,7 +1289,7 @@ fn merge_program_usage(
     merged.cidfont_type0 |= usage.cidfont_type0;
 }
 
-fn hayro_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
+fn source_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
     match dictionary
         .get::<HayroName<'_>>(b"Subtype")
         .as_ref()
@@ -1314,12 +1314,12 @@ fn hayro_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
     }
 }
 
-fn inspect_hayro_direct_font_dictionary(
+fn inspect_source_direct_font_dictionary(
     dictionary: &HayroDict<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) {
-    let usage = hayro_dictionary_font_usage(dictionary);
+    let usage = source_dictionary_font_usage(dictionary);
     if usage != FontProgramUsage::default() {
         for (name, value) in dictionary.entries() {
             if name.as_ref() != b"FontDescriptor" {
@@ -1351,21 +1351,25 @@ fn inspect_hayro_direct_font_dictionary(
         let HayroMaybeRef::NotRef(value) = value else {
             continue;
         };
-        inspect_hayro_direct_font_object(&value, program_usage, descriptor_usage_edges);
+        inspect_source_direct_font_object(&value, program_usage, descriptor_usage_edges);
     }
 }
 
-fn inspect_hayro_direct_font_object(
+fn inspect_source_direct_font_object(
     object: &HayroObject<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
 ) {
     match object {
         HayroObject::Dict(dictionary) => {
-            inspect_hayro_direct_font_dictionary(dictionary, program_usage, descriptor_usage_edges);
+            inspect_source_direct_font_dictionary(
+                dictionary,
+                program_usage,
+                descriptor_usage_edges,
+            );
         }
         HayroObject::Stream(stream) => {
-            inspect_hayro_direct_font_dictionary(
+            inspect_source_direct_font_dictionary(
                 stream.dict(),
                 program_usage,
                 descriptor_usage_edges,
@@ -1376,7 +1380,7 @@ fn inspect_hayro_direct_font_object(
                 let HayroMaybeRef::NotRef(value) = value else {
                     continue;
                 };
-                inspect_hayro_direct_font_object(&value, program_usage, descriptor_usage_edges);
+                inspect_source_direct_font_object(&value, program_usage, descriptor_usage_edges);
             }
         }
         HayroObject::Null(_)
@@ -1583,13 +1587,13 @@ fn current_font_program_usage(
     document.walk_output_objects(|handle, object| match object {
         CurrentObject::Source(object) => {
             match &object {
-                HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
+                HayroObject::Dict(dictionary) => inspect_source_font_dictionary(
                     handle,
                     dictionary,
                     &mut descriptor_usage_edges,
                     &mut descriptor_program_edges,
                 ),
-                HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
+                HayroObject::Stream(stream) => inspect_source_font_dictionary(
                     handle,
                     stream.dict(),
                     &mut descriptor_usage_edges,
@@ -1597,7 +1601,7 @@ fn current_font_program_usage(
                 ),
                 _ => {}
             }
-            inspect_hayro_direct_font_object(
+            inspect_source_direct_font_object(
                 &object,
                 &mut direct_program_usage,
                 &mut descriptor_usage_edges,
@@ -1881,13 +1885,13 @@ pub fn union_sparse_cid_font_programs_after_dedup(
     document.walk_output_objects(|handle, object| match object {
         CurrentObject::Source(object) => {
             match &object {
-                HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
+                HayroObject::Dict(dictionary) => inspect_source_font_dictionary(
                     handle,
                     dictionary,
                     &mut descriptor_usage_edges,
                     &mut descriptor_program_edges,
                 ),
-                HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
+                HayroObject::Stream(stream) => inspect_source_font_dictionary(
                     handle,
                     stream.dict(),
                     &mut descriptor_usage_edges,
@@ -1895,7 +1899,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
                 ),
                 _ => {}
             }
-            inspect_hayro_direct_font_object(
+            inspect_source_direct_font_object(
                 &object,
                 &mut direct_program_usage,
                 &mut descriptor_usage_edges,
@@ -1983,13 +1987,13 @@ pub fn strip_font_editing_tables(
     document.walk_output_objects(|handle, object| match object {
         CurrentObject::Source(object) => {
             match &object {
-                HayroObject::Dict(dictionary) => inspect_hayro_font_dictionary(
+                HayroObject::Dict(dictionary) => inspect_source_font_dictionary(
                     handle,
                     dictionary,
                     &mut descriptor_usage_edges,
                     &mut descriptor_program_edges,
                 ),
-                HayroObject::Stream(stream) => inspect_hayro_font_dictionary(
+                HayroObject::Stream(stream) => inspect_source_font_dictionary(
                     handle,
                     stream.dict(),
                     &mut descriptor_usage_edges,
@@ -1997,7 +2001,7 @@ pub fn strip_font_editing_tables(
                 ),
                 _ => {}
             }
-            inspect_hayro_direct_font_object(
+            inspect_source_direct_font_object(
                 &object,
                 &mut direct_program_usage,
                 &mut descriptor_usage_edges,

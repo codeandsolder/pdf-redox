@@ -384,7 +384,7 @@ fn retain_link_visual_shells(
     Ok(retained)
 }
 
-const fn keep_page_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_page_key(key: &[u8], policy: &PreservationConfig) -> bool {
     if matches!(
         key,
         b"Type"
@@ -413,7 +413,7 @@ const fn keep_page_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
     }
 }
 
-const fn keep_page_tree_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_page_tree_key(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"Type" | b"Parent" | b"Kids" | b"Count" | b"Resources" | b"MediaBox" | b"CropBox"
         | b"Rotate" => true,
@@ -426,7 +426,7 @@ const fn keep_page_tree_key_hayro(key: &[u8], policy: &PreservationConfig) -> bo
     }
 }
 
-const fn keep_catalog_key_hayro(key: &[u8], policy: &PreservationConfig) -> bool {
+const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"Type" | b"Pages" | b"Version" | b"Extensions" => true,
         b"AcroForm" => policy.forms,
@@ -647,7 +647,7 @@ fn resolved_number_array<const N: usize>(
     Ok(Some(out))
 }
 
-fn inherited_page_value_hayro(
+fn inherited_page_value(
     document: &EditDocument,
     page: &PreservationDictionaryTarget,
     key: &[u8],
@@ -908,11 +908,11 @@ fn appearance_content(
     Ok(format!("q\n{placement} cm\n/{resource_name} Do\nQ\n").into_bytes())
 }
 
-fn page_resources_hayro(
+fn page_resources(
     document: &EditDocument,
     page: &PreservationDictionaryTarget,
 ) -> Result<OwnedDictionary> {
-    let Some(resources) = inherited_page_value_hayro(document, page, b"Resources")? else {
+    let Some(resources) = inherited_page_value(document, page, b"Resources")? else {
         return Ok(OwnedDictionary::new());
     };
     Ok(match document.resolve_owned_value(&resources)? {
@@ -1060,7 +1060,7 @@ fn wrap_page_contents(
 }
 
 fn page_rotate(document: &EditDocument, page: &PreservationDictionaryTarget) -> Result<i32> {
-    let Some(value) = inherited_page_value_hayro(document, page, b"Rotate")? else {
+    let Some(value) = inherited_page_value(document, page, b"Rotate")? else {
         return Ok(0);
     };
     Ok(match document.resolve_owned_value(&value)? {
@@ -1087,7 +1087,7 @@ fn flatten_annotations(
             continue;
         };
         let rotate = page_rotate(document, page)?;
-        let mut resources = page_resources_hayro(document, page)?;
+        let mut resources = page_resources(document, page)?;
         let has_widget = annotations.iter().any(|annotation| {
             matches!(annotation_subtype(document, annotation), Ok(Some(name)) if name == b"Widget")
         });
@@ -1228,7 +1228,7 @@ pub fn apply_preservation_policy(
         prune_dictionary_target(
             document,
             page,
-            |key| keep_page_key_hayro(key, policy),
+            |key| keep_page_key(key, policy),
             policy.splice_unknown_wrappers,
             &mut stats.dropped_page_keys,
             &mut stats.spliced_unknown_wrapper_keys,
@@ -1238,7 +1238,7 @@ pub fn apply_preservation_policy(
         prune_dictionary_target(
             document,
             node,
-            |key| keep_page_tree_key_hayro(key, policy),
+            |key| keep_page_tree_key(key, policy),
             policy.splice_unknown_wrappers,
             &mut stats.dropped_page_tree_keys,
             &mut stats.spliced_unknown_wrapper_keys,
@@ -1251,7 +1251,7 @@ pub fn apply_preservation_policy(
     prune_dictionary_target(
         document,
         &catalog,
-        |key| keep_catalog_key_hayro(key, policy),
+        |key| keep_catalog_key(key, policy),
         policy.splice_unknown_wrappers,
         &mut stats.dropped_catalog_keys,
         &mut stats.spliced_unknown_wrapper_keys,
