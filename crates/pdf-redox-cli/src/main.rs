@@ -181,16 +181,6 @@ struct Args {
     /// Remove unused Font/XObject and typed ExtGState/Pattern/Properties/Shading resource entries. Enabled automatically in processing mode.
     #[arg(long)]
     prune_resources: bool,
-    /// Keep selected unused resources while pruning. With no value, keep all unused resources.
-    /// Selectors: `*`, `<Category>:*`, `<Category>:<Name>`, or a bare name; categories include `Font`, `XObject`, `ExtGState`, `Pattern`, `Properties`, and `Shading`.
-    #[arg(
-        long,
-        num_args = 0..=1,
-        default_missing_value = "*",
-        value_delimiter = ',',
-        action = clap::ArgAction::Append
-    )]
-    keep_unused_resources: Vec<String>,
     /// Preserve separate byte-identical metadata stream objects instead of canonicalizing them.
     #[arg(long)]
     no_metadata_dedup: bool,
@@ -348,15 +338,8 @@ fn config_from_args(args: &Args) -> Config {
     cfg.privacy.remove_attachments = args.remove_attachments;
     cfg.privacy.remove_active_content = args.remove_active_content;
     cfg.privacy.remove_signatures = args.remove_signatures;
-    let keep_all_unused = args
-        .keep_unused_resources
-        .iter()
-        .any(|selector| selector == "*");
-    cfg.prune_resources = args.prune_resources
-        || (!keep_all_unused
-            && (matches!(args.optimize_for, OptimizeForArg::Processing)
-                || !args.keep_unused_resources.is_empty()));
-    cfg.keep_unused_resources = args.keep_unused_resources.iter().cloned().collect();
+    cfg.prune_resources =
+        args.prune_resources || matches!(args.optimize_for, OptimizeForArg::Processing);
     cfg.deduplicate_metadata_streams = !args.no_metadata_dedup;
     cfg.deduplicate_font_programs = !args.no_font_program_dedup;
     cfg.deduplicate_to_unicode_cmaps = !args.no_to_unicode_dedup;
@@ -500,6 +483,14 @@ mod tests {
     #[test]
     fn removed_flate_level_override_is_rejected() {
         assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "7",]).is_err());
+    }
+
+    #[test]
+    fn removed_keep_unused_resources_override_is_rejected() {
+        assert!(
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--keep-unused-resources", "*"])
+                .is_err()
+        );
     }
 
     #[test]

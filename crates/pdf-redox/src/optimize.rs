@@ -544,13 +544,12 @@ fn optimize_pdf_with_document(
         if shared_usage_is_exact {
             prune_resources_with_usage(
                 &mut document,
-                &cfg.keep_unused_resources,
                 &raster_layout.page_resource_names_by_type,
                 &raster_layout.form_resource_names_by_type,
                 &vector_compaction.generated_page_xobjects,
             )
         } else {
-            prune_resources(&mut document, &cfg.keep_unused_resources)
+            prune_resources(&mut document)
         }
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {

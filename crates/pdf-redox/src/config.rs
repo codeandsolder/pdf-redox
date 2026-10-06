@@ -403,6 +403,7 @@ impl OptimizationGoal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "top-level configuration exposes independent user-selectable feature switches"
@@ -453,10 +454,6 @@ pub struct Config {
     /// Remove unused `/Font` and `/XObject` entries plus typed `/ExtGState`, `/Pattern`,
     /// `/Properties`, and `/Shading` entries using the parse-gated Hayro/COW pruning pass.
     pub prune_resources: bool,
-    /// Unused resource entries retained even when resource pruning is enabled. Selectors are
-    /// `*`, `<Category>:*`, `<Category>:<Name>`, or a bare resource name.
-    #[serde(default)]
-    pub keep_unused_resources: BTreeSet<String>,
     /// Canonicalize byte- and dictionary-identical `/Metadata` streams so a fresh rewrite
     /// can garbage-collect duplicate XMP objects.
     pub deduplicate_metadata_streams: bool,
@@ -516,7 +513,6 @@ impl Config {
             rasterize_excessive_small_vectors: false,
             flate_policy: FlatePolicy::default(),
             prune_resources: false,
-            keep_unused_resources: BTreeSet::new(),
             deduplicate_metadata_streams: true,
             deduplicate_font_programs: true,
             deduplicate_to_unicode_cmaps: true,
@@ -759,15 +755,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets resource selectors that remain preserved even when resource pruning is enabled.
-    pub fn keep_unused_resources(
-        mut self,
-        selectors: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.config.keep_unused_resources = selectors.into_iter().map(Into::into).collect();
-        self
-    }
-
     /// Sets whether exact duplicate metadata streams are canonicalized.
     pub const fn deduplicate_metadata_streams(mut self, value: bool) -> Self {
         self.config.deduplicate_metadata_streams = value;
@@ -869,6 +856,11 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_config_fields_are_rejected() {
+        assert!(serde_json::from_str::<Config>(r#"{"keep_unused_resources":[]}"#).is_err());
+    }
 
     #[test]
     fn optimization_goal_selects_compression_policy() {

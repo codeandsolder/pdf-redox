@@ -189,26 +189,6 @@ fn extend_borrowed_form_usage(
     Ok(())
 }
 
-fn keep_unused_resource(selectors: &BTreeSet<String>, category: &[u8], name: &[u8]) -> bool {
-    if selectors.is_empty() {
-        return false;
-    }
-    if selectors.contains("*") {
-        return true;
-    }
-    let category = String::from_utf8_lossy(category);
-    let name = String::from_utf8_lossy(name);
-    selectors.iter().any(|selector| {
-        if selector == name.as_ref() {
-            return true;
-        }
-        let Some((selector_category, selector_name)) = selector.split_once(':') else {
-            return false;
-        };
-        selector_category == category && (selector_name == "*" || selector_name == name)
-    })
-}
-
 fn resource_entry_used(
     category: &[u8],
     name: &[u8],
@@ -226,7 +206,6 @@ fn pruned_resources(
     mut resources: OwnedDictionary,
     used_by_type: &ResourceNamesByType,
     extra_xobjects: Option<&BTreeSet<Vec<u8>>>,
-    keep_unused: &BTreeSet<String>,
 ) -> Result<(OwnedDictionary, ResourcePruneStats)> {
     let mut stats = ResourcePruneStats::default();
     for category in [
@@ -244,10 +223,8 @@ fn pruned_resources(
             continue;
         };
         let before = dictionary.len();
-        dictionary.retain(|name, _| {
-            resource_entry_used(category, name, used_by_type, extra_xobjects)
-                || keep_unused_resource(keep_unused, category, name)
-        });
+        dictionary
+            .retain(|name, _| resource_entry_used(category, name, used_by_type, extra_xobjects));
         stats.record_category(category, before.saturating_sub(dictionary.len()));
         resources.insert(category.to_vec(), OwnedObject::Dictionary(dictionary));
     }
@@ -394,7 +371,6 @@ pub fn prune_xobject_candidates_for_content(
 
 pub fn prune_resources_with_usage(
     document: &mut EditDocument,
-    keep_unused: &BTreeSet<String>,
     page_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
     form_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
     generated_page_xobjects: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
@@ -409,8 +385,7 @@ pub fn prune_resources_with_usage(
         let Some(resources) = form_resources(document, form)? else {
             continue;
         };
-        let (resources, pruned) =
-            pruned_resources(document, resources, names_by_type, None, keep_unused)?;
+        let (resources, pruned) = pruned_resources(document, resources, names_by_type, None)?;
         stats.merge(pruned);
         install_form_resources(document, form, resources)?;
     }
@@ -424,7 +399,6 @@ pub fn prune_resources_with_usage(
             resources,
             names_by_type,
             generated_page_xobjects.get(&page),
-            keep_unused,
         )?;
         stats.merge(pruned);
         install_page_resources(document, page, resources)?;
@@ -432,10 +406,7 @@ pub fn prune_resources_with_usage(
     Ok(stats)
 }
 
-pub fn prune_resources(
-    document: &mut EditDocument,
-    keep_unused: &BTreeSet<String>,
-) -> Result<ResourcePruneStats> {
+pub fn prune_resources(document: &mut EditDocument) -> Result<ResourcePruneStats> {
     let mut stats = ResourcePruneStats::default();
     // Prune forms with local resource scopes first. Resource-less forms are
     // intentionally accounted against their caller's scope below.
@@ -457,8 +428,7 @@ pub fn prune_resources(
         };
         let mut names_by_type = usage.names_by_resource_type.clone();
         extend_borrowed_form_usage(document, &resources, &usage, &mut names_by_type)?;
-        let (resources, pruned) =
-            pruned_resources(document, resources, &names_by_type, None, keep_unused)?;
+        let (resources, pruned) = pruned_resources(document, resources, &names_by_type, None)?;
         stats.merge(pruned);
         install_form_resources(document, form, resources)?;
     }
@@ -475,8 +445,7 @@ pub fn prune_resources(
         };
         let mut names_by_type = usage.names_by_resource_type.clone();
         extend_borrowed_form_usage(document, &resources, &usage, &mut names_by_type)?;
-        let (resources, pruned) =
-            pruned_resources(document, resources, &names_by_type, None, keep_unused)?;
+        let (resources, pruned) = pruned_resources(document, resources, &names_by_type, None)?;
         stats.merge(pruned);
         install_page_resources(document, page, resources)?;
     }
@@ -485,42 +454,8 @@ pub fn prune_resources(
 
 #[cfg(test)]
 mod resource_retention_tests {
-    use super::{ResourceNamesByType, keep_unused_resource, resource_entry_used};
+    use super::{ResourceNamesByType, resource_entry_used};
     use std::collections::BTreeSet;
-
-    fn selectors(values: &[&str]) -> BTreeSet<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
-    }
-
-    #[test]
-    fn unused_resource_selectors_match_expected_scope() {
-        assert!(keep_unused_resource(&selectors(&["*"]), b"Font", b"F1"));
-        assert!(keep_unused_resource(
-            &selectors(&["XObject:*"]),
-            b"XObject",
-            b"Im7"
-        ));
-        assert!(!keep_unused_resource(
-            &selectors(&["XObject:*"]),
-            b"Font",
-            b"F1"
-        ));
-        assert!(keep_unused_resource(
-            &selectors(&["Font:F1"]),
-            b"Font",
-            b"F1"
-        ));
-        assert!(!keep_unused_resource(
-            &selectors(&["Font:F1"]),
-            b"Font",
-            b"F2"
-        ));
-        assert!(keep_unused_resource(
-            &selectors(&["SharedName"]),
-            b"XObject",
-            b"SharedName"
-        ));
-    }
 
     #[test]
     fn typed_resource_usage_does_not_cross_namespaces() {

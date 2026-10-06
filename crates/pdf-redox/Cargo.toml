@@ -23,3 +23,6 @@ skrifa.workspace = true
 write-fonts.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
