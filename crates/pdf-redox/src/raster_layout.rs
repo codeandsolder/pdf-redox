@@ -4,14 +4,12 @@ use crate::{
     StreamData,
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
-    hidden_text::{
-        HiddenTextSharedContext, hidden_text_shared_context_hayro, scan_physical_hidden_text_hayro,
-    },
+    hidden_text::{HiddenTextSharedContext, hidden_text_shared_context, scan_physical_hidden_text},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
-        cleanup_fragmented_inline_staging_hayro, externalize_fragmented_inline_target_hayro,
+        cleanup_fragmented_inline_staging, externalize_fragmented_inline_target,
     },
-    prune::prune_xobject_candidates_for_content_hayro,
+    prune::prune_xobject_candidates_for_content,
     vector_compact::{
         ProcessingPageScanner, ProcessingVectorAnalysis, compacted_rect_fill_len,
         merge_rect_fill_pair, rect_contains_rect,
@@ -1228,7 +1226,7 @@ fn scan_target_shared(
         let mut scanner = RasterVectorScanner::new(document, resources)?;
         let hidden_ranges = if let Some(context) = hidden_context {
             let Some(hidden_ranges) =
-                scan_physical_hidden_text_hayro(document, page, page_number, context, content)?
+                scan_physical_hidden_text(document, page, page_number, context, content)?
             else {
                 return Ok(None);
             };
@@ -1257,7 +1255,7 @@ fn scan_target_shared(
     let mut scanner = new_raster_scanner(document, resources)?;
     let hidden_ranges = if let Some(context) = hidden_context {
         let Some(hidden_ranges) =
-            scan_physical_hidden_text_hayro(document, page, page_number, context, content)?
+            scan_physical_hidden_text(document, page, page_number, context, content)?
         else {
             return Ok(None);
         };
@@ -5603,7 +5601,7 @@ fn build_merge_plans_for_scanner(
     clippy::too_many_lines,
     reason = "the raster normalization pipeline intentionally coordinates scan ordering, caches, rewrite plans, and statistics in one pass"
 )]
-pub fn normalize_raster_layout_hayro(
+pub fn normalize_raster_layout(
     document: &mut EditDocument,
     config: &RasterLayoutConfig,
     flate_level: i32,
@@ -5657,7 +5655,7 @@ pub fn normalize_raster_layout_hayro(
     let mut alpha_crop_cache = HashMap::<ObjectHandle, AlphaCropCacheEntry>::new();
     let mut alpha_crop_bounds_cache = HashMap::<ObjectHandle, Option<PixelCrop>>::new();
     let hidden_context: Option<HiddenTextSharedContext> = if config.prune_hidden_paints {
-        Some(hidden_text_shared_context_hayro(document)?)
+        Some(hidden_text_shared_context(document)?)
     } else {
         None
     };
@@ -5751,7 +5749,7 @@ pub fn normalize_raster_layout_hayro(
                 ContentTarget::Page(page) => InlineContentTarget::Page(page),
                 ContentTarget::Form(form) => InlineContentTarget::Form(form),
             };
-            let inline = externalize_fragmented_inline_target_hayro(
+            let inline = externalize_fragmented_inline_target(
                 document,
                 inline_target,
                 config.fragmented_paint_threshold,
@@ -6044,7 +6042,7 @@ pub fn normalize_raster_layout_hayro(
         if applied.changed && !applied.obsolete_resource_names.is_empty() {
             let current_content = target_content(document, target)?;
             if let Some(current_resources) = target_resources(document, target)? {
-                let (resources, removed) = prune_xobject_candidates_for_content_hayro(
+                let (resources, removed) = prune_xobject_candidates_for_content(
                     document,
                     current_resources,
                     &current_content,
@@ -6089,7 +6087,7 @@ pub fn normalize_raster_layout_hayro(
     }
     let staging_cleanup_started = Instant::now();
     stats.staging_xobject_entries_removed =
-        cleanup_fragmented_inline_staging_hayro(document, &staged_xobjects)?;
+        cleanup_fragmented_inline_staging(document, &staged_xobjects)?;
     stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
     if *DEBUG_RASTER {
         eprintln!(

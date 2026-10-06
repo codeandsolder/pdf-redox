@@ -245,7 +245,7 @@ fn hayro_font_program_fingerprint(
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
-pub fn canonicalize_font_program_streams_hayro(
+pub fn canonicalize_font_program_streams(
     document: &mut EditDocument,
 ) -> Result<TargetedDedupStats> {
     let holders = hayro_font_program_holders(document)?;
@@ -460,7 +460,7 @@ fn rewrite_direct_reference_holder(
     Ok(true)
 }
 
-fn canonicalize_named_stream_references_hayro(
+fn canonicalize_named_stream_references(
     document: &mut EditDocument,
     key: &[u8],
     domain: &[u8],
@@ -487,10 +487,8 @@ fn canonicalize_named_stream_references_hayro(
     Ok(plan.targeted_stats(references_canonicalized))
 }
 
-pub fn canonicalize_metadata_streams_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
-    canonicalize_named_stream_references_hayro(document, b"Metadata", b"metadata")
+pub fn canonicalize_metadata_streams(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+    canonicalize_named_stream_references(document, b"Metadata", b"metadata")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,7 +641,7 @@ fn rewrite_direct_array_reference_holder(
     Ok(true)
 }
 
-pub fn canonicalize_icc_profiles_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+pub fn canonicalize_icc_profiles(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = hayro_icc_array_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
@@ -688,10 +686,8 @@ fn object_at_direct_path_mut<'a>(
 /// whole-xref enumeration. On damaged or oddly indexed PDFs Hayro
 /// can therefore find additional real `/ToUnicode` holders that the legacy
 /// pass skipped; every rewrite still requires an exact stream fingerprint.
-pub fn canonicalize_to_unicode_cmaps_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
-    canonicalize_named_stream_references_hayro(document, b"ToUnicode", b"to-unicode")
+pub fn canonicalize_to_unicode_cmaps(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+    canonicalize_named_stream_references(document, b"ToUnicode", b"to-unicode")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -930,9 +926,7 @@ fn rewrite_type3_glyph_holder(
     Ok(true)
 }
 
-pub fn canonicalize_type3_charprocs_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_type3_charprocs(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = hayro_type3_glyph_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
 
@@ -1059,7 +1053,7 @@ fn reachable_streams_with_subtype(
     document.reachable_streams_with_subtype(subtype)
 }
 
-fn exact_stream_redirects_hayro(
+fn exact_stream_redirects(
     document: &EditDocument,
     streams: &[CowObjectHandle],
     domain: &[u8],
@@ -1304,9 +1298,7 @@ fn rewrite_dictionary_target_entries(
     Ok(rewritten)
 }
 
-pub fn canonicalize_image_xobjects_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_image_xobjects(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let images = reachable_streams_with_subtype(document, b"Image")?;
     if !stream_payloads_may_repeat(document, &images)? {
         return Ok(TargetedDedupStats::default());
@@ -1319,7 +1311,7 @@ pub fn canonicalize_image_xobjects_hayro(
     let mut duplicate_refs = HashSet::new();
     let mut duplicate_raw_bytes = 0_usize;
     let empty_redirects = HashMap::new();
-    let mask_redirects = exact_stream_redirects_hayro(
+    let mask_redirects = exact_stream_redirects(
         document,
         &images,
         b"image-xobject",
@@ -1337,7 +1329,7 @@ pub fn canonicalize_image_xobjects_hayro(
             &mask_redirects,
         )?;
     }
-    let redirects = exact_stream_redirects_hayro(
+    let redirects = exact_stream_redirects(
         document,
         &images,
         b"image-xobject",
@@ -1430,7 +1422,7 @@ fn form_resource_handles(
     Ok(handles.into_iter().collect())
 }
 
-fn exact_non_stream_resource_redirects_hayro(
+fn exact_non_stream_resource_redirects(
     document: &EditDocument,
     handles: &[CowObjectHandle],
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
@@ -1590,7 +1582,7 @@ fn inspect_owned_redirect_reference_holders(
     }
 }
 
-fn rewrite_all_references_hayro(
+fn rewrite_all_references(
     document: &mut EditDocument,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
@@ -1641,7 +1633,7 @@ fn rewrite_all_references_hayro(
     Ok(rewritten)
 }
 
-fn exact_dictionary_redirects_hayro(
+fn exact_dictionary_redirects(
     document: &EditDocument,
     handles: &BTreeSet<CowObjectHandle>,
     domain: &[u8],
@@ -1678,7 +1670,7 @@ fn exact_dictionary_redirects_hayro(
     Ok(redirects)
 }
 
-pub fn canonicalize_exact_extgstate_dictionaries_hayro(
+pub fn canonicalize_exact_extgstate_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {
     let targets = hayro_dictionary_targets(document, b"ExtGState")?;
@@ -1699,8 +1691,7 @@ pub fn canonicalize_exact_extgstate_dictionaries_hayro(
         }
     }
 
-    let redirects =
-        exact_dictionary_redirects_hayro(document, &handles, b"exact-extgstate-dictionary")?;
+    let redirects = exact_dictionary_redirects(document, &handles, b"exact-extgstate-dictionary")?;
     let references_canonicalized =
         rewrite_dictionary_target_entries(document, &targets, &redirects)?;
     Ok(ExactObjectDedupStats {
@@ -1709,7 +1700,7 @@ pub fn canonicalize_exact_extgstate_dictionaries_hayro(
     })
 }
 
-pub fn canonicalize_exact_structure_attribute_dictionaries_hayro(
+pub fn canonicalize_exact_structure_attribute_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {
     let mut holders = Vec::new();
@@ -1769,11 +1760,8 @@ pub fn canonicalize_exact_structure_attribute_dictionaries_hayro(
         Ok(())
     })?;
 
-    let redirects = exact_dictionary_redirects_hayro(
-        document,
-        &handles,
-        b"exact-structure-attribute-dictionary",
-    )?;
+    let redirects =
+        exact_dictionary_redirects(document, &handles, b"exact-structure-attribute-dictionary")?;
     let mut references_canonicalized = 0usize;
     for holder in &holders {
         let Some(canonical) = redirects.get(&holder.target).copied() else {
@@ -1818,7 +1806,7 @@ fn reachable_dictionaries_with_type(
     Ok(handles)
 }
 
-pub fn canonicalize_exact_font_dictionaries_hayro(
+pub fn canonicalize_exact_font_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {
     let handles = reachable_dictionaries_with_type(document, b"Font")?;
@@ -1852,14 +1840,14 @@ pub fn canonicalize_exact_font_dictionaries_hayro(
         }
     }
 
-    let references_canonicalized = rewrite_all_references_hayro(document, &redirects)?;
+    let references_canonicalized = rewrite_all_references(document, &redirects)?;
     Ok(ExactObjectDedupStats {
         duplicate_objects_detected: redirects.len(),
         references_canonicalized,
     })
 }
 
-fn exact_form_font_redirects_hayro(
+fn exact_form_font_redirects(
     document: &EditDocument,
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
@@ -1912,7 +1900,7 @@ fn hayro_stream_fingerprint_top_level_redirects(
     Ok(Some(hasher.finalize().into()))
 }
 
-fn virtual_form_image_redirects_hayro(
+fn virtual_form_image_redirects(
     document: &EditDocument,
     images: &[CowObjectHandle],
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
@@ -1965,7 +1953,7 @@ fn resolved_dictionary_clone(
         }))
 }
 
-fn normalized_named_form_resource_hayro(
+fn normalized_named_form_resource(
     document: &EditDocument,
     value: &OwnedObject,
     resource_kind: &[u8],
@@ -2000,7 +1988,7 @@ fn normalized_named_form_resource_hayro(
     Ok(OwnedObject::Dictionary(normalized))
 }
 
-fn normalized_form_resources_hayro(
+fn normalized_form_resources(
     document: &EditDocument,
     value: &OwnedObject,
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
@@ -2015,7 +2003,7 @@ fn normalized_form_resources_hayro(
     for (key, value) in dictionary {
         let value = match key.as_slice() {
             b"Font" | b"XObject" | b"ColorSpace" | b"ExtGState" | b"Properties" => {
-                normalized_named_form_resource_hayro(
+                normalized_named_form_resource(
                     document,
                     &value,
                     &key,
@@ -2067,7 +2055,7 @@ fn hayro_form_fingerprint(
     for (key, value) in entries {
         hash_len_prefixed(&mut hasher, key);
         if key.as_slice() == b"Resources" {
-            let normalized = normalized_form_resources_hayro(
+            let normalized = normalized_form_resources(
                 document,
                 value,
                 exact_redirects,
@@ -2083,7 +2071,7 @@ fn hayro_form_fingerprint(
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
-fn fixed_point_form_redirects_hayro(
+fn fixed_point_form_redirects(
     document: &EditDocument,
     forms: &[CowObjectHandle],
     ignored_dictionary_keys: &[&[u8]],
@@ -2255,7 +2243,7 @@ fn stream_payloads_may_repeat(document: &EditDocument, forms: &[CowObjectHandle]
     Ok(false)
 }
 
-fn form_dependency_redirects_hayro(
+fn form_dependency_redirects(
     document: &EditDocument,
     ignored_form_dictionary_keys: &[&[u8]],
 ) -> Result<FormDependencyRedirects> {
@@ -2271,10 +2259,10 @@ fn form_dependency_redirects_hayro(
     }
     let images = reachable_streams_with_subtype(document, b"Image")?;
     let resources = form_resource_handles(document, &form_streams)?;
-    let exact = exact_non_stream_resource_redirects_hayro(document, &resources)?;
-    let fonts = exact_form_font_redirects_hayro(document, &exact)?;
-    let image_redirects = virtual_form_image_redirects_hayro(document, &images, &exact)?;
-    let forms = fixed_point_form_redirects_hayro(
+    let exact = exact_non_stream_resource_redirects(document, &resources)?;
+    let fonts = exact_form_font_redirects(document, &exact)?;
+    let image_redirects = virtual_form_image_redirects(document, &images, &exact)?;
+    let forms = fixed_point_form_redirects(
         document,
         &form_streams,
         ignored_form_dictionary_keys,
@@ -2291,13 +2279,13 @@ fn form_dependency_redirects_hayro(
     })
 }
 
-pub fn canonicalize_form_xobjects_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
     } else {
         &[]
     };
-    let dependencies = form_dependency_redirects_hayro(document, ignored)?;
+    let dependencies = form_dependency_redirects(document, ignored)?;
     if dependencies.forms.is_empty() {
         return Ok(TargetedDedupStats::default());
     }
@@ -2371,14 +2359,12 @@ fn appearance_dictionary_targets(
     Ok(targets)
 }
 
-pub fn canonicalize_appearance_streams_hayro(
-    document: &mut EditDocument,
-) -> Result<TargetedDedupStats> {
+pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let holders = appearance_dictionary_targets(document)?;
     if holders.is_empty() {
         return Ok(TargetedDedupStats::default());
     }
-    let dependencies = form_dependency_redirects_hayro(document, &[])?;
+    let dependencies = form_dependency_redirects(document, &[])?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let Some(snapshot) = document.current_owned_object(holder.root)? else {
@@ -2443,7 +2429,7 @@ fn page_handles_hayro(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
     document.page_handles()
 }
 
-fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
+fn page_content_holders(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
     let mut holders = Vec::new();
     for page in page_handles_hayro(document)? {
         let Some(object) = document.current_owned_object(page)? else {
@@ -2509,8 +2495,8 @@ fn page_content_holders_hayro(document: &EditDocument) -> Result<Vec<PageContent
     Ok(holders)
 }
 
-pub fn canonicalize_page_contents_hayro(document: &mut EditDocument) -> Result<TargetedDedupStats> {
-    let holders = page_content_holders_hayro(document)?;
+pub fn canonicalize_page_contents(document: &mut EditDocument) -> Result<TargetedDedupStats> {
+    let holders = page_content_holders(document)?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
         let stream = holder.target();
@@ -2608,7 +2594,7 @@ mod tests {
     #[test]
     fn hayro_image_dedup_canonicalizes_exact_resource_duplicates() -> Result<()> {
         let mut document = EditDocument::from_bytes(duplicate_image_fixture()?)?;
-        let stats = canonicalize_image_xobjects_hayro(&mut document)?;
+        let stats = canonicalize_image_xobjects(&mut document)?;
         assert_eq!(stats.duplicate_streams_detected, 1);
         assert_eq!(stats.references_canonicalized, 1);
         let output = document.write_compact()?;
@@ -2619,7 +2605,7 @@ mod tests {
     #[test]
     fn hayro_page_content_dedup_canonicalizes_exact_streams() -> Result<()> {
         let mut document = EditDocument::from_bytes(duplicate_page_content_fixture()?)?;
-        let stats = canonicalize_page_contents_hayro(&mut document)?;
+        let stats = canonicalize_page_contents(&mut document)?;
         assert_eq!(stats.duplicate_streams_detected, 1);
         assert_eq!(stats.references_canonicalized, 1);
         let output = document.write_compact()?;

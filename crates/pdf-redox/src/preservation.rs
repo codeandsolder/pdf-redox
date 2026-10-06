@@ -184,7 +184,7 @@ fn preservation_page_tree_targets(
     Ok((pages.into_iter().collect(), nodes.into_iter().collect()))
 }
 
-fn page_annotations_hayro(
+fn page_annotations(
     document: &EditDocument,
     page: &PreservationDictionaryTarget,
 ) -> Result<Option<Vec<OwnedObject>>> {
@@ -203,7 +203,7 @@ fn page_annotations_hayro(
     })
 }
 
-fn replace_page_annotations_hayro(
+fn replace_page_annotations(
     document: &mut EditDocument,
     page: &PreservationDictionaryTarget,
     annotations: Vec<OwnedObject>,
@@ -219,7 +219,7 @@ fn replace_page_annotations_hayro(
     Ok(())
 }
 
-fn annotation_subtype_hayro(
+fn annotation_subtype(
     document: &EditDocument,
     annotation: &OwnedObject,
 ) -> Result<Option<Vec<u8>>> {
@@ -232,27 +232,25 @@ fn annotation_subtype_hayro(
     owned_name(document, dictionary.get(b"Subtype".as_slice()))
 }
 
-fn annotation_is_protected_hayro(
+fn annotation_is_protected(
     document: &EditDocument,
     annotation: &OwnedObject,
     policy: &PreservationConfig,
 ) -> Result<bool> {
-    Ok(
-        match annotation_subtype_hayro(document, annotation)?.as_deref() {
-            Some(b"Link") => policy.links,
-            Some(b"Widget") => policy.forms,
-            _ => false,
-        },
-    )
+    Ok(match annotation_subtype(document, annotation)?.as_deref() {
+        Some(b"Link") => policy.links,
+        Some(b"Widget") => policy.forms,
+        _ => false,
+    })
 }
 
-fn annotation_subtypes_hayro(
+fn annotation_subtypes(
     document: &EditDocument,
     pages: &[PreservationDictionaryTarget],
 ) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for page in pages {
-        let Some(annotations) = page_annotations_hayro(document, page)? else {
+        let Some(annotations) = page_annotations(document, page)? else {
             continue;
         };
         if annotations.is_empty() {
@@ -268,7 +266,7 @@ fn annotation_subtypes_hayro(
             continue;
         }
         for annotation in annotations {
-            let label = annotation_subtype_hayro(document, &annotation)?.map_or_else(
+            let label = annotation_subtype(document, &annotation)?.map_or_else(
                 || "(missing/non-name subtype)".to_owned(),
                 |name| format!("/{}", String::from_utf8_lossy(&name)),
             );
@@ -278,7 +276,7 @@ fn annotation_subtypes_hayro(
     Ok(counts)
 }
 
-fn filter_annotations_hayro(
+fn filter_annotations(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
     policy: &PreservationConfig,
@@ -286,13 +284,13 @@ fn filter_annotations_hayro(
 ) -> Result<usize> {
     let mut kept_total = 0;
     for page in pages {
-        let Some(items) = page_annotations_hayro(document, page)? else {
+        let Some(items) = page_annotations(document, page)? else {
             continue;
         };
         let mut kept = Vec::new();
         for annotation in items {
-            let subtype = annotation_subtype_hayro(document, &annotation)?;
-            let protected = annotation_is_protected_hayro(document, &annotation, policy)?;
+            let subtype = annotation_subtype(document, &annotation)?;
+            let protected = annotation_is_protected(document, &annotation, policy)?;
             let explicitly_disabled = matches!(subtype.as_deref(), Some(b"Link")) && !policy.links
                 || matches!(subtype.as_deref(), Some(b"Widget")) && !policy.forms;
             if protected || (preserve_other_annotations && !explicitly_disabled) {
@@ -300,38 +298,38 @@ fn filter_annotations_hayro(
             }
         }
         kept_total += kept.len();
-        replace_page_annotations_hayro(document, page, kept)?;
+        replace_page_annotations(document, page, kept)?;
     }
     Ok(kept_total)
 }
 
-fn detach_protected_annotations_hayro(
+fn detach_protected_annotations(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
     policy: &PreservationConfig,
 ) -> Result<Vec<Vec<OwnedObject>>> {
     let mut protected_by_page = Vec::with_capacity(pages.len());
     for page in pages {
-        let Some(items) = page_annotations_hayro(document, page)? else {
+        let Some(items) = page_annotations(document, page)? else {
             protected_by_page.push(Vec::new());
             continue;
         };
         let mut protected = Vec::new();
         let mut processable = Vec::new();
         for annotation in items {
-            if annotation_is_protected_hayro(document, &annotation, policy)? {
+            if annotation_is_protected(document, &annotation, policy)? {
                 protected.push(annotation);
             } else {
                 processable.push(annotation);
             }
         }
-        replace_page_annotations_hayro(document, page, processable)?;
+        replace_page_annotations(document, page, processable)?;
         protected_by_page.push(protected);
     }
     Ok(protected_by_page)
 }
 
-fn restore_protected_annotations_hayro(
+fn restore_protected_annotations(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
     protected_by_page: Vec<Vec<OwnedObject>>,
@@ -340,21 +338,21 @@ fn restore_protected_annotations_hayro(
         if protected.is_empty() {
             continue;
         }
-        let mut items = page_annotations_hayro(document, page)?.unwrap_or_default();
+        let mut items = page_annotations(document, page)?.unwrap_or_default();
         items.extend(protected);
-        replace_page_annotations_hayro(document, page, items)?;
+        replace_page_annotations(document, page, items)?;
     }
     Ok(())
 }
 
-fn retain_link_visual_shells_hayro(
+fn retain_link_visual_shells(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
 ) -> Result<usize> {
     const LINK_VISUAL_KEYS: &[&[u8]] = &[b"Rect", b"Border", b"BS", b"C", b"F", b"CA"];
     let mut retained = 0;
     for page in pages {
-        let Some(items) = page_annotations_hayro(document, page)? else {
+        let Some(items) = page_annotations(document, page)? else {
             continue;
         };
         let mut shells = Vec::new();
@@ -381,7 +379,7 @@ fn retain_link_visual_shells_hayro(
             shells.push(OwnedObject::Dictionary(shell));
             retained += 1;
         }
-        replace_page_annotations_hayro(document, page, shells)?;
+        replace_page_annotations(document, page, shells)?;
     }
     Ok(retained)
 }
@@ -490,7 +488,7 @@ fn collect_direct_authoring_metadata_removals(
     }
 }
 
-fn drop_authoring_metadata_hayro(
+fn drop_authoring_metadata(
     document: &mut EditDocument,
     stats: &mut PreservationStats,
 ) -> Result<()> {
@@ -550,7 +548,7 @@ fn drop_authoring_metadata_hayro(
     Ok(())
 }
 
-fn prune_dictionary_target_hayro(
+fn prune_dictionary_target(
     document: &mut EditDocument,
     target: &PreservationDictionaryTarget,
     keep: impl Fn(&[u8]) -> bool,
@@ -713,7 +711,7 @@ fn stream_source_from_value(
     })
 }
 
-fn selected_normal_appearance_hayro(
+fn selected_normal_appearance(
     document: &EditDocument,
     annotation: &OwnedDictionary,
 ) -> Result<(bool, Option<AppearanceSource>)> {
@@ -747,7 +745,7 @@ fn selected_normal_appearance_hayro(
     Ok((true, stream_source_from_value(document, value)?))
 }
 
-fn annotation_flags_hayro(document: &EditDocument, annotation: &OwnedDictionary) -> Result<i64> {
+fn annotation_flags(document: &EditDocument, annotation: &OwnedDictionary) -> Result<i64> {
     let Some(value) = annotation.get(b"F".as_slice()) else {
         return Ok(0);
     };
@@ -757,7 +755,7 @@ fn annotation_flags_hayro(document: &EditDocument, annotation: &OwnedDictionary)
     })
 }
 
-fn acroform_need_appearances_hayro(document: &EditDocument) -> Result<bool> {
+fn acroform_need_appearances(document: &EditDocument) -> Result<bool> {
     let catalog = CowObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = document.current_owned_object(catalog)? else {
         return Ok(false);
@@ -783,7 +781,7 @@ fn acroform_need_appearances_hayro(document: &EditDocument) -> Result<bool> {
     ))
 }
 
-fn appearance_as_form_hayro(
+fn appearance_as_form(
     document: &mut EditDocument,
     source: AppearanceSource,
 ) -> Result<CowObjectHandle> {
@@ -810,10 +808,7 @@ fn appearance_as_form_hayro(
     }
 }
 
-fn normalized_rectangle_hayro(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<Rectangle>> {
+fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<Option<Rectangle>> {
     let Some([x0, y0, x1, y1]) = resolved_number_array::<4>(document, value)? else {
         return Ok(None);
     };
@@ -825,10 +820,7 @@ fn normalized_rectangle_hayro(
     )))
 }
 
-fn appearance_matrix_hayro(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
-) -> Result<Matrix> {
+fn appearance_matrix(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<Matrix> {
     let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
         return Ok(Matrix::default());
     };
@@ -837,7 +829,7 @@ fn appearance_matrix_hayro(
         .unwrap_or_default())
 }
 
-fn appearance_content_hayro(
+fn appearance_content(
     document: &EditDocument,
     annotation: &OwnedDictionary,
     appearance: CowObjectHandle,
@@ -854,16 +846,16 @@ fn appearance_content_hayro(
     let Some(bbox_value) = appearance_dictionary.get(b"BBox".as_slice()) else {
         return Ok(Vec::new());
     };
-    let Some(bbox) = normalized_rectangle_hayro(document, bbox_value)? else {
+    let Some(bbox) = normalized_rectangle(document, bbox_value)? else {
         return Ok(Vec::new());
     };
     let Some(rect_value) = annotation.get(b"Rect".as_slice()) else {
         return Ok(Vec::new());
     };
-    let Some(rect) = normalized_rectangle_hayro(document, rect_value)? else {
+    let Some(rect) = normalized_rectangle(document, rect_value)? else {
         return Ok(Vec::new());
     };
-    let matrix = appearance_matrix_hayro(document, appearance_dictionary)?;
+    let matrix = appearance_matrix(document, appearance_dictionary)?;
     let do_rotate = rotate != 0 && (flags & 0x10) != 0;
     let (rect, matrix) = if do_rotate {
         let mut rotated_matrix = Matrix::default();
@@ -929,7 +921,7 @@ fn page_resources_hayro(
     })
 }
 
-fn resource_dictionary_hayro(
+fn resource_dictionary(
     document: &EditDocument,
     resources: &OwnedDictionary,
     key: &[u8],
@@ -943,7 +935,7 @@ fn resource_dictionary_hayro(
     })
 }
 
-fn acroform_default_resources_hayro(document: &EditDocument) -> Result<Option<OwnedDictionary>> {
+fn acroform_default_resources(document: &EditDocument) -> Result<Option<OwnedDictionary>> {
     let catalog = CowObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = document.current_owned_object(catalog)? else {
         return Ok(None);
@@ -969,7 +961,7 @@ fn acroform_default_resources_hayro(document: &EditDocument) -> Result<Option<Ow
     })
 }
 
-fn merge_resource_dictionaries_hayro(destination: &mut OwnedDictionary, source: OwnedDictionary) {
+fn merge_resource_dictionaries(destination: &mut OwnedDictionary, source: OwnedDictionary) {
     for (category, source_value) in source {
         match (destination.get_mut(category.as_slice()), source_value) {
             (None, source_value) => {
@@ -995,7 +987,7 @@ fn merge_resource_dictionaries_hayro(destination: &mut OwnedDictionary, source: 
     }
 }
 
-fn content_references_hayro(
+fn content_references(
     document: &mut EditDocument,
     value: Option<OwnedObject>,
 ) -> Result<Vec<OwnedObject>> {
@@ -1044,7 +1036,7 @@ fn content_references_hayro(
     }
 }
 
-fn wrap_page_contents_hayro(
+fn wrap_page_contents(
     document: &mut EditDocument,
     page: &PreservationDictionaryTarget,
     append_bytes: &[u8],
@@ -1059,7 +1051,7 @@ fn wrap_page_contents_hayro(
     after_bytes.extend_from_slice(append_bytes);
     let after = new_content_stream(document, after_bytes);
     let mut contents = vec![OwnedObject::Reference(before)];
-    contents.extend(content_references_hayro(document, old)?);
+    contents.extend(content_references(document, old)?);
     contents.push(OwnedObject::Reference(after));
     if let Some(dictionary) = preservation_target_mut(document, page)? {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Array(contents));
@@ -1067,7 +1059,7 @@ fn wrap_page_contents_hayro(
     Ok(())
 }
 
-fn page_rotate_hayro(document: &EditDocument, page: &PreservationDictionaryTarget) -> Result<i32> {
+fn page_rotate(document: &EditDocument, page: &PreservationDictionaryTarget) -> Result<i32> {
     let Some(value) = inherited_page_value_hayro(document, page, b"Rotate")? else {
         return Ok(0);
     };
@@ -1077,32 +1069,32 @@ fn page_rotate_hayro(document: &EditDocument, page: &PreservationDictionaryTarge
     })
 }
 
-fn flatten_annotations_hayro(
+fn flatten_annotations(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
     required_flags: i64,
     forbidden_flags: i64,
 ) -> Result<usize> {
-    let need_appearances = acroform_need_appearances_hayro(document)?;
+    let need_appearances = acroform_need_appearances(document)?;
     let default_resources = if need_appearances {
         None
     } else {
-        acroform_default_resources_hayro(document)?
+        acroform_default_resources(document)?
     };
     let mut flattened_total = 0;
     for page in pages {
-        let Some(annotations) = page_annotations_hayro(document, page)? else {
+        let Some(annotations) = page_annotations(document, page)? else {
             continue;
         };
-        let rotate = page_rotate_hayro(document, page)?;
+        let rotate = page_rotate(document, page)?;
         let mut resources = page_resources_hayro(document, page)?;
         let has_widget = annotations.iter().any(|annotation| {
-            matches!(annotation_subtype_hayro(document, annotation), Ok(Some(name)) if name == b"Widget")
+            matches!(annotation_subtype(document, annotation), Ok(Some(name)) if name == b"Widget")
         });
         if has_widget && let Some(default_resources) = default_resources.clone() {
-            merge_resource_dictionaries_hayro(&mut resources, default_resources);
+            merge_resource_dictionaries(&mut resources, default_resources);
         }
-        let mut xobjects = resource_dictionary_hayro(document, &resources, b"XObject")?;
+        let mut xobjects = resource_dictionary(document, &resources, b"XObject")?;
         let mut kept = Vec::new();
         let mut append_bytes = Vec::new();
         let mut changed_annotations = false;
@@ -1117,8 +1109,7 @@ fn flatten_annotations_hayro(
                 kept.push(annotation_value);
                 continue;
             };
-            let (has_appearance, appearance) =
-                selected_normal_appearance_hayro(document, annotation)?;
+            let (has_appearance, appearance) = selected_normal_appearance(document, annotation)?;
             let subtype = owned_name(document, annotation.get(b"Subtype".as_slice()))?;
             if need_appearances && subtype.as_deref() == Some(b"Widget") {
                 kept.push(annotation_value);
@@ -1132,7 +1123,7 @@ fn flatten_annotations_hayro(
             let Some(appearance) = appearance else {
                 continue;
             };
-            let flags = annotation_flags_hayro(document, annotation)?;
+            let flags = annotation_flags(document, annotation)?;
             if (flags & forbidden_flags) != 0 || (flags & required_flags) != required_flags {
                 continue;
             }
@@ -1143,8 +1134,8 @@ fn flatten_annotations_hayro(
                     break candidate;
                 }
             };
-            let appearance = appearance_as_form_hayro(document, appearance)?;
-            let content = appearance_content_hayro(
+            let appearance = appearance_as_form(document, appearance)?;
+            let content = appearance_content(
                 document,
                 annotation,
                 appearance,
@@ -1170,8 +1161,8 @@ fn flatten_annotations_hayro(
             page_dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
         }
         if changed_annotations {
-            wrap_page_contents_hayro(document, page, &append_bytes)?;
-            replace_page_annotations_hayro(document, page, kept)?;
+            wrap_page_contents(document, page, &append_bytes)?;
+            replace_page_annotations(document, page, kept)?;
         }
     }
     if !need_appearances {
@@ -1183,45 +1174,44 @@ fn flatten_annotations_hayro(
     Ok(flattened_total)
 }
 
-fn process_annotations_hayro(
+fn process_annotations(
     document: &mut EditDocument,
     pages: &[PreservationDictionaryTarget],
     policy: &PreservationConfig,
     stats: &mut PreservationStats,
 ) -> Result<()> {
-    stats.annotation_subtypes_seen = annotation_subtypes_hayro(document, pages)?;
+    stats.annotation_subtypes_seen = annotation_subtypes(document, pages)?;
     stats.annotation_entries_seen = stats.annotation_subtypes_seen.values().sum();
     match policy.annotations {
         AnnotationPolicy::Preserve => {
-            let kept = filter_annotations_hayro(document, pages, policy, true)?;
+            let kept = filter_annotations(document, pages, policy, true)?;
             stats.annotation_entries_dropped_unflattened =
                 stats.annotation_entries_seen.saturating_sub(kept);
         }
         AnnotationPolicy::Discard => {
-            let kept = filter_annotations_hayro(document, pages, policy, false)?;
+            let kept = filter_annotations(document, pages, policy, false)?;
             stats.annotation_entries_dropped_unflattened =
                 stats.annotation_entries_seen.saturating_sub(kept);
         }
         AnnotationPolicy::AppearanceOnly => {
-            let protected = detach_protected_annotations_hayro(document, pages, policy)?;
-            let processable_before: usize =
-                annotation_subtypes_hayro(document, pages)?.values().sum();
+            let protected = detach_protected_annotations(document, pages, policy)?;
+            let processable_before: usize = annotation_subtypes(document, pages)?.values().sum();
             if processable_before > 0 {
-                flatten_annotations_hayro(document, pages, 0, SCREEN_HIDDEN_ANNOTATION_FLAGS)?;
+                flatten_annotations(document, pages, 0, SCREEN_HIDDEN_ANNOTATION_FLAGS)?;
             }
-            stats.unflattened_annotation_subtypes = annotation_subtypes_hayro(document, pages)?;
+            stats.unflattened_annotation_subtypes = annotation_subtypes(document, pages)?;
             let unflattened: usize = stats.unflattened_annotation_subtypes.values().sum();
             stats.annotation_entries_flattened = processable_before.saturating_sub(unflattened);
-            stats.link_visual_shells_retained = retain_link_visual_shells_hayro(document, pages)?;
+            stats.link_visual_shells_retained = retain_link_visual_shells(document, pages)?;
             stats.annotation_entries_dropped_unflattened =
                 unflattened.saturating_sub(stats.link_visual_shells_retained);
-            restore_protected_annotations_hayro(document, pages, protected)?;
+            restore_protected_annotations(document, pages, protected)?;
         }
     }
     Ok(())
 }
 
-pub fn apply_preservation_policy_hayro(
+pub fn apply_preservation_policy(
     document: &mut EditDocument,
     policy: &PreservationConfig,
 ) -> Result<PreservationStats> {
@@ -1230,12 +1220,12 @@ pub fn apply_preservation_policy_hayro(
         pages: pages.len(),
         ..PreservationStats::default()
     };
-    process_annotations_hayro(document, &pages, policy, &mut stats)?;
+    process_annotations(document, &pages, policy, &mut stats)?;
     if !policy.metadata {
-        drop_authoring_metadata_hayro(document, &mut stats)?;
+        drop_authoring_metadata(document, &mut stats)?;
     }
     for page in &pages {
-        prune_dictionary_target_hayro(
+        prune_dictionary_target(
             document,
             page,
             |key| keep_page_key_hayro(key, policy),
@@ -1245,7 +1235,7 @@ pub fn apply_preservation_policy_hayro(
         )?;
     }
     for node in &page_tree_nodes {
-        prune_dictionary_target_hayro(
+        prune_dictionary_target(
             document,
             node,
             |key| keep_page_tree_key_hayro(key, policy),
@@ -1258,7 +1248,7 @@ pub fn apply_preservation_policy_hayro(
         root: CowObjectHandle::Existing(document.source().catalog_id()),
         path: Vec::new(),
     };
-    prune_dictionary_target_hayro(
+    prune_dictionary_target(
         document,
         &catalog,
         |key| keep_catalog_key_hayro(key, policy),
@@ -1296,7 +1286,7 @@ mod tests {
     fn visible_surface_drops_metadata_and_unknown_auxiliary_state() -> Result<()> {
         let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
         let stats =
-            apply_preservation_policy_hayro(&mut document, &PreservationConfig::visible_surface())?;
+            apply_preservation_policy(&mut document, &PreservationConfig::visible_surface())?;
         assert_eq!(stats.pages, 1);
         let source = SourcePdf::from_bytes(document.write_compact()?)?;
         let catalog = source.materialize(source.catalog_id())?;

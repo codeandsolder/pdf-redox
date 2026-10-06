@@ -534,7 +534,7 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
-pub fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> Result<bool> {
+pub fn repeated_page_objects_prefix_possible(document: &EditDocument) -> Result<bool> {
     let pages = document.page_handles()?;
     if pages.len() < MIN_SUPPORT_PAGES {
         return Ok(false);
@@ -554,7 +554,7 @@ pub fn repeated_page_objects_prefix_possible_hayro(document: &EditDocument) -> R
         .is_empty())
 }
 
-pub fn remove_repeated_page_objects_hayro(
+pub fn remove_repeated_page_objects(
     document: &mut EditDocument,
 ) -> Result<RepeatedPageObjectStats> {
     let pages = document.page_handles()?;

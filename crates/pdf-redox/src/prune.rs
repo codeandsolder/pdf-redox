@@ -295,7 +295,7 @@ fn install_form_resources(
     Ok(())
 }
 
-pub fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
+pub fn should_prune_resources(document: &EditDocument) -> Result<bool> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = document.current_owned_object(catalog)? else {
         return Ok(false);
@@ -377,7 +377,7 @@ pub fn should_prune_resources_hayro(document: &EditDocument) -> Result<bool> {
     Ok(false)
 }
 
-pub fn prune_xobject_candidates_for_content_hayro(
+pub fn prune_xobject_candidates_for_content(
     document: &EditDocument,
     mut resources: OwnedDictionary,
     content: &[u8],
@@ -416,7 +416,7 @@ pub fn prune_xobject_candidates_for_content_hayro(
     Ok((resources, removed))
 }
 
-pub fn prune_resources_with_usage_hayro(
+pub fn prune_resources_with_usage(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
     page_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
@@ -465,7 +465,7 @@ pub fn prune_resources_with_usage_hayro(
     Ok(stats)
 }
 
-pub fn prune_resources_hayro(
+pub fn prune_resources(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
 ) -> Result<ResourcePruneStats> {

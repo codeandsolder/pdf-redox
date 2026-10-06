@@ -474,7 +474,7 @@ fn install_rewrite(
     Ok(())
 }
 
-pub fn externalize_duplicate_inline_images_hayro(
+pub fn externalize_duplicate_inline_images(
     document: &mut EditDocument,
     min_size: usize,
     min_duplicate_payload_bytes: usize,
@@ -557,7 +557,7 @@ pub struct FragmentedInlineExternalization {
     pub staged_xobjects: HashSet<ObjectHandle>,
 }
 
-pub fn externalize_fragmented_inline_target_hayro(
+pub fn externalize_fragmented_inline_target(
     document: &mut EditDocument,
     target: ContentTarget,
     min_occurrences: usize,
@@ -628,7 +628,7 @@ fn used_xobject_names(content: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
 /// Remove only temporary `XObject` resource entries created by fragmented-inline
 /// staging that no longer have a `Do` reference after raster reconstruction.
 /// Other pre-existing resource entries are left untouched.
-pub fn cleanup_fragmented_inline_staging_hayro(
+pub fn cleanup_fragmented_inline_staging(
     document: &mut EditDocument,
     staged_xobjects: &HashSet<ObjectHandle>,
 ) -> Result<usize> {

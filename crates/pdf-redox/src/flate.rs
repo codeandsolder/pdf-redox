@@ -61,7 +61,7 @@ fn adaptive_flate_encode(
     }
 }
 
-fn is_safe_lone_flate_hayro(
+fn is_safe_lone_flate(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
 ) -> Result<bool> {
@@ -83,7 +83,7 @@ fn is_safe_lone_flate_hayro(
     Ok(true)
 }
 
-pub fn apply_flate_policy_hayro(
+pub fn apply_flate_policy(
     document: &mut crate::EditDocument,
     policy: FlatePolicy,
     level: i32,
@@ -104,7 +104,7 @@ pub fn apply_flate_policy_hayro(
         else {
             continue;
         };
-        if !is_safe_lone_flate_hayro(document, &dictionary)? {
+        if !is_safe_lone_flate(document, &dictionary)? {
             continue;
         }
         let raw = data.bytes(document.source())?;
@@ -146,7 +146,7 @@ pub fn apply_flate_policy_hayro(
     Ok(stats)
 }
 
-pub fn compress_unfiltered_streams_hayro(
+pub fn compress_unfiltered_streams(
     document: &mut crate::EditDocument,
     level: i32,
     adaptive_high_effort: bool,

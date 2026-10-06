@@ -615,7 +615,7 @@ fn transform_one(
     Ok(true)
 }
 
-pub fn optimize_images_hayro(
+pub fn optimize_images(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
 ) -> Result<ImageOptimizationStats> {
@@ -639,7 +639,7 @@ pub fn optimize_images_hayro(
     Ok(stats)
 }
 
-pub fn optimize_images_with_resize_targets_hayro(
+pub fn optimize_images_with_resize_targets(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
     targets: &HashMap<(ObjectHandle, ObjectHandle), ImageResizeTarget>,

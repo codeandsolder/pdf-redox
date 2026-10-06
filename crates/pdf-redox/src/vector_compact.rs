@@ -1674,7 +1674,7 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
     clippy::too_many_lines,
     reason = "candidate discovery, semantic grouping, size gating, and form rewrites are one ordered factorization pass"
 )]
-fn factor_repeated_path_forms_hayro(
+fn factor_repeated_path_forms(
     document: &mut EditDocument,
     flate_level: i32,
     mut pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
@@ -1967,7 +1967,7 @@ fn factor_repeated_path_forms_hayro(
     clippy::too_many_lines,
     reason = "transformed-block discovery, grouping, and rewrite validation are one ordered factorization pass"
 )]
-fn factor_repeated_transformed_blocks_hayro(
+fn factor_repeated_transformed_blocks(
     document: &mut EditDocument,
     flate_level: i32,
     mut cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
@@ -2691,7 +2691,7 @@ struct SelectedSharedRun {
     clippy::too_many_lines,
     reason = "shared-run factoring scans, proves resource identity, models encoded savings, then commits one fail-closed transaction"
 )]
-fn factor_shared_q_prefix_runs_hayro(
+fn factor_shared_q_prefix_runs(
     document: &mut EditDocument,
     flate_level: i32,
     pages: &[ObjectHandle],
@@ -3153,7 +3153,7 @@ fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<
     Ok((value.is_finite() && value > 0.0).then_some(value))
 }
 
-fn canonicalize_page_path_coordinates_hayro(
+fn canonicalize_page_path_coordinates(
     document: &mut EditDocument,
     flate_level: i32,
     pages: &[ObjectHandle],
@@ -3223,7 +3223,7 @@ fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
     clippy::too_many_lines,
     reason = "vector compaction coordinates scan, factoring, rewrite, and statistics stages over shared document state"
 )]
-pub fn compact_vector_paths_hayro(
+pub fn compact_vector_paths(
     document: &mut EditDocument,
     flate_level: i32,
     goal: OptimizationGoal,
@@ -3291,12 +3291,8 @@ pub fn compact_vector_paths_hayro(
         total.estimated_flate_bytes_saved += before_flate.saturating_sub(after_flate);
     }
     if goal == OptimizationGoal::Processing {
-        let factored = factor_repeated_path_forms_hayro(
-            document,
-            flate_level,
-            pre_scanned_processing,
-            &pages,
-        )?;
+        let factored =
+            factor_repeated_path_forms(document, flate_level, pre_scanned_processing, &pages)?;
         total.path_forms_created += factored.stats.path_forms_created;
         total.path_form_pages_rewritten += factored.stats.path_form_pages_rewritten;
         total.path_form_occurrences_replaced += factored.stats.path_form_occurrences_replaced;
@@ -3313,7 +3309,7 @@ pub fn compact_vector_paths_hayro(
                 .extend(names.iter().cloned());
         }
 
-        let transformed = factor_repeated_transformed_blocks_hayro(
+        let transformed = factor_repeated_transformed_blocks(
             document,
             flate_level,
             factored.cached_transformed,
@@ -3338,7 +3334,7 @@ pub fn compact_vector_paths_hayro(
                 .extend(names.iter().cloned());
         }
 
-        let shared_runs = factor_shared_q_prefix_runs_hayro(document, flate_level, &pages)?;
+        let shared_runs = factor_shared_q_prefix_runs(document, flate_level, &pages)?;
         total.pages_compacted += shared_runs.pages_compacted;
         total.decoded_bytes_removed += shared_runs.decoded_bytes_removed;
         total.estimated_flate_bytes_saved += shared_runs.estimated_flate_bytes_saved;
@@ -3356,8 +3352,7 @@ pub fn compact_vector_paths_hayro(
                 .extend(names.iter().cloned());
         }
 
-        let path_coordinates =
-            canonicalize_page_path_coordinates_hayro(document, flate_level, &pages)?;
+        let path_coordinates = canonicalize_page_path_coordinates(document, flate_level, &pages)?;
         total.pages_compacted += path_coordinates.pages_compacted;
         total.decoded_bytes_removed += path_coordinates.decoded_bytes_removed;
         total.estimated_flate_bytes_saved += path_coordinates.estimated_flate_bytes_saved;

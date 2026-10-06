@@ -1,7 +1,7 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
-    RiskKind, content::page_content, hidden_text::analyze_hidden_text_hayro,
-    prune::should_prune_resources_hayro,
+    RiskKind, content::page_content, hidden_text::analyze_hidden_text,
+    prune::should_prune_resources,
 };
 use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest, Sha256};
@@ -889,7 +889,7 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
                 .warnings
                 .push(format!("inline-image analysis skipped: {error}")),
         }
-        match should_prune_resources_hayro(document) {
+        match should_prune_resources(document) {
             Ok(candidate) => out.resource_pruning_auto_triggered = candidate,
             Err(error) => out
                 .warnings
@@ -931,7 +931,7 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
     );
 
     if deep {
-        match analyze_hidden_text_hayro(document) {
+        match analyze_hidden_text(document) {
             Ok(findings) => {
                 let suspicious = findings
                     .iter()

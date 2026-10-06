@@ -170,7 +170,7 @@ fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     (before == after).then_some(optimized)
 }
 
-pub fn optimize_jpeg_entropy_hayro(
+pub fn optimize_jpeg_entropy(
     document: &mut EditDocument,
     min_savings_bytes: usize,
     min_savings_percent: u8,

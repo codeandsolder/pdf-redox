@@ -543,7 +543,7 @@ fn cow_image_resize_safe(
     Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
 }
 
-pub fn plan_print_downsampling_hayro(
+pub fn plan_print_downsampling(
     document: &crate::EditDocument,
     target_ppi: u32,
 ) -> Result<PrintPlanHayro> {

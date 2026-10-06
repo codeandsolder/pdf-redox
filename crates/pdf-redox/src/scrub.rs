@@ -320,12 +320,12 @@ pub fn scrub_edit_document_cos_privacy(
     }
     if cfg.level == PrivacyLevel::BestEffort
         && cfg.remove_signatures
-        && strip_signature_values_hayro(document)?
+        && strip_signature_values(document)?
     {
         stats.bump("signature-values");
     }
     if cfg.strip_jpeg_metadata {
-        scrub_jpeg_metadata_hayro(document, cfg.aggressive_jpeg_app_scrub, &mut stats)?;
+        scrub_jpeg_metadata(document, cfg.aggressive_jpeg_app_scrub, &mut stats)?;
     }
 
     Ok(stats)
@@ -482,7 +482,7 @@ fn pure_widget_field(document: &EditDocument, dictionary: &OwnedDictionary) -> R
     Ok(is_widget && !has_field_entries)
 }
 
-fn strip_signature_field_hayro(
+fn strip_signature_field(
     document: &mut EditDocument,
     handle: CowObjectHandle,
     inherited_type: Option<Vec<u8>>,
@@ -544,7 +544,7 @@ fn strip_signature_field_hayro(
         if pure_widget_field(document, kid_dictionary)? {
             continue;
         }
-        strip_signature_field_hayro(
+        strip_signature_field(
             document,
             kid_handle,
             field_type.clone(),
@@ -556,7 +556,7 @@ fn strip_signature_field_hayro(
     Ok(())
 }
 
-fn strip_signature_values_hayro(document: &mut EditDocument) -> Result<bool> {
+fn strip_signature_values(document: &mut EditDocument) -> Result<bool> {
     let catalog_handle = CowObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog_object) = document.current_owned_object(catalog_handle)? else {
         return Ok(false);
@@ -585,12 +585,12 @@ fn strip_signature_values_hayro(document: &mut EditDocument) -> Result<bool> {
         let OwnedObject::Reference(handle) = field else {
             continue;
         };
-        strip_signature_field_hayro(document, handle, None, 0, &mut seen, &mut changed)?;
+        strip_signature_field(document, handle, None, 0, &mut seen, &mut changed)?;
     }
     Ok(changed)
 }
 
-fn scrub_jpeg_metadata_hayro(
+fn scrub_jpeg_metadata(
     document: &mut EditDocument,
     aggressive: bool,
     stats: &mut ScrubStats,

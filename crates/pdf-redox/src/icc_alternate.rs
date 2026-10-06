@@ -80,7 +80,7 @@ fn replace_object(
     Ok(())
 }
 
-pub fn elide_icc_profiles_to_alternates_hayro(
+pub fn elide_icc_profiles_to_alternates(
     document: &mut EditDocument,
 ) -> Result<IccAlternateElisionStats> {
     let reachable = document.reachable_output_objects()?;

@@ -870,7 +870,7 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     ))
 }
 
-pub fn coalesce_optional_content_hayro(
+pub fn coalesce_optional_content(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<MarkedContentCoalesceStats> {
@@ -1068,7 +1068,7 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((apply_replacements(input, replacements)?, vertices_removed))
 }
 
-pub fn compact_collinear_paths_hayro(
+pub fn compact_collinear_paths(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<CollinearPathStats> {
@@ -1869,7 +1869,7 @@ struct StrokeFormPlan {
     clippy::too_many_lines,
     reason = "keeps the all-or-nothing form factoring plan and mutation sequence together"
 )]
-pub fn factor_repeated_stroke_forms_hayro(
+pub fn factor_repeated_stroke_forms(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<StrokeFormFactorStats> {
@@ -2232,7 +2232,7 @@ fn outlined_glyph_font_dictionary(
     ObjectHandle::New(document.add_object(OwnedObject::Dictionary(dictionary)))
 }
 
-pub fn factor_outlined_glyphs_hayro(
+pub fn factor_outlined_glyphs(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<OutlinedGlyphFactorStats> {
@@ -2304,10 +2304,7 @@ fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
     Ok(encoder.finish()?.len())
 }
 
-pub fn batch_page_paints_hayro(
-    document: &mut EditDocument,
-    flate_level: i32,
-) -> Result<PaintBatchStats> {
+pub fn batch_page_paints(document: &mut EditDocument, flate_level: i32) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
     for page in document.page_handles()? {
         let Some(object) = document.current_owned_object(page)? else {

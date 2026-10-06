@@ -1368,41 +1368,41 @@ fn replace_page_content_hayro(
     Ok(())
 }
 
-pub fn analyze_hidden_text_hayro(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
-    let ocg = optional_content_state_hayro(document)?;
+pub fn analyze_hidden_text(document: &EditDocument) -> Result<Vec<HiddenTextFinding>> {
+    let ocg = optional_content_state(document)?;
     let pages = document.page_handles()?;
     let mut findings = Vec::new();
     for (index, page) in pages.into_iter().enumerate() {
-        let scan = scan_page_hayro(document, page, index + 1, &ocg)?;
+        let scan = scan_page(document, page, index + 1, &ocg)?;
         findings.extend(scan.findings.into_iter().map(|finding| finding.public));
     }
     Ok(findings)
 }
 
-pub fn apply_hidden_text_policy_hayro(
+pub fn apply_hidden_text_policy(
     document: &mut EditDocument,
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
     if policy.remove_categories.is_empty() && policy.overrides.is_empty() {
         return Ok(HiddenTextApplyStats::default());
     }
-    let ocg = optional_content_state_hayro(document)?;
+    let ocg = optional_content_state(document)?;
     let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
     for (index, page) in pages.into_iter().enumerate() {
-        let mut scan = scan_page_hayro(document, page, index + 1, &ocg)?;
+        let mut scan = scan_page(document, page, index + 1, &ocg)?;
         scan.findings
             .retain(|finding| policy.should_remove(&finding.public));
         if scan.findings.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes_hayro(document, page)?;
+        let decoded = page_content_bytes(document, page)?;
         let selected: BTreeSet<String> = scan
             .findings
             .iter()
             .map(|finding| finding.public.id.clone())
             .collect();
-        let mut ranges: Vec<(usize, usize)> = scan_page_hayro(document, page, index + 1, &ocg)?
+        let mut ranges: Vec<(usize, usize)> = scan_page(document, page, index + 1, &ocg)?
             .findings
             .into_iter()
             .filter(|finding| selected.contains(&finding.public.id))
@@ -1509,13 +1509,11 @@ fn may_contain_diagonal_text_transform(input: &[u8]) -> bool {
     false
 }
 
-pub fn remove_large_diagonal_text_hayro(
-    document: &mut EditDocument,
-) -> Result<HiddenTextApplyStats> {
+pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenTextApplyStats> {
     let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
     for page in pages {
-        let decoded = page_content_bytes_hayro(document, page)?;
+        let decoded = page_content_bytes(document, page)?;
         if !may_contain_diagonal_text_transform(&decoded) {
             continue;
         }
@@ -1538,23 +1536,23 @@ pub fn remove_large_diagonal_text_hayro(
 /// they are visually hidden. Zero-opacity text is physically absent; occlusion
 /// findings are removed only when the analyzer itself classifies them as safe
 /// to remove, because approximate glyph bounds are not a proof of invisibility.
-pub fn prune_physically_hidden_text_hayro(
+pub fn prune_physically_hidden_text(
     document: &mut EditDocument,
     candidate_pages: Option<&BTreeSet<CowObjectHandle>>,
 ) -> Result<HiddenTextApplyStats> {
-    let ocg = optional_content_state_hayro(document)?;
+    let ocg = optional_content_state(document)?;
     let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
     for (index, page) in pages.into_iter().enumerate() {
         if candidate_pages.is_some_and(|pages| !pages.contains(&page)) {
             continue;
         }
-        let scan = scan_page_hayro(document, page, index + 1, &ocg)?;
+        let scan = scan_page(document, page, index + 1, &ocg)?;
         let ranges = physical_hidden_ranges(scan);
         if ranges.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes_hayro(document, page)?;
+        let decoded = page_content_bytes(document, page)?;
         stats.removed += ranges.len();
         replace_page_content_hayro(document, page, remove_ranges(&decoded, &ranges))?;
     }
@@ -1587,7 +1585,7 @@ fn resolved_dictionary_hayro(
         .and_then(|value| value.as_dictionary().cloned()))
 }
 
-fn resolved_array_hayro(
+fn resolved_array(
     document: &EditDocument,
     value: Option<&OwnedObject>,
 ) -> Result<Vec<OwnedObject>> {
@@ -1610,14 +1608,14 @@ fn resolved_name_hayro(document: &EditDocument, value: Option<&OwnedObject>) -> 
     })
 }
 
-fn resolved_u32_hayro(document: &EditDocument, value: &OwnedObject) -> Result<Option<u32>> {
+fn resolved_u32(document: &EditDocument, value: &OwnedObject) -> Result<Option<u32>> {
     Ok(match document.resolve_owned_value(value)? {
         Some(OwnedObject::Integer(value)) => u32::try_from(value).ok(),
         _ => None,
     })
 }
 
-fn build_fonts_hayro(
+fn build_fonts(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, FontInfo>> {
@@ -1630,12 +1628,12 @@ fn build_fonts_hayro(
         let Some(font) = resolved_dictionary_hayro(document, Some(value))? else {
             continue;
         };
-        out.insert(key.clone(), font_info_hayro(document, &font)?);
+        out.insert(key.clone(), font_info(document, &font)?);
     }
     Ok(out)
 }
 
-fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
+fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
     let mut info = FontInfo::default();
     let subtype = resolved_name_hayro(document, font.get(b"Subtype".as_slice()))?;
     let encoding = resolved_name_hayro(document, font.get(b"Encoding".as_slice()))?;
@@ -1657,7 +1655,7 @@ fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<Fo
     }
 
     if subtype == b"Type0" {
-        let descendants = resolved_array_hayro(document, font.get(b"DescendantFonts".as_slice()))?;
+        let descendants = resolved_array(document, font.get(b"DescendantFonts".as_slice()))?;
         if let Some(descendant) = descendants.first()
             && let Some(descendant) = resolved_dictionary_hayro(document, Some(descendant))?
         {
@@ -1669,15 +1667,15 @@ fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<Fo
                 info.default_width = 1000.0;
             }
             if let Some(widths) = descendant.get(b"W".as_slice()) {
-                parse_cid_widths_hayro(document, widths, &mut info.widths)?;
+                parse_cid_widths(document, widths, &mut info.widths)?;
             }
         }
     } else {
         let first = match font.get(b"FirstChar".as_slice()) {
-            Some(value) => resolved_u32_hayro(document, value)?.unwrap_or(0),
+            Some(value) => resolved_u32(document, value)?.unwrap_or(0),
             None => 0,
         };
-        let widths = resolved_array_hayro(document, font.get(b"Widths".as_slice()))?;
+        let widths = resolved_array(document, font.get(b"Widths".as_slice()))?;
         for (offset, width) in widths.iter().enumerate() {
             if let Some(width) = owned_number_value(document, width)? {
                 info.widths.insert(
@@ -1690,15 +1688,15 @@ fn font_info_hayro(document: &EditDocument, font: &OwnedDictionary) -> Result<Fo
     Ok(info)
 }
 
-fn parse_cid_widths_hayro(
+fn parse_cid_widths(
     document: &EditDocument,
     widths: &OwnedObject,
     out: &mut HashMap<u32, f64>,
 ) -> Result<()> {
-    let items = resolved_array_hayro(document, Some(widths))?;
+    let items = resolved_array(document, Some(widths))?;
     let mut index = 0;
     while index < items.len() {
-        let Some(start) = resolved_u32_hayro(document, &items[index])? else {
+        let Some(start) = resolved_u32(document, &items[index])? else {
             index += 1;
             continue;
         };
@@ -1706,7 +1704,7 @@ fn parse_cid_widths_hayro(
         let Some(next) = items.get(index) else {
             break;
         };
-        let array = resolved_array_hayro(document, Some(next))?;
+        let array = resolved_array(document, Some(next))?;
         if !array.is_empty() {
             for (offset, width) in array.iter().enumerate() {
                 if let Some(width) = owned_number_value(document, width)? {
@@ -1720,7 +1718,7 @@ fn parse_cid_widths_hayro(
             continue;
         }
         index += 1;
-        if let Some(end) = resolved_u32_hayro(document, next)? {
+        if let Some(end) = resolved_u32(document, next)? {
             let Some(width) = items.get(index) else {
                 break;
             };
@@ -1735,7 +1733,7 @@ fn parse_cid_widths_hayro(
     Ok(())
 }
 
-fn build_ext_gstates_hayro(
+fn build_ext_gstates(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStateInfo>> {
@@ -1776,7 +1774,7 @@ fn build_ext_gstates_hayro(
     Ok(out)
 }
 
-fn build_images_hayro(
+fn build_images(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, bool>> {
@@ -1803,7 +1801,7 @@ fn build_images_hayro(
     Ok(out)
 }
 
-fn build_properties_hayro(
+fn build_properties(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, Option<ObjectKey>>> {
@@ -1827,7 +1825,7 @@ fn build_properties_hayro(
     Ok(out)
 }
 
-fn build_resources_hayro(
+fn build_resources(
     document: &EditDocument,
     resources_value: Option<OwnedObject>,
     _ocg: &OptionalContentState,
@@ -1842,14 +1840,14 @@ fn build_resources_hayro(
         .cloned()
         .unwrap_or_default();
     Ok(Resources {
-        fonts: build_fonts_hayro(document, &dictionary)?,
-        ext_gstates: build_ext_gstates_hayro(document, &dictionary)?,
-        images: build_images_hayro(document, &dictionary)?,
-        properties: build_properties_hayro(document, &dictionary)?,
+        fonts: build_fonts(document, &dictionary)?,
+        ext_gstates: build_ext_gstates(document, &dictionary)?,
+        images: build_images(document, &dictionary)?,
+        properties: build_properties(document, &dictionary)?,
     })
 }
 
-fn optional_content_state_hayro(document: &EditDocument) -> Result<OptionalContentState> {
+fn optional_content_state(document: &EditDocument) -> Result<OptionalContentState> {
     let mut out = OptionalContentState {
         off: BTreeSet::new(),
         on: BTreeSet::new(),
@@ -1936,7 +1934,7 @@ fn decoded_content_value_hayro(
     Ok(())
 }
 
-fn page_content_bytes_hayro(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
+fn page_content_bytes(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
     let Some(page) = document.current_owned_object(page)? else {
         return Ok(Vec::new());
     };
@@ -1979,7 +1977,7 @@ fn owned_number_array<const N: usize>(
     Ok(Some(out))
 }
 
-fn page_crop_hayro(document: &EditDocument, page: CowObjectHandle) -> Result<Rect> {
+fn page_crop(document: &EditDocument, page: CowObjectHandle) -> Result<Rect> {
     for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
         if let Some(value) = document.inherited_page_value(page, key)?
             && let Some(values) = owned_number_array::<4>(document, &value)?
@@ -1994,11 +1992,9 @@ pub struct HiddenTextSharedContext {
     ocg: OptionalContentState,
 }
 
-pub fn hidden_text_shared_context_hayro(
-    document: &EditDocument,
-) -> Result<HiddenTextSharedContext> {
+pub fn hidden_text_shared_context(document: &EditDocument) -> Result<HiddenTextSharedContext> {
     Ok(HiddenTextSharedContext {
-        ocg: optional_content_state_hayro(document)?,
+        ocg: optional_content_state(document)?,
     })
 }
 
@@ -2035,15 +2031,15 @@ fn physical_hidden_ranges(scan: PageScan) -> Vec<(usize, usize)> {
     ranges
 }
 
-pub fn scan_physical_hidden_text_hayro(
+pub fn scan_physical_hidden_text(
     document: &EditDocument,
     page: CowObjectHandle,
     page_number: usize,
     shared_context: &HiddenTextSharedContext,
     content: &[u8],
 ) -> Result<Option<Vec<(usize, usize)>>> {
-    let crop = page_crop_hayro(document, page)?;
-    let resources = build_resources_hayro(
+    let crop = page_crop(document, page)?;
+    let resources = build_resources(
         document,
         document.inherited_page_value(page, b"Resources")?,
         &shared_context.ocg,
@@ -2063,19 +2059,19 @@ pub fn scan_physical_hidden_text_hayro(
     Ok(Some(physical_hidden_ranges(scanner.finish())))
 }
 
-fn scan_page_hayro(
+fn scan_page(
     document: &EditDocument,
     page: CowObjectHandle,
     page_number: usize,
     ocg: &OptionalContentState,
 ) -> Result<PageScan> {
-    let crop = page_crop_hayro(document, page)?;
-    let resources = build_resources_hayro(
+    let crop = page_crop(document, page)?;
+    let resources = build_resources(
         document,
         document.inherited_page_value(page, b"Resources")?,
         ocg,
     )?;
-    let content = page_content_bytes_hayro(document, page)?;
+    let content = page_content_bytes(document, page)?;
     let mut scanner = PageScanner::new(
         page_number,
         crop,

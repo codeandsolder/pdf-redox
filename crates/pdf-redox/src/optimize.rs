@@ -1,53 +1,48 @@
 use crate::{
     Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{analyze_document_for_optimization, input_sha256},
-    content::normalize_page_contents_hayro,
+    content::normalize_page_contents,
     dedup::{
-        TargetedDedupStats, canonicalize_appearance_streams_hayro,
-        canonicalize_exact_extgstate_dictionaries_hayro,
-        canonicalize_exact_font_dictionaries_hayro,
-        canonicalize_exact_structure_attribute_dictionaries_hayro,
-        canonicalize_font_program_streams_hayro, canonicalize_form_xobjects_hayro,
-        canonicalize_icc_profiles_hayro, canonicalize_image_xobjects_hayro,
-        canonicalize_metadata_streams_hayro, canonicalize_page_contents_hayro,
-        canonicalize_to_unicode_cmaps_hayro, canonicalize_type3_charprocs_hayro,
+        TargetedDedupStats, canonicalize_appearance_streams,
+        canonicalize_exact_extgstate_dictionaries, canonicalize_exact_font_dictionaries,
+        canonicalize_exact_structure_attribute_dictionaries, canonicalize_font_program_streams,
+        canonicalize_form_xobjects, canonicalize_icc_profiles, canonicalize_image_xobjects,
+        canonicalize_metadata_streams, canonicalize_page_contents, canonicalize_to_unicode_cmaps,
+        canonicalize_type3_charprocs,
     },
-    flate::{apply_flate_policy_hayro, compress_unfiltered_streams_hayro},
+    flate::{apply_flate_policy, compress_unfiltered_streams},
     font::{
-        FontOptimizationStats, dense_compact_cidfont_type2_programs_hayro,
-        strip_font_editing_tables_hayro, union_sparse_cid_font_programs_after_dedup_hayro,
+        FontOptimizationStats, dense_compact_cidfont_type2_programs, strip_font_editing_tables,
+        union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
-        HiddenTextApplyStats, apply_hidden_text_policy_hayro, prune_physically_hidden_text_hayro,
-        remove_large_diagonal_text_hayro,
+        HiddenTextApplyStats, apply_hidden_text_policy, prune_physically_hidden_text,
+        remove_large_diagonal_text,
     },
-    icc_alternate::{IccAlternateElisionStats, elide_icc_profiles_to_alternates_hayro},
+    icc_alternate::{IccAlternateElisionStats, elide_icc_profiles_to_alternates},
     images::{
-        ImageOptimizationOptions, ImageOptimizationStats, optimize_images_hayro,
-        optimize_images_with_resize_targets_hayro,
+        ImageOptimizationOptions, ImageOptimizationStats, optimize_images,
+        optimize_images_with_resize_targets,
     },
-    inline_images::{DuplicateInlineImageStats, externalize_duplicate_inline_images_hayro},
-    jpeg_optimize::optimize_jpeg_entropy_hayro,
-    microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes_hayro},
+    inline_images::{DuplicateInlineImageStats, externalize_duplicate_inline_images},
+    jpeg_optimize::optimize_jpeg_entropy,
+    microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes},
     paint_batch::{
         CollinearPathStats, MarkedContentCoalesceStats, OutlinedGlyphFactorStats, PaintBatchStats,
-        StrokeFormFactorStats, batch_page_paints_hayro, coalesce_optional_content_hayro,
-        compact_collinear_paths_hayro, factor_outlined_glyphs_hayro,
-        factor_repeated_stroke_forms_hayro,
+        StrokeFormFactorStats, batch_page_paints, coalesce_optional_content,
+        compact_collinear_paths, factor_outlined_glyphs, factor_repeated_stroke_forms,
     },
-    preservation::{PreservationStats, apply_preservation_policy_hayro},
-    print::{PrintPlanHayro, plan_print_downsampling_hayro},
-    prune::{ResourcePruneStats, prune_resources_hayro, prune_resources_with_usage_hayro},
-    raster_layout::normalize_raster_layout_hayro,
+    preservation::{PreservationStats, apply_preservation_policy},
+    print::{PrintPlanHayro, plan_print_downsampling},
+    prune::{ResourcePruneStats, prune_resources, prune_resources_with_usage},
+    raster_layout::normalize_raster_layout,
     repeated_page_objects::{
-        RepeatedPageObjectStats, remove_repeated_page_objects_hayro,
-        repeated_page_objects_prefix_possible_hayro,
+        RepeatedPageObjectStats, remove_repeated_page_objects,
+        repeated_page_objects_prefix_possible,
     },
     scrub::scrub_edit_document_cos_privacy,
-    structure_compact::compact_structure_hayro,
-    vector_compact::{
-        VectorCompactionStats, compact_vector_paths_hayro, processing_factor_candidate,
-    },
+    structure_compact::compact_structure,
+    vector_compact::{VectorCompactionStats, compact_vector_paths, processing_factor_candidate},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -123,7 +118,7 @@ pub fn analyze_microstroke_rasterization(
         ));
     }
     let mut document = EditDocument::from_bytes(input.to_vec())?;
-    rasterize_pathological_microstrokes_hayro(&mut document, flate_level)
+    rasterize_pathological_microstrokes(&mut document, flate_level)
 }
 
 /// Optimize a PDF according to the supplied configuration.
@@ -194,15 +189,15 @@ fn optimize_pdf_with_document(
         if cfg.preservation == crate::PreservationConfig::functional() {
             Ok(PreservationStats::default())
         } else {
-            apply_preservation_policy_hayro(&mut document, &cfg.preservation)
+            apply_preservation_policy(&mut document, &cfg.preservation)
         }
     })?;
     let hidden_text = timed(&mut timings, "hidden-text", || {
-        apply_hidden_text_policy_hayro(&mut document, &cfg.hidden_text)
+        apply_hidden_text_policy(&mut document, &cfg.hidden_text)
     })?;
     let large_diagonal_text = timed(&mut timings, "large-diagonal-text", || {
         if cfg.remove_large_diagonal_text {
-            remove_large_diagonal_text_hayro(&mut document)
+            remove_large_diagonal_text(&mut document)
         } else {
             Ok(HiddenTextApplyStats::default())
         }
@@ -217,19 +212,19 @@ fn optimize_pdf_with_document(
         if cfg.preservation.font_editing_support {
             Ok(FontOptimizationStats::default())
         } else {
-            strip_font_editing_tables_hayro(&mut document, cfg.flate_level)
+            strip_font_editing_tables(&mut document, cfg.flate_level)
         }
     })?;
     let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
         if cfg.deduplicate_metadata_streams {
-            canonicalize_metadata_streams_hayro(&mut document)
+            canonicalize_metadata_streams(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let font_dedup = timed(&mut timings, "font-dedup", || {
         if cfg.deduplicate_font_programs {
-            canonicalize_font_program_streams_hayro(&mut document)
+            canonicalize_font_program_streams(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
@@ -238,7 +233,7 @@ fn optimize_pdf_with_document(
         if cfg.preservation.font_editing_support {
             Ok(FontOptimizationStats::default())
         } else {
-            union_sparse_cid_font_programs_after_dedup_hayro(&mut document, cfg.flate_level)
+            union_sparse_cid_font_programs_after_dedup(&mut document, cfg.flate_level)
         }
     })?;
     font_rendering.programs_optimized += font_sparse_union.programs_optimized;
@@ -254,35 +249,35 @@ fn optimize_pdf_with_document(
         {
             Ok(FontOptimizationStats::default())
         } else {
-            dense_compact_cidfont_type2_programs_hayro(&mut document, cfg.flate_level)
+            dense_compact_cidfont_type2_programs(&mut document, cfg.flate_level)
         }
     })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
         if cfg.deduplicate_to_unicode_cmaps {
-            canonicalize_to_unicode_cmaps_hayro(&mut document)
+            canonicalize_to_unicode_cmaps(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
-        canonicalize_exact_font_dictionaries_hayro(&mut document)
+        canonicalize_exact_font_dictionaries(&mut document)
     })?;
     let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
-        canonicalize_exact_extgstate_dictionaries_hayro(&mut document)
+        canonicalize_exact_extgstate_dictionaries(&mut document)
     })?;
     let structure_attribute_dedup = timed(&mut timings, "structure-attribute-dedup", || {
-        canonicalize_exact_structure_attribute_dictionaries_hayro(&mut document)
+        canonicalize_exact_structure_attribute_dictionaries(&mut document)
     })?;
     let icc_dedup = timed(&mut timings, "icc-dedup", || {
         if cfg.deduplicate_icc_profiles {
-            canonicalize_icc_profiles_hayro(&mut document)
+            canonicalize_icc_profiles(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let icc_alternate = timed(&mut timings, "icc-alternate-elision", || {
         if cfg.elide_icc_profiles_to_alternate {
-            elide_icc_profiles_to_alternates_hayro(&mut document)
+            elide_icc_profiles_to_alternates(&mut document)
         } else {
             Ok(IccAlternateElisionStats::default())
         }
@@ -290,7 +285,7 @@ fn optimize_pdf_with_document(
     let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
     {
-        repeated_page_objects_prefix_possible_hayro(&document)?
+        repeated_page_objects_prefix_possible(&document)?
     } else {
         false
     };
@@ -299,7 +294,7 @@ fn optimize_pdf_with_document(
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
             && !repeated_page_objects_may_rewrite)
             .then_some(&mut raster_vector_cache);
-        normalize_raster_layout_hayro(
+        normalize_raster_layout(
             &mut document,
             &cfg.raster_layout,
             cfg.flate_level,
@@ -336,10 +331,10 @@ fn optimize_pdf_with_document(
             if fallback.is_empty() {
                 Ok(HiddenTextApplyStats::default())
             } else {
-                prune_physically_hidden_text_hayro(&mut document, Some(&fallback))
+                prune_physically_hidden_text(&mut document, Some(&fallback))
             }
         } else {
-            prune_physically_hidden_text_hayro(&mut document, None)
+            prune_physically_hidden_text(&mut document, None)
         }
     })?;
 
@@ -348,7 +343,7 @@ fn optimize_pdf_with_document(
             && raster_layout.inline_inventory_complete
             && raster_layout.inline_occurrences_remaining == 0;
         if cfg.deduplicate_inline_images && !raster_proved_no_inline {
-            externalize_duplicate_inline_images_hayro(
+            externalize_duplicate_inline_images(
                 &mut document,
                 0,
                 cfg.inline_image_min_duplicate_payload_bytes,
@@ -362,42 +357,42 @@ fn optimize_pdf_with_document(
     // canonicalization. This preserves quantized DCT coefficients while allowing
     // images that differed only in Huffman coding to converge.
     let jpeg_entropy = timed(&mut timings, "jpeg-entropy", || {
-        optimize_jpeg_entropy_hayro(&mut document, 128, 1)
+        optimize_jpeg_entropy(&mut document, 128, 1)
     })?;
 
     // Exact image canonicalization follows inline-image externalization and JPEG
     // entropy normalization so both can converge with existing Image XObjects.
     let image_dedup = timed(&mut timings, "image-dedup", || {
         if cfg.deduplicate_image_xobjects {
-            canonicalize_image_xobjects_hayro(&mut document)
+            canonicalize_image_xobjects(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let form_dedup = timed(&mut timings, "form-dedup", || {
         if cfg.deduplicate_form_xobjects {
-            canonicalize_form_xobjects_hayro(&mut document)
+            canonicalize_form_xobjects(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if cfg.deduplicate_appearance_streams {
-            canonicalize_appearance_streams_hayro(&mut document)
+            canonicalize_appearance_streams(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let type3_charproc_dedup = timed(&mut timings, "type3-dedup", || {
         if cfg.deduplicate_type3_charprocs {
-            canonicalize_type3_charprocs_hayro(&mut document)
+            canonicalize_type3_charprocs(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
-            remove_repeated_page_objects_hayro(&mut document)
+            remove_repeated_page_objects(&mut document)
         } else {
             Ok(RepeatedPageObjectStats::default())
         }
@@ -407,7 +402,7 @@ fn optimize_pdf_with_document(
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
             let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
-            match plan_print_downsampling_hayro(&document, u32::from(target_ppi)) {
+            match plan_print_downsampling(&document, u32::from(target_ppi)) {
                 Ok(plan) => (plan, None),
                 Err(error) => (PrintPlanHayro::default(), Some(error.to_string())),
             }
@@ -429,7 +424,7 @@ fn optimize_pdf_with_document(
             if print_plan.resize_targets.is_empty() {
                 ImageOptimizationStats::default()
             } else {
-                optimize_images_with_resize_targets_hayro(
+                optimize_images_with_resize_targets(
                     &mut document,
                     ImageOptimizationOptions {
                         min_width: 0,
@@ -450,7 +445,7 @@ fn optimize_pdf_with_document(
             jpeg_quality,
             min_savings_percent,
             ..
-        } => optimize_images_hayro(
+        } => optimize_images(
             &mut document,
             ImageOptimizationOptions {
                 keep_inline_images: true,
@@ -500,7 +495,7 @@ fn optimize_pdf_with_document(
             } else {
                 BTreeMap::new()
             };
-            compact_vector_paths_hayro(
+            compact_vector_paths(
                 &mut document,
                 cfg.flate_level,
                 cfg.optimization_goal,
@@ -514,7 +509,7 @@ fn optimize_pdf_with_document(
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            coalesce_optional_content_hayro(&mut document, cfg.flate_level)
+            coalesce_optional_content(&mut document, cfg.flate_level)
         } else {
             Ok(MarkedContentCoalesceStats::default())
         }
@@ -523,7 +518,7 @@ fn optimize_pdf_with_document(
     let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            compact_collinear_paths_hayro(&mut document, cfg.flate_level)
+            compact_collinear_paths(&mut document, cfg.flate_level)
         } else {
             Ok(CollinearPathStats::default())
         }
@@ -532,7 +527,7 @@ fn optimize_pdf_with_document(
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            factor_outlined_glyphs_hayro(&mut document, cfg.flate_level)
+            factor_outlined_glyphs(&mut document, cfg.flate_level)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -541,7 +536,7 @@ fn optimize_pdf_with_document(
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            batch_page_paints_hayro(&mut document, cfg.flate_level)
+            batch_page_paints(&mut document, cfg.flate_level)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -550,7 +545,7 @@ fn optimize_pdf_with_document(
     let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            factor_repeated_stroke_forms_hayro(&mut document, cfg.flate_level)
+            factor_repeated_stroke_forms(&mut document, cfg.flate_level)
         } else {
             Ok(StrokeFormFactorStats::default())
         }
@@ -569,7 +564,7 @@ fn optimize_pdf_with_document(
             && outlined_glyphs.fonts_created == 0
             && stroke_forms.forms_created == 0;
         if shared_usage_is_exact {
-            prune_resources_with_usage_hayro(
+            prune_resources_with_usage(
                 &mut document,
                 &cfg.keep_unused_resources,
                 &raster_layout.page_resource_names,
@@ -579,12 +574,12 @@ fn optimize_pdf_with_document(
                 &vector_compaction.generated_page_xobjects,
             )
         } else {
-            prune_resources_hayro(&mut document, &cfg.keep_unused_resources)
+            prune_resources(&mut document, &cfg.keep_unused_resources)
         }
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes_hayro(&mut document, cfg.flate_level)
+            rasterize_pathological_microstrokes(&mut document, cfg.flate_level)
         } else {
             Ok(MicrostrokeRasterStats::default())
         }
@@ -592,7 +587,7 @@ fn optimize_pdf_with_document(
     let adaptive_flate_high_effort =
         cfg.optimization_goal == crate::OptimizationGoal::Processing && cfg.flate_level == 6;
     let flate = timed(&mut timings, "flate-policy", || {
-        apply_flate_policy_hayro(
+        apply_flate_policy(
             &mut document,
             cfg.flate_policy,
             cfg.flate_level,
@@ -601,7 +596,7 @@ fn optimize_pdf_with_document(
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.normalize_content_streams {
-            normalize_page_contents_hayro(&mut document)?;
+            normalize_page_contents(&mut document)?;
         }
         Ok(())
     })?;
@@ -609,23 +604,19 @@ fn optimize_pdf_with_document(
     // them, including lexical normalization.
     let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
         if cfg.deduplicate_page_contents {
-            canonicalize_page_contents_hayro(&mut document)
+            canonicalize_page_contents(&mut document)
         } else {
             Ok(TargetedDedupStats::default())
         }
     })?;
     let structure_compaction = timed(&mut timings, "structure-compaction", || {
-        compact_structure_hayro(&mut document)
+        compact_structure(&mut document)
     })?;
 
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams_hayro(
-            &mut document,
-            cfg.flate_level,
-            adaptive_flate_high_effort,
-        )
+        compress_unfiltered_streams(&mut document, cfg.flate_level, adaptive_flate_high_effort)
     })?;
     let output = timed(&mut timings, "writer", || {
         crate::writer::write_pdf_with_options(

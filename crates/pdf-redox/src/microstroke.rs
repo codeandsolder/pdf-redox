@@ -1079,7 +1079,7 @@ struct Candidate {
     clippy::too_many_lines,
     reason = "candidate discovery, encoded-cost gating, and document rewrites form one ordered optimization pass"
 )]
-pub fn rasterize_pathological_microstrokes_hayro(
+pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<MicrostrokeRasterStats> {

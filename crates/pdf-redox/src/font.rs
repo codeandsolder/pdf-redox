@@ -367,7 +367,7 @@ struct SparseCidUnionCandidate {
     clippy::too_many_lines,
     reason = "font discovery, compatibility checks, and document rewrites form one ordered optimization transaction"
 )]
-fn union_sparse_cid_font_programs_hayro(
+fn union_sparse_cid_font_programs(
     document: &mut EditDocument,
     flate_level: i32,
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
@@ -1719,7 +1719,7 @@ fn set_font_program_length1(
     clippy::too_many_lines,
     reason = "dense CID remapping keeps whole-program eligibility, map preparation, SFNT rewrite, and atomic size gating together for auditability"
 )]
-pub fn dense_compact_cidfont_type2_programs_hayro(
+pub fn dense_compact_cidfont_type2_programs(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<FontOptimizationStats> {
@@ -1871,7 +1871,7 @@ pub fn dense_compact_cidfont_type2_programs_hayro(
 
 /// Union compatible sparse `CIDFontType2` programs after exact font-program
 /// deduplication has already canonicalized byte-identical stripped subsets.
-pub fn union_sparse_cid_font_programs_after_dedup_hayro(
+pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<FontOptimizationStats> {
@@ -1957,7 +1957,7 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
         return Ok(FontOptimizationStats::default());
     }
 
-    union_sparse_cid_font_programs_hayro(
+    union_sparse_cid_font_programs(
         document,
         flate_level,
         &program_usage,
@@ -1973,7 +1973,7 @@ pub fn union_sparse_cid_font_programs_after_dedup_hayro(
     clippy::too_many_lines,
     reason = "font usage analysis, table filtering, and encoded-cost gating form one ordered optimization transaction"
 )]
-pub fn strip_font_editing_tables_hayro(
+pub fn strip_font_editing_tables(
     document: &mut EditDocument,
     flate_level: i32,
 ) -> Result<FontOptimizationStats> {
@@ -2368,7 +2368,7 @@ mod tests {
     #[test]
     fn dense_cidfont_rewrites_explicit_map_and_is_idempotent() -> Result<()> {
         let mut document = EditDocument::from_bytes(dense_cidfont_fixture()?)?;
-        let first = dense_compact_cidfont_type2_programs_hayro(&mut document, 9)?;
+        let first = dense_compact_cidfont_type2_programs(&mut document, 9)?;
         assert_eq!(first.programs_dense_remapped, 1);
         assert_eq!(first.cid_to_gid_maps_rewritten, 1);
         assert_eq!(first.dense_glyph_slots_removed, 2);
@@ -2391,7 +2391,7 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = dense_compact_cidfont_type2_programs_hayro(&mut reparsed, 9)?;
+        let second = dense_compact_cidfont_type2_programs(&mut reparsed, 9)?;
         assert_eq!(second.programs_dense_remapped, 0);
         assert_eq!(second.cid_to_gid_maps_rewritten, 0);
         Ok(())
@@ -2401,7 +2401,7 @@ mod tests {
     fn hayro_direct_cid_descriptor_font_is_optimized() -> Result<()> {
         let input = hayro_direct_cid_font_fixture()?;
         let mut document = EditDocument::from_bytes(input)?;
-        let first = strip_font_editing_tables_hayro(&mut document, 9)?;
+        let first = strip_font_editing_tables(&mut document, 9)?;
         assert_eq!(first.programs_optimized, 1);
         assert_eq!(first.programs_glyph_subset, 0);
         assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
@@ -2409,7 +2409,7 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = strip_font_editing_tables_hayro(&mut reparsed, 9)?;
+        let second = strip_font_editing_tables(&mut reparsed, 9)?;
         assert_eq!(second.programs_optimized, 0);
         Ok(())
     }
@@ -2418,14 +2418,14 @@ mod tests {
     fn hayro_font_table_strip_accepts_single_flate_filter_array() -> Result<()> {
         let input = hayro_font_fixture_with_filter_array(true)?;
         let mut document = EditDocument::from_bytes(input)?;
-        let first = strip_font_editing_tables_hayro(&mut document, 9)?;
+        let first = strip_font_editing_tables(&mut document, 9)?;
         assert_eq!(first.programs_optimized, 1);
         assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
         assert_eq!(first.decoded_table_bytes_removed, 8192);
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = strip_font_editing_tables_hayro(&mut reparsed, 9)?;
+        let second = strip_font_editing_tables(&mut reparsed, 9)?;
         assert_eq!(second.programs_optimized, 0);
         Ok(())
     }

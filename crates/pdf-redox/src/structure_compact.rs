@@ -552,7 +552,7 @@ fn compact_catalog_name_trees(
     Ok(())
 }
 
-pub fn compact_structure_hayro(document: &mut EditDocument) -> Result<StructureCompactionStats> {
+pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompactionStats> {
     let mut stats = StructureCompactionStats::default();
     compact_catalog_name_trees(document, &mut stats)?;
     compact_page_tree(document, &mut stats)?;
