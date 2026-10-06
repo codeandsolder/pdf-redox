@@ -2,6 +2,7 @@
 
 use crate::Result;
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
+use smallvec::SmallVec;
 
 /// Visit whole Hayro content instructions without recreating token callbacks.
 ///
@@ -15,6 +16,35 @@ pub fn visit_instructions(
         visit(&instruction)?;
     }
     Ok(!iter.is_at_end())
+}
+
+/// Parsed scalar/name content operand with its byte offset in the source stream.
+#[derive(Debug, Clone)]
+pub struct InstructionOperand {
+    pub number: Option<f64>,
+    pub name: Option<Vec<u8>>,
+    pub offset: usize,
+}
+
+/// Parse the scalar/name facets used by graphics-state and geometry scanners.
+pub fn instruction_operands(
+    input: &[u8],
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+) -> Vec<InstructionOperand> {
+    instruction
+        .operands()
+        .zip(instruction.operand_spans())
+        .map(|(object, span)| InstructionOperand {
+            number: operand_number(object, input.get(span.clone()).unwrap_or_default()),
+            name: operand_name(object).map(ToOwned::to_owned),
+            offset: span.start,
+        })
+        .collect()
+}
+
+/// Return all operands as numbers, or `None` when any operand is non-numeric.
+pub fn operand_numbers(operands: &[InstructionOperand]) -> Option<SmallVec<[f64; 6]>> {
+    operands.iter().map(|operand| operand.number).collect()
 }
 
 /// Borrow a content operand as a PDF name.

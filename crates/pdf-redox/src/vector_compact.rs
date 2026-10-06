@@ -2,6 +2,7 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{decoded_content_value, replace_page_content, resolved_dictionary},
+    content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
 };
 use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest as _, Sha256};
@@ -67,35 +68,6 @@ pub struct VectorCompactionStats {
     pub path_coordinate_decoded_bytes_removed: usize,
     pub path_coordinate_estimated_flate_bytes_saved: usize,
     pub generated_page_xobjects: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
-}
-
-#[derive(Debug, Clone)]
-struct Operand {
-    number: Option<f64>,
-    name: Option<Vec<u8>>,
-    offset: usize,
-}
-
-fn instruction_operands(
-    input: &[u8],
-    instruction: &hayro_syntax::content::Instruction<'_, '_>,
-) -> Vec<Operand> {
-    instruction
-        .operands()
-        .zip(instruction.operand_spans())
-        .map(|(object, span)| Operand {
-            number: crate::content_stream::operand_number(
-                object,
-                input.get(span.clone()).unwrap_or_default(),
-            ),
-            name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
-            offset: span.start,
-        })
-        .collect()
-}
-
-fn operand_numbers(operands: &[Operand]) -> Option<SmallVec<[f64; 6]>> {
-    operands.iter().map(|operand| operand.number).collect()
 }
 
 #[derive(Debug, Clone)]

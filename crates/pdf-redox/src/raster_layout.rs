@@ -4,6 +4,7 @@ use crate::{
     StreamData,
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
+    content_stream::{InstructionOperand, instruction_operands, operand_numbers},
     hidden_text::{HiddenTextSharedContext, hidden_text_shared_context, scan_physical_hidden_text},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
@@ -109,35 +110,6 @@ enum ContentTarget {
 }
 
 #[derive(Debug, Clone)]
-struct ParsedOperand {
-    number: Option<f64>,
-    name: Option<Vec<u8>>,
-    offset: usize,
-}
-
-fn parsed_operands(
-    input: &[u8],
-    instruction: &hayro_syntax::content::Instruction<'_, '_>,
-) -> Vec<ParsedOperand> {
-    instruction
-        .operands()
-        .zip(instruction.operand_spans())
-        .map(|(object, span)| ParsedOperand {
-            number: crate::content_stream::operand_number(
-                object,
-                input.get(span.clone()).unwrap_or_default(),
-            ),
-            name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
-            offset: span.start,
-        })
-        .collect()
-}
-
-fn parsed_operand_numbers(operands: &[ParsedOperand]) -> Option<SmallVec<[f64; 6]>> {
-    operands.iter().map(|operand| operand.number).collect()
-}
-
-#[derive(Debug, Clone)]
 struct RasterDraw {
     target: ObjectHandle,
     resource_name: Vec<u8>,
@@ -232,7 +204,7 @@ struct RasterScanner {
     ctm: Matrix,
     stack: Vec<GraphicsStateSnapshot>,
     frames: Vec<GraphicsFrame>,
-    operands: Vec<ParsedOperand>,
+    operands: Vec<InstructionOperand>,
     draws: Vec<RasterDraw>,
     rect_fills: Vec<RectFillPaint>,
     coverage_paints: Vec<CoveragePaint>,
@@ -410,7 +382,7 @@ impl RasterScanner {
                     self.vector_path_is_single_rect = false;
                     return;
                 }
-                let Some(values) = parsed_operand_numbers(&self.operands) else {
+                let Some(values) = operand_numbers(&self.operands) else {
                     self.vector_path_is_single_rect = false;
                     return;
                 };
@@ -744,7 +716,7 @@ impl RasterScanner {
             }
             b"cm" => {
                 if self.operands.len() == 6 {
-                    let values = parsed_operand_numbers(&self.operands);
+                    let values = operand_numbers(&self.operands);
                     if let Some(values) = values {
                         self.ctm.concat(Matrix::new(
                             values[0], values[1], values[2], values[3], values[4], values[5],
@@ -829,7 +801,7 @@ impl RasterScanner {
             }
             b"re" => {
                 if self.operands.len() == 4 {
-                    let values = parsed_operand_numbers(&self.operands);
+                    let values = operand_numbers(&self.operands);
                     if let Some(values) = values {
                         self.add_rect_path(values[0], values[1], values[2], values[3]);
                     } else {
@@ -841,7 +813,7 @@ impl RasterScanner {
             }
             b"m" => {
                 if self.operands.len() == 2 {
-                    let values = parsed_operand_numbers(&self.operands);
+                    let values = operand_numbers(&self.operands);
                     if let Some(values) = values {
                         self.begin_line_path(values[0], values[1]);
                     } else {
@@ -853,7 +825,7 @@ impl RasterScanner {
             }
             b"l" => {
                 if self.operands.len() == 2 {
-                    let values = parsed_operand_numbers(&self.operands);
+                    let values = operand_numbers(&self.operands);
                     if let Some(values) = values {
                         self.add_line_point(values[0], values[1]);
                     } else {
@@ -923,7 +895,7 @@ impl RasterScanner {
             self.barrier();
             return;
         }
-        self.operands = parsed_operands(input, instruction);
+        self.operands = instruction_operands(input, instruction);
         let span = instruction.operator_span();
         self.operator(&instruction.operator[..], span.start, span.len());
         self.operands.clear();
