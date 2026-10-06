@@ -85,6 +85,20 @@ impl<K: Eq + Hash> FingerprintRedirectPlan<K> {
     }
 }
 
+fn fingerprint_redirects(
+    handles: impl IntoIterator<Item = CowObjectHandle>,
+    mut fingerprint: impl FnMut(CowObjectHandle) -> Result<Option<[u8; 32]>>,
+) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    let mut plan = FingerprintRedirectPlan::new();
+    for handle in handles {
+        let Some(fingerprint) = fingerprint(handle)? else {
+            continue;
+        };
+        plan.observe(handle, handle, fingerprint);
+    }
+    Ok(plan.into_redirects())
+}
+
 fn canonicalize_stream_holders<H, K>(
     document: &mut EditDocument,
     holders: &[H],
@@ -1402,20 +1416,14 @@ fn exact_non_stream_resource_redirects(
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut redirects = HashMap::new();
     for _ in 0..=handles.len() {
-        let mut plan = FingerprintRedirectPlan::new();
-        for &handle in handles {
-            let Some(fingerprint) = hash_non_stream_object_with_redirects(
+        let next = fingerprint_redirects(handles.iter().copied(), |handle| {
+            hash_non_stream_object_with_redirects(
                 document,
                 handle,
                 b"form-resource-exact-object",
                 &redirects,
-            )?
-            else {
-                continue;
-            };
-            plan.observe(handle, handle, fingerprint);
-        }
-        let next = plan.into_redirects();
+            )
+        })?;
         if next == redirects {
             return Ok(next);
         }
@@ -1808,20 +1816,17 @@ fn exact_form_font_redirects(
     document: &EditDocument,
     exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
-    let mut plan = FingerprintRedirectPlan::new();
-    for handle in reachable_dictionaries_with_type(document, b"Font")? {
-        let Some(fingerprint) = hash_non_stream_object_with_redirects(
-            document,
-            handle,
-            b"form-font-resource-dictionary",
-            exact_redirects,
-        )?
-        else {
-            continue;
-        };
-        plan.observe(handle, handle, fingerprint);
-    }
-    Ok(plan.into_redirects())
+    fingerprint_redirects(
+        reachable_dictionaries_with_type(document, b"Font")?,
+        |handle| {
+            hash_non_stream_object_with_redirects(
+                document,
+                handle,
+                b"form-font-resource-dictionary",
+                exact_redirects,
+            )
+        },
+    )
 }
 
 fn source_stream_fingerprint_top_level_redirects(
@@ -1867,21 +1872,15 @@ fn virtual_form_image_redirects(
     } else {
         &[]
     };
-    let mut plan = FingerprintRedirectPlan::new();
-    for &image in images {
-        let Some(fingerprint) = source_stream_fingerprint_top_level_redirects(
+    fingerprint_redirects(images.iter().copied(), |image| {
+        source_stream_fingerprint_top_level_redirects(
             document,
             image,
             b"form-resource-image",
             ignored,
             exact_redirects,
-        )?
-        else {
-            continue;
-        };
-        plan.observe(image, image, fingerprint);
-    }
-    Ok(plan.into_redirects())
+        )
+    })
 }
 
 fn redirect_reference_value(
@@ -2038,9 +2037,8 @@ fn fixed_point_form_redirects(
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
     let mut redirects = HashMap::new();
     for _ in 0..=forms.len() {
-        let mut plan = FingerprintRedirectPlan::new();
-        for &form in forms {
-            let Some((fingerprint, _)) = source_form_fingerprint(
+        let next = fingerprint_redirects(forms.iter().copied(), |form| {
+            Ok(source_form_fingerprint(
                 document,
                 form,
                 ignored_dictionary_keys,
@@ -2049,12 +2047,8 @@ fn fixed_point_form_redirects(
                 image_redirects,
                 &redirects,
             )?
-            else {
-                continue;
-            };
-            plan.observe(form, form, fingerprint);
-        }
-        let next = plan.into_redirects();
+            .map(|(fingerprint, _)| fingerprint))
+        })?;
         if next == redirects {
             return Ok(next);
         }
