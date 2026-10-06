@@ -8,7 +8,6 @@ type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
 #[derive(Debug, Clone, Default)]
 struct DetachedResourceUsage {
-    names: BTreeSet<Vec<u8>>,
     names_by_resource_type: ResourceNamesByType,
 }
 
@@ -39,7 +38,6 @@ fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
         }
         if let Some(name) = last_name {
             let name = name.to_vec();
-            usage.names.insert(name.clone());
             usage
                 .names_by_resource_type
                 .entry(resource_type.to_vec())
@@ -150,13 +148,12 @@ fn extend_names_by_type(target: &mut ResourceNamesByType, source: &ResourceNames
     }
 }
 
-fn borrowed_form_names(
+fn extend_borrowed_form_usage(
     document: &EditDocument,
     resources: &OwnedDictionary,
     root_usage: &DetachedResourceUsage,
     used_by_type: &mut ResourceNamesByType,
-) -> Result<BTreeSet<Vec<u8>>> {
-    let mut used = BTreeSet::new();
+) -> Result<()> {
     let mut pending = VecDeque::new();
     let mut seen = BTreeSet::new();
     let xobjects = xobject_handles(document, resources)?;
@@ -180,7 +177,6 @@ fn borrowed_form_names(
         let Some(usage) = scan(&content) else {
             continue;
         };
-        used.extend(usage.names.iter().cloned());
         extend_names_by_type(used_by_type, &usage.names_by_resource_type);
         if let Some(names) = usage.names_by_resource_type.get(b"XObject".as_slice()) {
             for (name, handle) in &xobjects {
@@ -190,7 +186,7 @@ fn borrowed_form_names(
             }
         }
     }
-    Ok(used)
+    Ok(())
 }
 
 fn keep_unused_resource(selectors: &BTreeSet<String>, category: &[u8], name: &[u8]) -> bool {
@@ -216,27 +212,20 @@ fn keep_unused_resource(selectors: &BTreeSet<String>, category: &[u8], name: &[u
 fn resource_entry_used(
     category: &[u8],
     name: &[u8],
-    used_names: &BTreeSet<Vec<u8>>,
-    extra_used_names: Option<&BTreeSet<Vec<u8>>>,
-    used_by_type: Option<&ResourceNamesByType>,
+    used_by_type: &ResourceNamesByType,
+    extra_xobjects: Option<&BTreeSet<Vec<u8>>>,
 ) -> bool {
-    if matches!(category, b"Font" | b"XObject") {
-        // Preserve qpdf's conservative flat-name semantics for the two legacy
-        // categories: a same-named resource used by another operator is kept.
-        return used_names.contains(name)
-            || extra_used_names.is_some_and(|names| names.contains(name));
-    }
     used_by_type
-        .and_then(|usage| usage.get(category))
+        .get(category)
         .is_some_and(|names| names.contains(name))
+        || (category == b"XObject" && extra_xobjects.is_some_and(|names| names.contains(name)))
 }
 
 fn pruned_resources(
     document: &EditDocument,
     mut resources: OwnedDictionary,
-    used_names: &BTreeSet<Vec<u8>>,
-    extra_used_names: Option<&BTreeSet<Vec<u8>>>,
-    used_by_type: Option<&ResourceNamesByType>,
+    used_by_type: &ResourceNamesByType,
+    extra_xobjects: Option<&BTreeSet<Vec<u8>>>,
     keep_unused: &BTreeSet<String>,
 ) -> Result<(OwnedDictionary, ResourcePruneStats)> {
     let mut stats = ResourcePruneStats::default();
@@ -248,12 +237,6 @@ fn pruned_resources(
         b"Properties".as_slice(),
         b"Shading".as_slice(),
     ] {
-        // Typed categories are only destructive when typed usage was actually
-        // collected. This keeps legacy/shared callers without typed evidence
-        // conservative rather than treating missing evidence as "unused".
-        if !matches!(category, b"Font" | b"XObject") && used_by_type.is_none() {
-            continue;
-        }
         let Some(value) = resources.get(category).cloned() else {
             continue;
         };
@@ -262,7 +245,7 @@ fn pruned_resources(
         };
         let before = dictionary.len();
         dictionary.retain(|name, _| {
-            resource_entry_used(category, name, used_names, extra_used_names, used_by_type)
+            resource_entry_used(category, name, used_by_type, extra_xobjects)
                 || keep_unused_resource(keep_unused, category, name)
         });
         stats.record_category(category, before.saturating_sub(dictionary.len()));
@@ -389,14 +372,8 @@ pub fn prune_xobject_candidates_for_content(
     let Some(usage) = scan(content) else {
         return Ok((resources, 0));
     };
-    let mut names = usage.names.clone();
     let mut names_by_type = usage.names_by_resource_type.clone();
-    names.extend(borrowed_form_names(
-        document,
-        &resources,
-        &usage,
-        &mut names_by_type,
-    )?);
+    extend_borrowed_form_usage(document, &resources, &usage, &mut names_by_type)?;
 
     let Some(value) = resources.get(b"XObject".as_slice()).cloned() else {
         return Ok((resources, 0));
@@ -406,8 +383,7 @@ pub fn prune_xobject_candidates_for_content(
     };
     let before = xobjects.len();
     xobjects.retain(|name, _| {
-        !candidates.contains(name)
-            || resource_entry_used(b"XObject", name, &names, None, Some(&names_by_type))
+        !candidates.contains(name) || resource_entry_used(b"XObject", name, &names_by_type, None)
     });
     let removed = before.saturating_sub(xobjects.len());
     if removed != 0 {
@@ -419,8 +395,6 @@ pub fn prune_xobject_candidates_for_content(
 pub fn prune_resources_with_usage(
     document: &mut EditDocument,
     keep_unused: &BTreeSet<String>,
-    page_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
-    form_names: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
     page_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
     form_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
     generated_page_xobjects: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
@@ -431,32 +405,25 @@ pub fn prune_resources_with_usage(
     // complete, which implies every reachable Form has its own resource scope.
     // Resource-less Forms require caller-scope borrowing and therefore use the
     // canonical parsing path instead.
-    for (&form, names) in form_names {
+    for (&form, names_by_type) in form_names_by_type {
         let Some(resources) = form_resources(document, form)? else {
             continue;
         };
-        let (resources, pruned) = pruned_resources(
-            document,
-            resources,
-            names,
-            None,
-            form_names_by_type.get(&form),
-            keep_unused,
-        )?;
+        let (resources, pruned) =
+            pruned_resources(document, resources, names_by_type, None, keep_unused)?;
         stats.merge(pruned);
         install_form_resources(document, form, resources)?;
     }
 
-    for (&page, names) in page_names {
+    for (&page, names_by_type) in page_names_by_type {
         let Some(resources) = page_resources(document, page)? else {
             continue;
         };
         let (resources, pruned) = pruned_resources(
             document,
             resources,
-            names,
+            names_by_type,
             generated_page_xobjects.get(&page),
-            page_names_by_type.get(&page),
             keep_unused,
         )?;
         stats.merge(pruned);
@@ -488,22 +455,10 @@ pub fn prune_resources(
         let Some(usage) = scan(&content) else {
             continue;
         };
-        let mut names = usage.names.clone();
         let mut names_by_type = usage.names_by_resource_type.clone();
-        names.extend(borrowed_form_names(
-            document,
-            &resources,
-            &usage,
-            &mut names_by_type,
-        )?);
-        let (resources, pruned) = pruned_resources(
-            document,
-            resources,
-            &names,
-            None,
-            Some(&names_by_type),
-            keep_unused,
-        )?;
+        extend_borrowed_form_usage(document, &resources, &usage, &mut names_by_type)?;
+        let (resources, pruned) =
+            pruned_resources(document, resources, &names_by_type, None, keep_unused)?;
         stats.merge(pruned);
         install_form_resources(document, form, resources)?;
     }
@@ -518,22 +473,10 @@ pub fn prune_resources(
         let Some(usage) = scan(&content) else {
             continue;
         };
-        let mut names = usage.names.clone();
         let mut names_by_type = usage.names_by_resource_type.clone();
-        names.extend(borrowed_form_names(
-            document,
-            &resources,
-            &usage,
-            &mut names_by_type,
-        )?);
-        let (resources, pruned) = pruned_resources(
-            document,
-            resources,
-            &names,
-            None,
-            Some(&names_by_type),
-            keep_unused,
-        )?;
+        extend_borrowed_form_usage(document, &resources, &usage, &mut names_by_type)?;
+        let (resources, pruned) =
+            pruned_resources(document, resources, &names_by_type, None, keep_unused)?;
         stats.merge(pruned);
         install_page_resources(document, page, resources)?;
     }
@@ -581,84 +524,41 @@ mod resource_retention_tests {
 
     #[test]
     fn typed_resource_usage_does_not_cross_namespaces() {
-        let flat = BTreeSet::from([b"Shared".to_vec()]);
         let typed = ResourceNamesByType::from([
             (b"ExtGState".to_vec(), BTreeSet::from([b"Shared".to_vec()])),
             (b"Pattern".to_vec(), BTreeSet::from([b"P0".to_vec()])),
         ]);
 
-        // Preserve legacy qpdf-style flat-name semantics for Font/XObject.
-        assert!(resource_entry_used(
-            b"Font",
-            b"Shared",
-            &flat,
-            None,
-            Some(&typed)
-        ));
-        assert!(resource_entry_used(
-            b"XObject",
-            b"Shared",
-            &flat,
-            None,
-            Some(&typed)
-        ));
-
-        assert!(resource_entry_used(
-            b"ExtGState",
-            b"Shared",
-            &flat,
-            None,
-            Some(&typed)
-        ));
-        assert!(!resource_entry_used(
-            b"Pattern",
-            b"Shared",
-            &flat,
-            None,
-            Some(&typed)
-        ));
-        assert!(resource_entry_used(
-            b"Pattern",
-            b"P0",
-            &flat,
-            None,
-            Some(&typed)
-        ));
-        assert!(!resource_entry_used(
-            b"Shading",
-            b"P0",
-            &flat,
-            None,
-            Some(&typed)
-        ));
+        assert!(!resource_entry_used(b"Font", b"Shared", &typed, None));
+        assert!(!resource_entry_used(b"XObject", b"Shared", &typed, None));
+        assert!(resource_entry_used(b"ExtGState", b"Shared", &typed, None));
+        assert!(!resource_entry_used(b"Pattern", b"Shared", &typed, None));
+        assert!(resource_entry_used(b"Pattern", b"P0", &typed, None));
+        assert!(!resource_entry_used(b"Shading", b"P0", &typed, None));
     }
 
     #[test]
-    fn generated_page_xobjects_extend_flat_usage_without_copying_maps() {
-        let flat = BTreeSet::new();
+    fn generated_page_xobjects_are_scoped_to_xobject_namespace() {
+        let typed = ResourceNamesByType::new();
         let generated = BTreeSet::from([b"Generated".to_vec()]);
 
         assert!(resource_entry_used(
             b"XObject",
             b"Generated",
-            &flat,
-            Some(&generated),
-            None
+            &typed,
+            Some(&generated)
         ));
-        // Match the legacy flat-name behavior used by the old cloned overlay.
-        assert!(resource_entry_used(
+        assert!(!resource_entry_used(
             b"Font",
             b"Generated",
-            &flat,
-            Some(&generated),
-            None
+            &typed,
+            Some(&generated)
         ));
         assert!(!resource_entry_used(
             b"Pattern",
             b"Generated",
-            &flat,
-            Some(&generated),
-            None
+            &typed,
+            Some(&generated)
         ));
     }
 }

@@ -85,8 +85,6 @@ pub struct RasterLayoutStats {
     pub shared_hidden_text_paints_pruned: usize,
     pub page_hidden_text_inventory_complete: bool,
     pub resource_inventory_complete: bool,
-    pub page_resource_names: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
-    pub form_resource_names: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
     pub page_resource_names_by_type: BTreeMap<ObjectHandle, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>>,
     pub form_resource_names_by_type: BTreeMap<ObjectHandle, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>>,
     pub inline_externalize_us: u64,
@@ -190,7 +188,6 @@ struct VectorFillRun {
 
 #[derive(Debug)]
 struct ResourceUsage {
-    names: BTreeSet<Vec<u8>>,
     by_type: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
 }
 
@@ -233,7 +230,6 @@ struct RasterScanner {
     vector_epoch: usize,
     vector_run: Option<VectorFillRun>,
     vector_merge_candidate: bool,
-    resource_counts: BTreeMap<Vec<u8>, usize>,
     resource_counts_by_type: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, usize>>,
     analysis_only_no_images: bool,
     analysis_q_depth: usize,
@@ -275,7 +271,6 @@ impl RasterScanner {
             vector_epoch: 0,
             vector_run: None,
             vector_merge_candidate: false,
-            resource_counts: BTreeMap::new(),
             resource_counts_by_type: BTreeMap::new(),
             analysis_only_no_images: false,
             analysis_q_depth: 0,
@@ -305,7 +300,6 @@ impl RasterScanner {
         if let Some(resource_type) = Self::resource_type_for_operator(operator)
             && let Some(name) = name
         {
-            *self.resource_counts.entry(name.clone()).or_default() += 1;
             *self
                 .resource_counts_by_type
                 .entry(resource_type.to_vec())
@@ -324,18 +318,6 @@ impl RasterScanner {
                     .or_default() += 1;
             }
         }
-
-        let names = self
-            .resource_counts
-            .iter()
-            .filter_map(|(name, &count)| {
-                let removed = removed_xobjects
-                    .get(name.as_slice())
-                    .copied()
-                    .unwrap_or_default();
-                (count > removed).then(|| name.clone())
-            })
-            .collect();
 
         let names_by_type = self
             .resource_counts_by_type
@@ -361,7 +343,6 @@ impl RasterScanner {
             .collect();
 
         ResourceUsage {
-            names,
             by_type: names_by_type,
         }
     }
@@ -5847,13 +5828,11 @@ pub fn normalize_raster_layout(
             let usage = scanner.resource_usage_after_removing(&pruned_draws);
             match target {
                 ContentTarget::Page(page) => {
-                    stats.page_resource_names.insert(page, usage.names);
                     stats
                         .page_resource_names_by_type
                         .insert(page, usage.by_type);
                 }
                 ContentTarget::Form(form) => {
-                    stats.form_resource_names.insert(form, usage.names);
                     stats
                         .form_resource_names_by_type
                         .insert(form, usage.by_type);
@@ -5994,22 +5973,17 @@ pub fn normalize_raster_layout(
             consumed.extend(applied.consumed_draws.iter().copied());
             let mut usage = scanner.resource_usage_after_removing(&consumed);
             usage
-                .names
-                .extend(applied.added_resource_names.iter().cloned());
-            usage
                 .by_type
                 .entry(b"XObject".to_vec())
                 .or_default()
                 .extend(applied.added_resource_names);
             match target {
                 ContentTarget::Page(page) => {
-                    stats.page_resource_names.insert(page, usage.names);
                     stats
                         .page_resource_names_by_type
                         .insert(page, usage.by_type);
                 }
                 ContentTarget::Form(form) => {
-                    stats.form_resource_names.insert(form, usage.names);
                     stats
                         .form_resource_names_by_type
                         .insert(form, usage.by_type);

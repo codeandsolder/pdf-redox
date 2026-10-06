@@ -559,8 +559,6 @@ fn optimize_pdf_with_document(
             prune_resources_with_usage(
                 &mut document,
                 &cfg.keep_unused_resources,
-                &raster_layout.page_resource_names,
-                &raster_layout.form_resource_names,
                 &raster_layout.page_resource_names_by_type,
                 &raster_layout.form_resource_names_by_type,
                 &vector_compaction.generated_page_xobjects,
