@@ -550,7 +550,7 @@ fn optimize_pdf_with_document(
         compress_unfiltered_streams(&mut document, flate_level)
     })?;
     let output = timed(&mut timings, "writer", || {
-        crate::writer::write_pdf_with_options(&document, cfg.generate_object_streams, flate_level)
+        crate::writer::write_pdf_with_object_streams(&document, flate_level)
     })?;
 
     let mut notes = Vec::new();

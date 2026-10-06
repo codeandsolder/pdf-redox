@@ -525,7 +525,7 @@ fn push_xref_stream_entry(output: &mut Vec<u8>, kind: u8, field2: u64, field3: u
     clippy::too_many_lines,
     reason = "object-stream output keeps ID planning, offset capture, and xref construction in one stateful writer"
 )]
-fn write_pdf_with_object_streams(
+pub fn write_pdf_with_object_streams(
     document: &EditDocument,
     level: crate::FlateLevel,
 ) -> Result<Vec<u8>> {
@@ -659,18 +659,6 @@ fn write_pdf_with_object_streams(
     writeln!(&mut output, "{xref_offset}")?;
     output.extend_from_slice(b"%%EOF\n");
     Ok(output)
-}
-
-pub fn write_pdf_with_options(
-    document: &EditDocument,
-    generate_object_streams: bool,
-    compression_level: crate::FlateLevel,
-) -> Result<Vec<u8>> {
-    if generate_object_streams {
-        write_pdf_with_object_streams(document, compression_level)
-    } else {
-        write_pdf(document)
-    }
 }
 
 #[cfg(test)]

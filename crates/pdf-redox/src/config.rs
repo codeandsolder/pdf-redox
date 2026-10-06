@@ -434,8 +434,6 @@ pub struct Config {
     /// on every page, or on every page after the first. Explicit semantic cleanup; off by default.
     #[serde(default)]
     pub remove_repeated_page_objects: bool,
-    /// Repack eligible small indirect objects into `ObjStm` containers.
-    pub generate_object_streams: bool,
     /// Primary optimization objective used when size and display-list simplicity conflict.
     #[serde(default)]
     pub optimization_goal: OptimizationGoal,
@@ -476,7 +474,6 @@ impl Config {
             hidden_text: HiddenTextPolicy::default(),
             remove_large_diagonal_text: false,
             remove_repeated_page_objects: false,
-            generate_object_streams: true,
             optimization_goal: OptimizationGoal::Size,
             normalize_content_streams: false,
             compact_vector_paths: false,
@@ -673,12 +670,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets whether eligible small indirect objects are packed into object streams.
-    pub const fn generate_object_streams(mut self, value: bool) -> Self {
-        self.config.generate_object_streams = value;
-        self
-    }
-
     /// Sets whether optimization prioritizes encoded size or processing simplicity.
     pub const fn optimization_goal(mut self, value: OptimizationGoal) -> Self {
         self.config.optimization_goal = value;
@@ -763,6 +754,7 @@ mod tests {
             r#"{"keep_unused_resources":[]}"#,
             r#"{"deduplicate_metadata_streams":false}"#,
             r#"{"deduplicate_inline_images":false}"#,
+            r#"{"generate_object_streams":false}"#,
         ] {
             assert!(serde_json::from_str::<Config>(stale).is_err());
         }
@@ -819,7 +811,6 @@ mod tests {
             .annotation_policy(AnnotationPolicy::AppearanceOnly)
             .preserve_unknown_objects(false)
             .max_image_ppi(Some(300))
-            .generate_object_streams(false)
             .normalize_content_streams(true)
             .flate_policy(FlatePolicy::Preserve)
             .prune_resources(true)
@@ -846,7 +837,6 @@ mod tests {
         );
         assert!(!config.preservation.unknown_objects);
         assert_eq!(config.max_image_ppi, Some(300));
-        assert!(!config.generate_object_streams);
         assert!(config.normalize_content_streams);
         assert_eq!(config.flate_policy, FlatePolicy::Preserve);
         assert!(config.prune_resources);
