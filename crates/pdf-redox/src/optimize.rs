@@ -1,6 +1,6 @@
 use crate::{
     Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
-    analyze::{analyze_document_for_optimization, input_sha256},
+    analyze::analyze_document_for_optimization,
     content::normalize_page_contents,
     dedup::{
         TargetedDedupStats, canonicalize_appearance_streams,
@@ -134,40 +134,26 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     optimize_pdf_with_document(document, cfg, before, timings)
 }
 
-/// Optimize `input`, reusing a previously computed analysis when it belongs
-/// to these exact bytes. A missing/legacy digest or any byte-length/digest
-/// mismatch falls back to a fresh analysis.
-///
-/// The supplied analysis is treated as trusted cached application state once
-/// its input identity matches. Callers that accept analysis objects from an
-/// untrusted boundary should keep their own trusted cached copy rather than
-/// round-tripping mutable user data into this function.
+/// Optimize `input` using a previously computed analysis of these exact bytes.
 ///
 /// # Errors
 ///
-/// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
-/// a required fresh analysis or optimization pass fails, or output serialization fails.
+/// Returns an error when `analysis` does not belong to `input`, the configuration is invalid,
+/// the input PDF cannot be parsed, an optimization pass fails, or output serialization fails.
 pub fn optimize_pdf_with_analysis(
     input: &[u8],
     cfg: &Config,
     analysis: &PdfAnalysis,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
-    let matches = analysis.input_bytes == input.len()
-        && !analysis.input_sha256.is_empty()
-        && analysis.input_sha256 == input_sha256(input);
+    if !analysis.matches_input(input) {
+        return Err(crate::Error::AnalysisInputMismatch);
+    }
     let mut timings = BTreeMap::new();
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    let before = if matches {
-        analysis.clone()
-    } else {
-        timed(&mut timings, "analysis", || {
-            analyze_document_for_optimization(input, &document)
-        })?
-    };
-    optimize_pdf_with_document(document, cfg, before, timings)
+    optimize_pdf_with_document(document, cfg, analysis.clone(), timings)
 }
 
 #[expect(
@@ -1292,21 +1278,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_cached_analysis_falls_back_to_fresh_analysis() -> Result<()> {
+    fn stale_cached_analysis_is_rejected() -> Result<()> {
         let input = corrupt_xref_with_compressed_page_tree_fixture()?;
         let mut analysis =
             analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?;
         analysis.input_sha256 = "00".repeat(32);
-        analysis.warnings.push("stale-analysis-marker".to_owned());
-        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
-        assert_eq!(report.before.input_sha256, input_sha256(&input));
-        assert!(
-            !report
-                .before
-                .warnings
-                .iter()
-                .any(|warning| warning == "stale-analysis-marker")
-        );
+        assert!(matches!(
+            optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis),
+            Err(crate::Error::AnalysisInputMismatch)
+        ));
         Ok(())
     }
 

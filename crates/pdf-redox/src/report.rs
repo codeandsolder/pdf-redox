@@ -274,6 +274,14 @@ pub struct PdfAnalysis {
     pub warnings: Vec<String>,
 }
 
+impl PdfAnalysis {
+    /// Returns whether this analysis belongs to these exact input bytes.
+    #[must_use]
+    pub fn matches_input(&self, input: &[u8]) -> bool {
+        self.input_bytes == input.len() && self.input_sha256 == crate::analyze::input_sha256(input)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 /// Metrics and diagnostics produced by a complete optimization run.
 pub struct OptimizationReport {

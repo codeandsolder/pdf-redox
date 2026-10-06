@@ -41,6 +41,9 @@ pub enum Error {
     /// The document violates a structural or transformation invariant.
     #[error("invalid pdf structure: {0}")]
     Invalid(String),
+    /// A supplied cached analysis belongs to different input bytes.
+    #[error("cached analysis does not match input PDF")]
+    AnalysisInputMismatch,
     /// Hayro could not load the immutable source document.
     #[error("source parser failed to load PDF: {0}")]
     SourceLoad(#[from] SourceLoadError),

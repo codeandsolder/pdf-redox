@@ -55,10 +55,13 @@ fn config(profile: &str, privacy: &str) -> Config {
 fn run(bytes: &[u8], cfg: &Config) -> Result<JsValue, JsValue> {
     let optimized = LAST_ANALYSIS.with(|slot| {
         let cached = slot.borrow();
-        cached.as_ref().map_or_else(
-            || optimize_pdf(bytes, cfg),
-            |analysis| optimize_pdf_with_analysis(bytes, cfg, analysis),
-        )
+        cached
+            .as_ref()
+            .filter(|analysis| analysis.matches_input(bytes))
+            .map_or_else(
+                || optimize_pdf(bytes, cfg),
+                |analysis| optimize_pdf_with_analysis(bytes, cfg, analysis),
+            )
     });
     let (pdf, report) = optimized.map_err(|e| JsValue::from_str(&e.to_string()))?;
     LAST_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(report.before.clone()));
