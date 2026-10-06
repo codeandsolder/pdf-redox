@@ -486,24 +486,12 @@ fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Re
     })
 }
 
-fn zlib_encode(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
-    use flate2::{Compression, write::ZlibEncoder};
-    let compression = if (0..=9).contains(&level) {
-        Compression::new(level.cast_unsigned())
-    } else {
-        Compression::default()
-    };
-    let mut encoder = ZlibEncoder::new(Vec::new(), compression);
-    encoder.write_all(bytes)?;
-    Ok(encoder.finish()?)
-}
-
 fn write_objstm(
     output: &mut Vec<u8>,
     document: &EditDocument,
     plan: &OutputPlan,
     handles: &[ObjectHandle],
-    level: i32,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     let mut body = Vec::new();
     let mut header = Vec::new();
@@ -515,7 +503,7 @@ fn write_objstm(
     }
     let first = header.len();
     header.extend_from_slice(&body);
-    let encoded = zlib_encode(&header, level)?;
+    let encoded = crate::stream_codec::encode_flate(&header, level)?;
     let handle_count = handles.len();
     let encoded_len = encoded.len();
     write!(
@@ -537,7 +525,10 @@ fn push_xref_stream_entry(output: &mut Vec<u8>, kind: u8, field2: u64, field3: u
     clippy::too_many_lines,
     reason = "object-stream output keeps ID planning, offset capture, and xref construction in one stateful writer"
 )]
-fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<Vec<u8>> {
+fn write_pdf_with_object_streams(
+    document: &EditDocument,
+    level: crate::FlateLevel,
+) -> Result<Vec<u8>> {
     let plan = OutputPlan::new(document)?;
     let mut compressed = BTreeMap::<ObjectHandle, (u32, u16)>::new();
     let mut objstm_groups = Vec::<Vec<ObjectHandle>>::new();
@@ -647,7 +638,7 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
             push_xref_stream_entry(&mut xref_data, 1, offset as u64, 0);
         }
     }
-    let encoded_xref = zlib_encode(&xref_data, level)?;
+    let encoded_xref = crate::stream_codec::encode_flate(&xref_data, level)?;
 
     writeln!(&mut output, "{xref_id} 0 obj")?;
     output.extend_from_slice(b"<< /Type /XRef /Size ");
@@ -673,7 +664,7 @@ fn write_pdf_with_object_streams(document: &EditDocument, level: i32) -> Result<
 pub fn write_pdf_with_options(
     document: &EditDocument,
     generate_object_streams: bool,
-    compression_level: i32,
+    compression_level: crate::FlateLevel,
 ) -> Result<Vec<u8>> {
     if generate_object_streams {
         write_pdf_with_object_streams(document, compression_level)

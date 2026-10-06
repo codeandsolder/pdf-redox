@@ -36,16 +36,6 @@ enum OptimizeForArg {
     Processing,
 }
 
-fn parse_flate_level(value: &str) -> Result<i32, String> {
-    let level = value
-        .parse::<i32>()
-        .map_err(|_| "Flate level must be an integer from 0 through 9".to_owned())?;
-    (0..=9)
-        .contains(&level)
-        .then_some(level)
-        .ok_or_else(|| "Flate level must be an integer from 0 through 9".to_owned())
-}
-
 fn parse_jpeg_quality(value: &str) -> Result<u8, String> {
     let quality = value
         .parse::<u8>()
@@ -134,9 +124,6 @@ struct Args {
     /// Existing Flate stream policy. Selective is the optimize-only default.
     #[arg(long, value_enum, default_value = "selective")]
     flate_policy: FlatePolicyArg,
-    /// zlib compression level for rewritten Flate streams (0-9).
-    #[arg(long, value_parser = parse_flate_level)]
-    flate_level: Option<i32>,
     /// Choose whether conflicting rewrites favor encoded bytes or a simpler display list.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
@@ -334,13 +321,6 @@ fn config_from_args(args: &Args) -> Config {
         OptimizeForArg::Size => OptimizationGoal::Size,
         OptimizeForArg::Processing => OptimizationGoal::Processing,
     };
-    cfg.flate_level = args.flate_level.unwrap_or_else(|| {
-        if cfg.optimization_goal == OptimizationGoal::Processing {
-            6
-        } else {
-            cfg.flate_level
-        }
-    });
     cfg.normalize_content_streams = args.normalize_content;
     cfg.compact_vector_paths =
         args.compact_vector_paths || matches!(args.optimize_for, OptimizeForArg::Processing);
@@ -417,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::fs::read(&a.input)?;
     if a.analyze_microstrokes {
         let cfg = config_from_args(&a);
-        let stats = analyze_microstroke_rasterization(&input, cfg.flate_level)?;
+        let stats = analyze_microstroke_rasterization(&input, cfg.optimization_goal)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
         return Ok(());
     }
@@ -466,7 +446,10 @@ mod tests {
     fn processing_uses_faster_flate_default() -> Result<(), clap::Error> {
         let args =
             Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
-        assert_eq!(config_from_args(&args).flate_level, 6);
+        assert_eq!(
+            config_from_args(&args).optimization_goal,
+            OptimizationGoal::Processing
+        );
         Ok(())
     }
 
@@ -507,28 +490,16 @@ mod tests {
     #[test]
     fn size_mode_keeps_size_focused_flate_default() -> Result<(), clap::Error> {
         let args = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
-        assert_eq!(config_from_args(&args).flate_level, 9);
+        assert_eq!(
+            config_from_args(&args).optimization_goal,
+            OptimizationGoal::Size
+        );
         Ok(())
     }
 
     #[test]
-    fn explicit_flate_level_overrides_processing_default() -> Result<(), clap::Error> {
-        let args = Args::try_parse_from([
-            "pdf-redox",
-            "input.pdf",
-            "--optimize-for",
-            "processing",
-            "--flate-level",
-            "7",
-        ])?;
-        assert_eq!(config_from_args(&args).flate_level, 7);
-        Ok(())
-    }
-
-    #[test]
-    fn flate_level_rejects_out_of_range_values() {
-        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "10"]).is_err());
-        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "-1"]).is_err());
+    fn removed_flate_level_override_is_rejected() {
+        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-level", "7",]).is_err());
     }
 
     #[test]

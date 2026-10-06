@@ -22,12 +22,10 @@ struct AdaptiveFlateEncoding {
 
 fn adaptive_flate_encode(
     decoded: &[u8],
-    level: i32,
-    adaptive_high_effort: bool,
+    level: crate::FlateLevel,
 ) -> crate::Result<AdaptiveFlateEncoding> {
     let baseline = encode_flate(decoded, level)?;
-    if !adaptive_high_effort
-        || level >= 9
+    if level == crate::FlateLevel::SIZE
         || decoded.len() < ADAPTIVE_FLATE_MIN_DECODED_BYTES
         || baseline.len().saturating_mul(100)
             > decoded
@@ -42,7 +40,7 @@ fn adaptive_flate_encode(
         });
     }
 
-    let high_effort = encode_flate(decoded, 9)?;
+    let high_effort = encode_flate(decoded, crate::FlateLevel::SIZE)?;
     if high_effort.len() < baseline.len() {
         let extra = baseline.len().saturating_sub(high_effort.len());
         Ok(AdaptiveFlateEncoding {
@@ -86,8 +84,7 @@ fn is_safe_lone_flate(
 pub fn apply_flate_policy(
     document: &mut crate::EditDocument,
     policy: FlatePolicy,
-    level: i32,
-    adaptive_high_effort: bool,
+    level: crate::FlateLevel,
 ) -> Result<FlateOptimizationStats> {
     let (min_savings_bytes, min_savings_percent, force) = match policy {
         FlatePolicy::Preserve => return Ok(FlateOptimizationStats::default()),
@@ -111,7 +108,7 @@ pub fn apply_flate_policy(
         let Ok(decoded) = document.decoded_stream_data(handle) else {
             continue;
         };
-        let Ok(encoded) = adaptive_flate_encode(&decoded, level, adaptive_high_effort) else {
+        let Ok(encoded) = adaptive_flate_encode(&decoded, level) else {
             continue;
         };
         if encoded.high_effort_tested {
@@ -148,8 +145,7 @@ pub fn apply_flate_policy(
 
 pub fn compress_unfiltered_streams(
     document: &mut crate::EditDocument,
-    level: i32,
-    adaptive_high_effort: bool,
+    level: crate::FlateLevel,
 ) -> Result<FlateOptimizationStats> {
     let handles = document.reachable_streams()?;
     let mut stats = FlateOptimizationStats::default();
@@ -183,7 +179,7 @@ pub fn compress_unfiltered_streams(
         }
         // The writer's historical StreamDataMode::Compress behavior always
         // applies Flate to non-empty unfiltered streams, even when a tiny stream grows.
-        let encoded = adaptive_flate_encode(&raw, level, adaptive_high_effort)?;
+        let encoded = adaptive_flate_encode(&raw, level)?;
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }

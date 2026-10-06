@@ -1,7 +1,6 @@
 use crate::{Error, OwnedDictionary, OwnedObject, Result};
 use fax::{Color, VecWriter, encoder::Encoder};
-use flate2::{Compression, write::ZlibEncoder};
-use std::{collections::BTreeMap, convert::Infallible, io::Write as _};
+use std::{collections::BTreeMap, convert::Infallible};
 
 const CCITT_EXTRA_DICTIONARY_BYTES: usize = 96;
 
@@ -124,11 +123,14 @@ impl BilevelRaster {
         *byte &= !(0x80 >> (x % 8));
     }
 
-    pub(crate) fn encode(&self, flate_level: i32) -> Result<BilevelEncodedData> {
+    pub(crate) fn encode(&self, flate_level: crate::FlateLevel) -> Result<BilevelEncodedData> {
         encode_best_bilevel_data(&self.packed, self.width, self.height, flate_level)
     }
 
-    pub(crate) fn encode_image_mask(&self, flate_level: i32) -> Result<BilevelImagePayload> {
+    pub(crate) fn encode_image_mask(
+        &self,
+        flate_level: crate::FlateLevel,
+    ) -> Result<BilevelImagePayload> {
         let encoded = self.encode(flate_level)?;
         Ok(BilevelImagePayload {
             dictionary: image_mask_dictionary(self.width, self.height, encoded.codec),
@@ -143,13 +145,6 @@ fn infallible<T>(value: std::result::Result<T, Infallible>) -> T {
         Ok(value) => value,
         Err(never) => match never {},
     }
-}
-
-pub fn compress_flate(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    let level = u32::try_from(level.clamp(0, 9)).unwrap_or(9);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data)?;
-    Ok(encoder.finish()?)
 }
 
 fn encode_ccitt_group4(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
@@ -228,9 +223,9 @@ pub fn encode_best_bilevel_data(
     packed: &[u8],
     width: u32,
     height: u32,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<BilevelEncodedData> {
-    let flate = compress_flate(packed, flate_level)?;
+    let flate = crate::stream_codec::encode_flate(packed, flate_level)?;
     let ccitt = encode_ccitt_group4(packed, width, height)?;
 
     let codec =
@@ -251,7 +246,7 @@ pub fn encode_best_image_mask(
     packed: &[u8],
     width: u32,
     height: u32,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<BilevelImagePayload> {
     let encoded = encode_best_bilevel_data(packed, width, height, flate_level)?;
     Ok(BilevelImagePayload {
@@ -318,7 +313,7 @@ mod tests {
                 packed[row + byte] &= !(1 << (7 - (x & 7)));
             }
         }
-        let payload = encode_best_image_mask(&packed, width, height, 9)?;
+        let payload = encode_best_image_mask(&packed, width, height, crate::FlateLevel::SIZE)?;
         assert!(matches!(
             payload.dictionary.get(b"Filter".as_slice()),
             Some(OwnedObject::Name(name)) if name == b"CCITTFaxDecode"

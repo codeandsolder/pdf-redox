@@ -110,15 +110,10 @@ fn validate_config(cfg: &Config) -> Result<()> {
 #[doc(hidden)]
 pub fn analyze_microstroke_rasterization(
     input: &[u8],
-    flate_level: i32,
+    optimization_goal: crate::OptimizationGoal,
 ) -> Result<MicrostrokeRasterStats> {
-    if !(0..=9).contains(&flate_level) {
-        return Err(crate::Error::Invalid(
-            "Flate level must be an integer from 0 through 9".to_owned(),
-        ));
-    }
     let mut document = EditDocument::from_bytes(input.to_vec())?;
-    rasterize_pathological_microstrokes(&mut document, flate_level)
+    rasterize_pathological_microstrokes(&mut document, optimization_goal.flate_level())
 }
 
 /// Optimize a PDF according to the supplied configuration.
@@ -185,6 +180,7 @@ fn optimize_pdf_with_document(
     before: PdfAnalysis,
     mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
+    let flate_level = cfg.optimization_goal.flate_level();
     let preservation = timed(&mut timings, "preservation", || {
         if cfg.preservation == crate::PreservationConfig::functional() {
             Ok(PreservationStats::default())
@@ -212,7 +208,7 @@ fn optimize_pdf_with_document(
         if cfg.preservation.font_editing_support {
             Ok(FontOptimizationStats::default())
         } else {
-            strip_font_editing_tables(&mut document, cfg.flate_level)
+            strip_font_editing_tables(&mut document, flate_level)
         }
     })?;
     let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
@@ -233,7 +229,7 @@ fn optimize_pdf_with_document(
         if cfg.preservation.font_editing_support {
             Ok(FontOptimizationStats::default())
         } else {
-            union_sparse_cid_font_programs_after_dedup(&mut document, cfg.flate_level)
+            union_sparse_cid_font_programs_after_dedup(&mut document, flate_level)
         }
     })?;
     font_rendering.programs_optimized += font_sparse_union.programs_optimized;
@@ -249,7 +245,7 @@ fn optimize_pdf_with_document(
         {
             Ok(FontOptimizationStats::default())
         } else {
-            dense_compact_cidfont_type2_programs(&mut document, cfg.flate_level)
+            dense_compact_cidfont_type2_programs(&mut document, flate_level)
         }
     })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
@@ -294,12 +290,7 @@ fn optimize_pdf_with_document(
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
             && !repeated_page_objects_may_rewrite)
             .then_some(&mut raster_vector_cache);
-        normalize_raster_layout(
-            &mut document,
-            &cfg.raster_layout,
-            cfg.flate_level,
-            vector_cache,
-        )
+        normalize_raster_layout(&mut document, &cfg.raster_layout, flate_level, vector_cache)
     })?;
     for (name, micros) in [
         ("inline-externalize", raster_layout.inline_externalize_us),
@@ -432,11 +423,11 @@ fn optimize_pdf_with_document(
                         min_area: 0,
                         keep_inline_images: true,
                         jpeg_quality: *jpeg_quality,
-                        flate_level: cfg.flate_level,
                         min_savings_bytes: 1,
                         min_savings_percent: *min_savings_percent,
                         ..ImageOptimizationOptions::default()
                     },
+                    flate_level,
                     &print_plan.resize_targets,
                 )?
             }
@@ -454,6 +445,7 @@ fn optimize_pdf_with_document(
                 min_savings_percent: *min_savings_percent,
                 ..ImageOptimizationOptions::default()
             },
+            flate_level,
         )?,
     };
     timings.insert(
@@ -497,7 +489,7 @@ fn optimize_pdf_with_document(
             };
             compact_vector_paths(
                 &mut document,
-                cfg.flate_level,
+                flate_level,
                 cfg.optimization_goal,
                 vector_cache,
             )
@@ -509,7 +501,7 @@ fn optimize_pdf_with_document(
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            coalesce_optional_content(&mut document, cfg.flate_level)
+            coalesce_optional_content(&mut document, flate_level)
         } else {
             Ok(MarkedContentCoalesceStats::default())
         }
@@ -518,7 +510,7 @@ fn optimize_pdf_with_document(
     let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            compact_collinear_paths(&mut document, cfg.flate_level)
+            compact_collinear_paths(&mut document, flate_level)
         } else {
             Ok(CollinearPathStats::default())
         }
@@ -527,7 +519,7 @@ fn optimize_pdf_with_document(
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            factor_outlined_glyphs(&mut document, cfg.flate_level)
+            factor_outlined_glyphs(&mut document, flate_level)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -536,7 +528,7 @@ fn optimize_pdf_with_document(
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            batch_page_paints(&mut document, cfg.flate_level)
+            batch_page_paints(&mut document, flate_level)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -545,7 +537,7 @@ fn optimize_pdf_with_document(
     let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
         if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
         {
-            factor_repeated_stroke_forms(&mut document, cfg.flate_level)
+            factor_repeated_stroke_forms(&mut document, flate_level)
         } else {
             Ok(StrokeFormFactorStats::default())
         }
@@ -579,20 +571,13 @@ fn optimize_pdf_with_document(
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(&mut document, cfg.flate_level)
+            rasterize_pathological_microstrokes(&mut document, flate_level)
         } else {
             Ok(MicrostrokeRasterStats::default())
         }
     })?;
-    let adaptive_flate_high_effort =
-        cfg.optimization_goal == crate::OptimizationGoal::Processing && cfg.flate_level == 6;
     let flate = timed(&mut timings, "flate-policy", || {
-        apply_flate_policy(
-            &mut document,
-            cfg.flate_policy,
-            cfg.flate_level,
-            adaptive_flate_high_effort,
-        )
+        apply_flate_policy(&mut document, cfg.flate_policy, flate_level)
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.normalize_content_streams {
@@ -616,14 +601,10 @@ fn optimize_pdf_with_document(
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(&mut document, cfg.flate_level, adaptive_flate_high_effort)
+        compress_unfiltered_streams(&mut document, flate_level)
     })?;
     let output = timed(&mut timings, "writer", || {
-        crate::writer::write_pdf_with_options(
-            &document,
-            cfg.generate_object_streams,
-            cfg.flate_level,
-        )
+        crate::writer::write_pdf_with_options(&document, cfg.generate_object_streams, flate_level)
     })?;
 
     let mut notes = Vec::new();
@@ -966,8 +947,7 @@ fn optimize_pdf_with_document(
         .saturating_add(unfiltered_flate.high_effort_extra_savings_bytes);
     if adaptive_flate_streams_selected > 0 {
         notes.push(format!(
-            "Selected high-effort Flate for {adaptive_flate_streams_selected} of {adaptive_flate_streams_tested} highly-compressible large stream(s), saving about {adaptive_flate_extra_savings} additional encoded bytes beyond level {}.",
-            cfg.flate_level
+            "Selected high-effort Flate for {adaptive_flate_streams_selected} of {adaptive_flate_streams_tested} highly-compressible large stream(s), saving about {adaptive_flate_extra_savings} additional encoded bytes beyond level {flate_level}."
         ));
     }
 

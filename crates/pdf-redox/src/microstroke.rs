@@ -1,7 +1,7 @@
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster, compress_flate},
+    bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster},
     content::{
         decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
         replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
@@ -871,7 +871,10 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
     })
 }
 
-fn image_payload(raster: &RasterizedRun, flate_level: i32) -> Result<BilevelImagePayload> {
+fn image_payload(
+    raster: &RasterizedRun,
+    flate_level: crate::FlateLevel,
+) -> Result<BilevelImagePayload> {
     raster.mask.encode_image_mask(flate_level)
 }
 
@@ -917,8 +920,8 @@ fn replacement_bytes(name: &[u8], run: &MicroStrokeRun, raster: &RasterizedRun) 
     out
 }
 
-fn compressed_len(data: &[u8], flate_level: i32) -> Result<usize> {
-    Ok(compress_flate(data, flate_level)?.len())
+fn compressed_len(data: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
+    Ok(crate::stream_codec::encode_flate(data, flate_level)?.len())
 }
 
 fn apply_replacements(input: &[u8], replacements: &[(usize, usize, Vec<u8>)]) -> Option<Vec<u8>> {
@@ -1041,7 +1044,7 @@ struct Candidate {
 )]
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<MicrostrokeRasterStats> {
     let mut stats = MicrostrokeRasterStats::default();
     for page in document.page_handles()? {

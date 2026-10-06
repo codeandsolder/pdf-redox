@@ -375,6 +375,33 @@ pub enum OptimizationGoal {
     Processing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlateLevel(u32);
+
+impl FlateLevel {
+    pub const PROCESSING: Self = Self(6);
+    pub const SIZE: Self = Self(9);
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FlateLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl OptimizationGoal {
+    pub(crate) const fn flate_level(self) -> FlateLevel {
+        match self {
+            Self::Size => FlateLevel::SIZE,
+            Self::Processing => FlateLevel::PROCESSING,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -467,8 +494,6 @@ pub struct Config {
     /// This intentionally drops embedded color-management transforms and is therefore lossy.
     #[serde(default)]
     pub elide_icc_profiles_to_alternate: bool,
-    /// zlib level used for rewritten streams. 9 is slower at ingest but cheap to decode.
-    pub flate_level: i32,
 }
 
 impl Config {
@@ -504,7 +529,6 @@ impl Config {
             deduplicate_type3_charprocs: true,
             deduplicate_icc_profiles: true,
             elide_icc_profiles_to_alternate: false,
-            flate_level: 9,
         }
     }
 
@@ -816,12 +840,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets the zlib compression level used for rewritten Flate streams.
-    pub const fn flate_level(mut self, value: i32) -> Self {
-        self.config.flate_level = value;
-        self
-    }
-
     #[must_use]
     /// Finishes the builder and returns the configured optimization policy.
     pub fn build(self) -> Config {
@@ -851,6 +869,12 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimization_goal_selects_compression_policy() {
+        assert_eq!(OptimizationGoal::Processing.flate_level().value(), 6);
+        assert_eq!(OptimizationGoal::Size.flate_level().value(), 9);
+    }
 
     #[test]
     fn raster_occlusion_pruning_is_explicit_opt_in() {
@@ -912,7 +936,6 @@ mod tests {
             .deduplicate_page_contents(false)
             .deduplicate_type3_charprocs(false)
             .deduplicate_icc_profiles(false)
-            .flate_level(6)
             .privacy(PrivacyConfig {
                 level: PrivacyLevel::Metadata,
                 strip_jpeg_metadata: true,
@@ -950,7 +973,6 @@ mod tests {
         assert!(!config.deduplicate_page_contents);
         assert!(!config.deduplicate_type3_charprocs);
         assert!(!config.deduplicate_icc_profiles);
-        assert_eq!(config.flate_level, 6);
         assert_eq!(config.privacy.level, PrivacyLevel::Metadata);
         assert!(config.privacy.strip_jpeg_metadata);
     }

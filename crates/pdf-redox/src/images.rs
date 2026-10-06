@@ -48,7 +48,6 @@ pub struct ImageOptimizationOptions {
     pub inline_min_bytes: usize,
     pub keep_inline_images: bool,
     pub jpeg_quality: u8,
-    pub flate_level: i32,
     pub min_savings_bytes: u64,
     pub min_savings_percent: u8,
 }
@@ -62,7 +61,6 @@ impl Default for ImageOptimizationOptions {
             inline_min_bytes: 1_024,
             keep_inline_images: false,
             jpeg_quality: 75,
-            flate_level: -1,
             min_savings_bytes: 1,
             min_savings_percent: 0,
         }
@@ -490,6 +488,7 @@ fn resize_image(
     image: &OwnedObject,
     options: ImageOptimizationOptions,
     target: ImageResizeTarget,
+    flate_level: crate::FlateLevel,
 ) -> Result<Option<ImageTransform>> {
     let OwnedObject::Stream { dictionary, data } = image else {
         return Ok(None);
@@ -536,7 +535,7 @@ fn resize_image(
             b"DCTDecode".to_vec(),
         ),
         ImageResizeEncoding::Flate => (
-            encode_flate(destination.buffer(), options.flate_level)?,
+            encode_flate(destination.buffer(), flate_level)?,
             b"FlateDecode".to_vec(),
         ),
     };
@@ -562,6 +561,7 @@ fn transform_one(
     handle: ObjectHandle,
     options: ImageOptimizationOptions,
     target: Option<ImageResizeTarget>,
+    flate_level: crate::FlateLevel,
     stats: &mut ImageOptimizationStats,
 ) -> Result<bool> {
     if !is_image(document, handle)? {
@@ -571,7 +571,7 @@ fn transform_one(
         return Ok(false);
     };
     let transform = match target {
-        Some(target) => resize_image(document, &image, options, target)?,
+        Some(target) => resize_image(document, &image, options, target, flate_level)?,
         None => transcode_image(document, &image, options)?,
     };
     let Some(transform) = transform else {
@@ -608,6 +608,7 @@ fn transform_one(
 pub fn optimize_images(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
 ) -> Result<ImageOptimizationStats> {
     let binding_counts = image_binding_counts(document)?;
     let mut stats = ImageOptimizationStats::default();
@@ -616,7 +617,7 @@ pub fn optimize_images(
         .into_iter()
         .collect::<BTreeSet<_>>();
     for image in images {
-        if transform_one(document, image, options, None, &mut stats)? {
+        if transform_one(document, image, options, None, flate_level, &mut stats)? {
             stats.references_reused = stats.references_reused.saturating_add(
                 binding_counts
                     .get(&image)
@@ -632,6 +633,7 @@ pub fn optimize_images(
 pub fn optimize_images_with_resize_targets(
     document: &mut EditDocument,
     options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
     targets: &HashMap<(ObjectHandle, ObjectHandle), ImageResizeTarget>,
 ) -> Result<ImageOptimizationStats> {
     let mut by_image = BTreeMap::<ObjectHandle, ImageResizeTarget>::new();
@@ -657,7 +659,14 @@ pub fn optimize_images_with_resize_targets(
     }
     let mut stats = ImageOptimizationStats::default();
     for (image, target) in by_image {
-        if transform_one(document, image, options, Some(target), &mut stats)? {
+        if transform_one(
+            document,
+            image,
+            options,
+            Some(target),
+            flate_level,
+            &mut stats,
+        )? {
             stats.references_reused = stats.references_reused.saturating_add(
                 binding_counts
                     .get(&image)

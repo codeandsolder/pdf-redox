@@ -3,10 +3,8 @@ use crate::{
     RiskKind, content::page_content, hidden_text::analyze_hidden_text,
     prune::should_prune_resources,
 };
-use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
 
 pub fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -808,19 +806,17 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             }
             if deep {
                 let raw = raw_stream_bytes(document, object)?;
-                if let Ok(decoded) = document.decoded_owned_stream_data(object) {
-                    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-                    if encoder.write_all(&decoded).is_ok()
-                        && let Ok(repacked) = encoder.finish()
-                    {
-                        let saving = raw.len().saturating_sub(repacked.len());
-                        if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
-                            out.flate_recompress_candidate_count += 1;
-                            out.flate_recompress_potential_saving_bytes += saving;
-                            if !is_image {
-                                out.non_image_flate_recompress_candidate_count += 1;
-                                out.non_image_flate_recompress_potential_saving_bytes += saving;
-                            }
+                if let Ok(decoded) = document.decoded_owned_stream_data(object)
+                    && let Ok(repacked) =
+                        crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::SIZE)
+                {
+                    let saving = raw.len().saturating_sub(repacked.len());
+                    if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
+                        out.flate_recompress_candidate_count += 1;
+                        out.flate_recompress_potential_saving_bytes += saving;
+                        if !is_image {
+                            out.non_image_flate_recompress_candidate_count += 1;
+                            out.non_image_flate_recompress_potential_saving_bytes += saving;
                         }
                     }
                 }

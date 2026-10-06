@@ -400,7 +400,7 @@ struct SparseCidUnionCandidate {
 )]
 fn union_sparse_cid_font_programs(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
     program_descriptors: &HashMap<CowObjectHandle, Vec<CowObjectHandle>>,
     union_unsafe_programs: &BTreeSet<CowObjectHandle>,
@@ -1680,7 +1680,7 @@ fn encode_like_stream(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     decoded: &[u8],
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<Option<(Vec<u8>, bool)>> {
     if !dictionary.contains_key(b"Filter".as_slice()) {
         return Ok(Some((decoded.to_vec(), false)));
@@ -1720,7 +1720,7 @@ fn set_font_program_length1(
 )]
 pub fn dense_compact_cidfont_type2_programs(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let program_usage = current_font_program_usage(document)?;
     let users = dense_cid_program_users(document)?;
@@ -1872,7 +1872,7 @@ pub fn dense_compact_cidfont_type2_programs(
 /// deduplication has already canonicalized byte-identical stripped subsets.
 pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let graph = collect_font_usage_graph(document)?;
 
@@ -1917,7 +1917,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
 /// The graph walk, mutation, and stream filter handling are Hayro-native.
 pub fn strip_font_editing_tables(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let graph = collect_font_usage_graph(document)?;
 
@@ -2023,8 +2023,6 @@ pub fn strip_font_editing_tables(
 mod tests {
     use super::*;
     use crate::ObjectId;
-    use flate2::{Compression, write::ZlibEncoder};
-    use std::io::Write;
 
     fn append_pdf_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]) {
         offsets.push(pdf.len());
@@ -2042,9 +2040,7 @@ mod tests {
             (*b"post", b"post-data"),
             (*b"GSUB", gsub.as_slice()),
         ]);
-        let mut compressor = ZlibEncoder::new(Vec::new(), Compression::best());
-        compressor.write_all(&source_font)?;
-        let encoded = compressor.finish()?;
+        let encoded = crate::stream_codec::encode_flate(&source_font, crate::FlateLevel::SIZE)?;
 
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
@@ -2118,9 +2114,7 @@ mod tests {
             (*b"post", b"post-data"),
             (*b"GSUB", gsub.as_slice()),
         ]);
-        let mut compressor = ZlibEncoder::new(Vec::new(), Compression::best());
-        compressor.write_all(&source_font)?;
-        let encoded = compressor.finish()?;
+        let encoded = crate::stream_codec::encode_flate(&source_font, crate::FlateLevel::SIZE)?;
 
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
@@ -2251,7 +2245,7 @@ mod tests {
     #[test]
     fn dense_cidfont_rewrites_explicit_map_and_is_idempotent() -> Result<()> {
         let mut document = EditDocument::from_bytes(dense_cidfont_fixture()?)?;
-        let first = dense_compact_cidfont_type2_programs(&mut document, 9)?;
+        let first = dense_compact_cidfont_type2_programs(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(first.programs_dense_remapped, 1);
         assert_eq!(first.cid_to_gid_maps_rewritten, 1);
         assert_eq!(first.dense_glyph_slots_removed, 2);
@@ -2274,7 +2268,7 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = dense_compact_cidfont_type2_programs(&mut reparsed, 9)?;
+        let second = dense_compact_cidfont_type2_programs(&mut reparsed, crate::FlateLevel::SIZE)?;
         assert_eq!(second.programs_dense_remapped, 0);
         assert_eq!(second.cid_to_gid_maps_rewritten, 0);
         Ok(())
@@ -2284,7 +2278,7 @@ mod tests {
     fn hayro_direct_cid_descriptor_font_is_optimized() -> Result<()> {
         let input = hayro_direct_cid_font_fixture()?;
         let mut document = EditDocument::from_bytes(input)?;
-        let first = strip_font_editing_tables(&mut document, 9)?;
+        let first = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(first.programs_optimized, 1);
         assert_eq!(first.programs_glyph_subset, 0);
         assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
@@ -2292,7 +2286,7 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = strip_font_editing_tables(&mut reparsed, 9)?;
+        let second = strip_font_editing_tables(&mut reparsed, crate::FlateLevel::SIZE)?;
         assert_eq!(second.programs_optimized, 0);
         Ok(())
     }
@@ -2301,14 +2295,14 @@ mod tests {
     fn hayro_font_table_strip_accepts_single_flate_filter_array() -> Result<()> {
         let input = hayro_font_fixture_with_filter_array(true)?;
         let mut document = EditDocument::from_bytes(input)?;
-        let first = strip_font_editing_tables(&mut document, 9)?;
+        let first = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(first.programs_optimized, 1);
         assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
         assert_eq!(first.decoded_table_bytes_removed, 8192);
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
-        let second = strip_font_editing_tables(&mut reparsed, 9)?;
+        let second = strip_font_editing_tables(&mut reparsed, crate::FlateLevel::SIZE)?;
         assert_eq!(second.programs_optimized, 0);
         Ok(())
     }

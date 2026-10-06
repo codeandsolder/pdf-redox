@@ -139,12 +139,8 @@ pub fn decode_image_stream(
 }
 
 /// Encode ordinary zlib/Flate data at an explicit PDF compression level.
-pub fn encode_flate(decoded: &[u8], level: i32) -> Result<Vec<u8>> {
-    let level = u32::try_from(level)
-        .ok()
-        .filter(|level| *level <= 9)
-        .ok_or_else(|| Error::Invalid(format!("invalid Flate compression level {level}")))?;
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level.value()));
     encoder.write_all(decoded)?;
     Ok(encoder.finish()?)
 }

@@ -19,12 +19,10 @@ use crate::{
         merge_rect_fill_pair, rect_contains_rect,
     },
 };
-use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    io::Write,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -2807,13 +2805,6 @@ fn prune_hidden_raster_paints(
     })
 }
 
-fn compress_flate(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
-    let level = u32::try_from(level.clamp(0, 9)).unwrap_or(9);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(bytes)?;
-    Ok(encoder.finish()?)
-}
-
 fn pack_binary_samples(data: &[u8], width: u32, height: u32, components: usize) -> Option<Vec<u8>> {
     let width = usize::try_from(width).ok()?;
     let height = usize::try_from(height).ok()?;
@@ -2975,7 +2966,7 @@ fn constant_visible_device_color(
 
 #[derive(Debug, Clone, Copy)]
 struct ImageEncodingContext {
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     exact_raster_rendering: bool,
     source_color_budget: Option<usize>,
 }
@@ -3008,7 +2999,7 @@ fn prepare_constant_color_mask_stencil(
     width: u32,
     height: u32,
     alpha: &[u8],
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<Option<PreparedImage>> {
     let Some(color) = constant_device_color(info, &info.data) else {
         return Ok(None);
@@ -3070,7 +3061,7 @@ fn prepare_image(
             })
     {
         let stencil_payload = stencil.encode_image_mask(flate_level)?;
-        let alpha_8bit_encoded = compress_flate(alpha, flate_level)?;
+        let alpha_8bit_encoded = crate::stream_codec::encode_flate(alpha, flate_level)?;
         // Include the tiny color operator in the comparison. Object/dictionary
         // overhead further favors the stencil because it replaces two streams.
         let stencil_cost = stencil_payload
@@ -3083,7 +3074,7 @@ fn prepare_image(
         let normal_cost = if stencil_cost < alpha_8bit_encoded.len() {
             alpha_8bit_encoded.len()
         } else {
-            let encoded = compress_flate(data, flate_level)?;
+            let encoded = crate::stream_codec::encode_flate(data, flate_level)?;
             let cost = encoded.len().saturating_add(alpha_8bit_encoded.len());
             encoded_8bit = Some(encoded);
             cost
@@ -3110,7 +3101,7 @@ fn prepare_image(
 
     let encoded_8bit = match encoded_8bit {
         Some(encoded) => encoded,
-        None => compress_flate(data, flate_level)?,
+        None => crate::stream_codec::encode_flate(data, flate_level)?,
     };
 
     let mut dictionary = info.dictionary_template.clone();
@@ -3125,7 +3116,7 @@ fn prepare_image(
     dictionary.remove(b"DecodeParms".as_slice());
 
     let prepared_alpha = if let Some(alpha) = alpha {
-        let alpha_8bit = compress_flate(&alpha, flate_level)?;
+        let alpha_8bit = crate::stream_codec::encode_flate(&alpha, flate_level)?;
         let (alpha_data, alpha_bpc, alpha_codec) =
             if let Some(raster) = BilevelRaster::from_binary_gray_samples(&alpha, width, height) {
                 let encoded = raster.encode(flate_level)?;
@@ -3209,7 +3200,7 @@ fn prepare_image(
     } else if binary_components == Some(3)
         && let Some(packed) = pack_binary_samples(data, width, height, 3)
     {
-        let encoded_1bit = compress_flate(&packed, flate_level)?;
+        let encoded_1bit = crate::stream_codec::encode_flate(&packed, flate_level)?;
         if encoded_1bit.len() < encoded_8bit.len() {
             dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(1));
             encoding.binary_packed = true;
@@ -4875,7 +4866,7 @@ struct ApplyPlansContext<'a> {
     resources: OwnedDictionary,
     input: RewriteInput<'a>,
     config: &'a RasterLayoutConfig,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     alpha_crop_cache: &'a mut HashMap<ObjectHandle, AlphaCropCacheEntry>,
 }
 
@@ -5545,7 +5536,7 @@ fn build_merge_plans_for_scanner(
 pub fn normalize_raster_layout(
     document: &mut EditDocument,
     config: &RasterLayoutConfig,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     mut vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
 ) -> Result<RasterLayoutStats> {
     if *DEBUG_RASTER {

@@ -38,6 +38,7 @@ mod vector_compact;
 pub(crate) mod writer;
 
 pub use analyze::analyze_pdf;
+pub(crate) use config::FlateLevel;
 pub use config::{
     AnnotationPolicy, Config, ConfigBuilder, FlatePolicy, HiddenTextPolicy, ImagePolicy,
     OptimizationGoal, OutputProfile, PreservationConfig, PrivacyConfig, PrivacyLevel,

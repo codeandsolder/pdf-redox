@@ -7,12 +7,10 @@ use crate::{
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
 };
-use flate2::{Compression, write::ZlibEncoder};
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    io::Write as _,
     sync::LazyLock,
 };
 
@@ -1608,7 +1606,7 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
 )]
 fn factor_repeated_path_forms(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     mut pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
     pages: &[ObjectHandle],
 ) -> Result<PathFactoringOutcome> {
@@ -1907,7 +1905,7 @@ fn factor_repeated_path_forms(
 )]
 fn factor_repeated_transformed_blocks(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     mut cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
     rewritten_pages: &BTreeSet<ObjectHandle>,
     pages: &[ObjectHandle],
@@ -2637,7 +2635,7 @@ struct SelectedSharedRun {
 )]
 fn factor_shared_q_prefix_runs(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
 ) -> Result<VectorCompactionStats> {
     let mut page_data = Vec::new();
@@ -3084,7 +3082,7 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
 
 fn canonicalize_page_path_coordinates(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
 ) -> Result<VectorCompactionStats> {
     let mut stats = VectorCompactionStats::default();
@@ -3141,11 +3139,8 @@ fn canonicalize_page_path_coordinates(
     Ok(stats)
 }
 
-fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
-    let level = u32::try_from(flate_level.clamp(0, 9)).unwrap_or(9);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(bytes)?;
-    Ok(encoder.finish()?.len())
+fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
+    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
 #[expect(
@@ -3154,7 +3149,7 @@ fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
 )]
 pub fn compact_vector_paths(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
     mut raster_pre_scanned: BTreeMap<ObjectHandle, ProcessingVectorAnalysis>,
 ) -> Result<VectorCompactionStats> {

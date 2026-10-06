@@ -5,12 +5,8 @@ use crate::{
         replace_page_content, resolved_dictionary,
     },
 };
-use flate2::{Compression, write::ZlibEncoder};
 use smallvec::SmallVec;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Write as _,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SOURCE_PATHS_PER_BATCH: usize = 64;
 const MIN_PAGE_CONTENT_BYTES: usize = 64 * 1024;
@@ -875,7 +871,7 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 pub fn coalesce_optional_content(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<MarkedContentCoalesceStats> {
     let mut stats = MarkedContentCoalesceStats::default();
     for page in document.page_handles()? {
@@ -1073,7 +1069,7 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 pub fn compact_collinear_paths(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<CollinearPathStats> {
     let mut stats = CollinearPathStats::default();
     for page in document.page_handles()? {
@@ -1831,7 +1827,7 @@ struct StrokeFormPlan {
 )]
 pub fn factor_repeated_stroke_forms(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<StrokeFormFactorStats> {
     let pages = document.page_handles()?;
     let mut page_data = Vec::<StrokeFormPageData>::new();
@@ -2107,7 +2103,7 @@ fn outlined_glyph_replacements(plans: &[GlyphFontPlan]) -> Option<GlyphReplaceme
 fn outlined_glyph_estimated_after_flate(
     rewritten: &[u8],
     plans: &[GlyphFontPlan],
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<usize> {
     let mut total = compressed_len(rewritten, flate_level)?;
     let glyphs = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
@@ -2195,7 +2191,7 @@ fn outlined_glyph_font_dictionary(
 
 pub fn factor_outlined_glyphs(
     document: &mut EditDocument,
-    flate_level: i32,
+    flate_level: crate::FlateLevel,
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = OutlinedGlyphFactorStats::default();
     for page in document.page_handles()? {
@@ -2258,14 +2254,14 @@ pub fn factor_outlined_glyphs(
     Ok(stats)
 }
 
-fn compressed_len(bytes: &[u8], flate_level: i32) -> Result<usize> {
-    let level = u32::try_from(flate_level.clamp(0, 9)).unwrap_or(9);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(bytes)?;
-    Ok(encoder.finish()?.len())
+fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
+    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
-pub fn batch_page_paints(document: &mut EditDocument, flate_level: i32) -> Result<PaintBatchStats> {
+pub fn batch_page_paints(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
     for page in document.page_handles()? {
         let Some(object) = document.current_owned_object(page)? else {
