@@ -37,7 +37,7 @@ pub(crate) mod test_support;
 mod vector_compact;
 pub(crate) mod writer;
 
-pub use analyze::analyze_pdf;
+pub use analyze::{analyze_pdf, analyze_pdf_preflight};
 pub(crate) use config::FlateLevel;
 pub use config::{
     AnnotationPolicy, Config, HiddenTextPolicy, ImagePolicy, OptimizationGoal, PreservationConfig,

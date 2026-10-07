@@ -3,7 +3,7 @@ mod corpus;
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
     AnnotationPolicy, Config, OptimizationGoal, PrivacyLevel, analyze_microstroke_rasterization,
-    analyze_pdf, optimize_pdf,
+    analyze_pdf, analyze_pdf_preflight, optimize_pdf,
 };
 use std::{
     io::{self, Write},
@@ -178,8 +178,11 @@ struct Args {
     /// Run only the production pathological-microstroke detector/cost gate.
     #[arg(long, hide = true)]
     analyze_microstrokes: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "analyze_fast")]
     analyze_only: bool,
+    /// Run inexpensive structural analysis plus page/Form content-density counters.
+    #[arg(long, conflicts_with = "analyze_only")]
+    analyze_fast: bool,
     #[arg(long)]
     json: bool,
 }
@@ -309,6 +312,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if a.analyze_only {
         let r = analyze_pdf(&input)?;
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    if a.analyze_fast {
+        let r = analyze_pdf_preflight(&input)?;
         println!("{}", serde_json::to_string_pretty(&r)?);
         return Ok(());
     }

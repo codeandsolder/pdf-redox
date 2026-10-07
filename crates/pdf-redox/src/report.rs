@@ -240,6 +240,60 @@ pub struct PdfAnalysis {
     pub duplicate_font_payload_groups: usize,
     /// Embedded font-program bytes wasted by exact duplicate payloads.
     pub duplicate_font_payload_wasted_bytes: usize,
+    /// Total number of parsed instructions in page content streams.
+    #[serde(default)]
+    pub page_content_instruction_count: usize,
+    /// Maximum parsed instruction count on any single page.
+    #[serde(default)]
+    pub page_content_max_instructions_per_page: usize,
+    /// Total number of path-construction operators in page content streams.
+    #[serde(default)]
+    pub page_content_path_construction_operator_count: usize,
+    /// Maximum path-construction operator count on any single page.
+    #[serde(default)]
+    pub page_content_max_path_construction_operators_per_page: usize,
+    /// Total number of painting/showing operators in page content streams.
+    #[serde(default)]
+    pub page_content_paint_operator_count: usize,
+    /// Maximum painting/showing operator count on any single page.
+    #[serde(default)]
+    pub page_content_max_paint_operators_per_page: usize,
+    /// Total number of `Do` `XObject` painting operators in page content streams.
+    #[serde(default)]
+    pub page_content_xobject_paint_operator_count: usize,
+    /// Maximum `Do` operator count on any single page.
+    #[serde(default)]
+    pub page_content_max_xobject_paints_per_page: usize,
+    /// Total number of text-show operators (`Tj`, `TJ`, `'`, `"`) in page content streams.
+    #[serde(default)]
+    pub page_content_text_show_operator_count: usize,
+    /// Maximum text-show operator count on any single page.
+    #[serde(default)]
+    pub page_content_max_text_show_operators_per_page: usize,
+    /// Pages whose content parser stopped before the physical end of the stream.
+    #[serde(default)]
+    pub page_content_incomplete_parse_pages: usize,
+    /// Total number of parsed instructions in Form `XObject` content streams.
+    #[serde(default)]
+    pub form_content_instruction_count: usize,
+    /// Maximum parsed instruction count in any single Form `XObject`.
+    #[serde(default)]
+    pub form_content_max_instructions_per_form: usize,
+    /// Total number of path-construction operators in Form `XObject` streams.
+    #[serde(default)]
+    pub form_content_path_construction_operator_count: usize,
+    /// Maximum path-construction operator count in any single Form `XObject`.
+    #[serde(default)]
+    pub form_content_max_path_construction_operators_per_form: usize,
+    /// Total number of painting/showing operators in Form `XObject` streams.
+    #[serde(default)]
+    pub form_content_paint_operator_count: usize,
+    /// Maximum painting/showing operator count in any single Form `XObject`.
+    #[serde(default)]
+    pub form_content_max_paint_operators_per_form: usize,
+    /// Form `XObjects` whose content parser stopped before the physical end of the stream.
+    #[serde(default)]
+    pub form_content_incomplete_parse_forms: usize,
     /// Number of inline image entries.
     pub inline_image_count: usize,
     /// Total bytes represented by inline image.

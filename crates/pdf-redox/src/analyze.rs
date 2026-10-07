@@ -500,33 +500,128 @@ fn duplicate_payload_role_stats(
 }
 
 #[derive(Debug, Default)]
-struct InlineImageCounter {
-    count: usize,
-    bytes: usize,
-    payloads: HashMap<[u8; 32], (usize, usize)>,
+struct ContentAnalysisStats {
+    inline_count: usize,
+    inline_bytes: usize,
+    inline_payloads: HashMap<[u8; 32], (usize, usize)>,
+    page_instruction_count: usize,
+    page_max_instructions: usize,
+    page_path_construction_count: usize,
+    page_max_path_construction: usize,
+    page_paint_count: usize,
+    page_max_paints: usize,
+    page_xobject_paint_count: usize,
+    page_max_xobject_paints: usize,
+    page_text_show_count: usize,
+    page_max_text_shows: usize,
+    page_incomplete_parse_count: usize,
+    form_instruction_count: usize,
+    form_max_instructions: usize,
+    form_path_construction_count: usize,
+    form_max_path_construction: usize,
+    form_paint_count: usize,
+    form_max_paints: usize,
+    form_incomplete_parse_count: usize,
 }
 
-fn scan_inline_images(content: &[u8], counter: &mut InlineImageCounter) -> Result<()> {
+#[derive(Debug, Default)]
+struct PageInstructionCounter {
+    instructions: usize,
+    path_construction: usize,
+    paints: usize,
+    xobject_paints: usize,
+    text_shows: usize,
+}
+
+fn scan_content(
+    content: &[u8],
+    inline_count: &mut usize,
+    inline_bytes: &mut usize,
+    inline_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
+    mut page: Option<&mut PageInstructionCounter>,
+) -> Result<bool> {
     crate::content_stream::visit_instructions(content, |instruction| {
-        if &instruction.operator[..] == b"BI"
+        let operator = &instruction.operator[..];
+        if let Some(page) = page.as_deref_mut() {
+            page.instructions = page.instructions.saturating_add(1);
+            if matches!(operator, b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re") {
+                page.path_construction = page.path_construction.saturating_add(1);
+            }
+            if matches!(
+                operator,
+                b"S" | b"s"
+                    | b"f"
+                    | b"F"
+                    | b"f*"
+                    | b"B"
+                    | b"B*"
+                    | b"b"
+                    | b"b*"
+                    | b"sh"
+                    | b"Do"
+                    | b"BI"
+                    | b"Tj"
+                    | b"TJ"
+                    | b"'"
+                    | b"\""
+            ) {
+                page.paints = page.paints.saturating_add(1);
+            }
+            if operator == b"Do" {
+                page.xobject_paints = page.xobject_paints.saturating_add(1);
+            }
+            if matches!(operator, b"Tj" | b"TJ" | b"'" | b"\"") {
+                page.text_shows = page.text_shows.saturating_add(1);
+            }
+        }
+        if operator == b"BI"
             && let Some(hayro_syntax::object::Object::Stream(stream)) =
                 instruction.operands().next()
         {
             let bytes = stream.raw_data();
-            counter.count += 1;
-            counter.bytes += bytes.len();
-            record_payload(&mut counter.payloads, bytes.as_ref());
+            *inline_count = inline_count.saturating_add(1);
+            *inline_bytes = inline_bytes.saturating_add(bytes.len());
+            record_payload(inline_payloads, bytes.as_ref());
         }
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
-fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize, usize)> {
-    let mut counter = InlineImageCounter::default();
+fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
+    let mut out = ContentAnalysisStats::default();
     for page in document.page_handles()? {
         let content = page_content(document, page)?;
-        scan_inline_images(&content, &mut counter)?;
+        let mut page_stats = PageInstructionCounter::default();
+        let incomplete = scan_content(
+            &content,
+            &mut out.inline_count,
+            &mut out.inline_bytes,
+            &mut out.inline_payloads,
+            Some(&mut page_stats),
+        )?;
+        out.page_instruction_count = out
+            .page_instruction_count
+            .saturating_add(page_stats.instructions);
+        out.page_max_instructions = out.page_max_instructions.max(page_stats.instructions);
+        out.page_path_construction_count = out
+            .page_path_construction_count
+            .saturating_add(page_stats.path_construction);
+        out.page_max_path_construction = out
+            .page_max_path_construction
+            .max(page_stats.path_construction);
+        out.page_paint_count = out.page_paint_count.saturating_add(page_stats.paints);
+        out.page_max_paints = out.page_max_paints.max(page_stats.paints);
+        out.page_xobject_paint_count = out
+            .page_xobject_paint_count
+            .saturating_add(page_stats.xobject_paints);
+        out.page_max_xobject_paints = out.page_max_xobject_paints.max(page_stats.xobject_paints);
+        out.page_text_show_count = out
+            .page_text_show_count
+            .saturating_add(page_stats.text_shows);
+        out.page_max_text_shows = out.page_max_text_shows.max(page_stats.text_shows);
+        out.page_incomplete_parse_count = out
+            .page_incomplete_parse_count
+            .saturating_add(usize::from(incomplete));
     }
 
     let mut seen_forms = BTreeSet::new();
@@ -544,16 +639,31 @@ fn analyze_inline_images(document: &EditDocument) -> Result<(usize, usize, usize
             continue;
         }
         let content = document.decoded_owned_stream_data(&object)?;
-        scan_inline_images(&content, &mut counter)?;
+        let mut form_stats = PageInstructionCounter::default();
+        let incomplete = scan_content(
+            &content,
+            &mut out.inline_count,
+            &mut out.inline_bytes,
+            &mut out.inline_payloads,
+            Some(&mut form_stats),
+        )?;
+        out.form_instruction_count = out
+            .form_instruction_count
+            .saturating_add(form_stats.instructions);
+        out.form_max_instructions = out.form_max_instructions.max(form_stats.instructions);
+        out.form_path_construction_count = out
+            .form_path_construction_count
+            .saturating_add(form_stats.path_construction);
+        out.form_max_path_construction = out
+            .form_max_path_construction
+            .max(form_stats.path_construction);
+        out.form_paint_count = out.form_paint_count.saturating_add(form_stats.paints);
+        out.form_max_paints = out.form_max_paints.max(form_stats.paints);
+        out.form_incomplete_parse_count = out
+            .form_incomplete_parse_count
+            .saturating_add(usize::from(incomplete));
     }
-
-    let (duplicate_groups, duplicate_wasted_bytes) = duplicate_payload_stats(counter.payloads);
-    Ok((
-        counter.count,
-        counter.bytes,
-        duplicate_groups,
-        duplicate_wasted_bytes,
-    ))
+    Ok(out)
 }
 
 fn raw_stream_bytes<'a>(
@@ -600,26 +710,42 @@ fn filter_name(
 ///
 /// Returns an error when the input cannot be parsed or a referenced stream cannot be decoded.
 pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
-    analyze_pdf_impl(input, true)
+    analyze_pdf_impl(input, true, true)
+}
+
+/// Analyze inexpensive structural and content-density metrics without deep duplicate/compression work.
+///
+/// The returned report has `analysis_complete = false`.
+///
+/// # Errors
+///
+/// Returns an error when the input cannot be parsed or required structural streams cannot be decoded.
+pub fn analyze_pdf_preflight(input: &[u8]) -> Result<PdfAnalysis> {
+    analyze_pdf_impl(input, false, true)
 }
 
 pub fn analyze_document_for_optimization(
     input: &[u8],
     document: &EditDocument,
 ) -> Result<PdfAnalysis> {
-    analyze_document_impl(input, document, false)
+    analyze_document_impl(input, document, false, false)
 }
 
-fn analyze_pdf_impl(input: &[u8], deep: bool) -> Result<PdfAnalysis> {
+fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
-    analyze_document_impl(input, &document, deep)
+    analyze_document_impl(input, &document, deep, content_density)
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "the analysis is a single ordered aggregation pass over related document metrics"
 )]
-fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> Result<PdfAnalysis> {
+fn analyze_document_impl(
+    input: &[u8],
+    document: &EditDocument,
+    deep: bool,
+    content_density: bool,
+) -> Result<PdfAnalysis> {
     let objects = all_source_objects(document)?;
     let mut out = PdfAnalysis {
         input_bytes: input.len(),
@@ -872,17 +998,43 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
             out.duplicate_font_payload_groups,
             out.duplicate_font_payload_wasted_bytes,
         ) = duplicate_payload_stats(font_payloads);
+    }
 
-        match analyze_inline_images(document) {
-            Ok((count, bytes, duplicate_groups, duplicate_wasted_bytes)) => {
-                out.inline_image_count = count;
-                out.inline_image_bytes = bytes;
+    if content_density {
+        match analyze_content(document) {
+            Ok(content) => {
+                let (duplicate_groups, duplicate_wasted_bytes) =
+                    duplicate_payload_stats(content.inline_payloads);
+                out.inline_image_count = content.inline_count;
+                out.inline_image_bytes = content.inline_bytes;
                 out.duplicate_inline_image_payload_groups = duplicate_groups;
                 out.duplicate_inline_image_payload_wasted_bytes = duplicate_wasted_bytes;
+                out.page_content_instruction_count = content.page_instruction_count;
+                out.page_content_max_instructions_per_page = content.page_max_instructions;
+                out.page_content_path_construction_operator_count =
+                    content.page_path_construction_count;
+                out.page_content_max_path_construction_operators_per_page =
+                    content.page_max_path_construction;
+                out.page_content_paint_operator_count = content.page_paint_count;
+                out.page_content_max_paint_operators_per_page = content.page_max_paints;
+                out.page_content_xobject_paint_operator_count = content.page_xobject_paint_count;
+                out.page_content_max_xobject_paints_per_page = content.page_max_xobject_paints;
+                out.page_content_text_show_operator_count = content.page_text_show_count;
+                out.page_content_max_text_show_operators_per_page = content.page_max_text_shows;
+                out.page_content_incomplete_parse_pages = content.page_incomplete_parse_count;
+                out.form_content_instruction_count = content.form_instruction_count;
+                out.form_content_max_instructions_per_form = content.form_max_instructions;
+                out.form_content_path_construction_operator_count =
+                    content.form_path_construction_count;
+                out.form_content_max_path_construction_operators_per_form =
+                    content.form_max_path_construction;
+                out.form_content_paint_operator_count = content.form_paint_count;
+                out.form_content_max_paint_operators_per_form = content.form_max_paints;
+                out.form_content_incomplete_parse_forms = content.form_incomplete_parse_count;
             }
             Err(error) => out
                 .warnings
-                .push(format!("inline-image analysis skipped: {error}")),
+                .push(format!("content-stream analysis skipped: {error}")),
         }
     }
 
@@ -951,4 +1103,44 @@ fn analyze_document_impl(input: &[u8], document: &EditDocument, deep: bool) -> R
         .map(|(kind, (count, note))| RiskFinding { kind, count, note })
         .collect();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ClassicPdfBuilder;
+
+    fn content_density_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /F 5 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q /F Do Q 0 0 m 10 10 l S BT (x) Tj ET")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>>",
+            b"0 0 m 5 5 l S",
+        )?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn preflight_analysis_reports_page_and_form_content_density() -> Result<()> {
+        let input = content_density_fixture()?;
+        let analysis = analyze_pdf_preflight(&input)?;
+        assert!(!analysis.analysis_complete);
+        assert_eq!(analysis.page_content_instruction_count, 9);
+        assert_eq!(analysis.page_content_max_instructions_per_page, 9);
+        assert_eq!(analysis.page_content_path_construction_operator_count, 2);
+        assert_eq!(analysis.page_content_paint_operator_count, 3);
+        assert_eq!(analysis.page_content_xobject_paint_operator_count, 1);
+        assert_eq!(analysis.page_content_text_show_operator_count, 1);
+        assert_eq!(analysis.form_content_instruction_count, 3);
+        assert_eq!(analysis.form_content_max_instructions_per_form, 3);
+        assert_eq!(analysis.form_content_path_construction_operator_count, 2);
+        assert_eq!(analysis.form_content_paint_operator_count, 1);
+        assert_eq!(analysis.page_content_incomplete_parse_pages, 0);
+        assert_eq!(analysis.form_content_incomplete_parse_forms, 0);
+        Ok(())
+    }
 }
