@@ -40,8 +40,8 @@ pub(crate) mod writer;
 pub use analyze::analyze_pdf;
 pub(crate) use config::FlateLevel;
 pub use config::{
-    AnnotationPolicy, Config, ConfigBuilder, HiddenTextPolicy, ImagePolicy, OptimizationGoal,
-    OutputProfile, PreservationConfig, PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
+    AnnotationPolicy, Config, HiddenTextPolicy, ImagePolicy, OptimizationGoal, PreservationConfig,
+    PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
 };
 pub use error::{Error, Result, SourceLoadError};
 pub use microstroke::MicrostrokeRasterStats;
