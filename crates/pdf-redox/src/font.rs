@@ -77,8 +77,8 @@ fn single_font_ttc_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
     crate::font_subset::unwrap_single_face_collection(bytes)
 }
 
-fn sfnt_for_pdf_rendering(bytes: &[u8], usage: FontProgramUsage) -> Option<(Vec<u8>, usize)> {
-    crate::font_subset::strip_pdf_unused_tables(bytes, usage.cidfont_type2_only())
+fn sfnt_for_pdf_rendering(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    crate::font_subset::strip_pdf_unused_tables(bytes)
 }
 
 fn composite_components(glyph: &[u8]) -> Option<Vec<u16>> {
@@ -429,7 +429,7 @@ fn union_sparse_cid_font_programs(
         if decoded.get(..4) != Some(&[0, 1, 0, 0]) {
             continue;
         }
-        let font = sfnt_for_pdf_rendering(&decoded, usage)
+        let font = sfnt_for_pdf_rendering(&decoded)
             .map(|(trimmed, _)| trimmed)
             .unwrap_or(decoded);
         let Some(_) = sparse_cid_union_skeleton_hash(&font) else {
@@ -1929,7 +1929,7 @@ pub fn strip_font_editing_tables(
             false
         };
         changed |= outline_subset_changed;
-        if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate, usage) {
+        if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate) {
             candidate = trimmed;
             removed_decoded_bytes = removed;
             changed = true;
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(first.programs_optimized, 1);
         assert_eq!(first.programs_glyph_subset, 0);
         assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
-        assert!(first.decoded_table_bytes_removed > 8192);
+        assert_eq!(first.decoded_table_bytes_removed, 8192);
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
@@ -2414,8 +2414,7 @@ mod tests {
             (*b"LTSH", b"linear threshold"),
             (*b"VDMX", b"vertical device metrics"),
         ]);
-        let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&source, FontProgramUsage::default())
-        else {
+        let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&source) else {
             return Err(Error::Invalid(
                 "expected removable rendering-unused tables".to_owned(),
             ));
@@ -2436,7 +2435,7 @@ mod tests {
     }
 
     #[test]
-    fn cidfont_type2_drops_cmap_and_post() -> Result<()> {
+    fn rendering_sfnt_preserves_required_identity_tables() -> Result<()> {
         let head = [0_u8; 54];
         let source = sfnt(&[
             (*b"head", &head),
@@ -2444,30 +2443,19 @@ mod tests {
             (*b"cmap", b"mapping"),
             (*b"post", b"names"),
             (*b"name", b"editing metadata"),
+            (*b"OS/2", b"metrics metadata"),
+            (*b"GSUB", b"substitution"),
         ]);
-        let cid_usage = FontProgramUsage {
-            simple_truetype: false,
-            cidfont_type2: true,
-            cidfont_type0: false,
-        };
-        let Some((trimmed, _)) = sfnt_for_pdf_rendering(&source, cid_usage) else {
-            return Err(Error::Invalid("expected CID-only table removal".to_owned()));
+        let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&source) else {
+            return Err(Error::Invalid("expected optional table removal".to_owned()));
         };
         let remaining = tags(&trimmed);
-        assert!(!remaining.contains(b"cmap"));
-        assert!(!remaining.contains(b"post"));
-
-        let simple_usage = FontProgramUsage {
-            simple_truetype: true,
-            cidfont_type2: false,
-            cidfont_type0: false,
-        };
-        let Some((simple, _)) = sfnt_for_pdf_rendering(&source, simple_usage) else {
-            return Err(Error::Invalid("expected metadata table removal".to_owned()));
-        };
-        let simple_remaining = tags(&simple);
-        assert!(simple_remaining.contains(b"cmap"));
-        assert!(simple_remaining.contains(b"post"));
+        assert!(remaining.contains(b"cmap"));
+        assert!(remaining.contains(b"post"));
+        assert!(remaining.contains(b"name"));
+        assert!(remaining.contains(b"OS/2"));
+        assert!(!remaining.contains(b"GSUB"));
+        assert_eq!(removed, b"substitution".len());
         Ok(())
     }
 
@@ -2475,6 +2463,6 @@ mod tests {
     fn rendering_sfnt_is_noop_without_removable_tables() {
         let head = [0_u8; 54];
         let source = sfnt(&[(*b"head", &head), (*b"glyf", b"glyphs")]);
-        assert!(sfnt_for_pdf_rendering(&source, FontProgramUsage::default()).is_none());
+        assert!(sfnt_for_pdf_rendering(&source).is_none());
     }
 }

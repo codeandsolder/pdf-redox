@@ -11,7 +11,7 @@ use write_fonts::{
     types::{GlyphId, NameId, Tag},
 };
 
-const PDF_RENDERING_UNUSED_TABLES: [Tag; 16] = [
+const PDF_RENDERING_UNUSED_TABLES: [Tag; 14] = [
     Tag::new(b"BASE"),
     Tag::new(b"GDEF"),
     Tag::new(b"GPOS"),
@@ -22,14 +22,11 @@ const PDF_RENDERING_UNUSED_TABLES: [Tag; 16] = [
     Tag::new(b"vhea"),
     Tag::new(b"vmtx"),
     Tag::new(b"DSIG"),
-    Tag::new(b"name"),
-    Tag::new(b"OS/2"),
     Tag::new(b"PCLT"),
     Tag::new(b"hdmx"),
     Tag::new(b"LTSH"),
     Tag::new(b"VDMX"),
 ];
-const CID_TYPE2_UNUSED_TABLES: [Tag; 2] = [Tag::new(b"cmap"), Tag::new(b"post")];
 
 fn rebuild_font(
     font: &FontRef<'_>,
@@ -67,12 +64,9 @@ pub fn unwrap_single_face_collection(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Rebuild a standalone OpenType font while omitting tables that an already-
 /// positioned PDF text stream does not use for rendering.
-pub fn strip_pdf_unused_tables(bytes: &[u8], cid_type2_only: bool) -> Option<(Vec<u8>, usize)> {
+pub fn strip_pdf_unused_tables(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let font = FontRef::new(bytes).ok()?;
-    let result = rebuild_font(&font, |tag| {
-        !(PDF_RENDERING_UNUSED_TABLES.contains(&tag)
-            || cid_type2_only && CID_TYPE2_UNUSED_TABLES.contains(&tag))
-    })?;
+    let result = rebuild_font(&font, |tag| !PDF_RENDERING_UNUSED_TABLES.contains(&tag))?;
     (result.1 > 0).then_some(result)
 }
 
