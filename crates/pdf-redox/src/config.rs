@@ -431,15 +431,6 @@ impl Config {
     }
 
     #[must_use]
-    /// Returns the policy that retains what can affect the default visible page surface while dropping non-visual semantics.
-    pub fn visible_surface() -> Self {
-        Self {
-            preservation: PreservationConfig::visible_surface(),
-            ..Self::optimize_only()
-        }
-    }
-
-    #[must_use]
     /// Returns the perceptual preset with size-gated JPEG optimization enabled.
     pub fn perceptual() -> Self {
         Self {

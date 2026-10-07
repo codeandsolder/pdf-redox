@@ -380,12 +380,6 @@ impl StreamData {
             Self::Owned(bytes) => Ok(Cow::Borrowed(bytes)),
         }
     }
-
-    #[must_use]
-    /// Returns whether this stream payload still refers directly to immutable source bytes.
-    pub const fn is_source_backed(&self) -> bool {
-        matches!(self, Self::Source(_))
-    }
 }
 
 /// Owned COS value used by the mutation overlay.
@@ -499,11 +493,6 @@ impl ObjectOverlay {
         }
     }
 
-    /// Removes and returns any pending change for an existing source object.
-    pub fn clear_change(&mut self, id: ObjectId) -> Option<ExistingObjectChange> {
-        self.existing.remove(&id)
-    }
-
     #[must_use]
     /// Returns the pending change for an existing source object, if any.
     pub fn change(&self, id: ObjectId) -> Option<&ExistingObjectChange> {
@@ -531,12 +520,6 @@ impl ObjectOverlay {
     /// Returns a mutable newly added overlay object by temporary identifier.
     pub fn added_mut(&mut self, id: NewObjectId) -> Option<&mut OwnedObject> {
         self.added.get_mut(id.index())
-    }
-
-    #[must_use]
-    /// Returns all objects newly added to the overlay.
-    pub fn added_objects(&self) -> &[OwnedObject] {
-        &self.added
     }
 
     #[must_use]
