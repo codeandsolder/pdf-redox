@@ -779,6 +779,9 @@ pub struct OptimizationReport {
     /// Number of named destination wrappers inlined.
     pub named_destination_wrappers_inlined: usize,
     #[serde(default)]
+    /// Number of indirect named-destination arrays inlined into name-tree leaves.
+    pub named_destination_arrays_inlined: usize,
+    #[serde(default)]
     /// Number of microstroke pages rasterized.
     pub microstroke_pages_rasterized: usize,
     #[serde(default)]

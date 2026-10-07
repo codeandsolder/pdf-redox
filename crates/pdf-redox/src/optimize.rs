@@ -850,14 +850,16 @@ fn optimize_pdf_with_document(
     if structure_compaction.page_tree_nodes_removed > 0
         || structure_compaction.name_tree_nodes_removed > 0
         || structure_compaction.named_destination_wrappers_inlined > 0
+        || structure_compaction.named_destination_arrays_inlined > 0
     {
         notes.push(format!(
-            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, and inlined {} trivial named-destination wrapper object(s).",
+            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), and inlined {} indirect destination array(s).",
             structure_compaction.page_tree_nodes_before,
             structure_compaction.page_tree_nodes_after,
             structure_compaction.name_tree_nodes_before,
             structure_compaction.name_tree_nodes_after,
-            structure_compaction.named_destination_wrappers_inlined
+            structure_compaction.named_destination_wrappers_inlined,
+            structure_compaction.named_destination_arrays_inlined
         ));
     }
     if flate.streams_selected > 0 {
@@ -1085,6 +1087,7 @@ fn optimize_pdf_with_document(
         name_tree_nodes_after: structure_compaction.name_tree_nodes_after,
         name_tree_nodes_removed: structure_compaction.name_tree_nodes_removed,
         named_destination_wrappers_inlined: structure_compaction.named_destination_wrappers_inlined,
+        named_destination_arrays_inlined: structure_compaction.named_destination_arrays_inlined,
         microstroke_pages_rasterized: microstroke_raster.pages_rewritten,
         microstroke_runs_rasterized: microstroke_raster.runs_rasterized,
         microstroke_strokes_rasterized: microstroke_raster.strokes_rasterized,

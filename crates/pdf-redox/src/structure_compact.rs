@@ -15,6 +15,7 @@ pub struct StructureCompactionStats {
     pub name_tree_nodes_after: usize,
     pub name_tree_nodes_removed: usize,
     pub named_destination_wrappers_inlined: usize,
+    pub named_destination_arrays_inlined: usize,
 }
 
 fn dictionary_reference(dictionary: &OwnedDictionary, key: &[u8]) -> Option<ObjectHandle> {
@@ -301,11 +302,12 @@ fn collect_name_tree(
     }))
 }
 
-fn inline_destination_wrappers(
+fn inline_destination_objects(
     document: &EditDocument,
     snapshot: &mut NameTreeSnapshot,
-) -> Result<usize> {
-    let mut inlined = 0usize;
+) -> Result<(usize, usize)> {
+    let mut wrappers_inlined = 0usize;
+    let mut arrays_inlined = 0usize;
     for leaf in &mut snapshot.leaves {
         for pair in leaf.names.as_chunks_mut::<2>().0 {
             let OwnedObject::Reference(target) = pair[1] else {
@@ -314,17 +316,23 @@ fn inline_destination_wrappers(
             let Some(object) = document.current_owned_object(target)? else {
                 continue;
             };
-            let OwnedObject::Dictionary(dictionary) = object else {
-                continue;
-            };
-            if dictionary.len() == 1 && dictionary.contains_key(b"D".as_slice()) {
-                pair[1] = OwnedObject::Dictionary(dictionary);
-                inlined = inlined.saturating_add(1);
+            match object {
+                OwnedObject::Array(array) => {
+                    pair[1] = OwnedObject::Array(array);
+                    arrays_inlined = arrays_inlined.saturating_add(1);
+                }
+                OwnedObject::Dictionary(dictionary)
+                    if dictionary.len() == 1 && dictionary.contains_key(b"D".as_slice()) =>
+                {
+                    pair[1] = OwnedObject::Dictionary(dictionary);
+                    wrappers_inlined = wrappers_inlined.saturating_add(1);
+                }
+                _ => {}
             }
         }
     }
 
-    if inlined != 0 {
+    if wrappers_inlined != 0 || arrays_inlined != 0 {
         snapshot.pairs.clear();
         for leaf in &snapshot.leaves {
             for pair in leaf.names.as_chunks::<2>().0 {
@@ -336,7 +344,7 @@ fn inline_destination_wrappers(
         }
         snapshot.pairs.sort_by(|a, b| a.0.cmp(&b.0));
     }
-    Ok(inlined)
+    Ok((wrappers_inlined, arrays_inlined))
 }
 
 const fn name_tree_required_nodes(pairs: usize) -> usize {
@@ -523,14 +531,17 @@ fn compact_catalog_name_trees(
         if before == 0 {
             continue;
         }
-        let inlined = if kind.as_slice() == b"Dests" {
-            inline_destination_wrappers(document, &mut snapshot)?
+        let (wrappers_inlined, arrays_inlined) = if kind.as_slice() == b"Dests" {
+            inline_destination_objects(document, &mut snapshot)?
         } else {
-            0
+            (0, 0)
         };
         stats.named_destination_wrappers_inlined = stats
             .named_destination_wrappers_inlined
-            .saturating_add(inlined);
+            .saturating_add(wrappers_inlined);
+        stats.named_destination_arrays_inlined = stats
+            .named_destination_arrays_inlined
+            .saturating_add(arrays_inlined);
 
         let required = name_tree_required_nodes(snapshot.pairs.len());
         stats.name_tree_nodes_before = stats.name_tree_nodes_before.saturating_add(before);
@@ -543,7 +554,7 @@ fn compact_catalog_name_trees(
                 .name_tree_nodes_removed
                 .saturating_add(before.saturating_sub(after));
         } else {
-            if inlined != 0 {
+            if wrappers_inlined != 0 || arrays_inlined != 0 {
                 apply_leaf_inlining(document, &snapshot)?;
             }
             stats.name_tree_nodes_after = stats.name_tree_nodes_after.saturating_add(before);
@@ -557,4 +568,52 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
     compact_catalog_name_trees(document, &mut stats)?;
     compact_page_tree(document, &mut stats)?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn inlines_indirect_named_destination_arrays() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Names 7 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"")?;
+        pdf.object(7, b"<< /Dests 8 0 R >>")?;
+        pdf.object(8, b"<< /Names [(target) 9 0 R] >>")?;
+        pdf.object(9, b"[3 0 R /Fit]")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.named_destination_arrays_inlined, 1);
+
+        let catalog = current_dictionary(
+            &document,
+            ObjectHandle::Existing(document.source().catalog_id()),
+        )?
+        .expect("catalog");
+        let names = dictionary_reference(&catalog, b"Names").expect("Names");
+        let names = current_dictionary(&document, names)?.expect("Names dictionary");
+        let dests = dictionary_reference(&names, b"Dests").expect("Dests");
+        let dests = current_dictionary(&document, dests)?.expect("Dests name tree");
+        let Some(OwnedObject::Array(entries)) = dests.get(b"Names".as_slice()) else {
+            panic!("Dests root has no direct Names array");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], OwnedObject::String(b"target".to_vec()));
+        assert!(matches!(
+            &entries[1],
+            OwnedObject::Array(destination)
+                if destination.len() == 2
+                    && matches!(destination[0], OwnedObject::Reference(_))
+                    && destination[1] == OwnedObject::Name(b"Fit".to_vec())
+        ));
+        Ok(())
+    }
 }
