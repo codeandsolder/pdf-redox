@@ -8,7 +8,6 @@ fuzz_target!(|data: &[u8]| {
 
     let mut config = Config::optimize_only();
     config.optimization_goal = OptimizationGoal::Processing;
-    config.compact_vector_paths = true;
     config.raster_layout.enabled = true;
     config.raster_layout.bake_masks = true;
     let _ = optimize_pdf(data, &config);

@@ -396,9 +396,6 @@ pub struct Config {
     /// Primary optimization objective used when size and display-list simplicity conflict.
     #[serde(default)]
     pub optimization_goal: OptimizationGoal,
-    /// Batch semantically equivalent vector path paints while preserving vector geometry.
-    #[serde(default)]
-    pub compact_vector_paths: bool,
     /// Rasterize only pathological fields of hundreds of tiny opaque vector strokes.
     /// This is intentionally lossy at the vector/semantic level, so it is off for the
     /// normal optimize/processing policies and enabled by default only for Print.
@@ -424,7 +421,6 @@ impl Config {
             remove_large_diagonal_text: false,
             remove_repeated_page_objects: false,
             optimization_goal: OptimizationGoal::Size,
-            compact_vector_paths: false,
             rasterize_excessive_small_vectors: false,
             elide_icc_profiles_to_alternate: false,
         }

@@ -117,9 +117,6 @@ struct Args {
     /// Choose whether conflicting rewrites favor encoded bytes or a simpler display list.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
-    /// Compact compatible vector path paints without rasterizing them.
-    #[arg(long)]
-    compact_vector_paths: bool,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by the Print profile.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -253,8 +250,6 @@ fn config_from_args(args: &Args) -> Config {
         OptimizeForArg::Size => OptimizationGoal::Size,
         OptimizeForArg::Processing => OptimizationGoal::Processing,
     };
-    cfg.compact_vector_paths =
-        args.compact_vector_paths || matches!(args.optimize_for, OptimizeForArg::Processing);
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
         && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled =
@@ -445,6 +440,7 @@ mod tests {
             &["pdf-redox", "input.pdf", "--flate-policy", "preserve"][..],
             &["pdf-redox", "input.pdf", "--normalize-content"][..],
             &["pdf-redox", "input.pdf", "--prune-resources"][..],
+            &["pdf-redox", "input.pdf", "--compact-vector-paths"][..],
             &[
                 "pdf-redox",
                 "input.pdf",

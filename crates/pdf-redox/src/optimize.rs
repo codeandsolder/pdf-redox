@@ -427,10 +427,7 @@ fn optimize_pdf_with_document(
         } else {
             false
         };
-        if cfg.compact_vector_paths
-            && !raster_proved_no_vector_candidate
-            && !processing_proved_no_vector_candidate
-        {
+        if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
             let vector_cache = if raster_cache_is_exact {
                 std::mem::take(&mut raster_vector_cache)
             } else {
@@ -448,8 +445,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
-        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             coalesce_optional_content(&mut document, flate_level)
         } else {
             Ok(MarkedContentCoalesceStats::default())
@@ -457,8 +453,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
-        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             compact_collinear_paths(&mut document, flate_level)
         } else {
             Ok(CollinearPathStats::default())
@@ -466,8 +461,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
-        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             factor_outlined_glyphs(&mut document, flate_level)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
@@ -475,8 +469,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
-        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             batch_page_paints(&mut document, flate_level)
         } else {
             Ok(PaintBatchStats::default())
@@ -484,8 +477,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
-        if cfg.compact_vector_paths && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             factor_repeated_stroke_forms(&mut document, flate_level)
         } else {
             Ok(StrokeFormFactorStats::default())
