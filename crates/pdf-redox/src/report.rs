@@ -589,6 +589,18 @@ pub struct OptimizationReport {
     pub image_duplicate_raw_bytes: usize,
     /// Number of image references canonicalized.
     pub image_references_canonicalized: usize,
+    /// Number of exact duplicate coloured tiling-pattern cell payload groups factored.
+    #[serde(default)]
+    pub pattern_payload_groups_factored: usize,
+    /// Number of Pattern streams rewritten as wrappers around shared cell Forms.
+    #[serde(default)]
+    pub pattern_payload_patterns_rewritten: usize,
+    /// Number of shared Form `XObjects` created for duplicate Pattern cell payloads.
+    #[serde(default)]
+    pub pattern_payload_forms_created: usize,
+    /// Duplicate encoded Pattern cell payload bytes moved behind shared Forms, before wrapper overhead.
+    #[serde(default)]
+    pub pattern_payload_duplicate_raw_bytes_factored: usize,
     /// Number of form duplicate streams detected.
     pub form_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to form duplicate.

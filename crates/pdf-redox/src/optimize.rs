@@ -8,6 +8,7 @@ use crate::{
         canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
         canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
+        factor_duplicate_pattern_payloads,
     },
     flate::{compress_unfiltered_streams, optimize_flate_streams},
     font::{
@@ -320,6 +321,9 @@ fn optimize_pdf_with_document(
     // entropy normalization so both can converge with existing Image XObjects.
     let image_dedup = timed(&mut timings, "image-dedup", || {
         canonicalize_image_xobjects(&mut document)
+    })?;
+    let pattern_payload_factor = timed(&mut timings, "pattern-payload-factor", || {
+        factor_duplicate_pattern_payloads(&mut document)
     })?;
     let form_dedup = timed(&mut timings, "form-dedup", || {
         canonicalize_form_xobjects(&mut document)
@@ -862,6 +866,15 @@ fn optimize_pdf_with_document(
             structure_compaction.named_destination_arrays_inlined
         ));
     }
+    if pattern_payload_factor.groups_factored > 0 {
+        notes.push(format!(
+            "Factored {} duplicate coloured tiling-pattern payload group(s) across {} Pattern stream(s) into {} shared Form XObject(s), eliminating {} bytes of duplicate encoded cell payload before wrapper overhead.",
+            pattern_payload_factor.groups_factored,
+            pattern_payload_factor.patterns_rewritten,
+            pattern_payload_factor.forms_created,
+            pattern_payload_factor.duplicate_raw_bytes_factored
+        ));
+    }
     if flate.streams_selected > 0 {
         notes.push(format!(
             "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
@@ -1013,6 +1026,11 @@ fn optimize_pdf_with_document(
         image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
         image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
         image_references_canonicalized: image_dedup.references_canonicalized,
+        pattern_payload_groups_factored: pattern_payload_factor.groups_factored,
+        pattern_payload_patterns_rewritten: pattern_payload_factor.patterns_rewritten,
+        pattern_payload_forms_created: pattern_payload_factor.forms_created,
+        pattern_payload_duplicate_raw_bytes_factored: pattern_payload_factor
+            .duplicate_raw_bytes_factored,
         form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
         form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
         form_references_canonicalized: form_dedup.references_canonicalized,
