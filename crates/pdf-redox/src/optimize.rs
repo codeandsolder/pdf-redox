@@ -32,6 +32,9 @@ use crate::{
         StrokeFormFactorStats, batch_page_paints, coalesce_optional_content,
         compact_collinear_paths, factor_outlined_glyphs, factor_repeated_stroke_forms,
     },
+    polyline_simplify::{
+        MAX_POLYLINE_PAGE_ERROR_PT, PolylineSimplificationStats, simplify_page_polylines,
+    },
     preservation::{PreservationStats, apply_preservation_policy},
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
@@ -488,6 +491,14 @@ fn optimize_pdf_with_document(
         }
     })?;
 
+    let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            simplify_page_polylines(&mut document, flate_level)
+        } else {
+            Ok(PolylineSimplificationStats::default())
+        }
+    })?;
+
     let resource_prune = timed(&mut timings, "resource-prune", || {
         let shared_usage_is_exact = cfg.raster_layout.enabled
             && raster_layout.resource_inventory_complete
@@ -786,6 +797,15 @@ fn optimize_pdf_with_document(
             vector_compaction.path_coordinate_estimated_flate_bytes_saved
         ));
     }
+    if polyline_simplification.vertices_removed > 0 {
+        let vertices_removed = polyline_simplification.vertices_removed;
+        let pages_rewritten = polyline_simplification.pages_rewritten;
+        let decoded_bytes_removed = polyline_simplification.decoded_bytes_removed;
+        let estimated_flate_bytes_saved = polyline_simplification.estimated_flate_bytes_saved;
+        notes.push(format!(
+            "Simplified {vertices_removed} oversampled filled-polyline vertex/vertices across {pages_rewritten} page(s) within a {MAX_POLYLINE_PAGE_ERROR_PT:.3} pt page-space deviation bound, removing about {decoded_bytes_removed} decoded bytes and saving about {estimated_flate_bytes_saved} encoded bytes."
+        ));
+    }
     if marked_content.boundaries_coalesced > 0 {
         notes.push(format!(
             "Coalesced {} redundant adjacent optional-content boundary pair(s) across {} page(s), removing about {} decoded bytes and saving about {} encoded bytes while preserving the OCG layer scopes.",
@@ -965,6 +985,12 @@ fn optimize_pdf_with_document(
         marked_content_boundaries_coalesced: marked_content.boundaries_coalesced,
         marked_content_decoded_bytes_removed: marked_content.decoded_bytes_removed,
         marked_content_estimated_flate_bytes_saved: marked_content.estimated_flate_bytes_saved,
+        polyline_simplification_pages_rewritten: polyline_simplification.pages_rewritten,
+        polyline_simplification_vertices_removed: polyline_simplification.vertices_removed,
+        polyline_simplification_decoded_bytes_removed: polyline_simplification
+            .decoded_bytes_removed,
+        polyline_simplification_estimated_flate_bytes_saved: polyline_simplification
+            .estimated_flate_bytes_saved,
         collinear_path_pages_rewritten: collinear_paths.pages_rewritten,
         collinear_path_vertices_removed: collinear_paths.vertices_removed,
         collinear_path_decoded_bytes_removed: collinear_paths.decoded_bytes_removed,

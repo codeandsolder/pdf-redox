@@ -489,6 +489,18 @@ pub struct OptimizationReport {
     /// Estimated encoded bytes saved by optional-content boundary coalescing.
     #[serde(default)]
     pub marked_content_estimated_flate_bytes_saved: usize,
+    /// Number of pages rewritten by bounded Processing-mode polyline simplification.
+    #[serde(default)]
+    pub polyline_simplification_pages_rewritten: usize,
+    /// Number of line vertices removed within the bounded page-space deviation.
+    #[serde(default)]
+    pub polyline_simplification_vertices_removed: usize,
+    /// Decoded page-content bytes removed by bounded polyline simplification.
+    #[serde(default)]
+    pub polyline_simplification_decoded_bytes_removed: usize,
+    /// Estimated encoded bytes saved by bounded polyline simplification.
+    #[serde(default)]
+    pub polyline_simplification_estimated_flate_bytes_saved: usize,
     /// Number of pages rewritten by exact collinear path compaction.
     #[serde(default)]
     pub collinear_path_pages_rewritten: usize,
