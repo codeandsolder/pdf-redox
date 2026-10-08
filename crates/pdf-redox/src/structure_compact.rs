@@ -597,13 +597,19 @@ mod tests {
             &document,
             ObjectHandle::Existing(document.source().catalog_id()),
         )?
-        .expect("catalog");
-        let names = dictionary_reference(&catalog, b"Names").expect("Names");
-        let names = current_dictionary(&document, names)?.expect("Names dictionary");
-        let dests = dictionary_reference(&names, b"Dests").expect("Dests");
-        let dests = current_dictionary(&document, dests)?.expect("Dests name tree");
+        .ok_or_else(|| crate::Error::Invalid("catalog is missing".to_owned()))?;
+        let names = dictionary_reference(&catalog, b"Names")
+            .ok_or_else(|| crate::Error::Invalid("Names reference is missing".to_owned()))?;
+        let names = current_dictionary(&document, names)?
+            .ok_or_else(|| crate::Error::Invalid("Names dictionary is missing".to_owned()))?;
+        let dests = dictionary_reference(&names, b"Dests")
+            .ok_or_else(|| crate::Error::Invalid("Dests reference is missing".to_owned()))?;
+        let dests = current_dictionary(&document, dests)?
+            .ok_or_else(|| crate::Error::Invalid("Dests name tree is missing".to_owned()))?;
         let Some(OwnedObject::Array(entries)) = dests.get(b"Names".as_slice()) else {
-            panic!("Dests root has no direct Names array");
+            return Err(crate::Error::Invalid(
+                "Dests root has no direct Names array".to_owned(),
+            ));
         };
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], OwnedObject::String(b"target".to_vec()));

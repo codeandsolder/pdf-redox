@@ -798,13 +798,12 @@ fn optimize_pdf_with_document(
         ));
     }
     if polyline_simplification.vertices_removed > 0 {
+        let vertices_removed = polyline_simplification.vertices_removed;
+        let pages_rewritten = polyline_simplification.pages_rewritten;
+        let decoded_bytes_removed = polyline_simplification.decoded_bytes_removed;
+        let estimated_flate_bytes_saved = polyline_simplification.estimated_flate_bytes_saved;
         notes.push(format!(
-            "Simplified {} oversampled filled-polyline vertex/vertices across {} page(s) within a {:.3} pt page-space deviation bound, removing about {} decoded bytes and saving about {} encoded bytes.",
-            polyline_simplification.vertices_removed,
-            polyline_simplification.pages_rewritten,
-            MAX_POLYLINE_PAGE_ERROR_PT,
-            polyline_simplification.decoded_bytes_removed,
-            polyline_simplification.estimated_flate_bytes_saved
+            "Simplified {vertices_removed} oversampled filled-polyline vertex/vertices across {pages_rewritten} page(s) within a {MAX_POLYLINE_PAGE_ERROR_PT:.3} pt page-space deviation bound, removing about {decoded_bytes_removed} decoded bytes and saving about {estimated_flate_bytes_saved} encoded bytes."
         ));
     }
     if marked_content.boundaries_coalesced > 0 {

@@ -2854,23 +2854,27 @@ mod tests {
 
         let first = document
             .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(5, 0)))?
-            .expect("first pattern");
+            .ok_or_else(|| crate::Error::Invalid("first pattern is missing".to_owned()))?;
         let second = document
             .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(6, 0)))?
-            .expect("second pattern");
+            .ok_or_else(|| crate::Error::Invalid("second pattern is missing".to_owned()))?;
         let OwnedObject::Stream {
             dictionary: first_dictionary,
             data: first_data,
         } = first
         else {
-            panic!("first pattern is not a stream");
+            return Err(crate::Error::Invalid(
+                "first pattern is not a stream".to_owned(),
+            ));
         };
         let OwnedObject::Stream {
             dictionary: second_dictionary,
             data: second_data,
         } = second
         else {
-            panic!("second pattern is not a stream");
+            return Err(crate::Error::Invalid(
+                "second pattern is not a stream".to_owned(),
+            ));
         };
         assert_eq!(
             first_data.bytes(document.source())?.as_ref(),
