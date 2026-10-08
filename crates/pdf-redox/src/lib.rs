@@ -22,6 +22,7 @@ mod jpeg_optimize;
 mod microstroke;
 mod optimize;
 mod paint_batch;
+mod polyline_simplify;
 mod preservation;
 mod print;
 mod prune;
