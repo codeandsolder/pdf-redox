@@ -564,12 +564,6 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of paint operations eliminated by batching.
     pub paint_batch_paints_eliminated: usize,
-    #[serde(default)]
-    /// Decoded content bytes removed by paint batching.
-    pub paint_batch_decoded_bytes_removed: usize,
-    #[serde(default)]
-    /// Estimated encoded bytes saved by paint batching.
-    pub paint_batch_estimated_flate_bytes_saved: usize,
     /// Number of pages rewritten by repeated fenced-stroke Form factoring.
     #[serde(default)]
     pub stroke_form_pages_rewritten: usize,

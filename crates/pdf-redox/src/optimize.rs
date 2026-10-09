@@ -487,7 +487,7 @@ fn optimize_pdf_with_document(
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            batch_page_paints(&mut document, flate_level)
+            batch_page_paints(&mut document)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -858,13 +858,11 @@ fn optimize_pdf_with_document(
     }
     if paint_batch.paints_eliminated > 0 {
         notes.push(format!(
-            "Collapsed {} source paint operation(s) into {} bounded compound paint group(s) across {} page(s), eliminating {} paint operations, removing about {} decoded bytes, and saving about {} encoded bytes.",
+            "Collapsed {} source paint operation(s) into {} bounded compound paint group(s) across {} page(s), eliminating {} paint operations.",
             paint_batch.source_paints_batched,
             paint_batch.groups_created,
             paint_batch.pages_rewritten,
-            paint_batch.paints_eliminated,
-            paint_batch.decoded_bytes_removed,
-            paint_batch.estimated_flate_bytes_saved
+            paint_batch.paints_eliminated
         ));
     }
     if stroke_forms.forms_created > 0 {
@@ -1033,8 +1031,6 @@ fn optimize_pdf_with_document(
         paint_batch_groups_created: paint_batch.groups_created,
         paint_batch_source_paints_batched: paint_batch.source_paints_batched,
         paint_batch_paints_eliminated: paint_batch.paints_eliminated,
-        paint_batch_decoded_bytes_removed: paint_batch.decoded_bytes_removed,
-        paint_batch_estimated_flate_bytes_saved: paint_batch.estimated_flate_bytes_saved,
         stroke_form_pages_rewritten: stroke_forms.pages_rewritten,
         stroke_forms_created: stroke_forms.forms_created,
         stroke_form_occurrences_replaced: stroke_forms.occurrences_replaced,
