@@ -27,6 +27,7 @@ mod preservation;
 mod print;
 mod prune;
 mod raster_layout;
+mod repeated_clip;
 mod repeated_page_objects;
 mod report;
 mod scrub;

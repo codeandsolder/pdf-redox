@@ -39,6 +39,7 @@ use crate::{
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
     raster_layout::normalize_raster_layout,
+    repeated_clip::{RepeatedClipStats, hoist_repeated_clip_prefixes},
     repeated_page_objects::{
         RepeatedPageObjectStats, remove_repeated_page_objects,
         repeated_page_objects_prefix_possible,
@@ -409,14 +410,23 @@ fn optimize_pdf_with_document(
         raster_transform_started.elapsed().as_secs_f64() * 1000.0,
     );
 
+    let repeated_clips = timed(&mut timings, "repeated-clip-hoist", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            hoist_repeated_clip_prefixes(&mut document, flate_level)
+        } else {
+            Ok(RepeatedClipStats::default())
+        }
+    })?;
+
     let vector_compaction = timed(&mut timings, "vector-compaction", || {
         let raster_proved_no_vector_candidate = cfg.optimization_goal
             != crate::OptimizationGoal::Processing
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
             && !raster_layout.page_vector_merge_candidate;
-        let raster_cache_is_exact =
-            physically_hidden_text.removed == 0 && inline_image_dedup.occurrences_externalized == 0;
+        let raster_cache_is_exact = physically_hidden_text.removed == 0
+            && inline_image_dedup.occurrences_externalized == 0
+            && repeated_clips.pages_rewritten == 0;
         if raster_cache_is_exact {
             for page in &repeated_page_objects.rewritten_pages {
                 raster_vector_cache.remove(page);
@@ -788,6 +798,16 @@ fn optimize_pdf_with_document(
             vector_compaction.shared_run_estimated_flate_bytes_saved
         ));
     }
+    if repeated_clips.blocks_hoisted > 0 {
+        let pages_rewritten = repeated_clips.pages_rewritten;
+        let runs_hoisted = repeated_clips.runs_hoisted;
+        let blocks_hoisted = repeated_clips.blocks_hoisted;
+        let decoded_bytes_removed = repeated_clips.decoded_bytes_removed;
+        let estimated_flate_bytes_saved = repeated_clips.estimated_flate_bytes_saved;
+        notes.push(format!(
+            "Hoisted {runs_hoisted} repeated clipping-path run(s) across {pages_rewritten} page(s), collapsing {blocks_hoisted} q-block clip prefixes, removing about {decoded_bytes_removed} decoded bytes and saving about {estimated_flate_bytes_saved} encoded bytes."
+        ));
+    }
     if vector_compaction.path_coordinates_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} path-coordinate operand(s) across {} page(s) within a 0.0071 pt page-space error bound, removing about {} decoded bytes and saving about {} encoded bytes.",
@@ -975,6 +995,11 @@ fn optimize_pdf_with_document(
             .shared_run_decoded_bytes_factored,
         vector_shared_run_estimated_flate_bytes_saved: vector_compaction
             .shared_run_estimated_flate_bytes_saved,
+        repeated_clip_pages_rewritten: repeated_clips.pages_rewritten,
+        repeated_clip_runs_hoisted: repeated_clips.runs_hoisted,
+        repeated_clip_blocks_hoisted: repeated_clips.blocks_hoisted,
+        repeated_clip_decoded_bytes_removed: repeated_clips.decoded_bytes_removed,
+        repeated_clip_estimated_flate_bytes_saved: repeated_clips.estimated_flate_bytes_saved,
         vector_path_coordinates_canonicalized: vector_compaction.path_coordinates_canonicalized,
         vector_path_coordinate_pages_rewritten: vector_compaction.path_coordinate_pages_rewritten,
         vector_path_coordinate_decoded_bytes_removed: vector_compaction
