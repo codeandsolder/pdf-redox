@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SOURCE_PATHS_PER_BATCH: usize = 64;
 const MIN_PAGE_CONTENT_BYTES: usize = 64 * 1024;
+const MIN_FORM_COLLINEAR_VERTICES_REMOVED: usize = 1024;
+const MIN_FORM_COLLINEAR_FLATE_SAVINGS: usize = 4 * 1024;
 const MIN_PAINTS_ELIMINATED: usize = 16;
 const GEOMETRY_EPSILON: f64 = 1.0e-10;
 
@@ -45,6 +47,7 @@ pub struct MarkedContentCoalesceStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollinearPathStats {
     pub pages_rewritten: usize,
+    pub forms_rewritten: usize,
     pub vertices_removed: usize,
     pub decoded_bytes_removed: usize,
     pub estimated_flate_bytes_saved: usize,
@@ -1067,6 +1070,86 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((apply_replacements(input, replacements)?, vertices_removed))
 }
 
+#[derive(Debug)]
+struct FormCollinearCandidate {
+    handle: ObjectHandle,
+    encoded: Vec<u8>,
+    vertices_removed: usize,
+    decoded_bytes_removed: usize,
+    estimated_flate_bytes_saved: usize,
+}
+
+const fn form_collinear_material(vertices_removed: usize, flate_bytes_saved: usize) -> bool {
+    vertices_removed >= MIN_FORM_COLLINEAR_VERTICES_REMOVED
+        || flate_bytes_saved >= MIN_FORM_COLLINEAR_FLATE_SAVINGS
+}
+
+fn compact_collinear_form_paths(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+) -> Result<CollinearPathStats> {
+    let mut candidates = Vec::new();
+    let mut vertices_removed = 0usize;
+    let mut flate_bytes_saved = 0usize;
+    for handle in document.reachable_streams_with_subtype(b"Form")? {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let decoded = document.decoded_owned_stream_data(&object)?;
+        if decoded.len() < MIN_PAGE_CONTENT_BYTES {
+            continue;
+        }
+        let Some((compacted, candidate_vertices_removed)) = compact_collinear_line_points(&decoded)
+        else {
+            continue;
+        };
+        if candidate_vertices_removed == 0 || compacted == decoded {
+            continue;
+        }
+        let before_flate = compressed_len(&decoded, flate_level)?;
+        let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
+        let encoded_len = encoded.len();
+        if encoded_len > before_flate {
+            continue;
+        }
+        let candidate_flate_bytes_saved = before_flate.saturating_sub(encoded_len);
+        vertices_removed = vertices_removed.saturating_add(candidate_vertices_removed);
+        flate_bytes_saved = flate_bytes_saved.saturating_add(candidate_flate_bytes_saved);
+        candidates.push(FormCollinearCandidate {
+            handle,
+            encoded,
+            vertices_removed: candidate_vertices_removed,
+            decoded_bytes_removed: decoded.len().saturating_sub(compacted.len()),
+            estimated_flate_bytes_saved: candidate_flate_bytes_saved,
+        });
+    }
+
+    if !form_collinear_material(vertices_removed, flate_bytes_saved) {
+        return Ok(CollinearPathStats::default());
+    }
+
+    let mut stats = CollinearPathStats::default();
+    for candidate in candidates {
+        let object = document.edit_handle(candidate.handle)?;
+        let OwnedObject::Stream { dictionary, data } = object else {
+            continue;
+        };
+        crate::stream_codec::set_plain_flate(dictionary);
+        *data = StreamData::Owned(candidate.encoded);
+        stats.forms_rewritten = stats.forms_rewritten.saturating_add(1);
+        stats.vertices_removed = stats
+            .vertices_removed
+            .saturating_add(candidate.vertices_removed);
+        stats.decoded_bytes_removed = stats
+            .decoded_bytes_removed
+            .saturating_add(candidate.decoded_bytes_removed);
+        stats.estimated_flate_bytes_saved = stats
+            .estimated_flate_bytes_saved
+            .saturating_add(candidate.estimated_flate_bytes_saved);
+    }
+    Ok(stats)
+}
+
 pub fn compact_collinear_paths(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -1109,6 +1192,20 @@ pub fn compact_collinear_paths(
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
+
+    let form_stats = compact_collinear_form_paths(document, flate_level)?;
+    stats.forms_rewritten = stats
+        .forms_rewritten
+        .saturating_add(form_stats.forms_rewritten);
+    stats.vertices_removed = stats
+        .vertices_removed
+        .saturating_add(form_stats.vertices_removed);
+    stats.decoded_bytes_removed = stats
+        .decoded_bytes_removed
+        .saturating_add(form_stats.decoded_bytes_removed);
+    stats.estimated_flate_bytes_saved = stats
+        .estimated_flate_bytes_saved
+        .saturating_add(form_stats.estimated_flate_bytes_saved);
     Ok(stats)
 }
 
@@ -2505,6 +2602,58 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(output, input);
     }
+    #[test]
+    fn form_collinear_material_gate_requires_structural_or_encoded_win() {
+        assert!(!form_collinear_material(1023, 4095));
+        assert!(form_collinear_material(1024, 0));
+        assert!(form_collinear_material(0, 4096));
+    }
+
+    #[test]
+    fn compacts_large_collinear_form_xobject() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        use std::io::Write as _;
+
+        let mut form = b"0 0 m ".to_vec();
+        for x in 1..=12_000 {
+            write!(&mut form, "{x} 0 l ")?;
+        }
+        form.extend_from_slice(b"S");
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12000 10] /Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q /Fm0 Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 12000 10] /Resources << >>",
+            &form,
+        )?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        assert_eq!(stats.pages_rewritten, 0);
+        assert_eq!(stats.forms_rewritten, 1);
+        assert!(stats.vertices_removed > 10_000);
+
+        let forms = document.reachable_streams_with_subtype(b"Form")?;
+        assert_eq!(forms.len(), 1);
+        let Some(object) = document.current_owned_object(forms[0])? else {
+            return Err(crate::Error::Invalid("test Form disappeared".to_owned()));
+        };
+        let decoded = document.decoded_owned_stream_data(&object)?;
+        assert_eq!(operator_count(&decoded, b"l"), 1);
+
+        let output = document.write_compact()?;
+        let reparsed = EditDocument::from_bytes(output)?;
+        assert_eq!(reparsed.reachable_streams_with_subtype(b"Form")?.len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn removes_exact_forward_collinear_vertex() {
         let input = b"0 0 m 1 0 l 2 0 l S";

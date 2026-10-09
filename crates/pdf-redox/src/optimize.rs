@@ -837,9 +837,10 @@ fn optimize_pdf_with_document(
     }
     if collinear_paths.vertices_removed > 0 {
         notes.push(format!(
-            "Removed {} exact forward-collinear line vertex/vertices across {} page(s), removing about {} decoded bytes and saving about {} encoded bytes without changing path geometry.",
+            "Removed {} exact forward-collinear line vertex/vertices across {} page(s) and {} Form XObject(s), removing about {} decoded bytes and saving about {} encoded bytes without changing path geometry.",
             collinear_paths.vertices_removed,
             collinear_paths.pages_rewritten,
+            collinear_paths.forms_rewritten,
             collinear_paths.decoded_bytes_removed,
             collinear_paths.estimated_flate_bytes_saved
         ));
@@ -1017,6 +1018,7 @@ fn optimize_pdf_with_document(
         polyline_simplification_estimated_flate_bytes_saved: polyline_simplification
             .estimated_flate_bytes_saved,
         collinear_path_pages_rewritten: collinear_paths.pages_rewritten,
+        collinear_path_forms_rewritten: collinear_paths.forms_rewritten,
         collinear_path_vertices_removed: collinear_paths.vertices_removed,
         collinear_path_decoded_bytes_removed: collinear_paths.decoded_bytes_removed,
         collinear_path_estimated_flate_bytes_saved: collinear_paths.estimated_flate_bytes_saved,

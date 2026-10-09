@@ -519,6 +519,9 @@ pub struct OptimizationReport {
     /// Number of pages rewritten by exact collinear path compaction.
     #[serde(default)]
     pub collinear_path_pages_rewritten: usize,
+    /// Number of Form `XObjects` rewritten by exact collinear path compaction.
+    #[serde(default)]
+    pub collinear_path_forms_rewritten: usize,
     /// Number of exact forward-collinear line vertices removed.
     #[serde(default)]
     pub collinear_path_vertices_removed: usize,
