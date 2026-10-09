@@ -466,6 +466,21 @@ pub struct OptimizationReport {
     /// Estimated encoded bytes saved by shared q-block run factoring.
     pub vector_shared_run_estimated_flate_bytes_saved: usize,
     #[serde(default)]
+    /// Number of pages rewritten by repeated clipping-path hoisting.
+    pub repeated_clip_pages_rewritten: usize,
+    #[serde(default)]
+    /// Number of adjacent repeated clipping-path runs hoisted.
+    pub repeated_clip_runs_hoisted: usize,
+    #[serde(default)]
+    /// Number of original q-blocks covered by repeated clipping-path hoisting.
+    pub repeated_clip_blocks_hoisted: usize,
+    #[serde(default)]
+    /// Decoded page-content bytes removed by repeated clipping-path hoisting.
+    pub repeated_clip_decoded_bytes_removed: usize,
+    #[serde(default)]
+    /// Estimated encoded bytes saved by repeated clipping-path hoisting.
+    pub repeated_clip_estimated_flate_bytes_saved: usize,
+    #[serde(default)]
     /// Number of path coordinate operands shortened within the physical-error gate.
     pub vector_path_coordinates_canonicalized: usize,
     #[serde(default)]
