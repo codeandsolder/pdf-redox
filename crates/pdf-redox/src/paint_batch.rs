@@ -21,8 +21,6 @@ pub struct PaintBatchStats {
     pub groups_created: usize,
     pub source_paints_batched: usize,
     pub paints_eliminated: usize,
-    pub decoded_bytes_removed: usize,
-    pub estimated_flate_bytes_saved: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2355,10 +2353,7 @@ fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize>
     Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
-pub fn batch_page_paints(
-    document: &mut EditDocument,
-    flate_level: crate::FlateLevel,
-) -> Result<PaintBatchStats> {
+pub fn batch_page_paints(document: &mut EditDocument) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
     for page in document.page_handles()? {
         let Some(object) = document.current_owned_object(page)? else {
@@ -2381,13 +2376,7 @@ pub fn batch_page_paints(
         if page_stats.paints_eliminated < MIN_PAINTS_ELIMINATED || batched == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&batched, flate_level)?;
-        if after_flate > before_flate {
-            continue;
-        }
-
-        replace_page_content(document, page, batched.clone())?;
+        replace_page_content(document, page, batched)?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.groups_created = stats
             .groups_created
@@ -2398,12 +2387,6 @@ pub fn batch_page_paints(
         stats.paints_eliminated = stats
             .paints_eliminated
             .saturating_add(page_stats.paints_eliminated);
-        stats.decoded_bytes_removed = stats
-            .decoded_bytes_removed
-            .saturating_add(decoded.len().saturating_sub(batched.len()));
-        stats.estimated_flate_bytes_saved = stats
-            .estimated_flate_bytes_saved
-            .saturating_add(before_flate.saturating_sub(after_flate));
     }
     Ok(stats)
 }
@@ -2534,6 +2517,46 @@ mod tests {
         let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn processing_page_batching_accepts_structural_win_even_if_flate_grows() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        use std::io::Write as _;
+
+        let mut content = Vec::new();
+        for index in 0..17 {
+            let x = index % 10;
+            write!(&mut content, "{x} 0 m {x} 1 l S ")?;
+        }
+        content.resize(MIN_PAGE_CONTENT_BYTES + 512, b' ');
+
+        let Some((batched, candidate_stats)) = batch_content(&content) else {
+            return Err(crate::Error::Invalid(
+                "test paint stream did not parse".to_owned(),
+            ));
+        };
+        assert!(candidate_stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
+        assert!(
+            compressed_len(&batched, crate::FlateLevel::PROCESSING)?
+                > compressed_len(&content, crate::FlateLevel::PROCESSING)?,
+            "fixture must exercise the structural-over-size policy"
+        );
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", &content)?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let stats = batch_page_paints(&mut document)?;
+        assert_eq!(stats.pages_rewritten, 1);
+        assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
+        Ok(())
     }
 
     #[test]
