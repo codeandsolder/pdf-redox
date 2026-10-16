@@ -1221,6 +1221,178 @@ fn form_xobject_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>>
     Ok(forms)
 }
 
+fn tiling_pattern_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
+    let mut patterns = Vec::new();
+    for handle in document.reachable_streams()? {
+        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let Some(pattern_type) = dictionary.get(b"PatternType".as_slice()) else {
+            continue;
+        };
+        if matches!(
+            document.resolve_owned_value(pattern_type)?,
+            Some(OwnedObject::Integer(1))
+        ) {
+            patterns.push(handle);
+        }
+    }
+    Ok(patterns)
+}
+
+fn collect_type3_font_dictionaries(
+    document: &EditDocument,
+    object: &OwnedObject,
+    fonts: &mut Vec<OwnedDictionary>,
+) -> Result<()> {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+                == Some(b"Type3")
+            {
+                fonts.push(dictionary.clone());
+            }
+            for value in dictionary.values() {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_type3_font_dictionaries(document, value, fonts)?;
+                }
+            }
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    collect_type3_font_dictionaries(document, value, fonts)?;
+                }
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+    Ok(())
+}
+
+fn type3_font_dictionaries(document: &EditDocument) -> Result<Vec<OwnedDictionary>> {
+    let mut fonts = Vec::new();
+    for handle in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        collect_type3_font_dictionaries(document, &object, &mut fonts)?;
+    }
+    Ok(fonts)
+}
+
+fn poison_font_usage_scope(
+    identity_eligible: &HashMap<Vec<u8>, CidFontGlyphSpec>,
+    winansi_eligible: &HashMap<Vec<u8>, CowObjectHandle>,
+    usage: &mut FontUsageAccumulator,
+) {
+    usage
+        .identity_unsafe
+        .extend(identity_eligible.values().map(|spec| spec.program));
+    usage
+        .winansi_unsafe
+        .extend(winansi_eligible.values().copied());
+}
+
+fn scan_tiling_pattern_font_usage(
+    document: &EditDocument,
+    usage: &mut FontUsageAccumulator,
+) -> Result<bool> {
+    for pattern in tiling_pattern_handles(document)? {
+        let Some(OwnedObject::Stream { dictionary, .. }) =
+            document.current_owned_object(pattern)?
+        else {
+            continue;
+        };
+        let Some(resources_value) = dictionary.get(b"Resources".as_slice()) else {
+            return Ok(true);
+        };
+        let Some(resources) = resolved_owned_dictionary(document, Some(resources_value))? else {
+            return Ok(true);
+        };
+        let identity_eligible =
+            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
+        let winansi_eligible =
+            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        if identity_eligible.is_empty() && winansi_eligible.is_empty() {
+            continue;
+        }
+        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let Ok(content) = document.decoded_content_stream_data(pattern) else {
+            poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
+            continue;
+        };
+        if usage.scan_scope(
+            &content,
+            &identity_eligible,
+            &winansi_eligible,
+            &font_neutral_ext_gstates,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn scan_type3_charproc_font_usage(
+    document: &EditDocument,
+    usage: &mut FontUsageAccumulator,
+) -> Result<bool> {
+    for font in type3_font_dictionaries(document)? {
+        let Some(resources_value) = font.get(b"Resources".as_slice()) else {
+            // PDF 1.x permits legacy Type 3 fonts without /Resources to use
+            // the resource dictionary of the page on which the font is used.
+            // Without a call graph, we cannot attribute that inherited scope.
+            return Ok(true);
+        };
+        let Some(resources) = resolved_owned_dictionary(document, Some(resources_value))? else {
+            return Ok(true);
+        };
+        let identity_eligible =
+            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
+        let winansi_eligible =
+            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        if identity_eligible.is_empty() && winansi_eligible.is_empty() {
+            continue;
+        }
+        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let Some(char_procs_value) = font.get(b"CharProcs".as_slice()) else {
+            poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
+            continue;
+        };
+        let Some(char_procs) = resolved_owned_dictionary(document, Some(char_procs_value))? else {
+            poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
+            continue;
+        };
+        for value in char_procs.values() {
+            let Some(stream) = document.resolve_owned_value(value)? else {
+                poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
+                break;
+            };
+            let Ok(content) = document.decoded_content_stream_value(&stream) else {
+                poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
+                break;
+            };
+            if usage.scan_scope(
+                &content,
+                &identity_eligible,
+                &winansi_eligible,
+                &font_neutral_ext_gstates,
+            ) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 type IdentityGlyphUsage = HashMap<CowObjectHandle, BTreeSet<u16>>;
 type WinAnsiCodeUsage = HashMap<CowObjectHandle, BTreeSet<u8>>;
 type FontGlyphUsage = (IdentityGlyphUsage, WinAnsiCodeUsage);
@@ -1303,6 +1475,12 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
         ) {
             return Ok((HashMap::new(), HashMap::new()));
         }
+    }
+
+    if scan_tiling_pattern_font_usage(document, &mut usage)?
+        || scan_type3_charproc_font_usage(document, &mut usage)?
+    {
+        return Ok((HashMap::new(), HashMap::new()));
     }
 
     for program in &usage.identity_unsafe {
@@ -2096,6 +2274,173 @@ mod tests {
         pdf.extend_from_slice(body);
     }
 
+    fn finish_test_pdf(mut pdf: Vec<u8>, offsets: Vec<usize>, root: usize) -> Vec<u8> {
+        let size = offsets.len() + 1;
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn pattern_font_usage_fixture() -> Vec<u8> {
+        let page_content = b"/Pattern cs /P1 scn 0 0 100 100 re f";
+        let pattern_content = b"BT /F1 10 Tf <0002> Tj ET";
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                page_content.len(),
+                String::from_utf8_lossy(page_content)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /Font << /F1 6 0 R >> >> /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                pattern_content.len(),
+                String::from_utf8_lossy(pattern_content)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /PatternCID /Encoding /Identity-H /DescendantFonts [7 0 R] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /PatternCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /FontDescriptor /FontName /PatternCID /FontFile2 9 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Length 1 >>\nstream\nx\nendstream\nendobj\n",
+        );
+        finish_test_pdf(pdf, offsets, 1)
+    }
+
+    fn type3_font_usage_fixture(local_resources: bool) -> Vec<u8> {
+        let page_content = b"BT /T3 10 Tf (A) Tj ET";
+        let glyph_content = b"500 0 d0 BT /F1 10 Tf <0003> Tj ET";
+        let page_fonts = if local_resources {
+            b"/T3 5 0 R".as_slice()
+        } else {
+            b"/T3 5 0 R /F1 6 0 R".as_slice()
+        };
+        let type3_resources = if local_resources {
+            b"/Resources << /Font << /F1 6 0 R >> >>".as_slice()
+        } else {
+            b"".as_slice()
+        };
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << {} >> >> /Contents 4 0 R >>\nendobj\n",
+                String::from_utf8_lossy(page_fonts)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                page_content.len(),
+                String::from_utf8_lossy(page_content)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "5 0 obj\n<< /Type /Font /Subtype /Type3 /Name /T3 /FontBBox [0 0 500 500] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /A 10 0 R >> /Encoding << /Type /Encoding /Differences [65 /A] >> /FirstChar 65 /LastChar 65 /Widths [500] {} >>\nendobj\n",
+                String::from_utf8_lossy(type3_resources)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /NestedCID /Encoding /Identity-H /DescendantFonts [7 0 R] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NestedCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /FontDescriptor /FontName /NestedCID /FontFile2 9 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Length 1 >>\nstream\nx\nendstream\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "10 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                glyph_content.len(),
+                String::from_utf8_lossy(glyph_content)
+            )
+            .as_bytes(),
+        );
+        finish_test_pdf(pdf, offsets, 1)
+    }
+
     fn hayro_font_fixture_with_filter_array(array_filter: bool) -> Result<Vec<u8>> {
         let head = [0_u8; 54];
         let gsub = vec![0x55_u8; 8192];
@@ -2515,6 +2860,35 @@ mod tests {
         assert!(
             sfnt_union_sparse_glyphs(&[(a.as_slice(), &used), (b.as_slice(), &used)]).is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn glyph_usage_scans_text_inside_tiling_patterns() -> Result<()> {
+        let document = EditDocument::from_bytes(pattern_font_usage_fixture())?;
+        let (identity, winansi) = font_glyph_usage(&document)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(9, 0));
+        assert_eq!(identity.get(&program), Some(&BTreeSet::from([2_u16])));
+        assert!(winansi.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn glyph_usage_scans_text_inside_type3_charprocs() -> Result<()> {
+        let document = EditDocument::from_bytes(type3_font_usage_fixture(true))?;
+        let (identity, winansi) = font_glyph_usage(&document)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(9, 0));
+        assert_eq!(identity.get(&program), Some(&BTreeSet::from([3_u16])));
+        assert!(winansi.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resource_less_type3_font_fails_glyph_usage_closed() -> Result<()> {
+        let document = EditDocument::from_bytes(type3_font_usage_fixture(false))?;
+        let (identity, winansi) = font_glyph_usage(&document)?;
+        assert!(identity.is_empty());
+        assert!(winansi.is_empty());
         Ok(())
     }
 
