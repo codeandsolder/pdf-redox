@@ -12,7 +12,8 @@ use crate::{
     },
     flate::{compress_unfiltered_streams, optimize_flate_streams},
     font::{
-        FontOptimizationStats, dense_compact_cidfont_type2_programs, strip_font_editing_tables,
+        FontOptimizationStats, collect_font_usage_graph, dense_compact_cidfont_type2_programs,
+        strip_font_editing_tables, subset_font_outlines_after_dedup,
         union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
@@ -207,12 +208,22 @@ fn optimize_pdf_with_document(
     let font_dedup = timed(&mut timings, "font-dedup", || {
         canonicalize_font_program_streams(&mut document)
     })?;
+    // Sparse union only redirects indirect CIDFontType2 descriptors between
+    // compatible CIDFontType2 programs. The subtype proof in this graph stays
+    // valid across those redirects; outline subsetting rescans live glyph usage
+    // after union, so both stages can safely share one expensive object walk.
+    let post_dedup_font_graph = if cfg.preservation.font_editing_support {
+        None
+    } else {
+        Some(timed(&mut timings, "font-post-dedup-usage-graph", || {
+            collect_font_usage_graph(&document)
+        })?)
+    };
     let font_sparse_union = timed(&mut timings, "font-sparse-union", || {
-        if cfg.preservation.font_editing_support {
-            Ok(FontOptimizationStats::default())
-        } else {
-            union_sparse_cid_font_programs_after_dedup(&mut document, flate_level)
-        }
+        let Some(graph) = post_dedup_font_graph.as_ref() else {
+            return Ok(FontOptimizationStats::default());
+        };
+        union_sparse_cid_font_programs_after_dedup(&mut document, flate_level, graph)
     })?;
     font_rendering.programs_optimized += font_sparse_union.programs_optimized;
     font_rendering.programs_glyph_subset += font_sparse_union.programs_glyph_subset;
@@ -221,6 +232,19 @@ fn optimize_pdf_with_document(
     font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
     font_rendering.glyph_subset_decoded_bytes_removed +=
         font_sparse_union.glyph_subset_decoded_bytes_removed;
+    let font_outline_subset = timed(&mut timings, "font-outline-subset", || {
+        let Some(graph) = post_dedup_font_graph.as_ref() else {
+            return Ok(FontOptimizationStats::default());
+        };
+        subset_font_outlines_after_dedup(&mut document, flate_level, graph)
+    })?;
+    font_rendering.programs_optimized += font_outline_subset.programs_optimized;
+    font_rendering.programs_glyph_subset += font_outline_subset.programs_glyph_subset;
+    font_rendering.original_encoded_bytes += font_outline_subset.original_encoded_bytes;
+    font_rendering.optimized_encoded_bytes += font_outline_subset.optimized_encoded_bytes;
+    font_rendering.decoded_table_bytes_removed += font_outline_subset.decoded_table_bytes_removed;
+    font_rendering.glyph_subset_decoded_bytes_removed +=
+        font_outline_subset.glyph_subset_decoded_bytes_removed;
     let font_dense = timed(&mut timings, "font-dense-gid", || {
         if cfg.preservation.font_editing_support
             || cfg.optimization_goal != crate::OptimizationGoal::Processing
