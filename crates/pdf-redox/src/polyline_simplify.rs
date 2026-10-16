@@ -1,8 +1,9 @@
 //! Processing-mode simplification for grotesquely oversampled native polylines.
 //!
-//! This deliberately runs after the exact glyph/stroke factoring passes. It only
-//! rewrites plain `m`/`l` subpaths that end in a pure fill and rejects mixed,
-//! curved, clipped, stroked, malformed, or graphics-state-interleaved paths.
+//! This deliberately runs after the exact glyph/stroke factoring passes. It
+//! rewrites plain `m`/`l` subpaths that end in a pure fill or a solid `S` stroke,
+//! and rejects mixed, curved, clipped, dashed/ExtGState-dependent, malformed, or
+//! graphics-state-interleaved paths.
 //! Distances are measured after CTM and `/UserUnit`, so the tolerance is in real
 //! page points rather than source-coordinate units.
 
@@ -37,6 +38,12 @@ struct Vertex {
     deletable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrokePolicy {
+    FillOnly,
+    SolidStroke,
+}
+
 struct Scanner<'a> {
     input: &'a [u8],
     user_unit: f64,
@@ -49,10 +56,11 @@ struct Scanner<'a> {
     pending: Vec<Replacement>,
     committed: Vec<Replacement>,
     vertices_removed: usize,
+    stroke_policy: StrokePolicy,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(input: &'a [u8], user_unit: f64) -> Self {
+    fn new(input: &'a [u8], user_unit: f64, stroke_policy: StrokePolicy) -> Self {
         Self {
             input,
             user_unit,
@@ -65,6 +73,7 @@ impl<'a> Scanner<'a> {
             pending: Vec::new(),
             committed: Vec::new(),
             vertices_removed: 0,
+            stroke_policy,
         }
     }
 
@@ -223,7 +232,8 @@ impl<'a> Scanner<'a> {
             }
             b"h" if self.path_active => self.flush_run(),
             b"f" | b"F" | b"f*" => self.end_path(true),
-            b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" | b"n" => self.end_path(false),
+            b"S" => self.end_path(self.stroke_policy == StrokePolicy::SolidStroke),
+            b"s" | b"B" | b"B*" | b"b" | b"b*" | b"n" => self.end_path(false),
             b"q" => {
                 self.invalidate_path();
                 self.stack.push(self.ctm);
@@ -303,7 +313,19 @@ pub fn simplify_page_polylines(
         };
         let mut decoded = Vec::new();
         decoded_content_value(document, contents, &mut decoded)?;
-        let Some((replacements, vertices_removed)) = Scanner::new(&decoded, user_unit).scan()?
+        let mut stroke_policy = StrokePolicy::SolidStroke;
+        let hazard_parse_incomplete =
+            crate::content_stream::visit_instructions(&decoded, |instruction| {
+                if matches!(&instruction.operator[..], b"d" | b"gs") {
+                    stroke_policy = StrokePolicy::FillOnly;
+                }
+                Ok(())
+            })?;
+        if hazard_parse_incomplete {
+            stroke_policy = StrokePolicy::FillOnly;
+        }
+        let Some((replacements, vertices_removed)) =
+            Scanner::new(&decoded, user_unit, stroke_policy).scan()?
         else {
             continue;
         };
@@ -394,7 +416,9 @@ mod tests {
     #[test]
     fn scanner_commits_only_filled_path_simplification() -> Result<()> {
         let fill = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l f";
-        let Some((fill_replacements, fill_removed)) = Scanner::new(fill, 1.0).scan()? else {
+        let Some((fill_replacements, fill_removed)) =
+            Scanner::new(fill, 1.0, StrokePolicy::FillOnly).scan()?
+        else {
             return Err(crate::Error::Invalid(
                 "fill scan unexpectedly incomplete".to_owned(),
             ));
@@ -403,7 +427,9 @@ mod tests {
         assert_eq!(fill_replacements.len(), fill_removed);
 
         let stroke = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l S";
-        let Some((stroke_replacements, stroke_removed)) = Scanner::new(stroke, 1.0).scan()? else {
+        let Some((stroke_replacements, stroke_removed)) =
+            Scanner::new(stroke, 1.0, StrokePolicy::FillOnly).scan()?
+        else {
             return Err(crate::Error::Invalid(
                 "stroke scan unexpectedly incomplete".to_owned(),
             ));
@@ -414,9 +440,26 @@ mod tests {
     }
 
     #[test]
+    fn scanner_commits_plain_solid_stroke_when_enabled() -> Result<()> {
+        let stroke = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l S";
+        let Some((replacements, removed)) =
+            Scanner::new(stroke, 1.0, StrokePolicy::SolidStroke).scan()?
+        else {
+            return Err(crate::Error::Invalid(
+                "stroke scan unexpectedly incomplete".to_owned(),
+            ));
+        };
+        assert!(removed > 0);
+        assert_eq!(replacements.len(), removed);
+        Ok(())
+    }
+
+    #[test]
     fn scanner_applies_ctm_before_error_bound() -> Result<()> {
         let input = b"100 0 0 100 0 0 cm 0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l f";
-        let Some((replacements, removed)) = Scanner::new(input, 1.0).scan()? else {
+        let Some((replacements, removed)) =
+            Scanner::new(input, 1.0, StrokePolicy::FillOnly).scan()?
+        else {
             return Err(crate::Error::Invalid(
                 "scaled scan unexpectedly incomplete".to_owned(),
             ));
@@ -434,7 +477,9 @@ mod tests {
     #[test]
     fn scanner_rejects_mixed_curve_path() -> Result<()> {
         let input = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l 7 0 8 0 9 0 c f";
-        let Some((replacements, removed)) = Scanner::new(input, 1.0).scan()? else {
+        let Some((replacements, removed)) =
+            Scanner::new(input, 1.0, StrokePolicy::FillOnly).scan()?
+        else {
             return Err(crate::Error::Invalid(
                 "curve scan unexpectedly incomplete".to_owned(),
             ));
@@ -447,7 +492,9 @@ mod tests {
     #[test]
     fn scanner_applies_user_unit_before_error_bound() -> Result<()> {
         let input = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l f";
-        let Some((replacements, removed)) = Scanner::new(input, 100.0).scan()? else {
+        let Some((replacements, removed)) =
+            Scanner::new(input, 100.0, StrokePolicy::FillOnly).scan()?
+        else {
             return Err(crate::Error::Invalid(
                 "UserUnit scan unexpectedly incomplete".to_owned(),
             ));
@@ -466,10 +513,18 @@ mod tests {
     #[test]
     fn scanner_rejects_unbalanced_graphics_state() -> Result<()> {
         let input = b"0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l f Q";
-        assert!(Scanner::new(input, 1.0).scan()?.is_none());
+        assert!(
+            Scanner::new(input, 1.0, StrokePolicy::FillOnly)
+                .scan()?
+                .is_none()
+        );
 
         let input = b"q 0 0 m 1 0.001 l 2 0 l 3 0 l 4 0 l 5 0 l 6 0 l 7 0 l f";
-        assert!(Scanner::new(input, 1.0).scan()?.is_none());
+        assert!(
+            Scanner::new(input, 1.0, StrokePolicy::FillOnly)
+                .scan()?
+                .is_none()
+        );
         Ok(())
     }
 }
