@@ -189,6 +189,91 @@ fn sfnt_glyph_offsets(bytes: &[u8]) -> Option<Vec<usize>> {
     (offsets.last().copied()? <= glyf_len).then_some(offsets)
 }
 
+fn sfnt_blank_unused_glyph_outlines(
+    bytes: &[u8],
+    used_gids: &BTreeSet<u16>,
+) -> Option<(Vec<u8>, usize)> {
+    use write_fonts::read::{FontRef, TableProvider};
+
+    let font = FontRef::new(bytes).ok()?;
+    if font.table_directory().sfnt_version() != 0x0001_0000 {
+        return None;
+    }
+    let glyph_count = usize::from(font.maxp().ok()?.num_glyphs());
+    if glyph_count == 0 || used_gids.iter().any(|gid| usize::from(*gid) >= glyph_count) {
+        return None;
+    }
+    let offsets = sfnt_glyph_offsets(bytes)?;
+    let glyf = font.glyf().ok()?.offset_data().as_bytes();
+
+    // Preserve the complete original GID address space. Only outline bodies are
+    // discarded; cmap, metrics, hint programs, maxp.numGlyphs and every other
+    // SFNT table retain their source semantics.
+    let mut retained = BTreeSet::new();
+    let mut pending = VecDeque::from([0_usize]);
+    pending.extend(used_gids.iter().map(|gid| usize::from(*gid)));
+    while let Some(gid) = pending.pop_front() {
+        if gid >= glyph_count || !retained.insert(gid) {
+            continue;
+        }
+        let glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
+        // A zero-length TrueType glyph is a valid empty outline and has no
+        // composite dependencies.
+        if glyph.is_empty() {
+            continue;
+        }
+        for component in composite_components(glyph)? {
+            let component = usize::from(component);
+            if component >= glyph_count {
+                return None;
+            }
+            if !retained.contains(&component) {
+                pending.push_back(component);
+            }
+        }
+    }
+
+    let loca_format = font.head().ok()?.index_to_loc_format();
+    let alignment = match loca_format {
+        0 => 2usize,
+        1 => 4usize,
+        _ => return None,
+    };
+    let mut rebuilt_glyf = Vec::new();
+    let mut rebuilt_offsets = Vec::with_capacity(glyph_count + 1);
+    for gid in 0..glyph_count {
+        rebuilt_offsets.push(rebuilt_glyf.len());
+        if retained.contains(&gid) {
+            rebuilt_glyf.extend_from_slice(glyf.get(offsets[gid]..offsets[gid + 1])?);
+            while rebuilt_glyf.len() % alignment != 0 {
+                rebuilt_glyf.push(0);
+            }
+        }
+    }
+    rebuilt_offsets.push(rebuilt_glyf.len());
+
+    let mut rebuilt_loca = Vec::new();
+    match loca_format {
+        0 => {
+            for offset in rebuilt_offsets {
+                if offset % 2 != 0 || offset / 2 > usize::from(u16::MAX) {
+                    return None;
+                }
+                rebuilt_loca.extend_from_slice(&u16::try_from(offset / 2).ok()?.to_be_bytes());
+            }
+        }
+        1 => {
+            for offset in rebuilt_offsets {
+                rebuilt_loca.extend_from_slice(&u32::try_from(offset).ok()?.to_be_bytes());
+            }
+        }
+        _ => return None,
+    }
+    let rebuilt = crate::font_subset::replace_glyf_and_loca(bytes, rebuilt_glyf, rebuilt_loca)?;
+    let removed = bytes.len().saturating_sub(rebuilt.len());
+    (removed > 0).then_some((rebuilt, removed))
+}
+
 fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>> {
     use write_fonts::read::{FontRef, TableProvider};
 
@@ -884,6 +969,169 @@ impl<T: Copy> FontSelectionState<T> {
     }
 }
 
+const fn raw_operand_contains_unescaped_literal_cr(raw: &[u8]) -> bool {
+    let mut index = 0_usize;
+    let mut literal_depth = 0_usize;
+    let mut in_comment = false;
+    while index < raw.len() {
+        let byte = raw[index];
+        if literal_depth == 0 {
+            if in_comment {
+                if matches!(byte, b'\r' | b'\n') {
+                    in_comment = false;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'%' => in_comment = true,
+                b'(' => literal_depth = 1,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'\\' => {
+                index += 1;
+                if index >= raw.len() {
+                    break;
+                }
+                if raw[index] == b'\r' {
+                    index += 1;
+                    if index < raw.len() && raw[index] == b'\n' {
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            b'(' => {
+                literal_depth += 1;
+                index += 1;
+            }
+            b')' => {
+                literal_depth -= 1;
+                index += 1;
+            }
+            b'\r' => return true,
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+fn decode_raw_literal_string_preserving_cr(raw: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
+    if raw.get(start) != Some(&b'(') {
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut depth = 1_usize;
+    let mut index = start + 1;
+    while index < raw.len() {
+        match raw[index] {
+            b'\\' => {
+                index += 1;
+                let escaped = *raw.get(index)?;
+                match escaped {
+                    b'n' => output.push(b'\n'),
+                    b'r' => output.push(b'\r'),
+                    b't' => output.push(b'\t'),
+                    b'b' => output.push(0x08),
+                    b'f' => output.push(0x0c),
+                    b'\r' => {
+                        index += 1;
+                        if raw.get(index) == Some(&b'\n') {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    b'\n' => {
+                        index += 1;
+                        continue;
+                    }
+                    b'0'..=b'7' => {
+                        let mut value = u16::from(escaped - b'0');
+                        let mut digits = 1_u8;
+                        while digits < 3 {
+                            let Some(next) = raw.get(index + 1).copied() else {
+                                break;
+                            };
+                            if !(b'0'..=b'7').contains(&next) {
+                                break;
+                            }
+                            index += 1;
+                            value = value * 8 + u16::from(next - b'0');
+                            digits += 1;
+                        }
+                        output.push(u8::try_from(value).ok()?);
+                    }
+                    other => output.push(other),
+                }
+                index += 1;
+            }
+            b'(' => {
+                depth += 1;
+                output.push(b'(');
+                index += 1;
+            }
+            b')' => {
+                depth -= 1;
+                index += 1;
+                if depth == 0 {
+                    return Some((output, index));
+                }
+                output.push(b')');
+            }
+            b'\r' => {
+                // A raw CR is the producer ambiguity we are preserving. CRLF is
+                // a different-width ambiguity; fail closed instead of guessing
+                // how a renderer pairs the following byte in an Identity code.
+                if raw.get(index + 1) == Some(&b'\n') {
+                    return None;
+                }
+                output.push(b'\r');
+                index += 1;
+            }
+            other => {
+                output.push(other);
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+fn decode_raw_literal_strings_preserving_cr(raw: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut strings = Vec::new();
+    let mut index = 0_usize;
+    let mut in_comment = false;
+    while index < raw.len() {
+        let byte = raw[index];
+        if in_comment {
+            if matches!(byte, b'\r' | b'\n') {
+                in_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'%' => {
+                in_comment = true;
+                index += 1;
+            }
+            b'(' => {
+                let (decoded, next) = decode_raw_literal_string_preserving_cr(raw, index)?;
+                strings.push(decoded);
+                index = next;
+            }
+            _ => index += 1,
+        }
+    }
+    Some(strings)
+}
+
 struct IdentityCidGlyphScanner<'a> {
     fonts: &'a HashMap<Vec<u8>, CidFontGlyphSpec>,
     font_neutral_ext_gstates: &'a BTreeSet<Vec<u8>>,
@@ -894,6 +1142,45 @@ struct IdentityCidGlyphScanner<'a> {
 }
 
 impl IdentityCidGlyphScanner<'_> {
+    fn mark_current_program_unsafe(&mut self) {
+        if !self.selection.known {
+            self.unknown_font_text = true;
+        } else if let Some(font) = self.selection.current {
+            self.unsafe_programs.insert(font.program);
+        }
+    }
+
+    fn record_raw_cr_variants(
+        &mut self,
+        content: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        operand_index: usize,
+    ) -> bool {
+        let Some(raw) = instruction
+            .operand_spans()
+            .nth(operand_index)
+            .and_then(|span| content.get(span))
+        else {
+            self.mark_current_program_unsafe();
+            return false;
+        };
+        if !raw_operand_contains_unescaped_literal_cr(raw) {
+            return true;
+        }
+        let Some(strings) = decode_raw_literal_strings_preserving_cr(raw) else {
+            self.mark_current_program_unsafe();
+            return false;
+        };
+        if strings.is_empty() {
+            self.mark_current_program_unsafe();
+            return false;
+        }
+        for bytes in strings {
+            self.record_string(&bytes);
+        }
+        true
+    }
+
     fn record_string(&mut self, bytes: &[u8]) {
         if !self.selection.known {
             self.unknown_font_text = true;
@@ -923,7 +1210,11 @@ impl IdentityCidGlyphScanner<'_> {
         }
     }
 
-    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+    fn instruction(
+        &mut self,
+        content: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
         let mut operands = instruction.operands();
         match &instruction.operator[..] {
             b"q" => self.selection.save(),
@@ -948,6 +1239,9 @@ impl IdentityCidGlyphScanner<'_> {
                 }
             }
             b"Tj" | b"'" => {
+                if !self.record_raw_cr_variants(content, instruction, 0) {
+                    return;
+                }
                 if let Some(bytes) = operands
                     .next()
                     .and_then(crate::content_stream::operand_string)
@@ -956,6 +1250,9 @@ impl IdentityCidGlyphScanner<'_> {
                 }
             }
             b"\"" => {
+                if !self.record_raw_cr_variants(content, instruction, 2) {
+                    return;
+                }
                 if let Some(bytes) = operands
                     .nth(2)
                     .and_then(crate::content_stream::operand_string)
@@ -964,6 +1261,9 @@ impl IdentityCidGlyphScanner<'_> {
                 }
             }
             b"TJ" => {
+                if !self.record_raw_cr_variants(content, instruction, 0) {
+                    return;
+                }
                 if let Some(HayroObject::Array(array)) = operands.next() {
                     for item in array.raw_iter() {
                         if let HayroMaybeRef::NotRef(HayroObject::String(value)) = item {
@@ -1172,7 +1472,7 @@ impl FontUsageAccumulator {
 
         let parsed = crate::content_stream::visit_instructions(content, |instruction| {
             if !identity_eligible.is_empty() {
-                identity.instruction(instruction);
+                identity.instruction(content, instruction);
             }
             if !winansi_eligible.is_empty() {
                 winansi.instruction(instruction);
@@ -1729,7 +2029,7 @@ fn inspect_owned_direct_font_object(
 }
 
 #[derive(Default)]
-struct FontUsageGraph {
+pub struct FontUsageGraph {
     descriptor_usage: HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_program_edges: Vec<(CowObjectHandle, CowObjectHandle)>,
     direct_program_usage: HashMap<CowObjectHandle, FontProgramUsage>,
@@ -1756,7 +2056,7 @@ impl FontUsageGraph {
     }
 }
 
-fn collect_font_usage_graph(document: &EditDocument) -> Result<FontUsageGraph> {
+pub fn collect_font_usage_graph(document: &EditDocument) -> Result<FontUsageGraph> {
     let mut descriptor_usage_edges = Vec::new();
     let mut graph = FontUsageGraph::default();
     document.walk_output_objects(|handle, object| match object {
@@ -2134,9 +2434,8 @@ pub fn dense_compact_cidfont_type2_programs(
 pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
+    graph: &FontUsageGraph,
 ) -> Result<FontOptimizationStats> {
-    let graph = collect_font_usage_graph(document)?;
-
     let mut program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
     let mut program_descriptors = HashMap::<CowObjectHandle, Vec<CowObjectHandle>>::new();
     let mut union_unsafe_programs = BTreeSet::<CowObjectHandle>::new();
@@ -2176,30 +2475,22 @@ pub fn union_sparse_cid_font_programs_after_dedup(
 /// Hayro/COW port of [`strip_font_editing_tables`].
 ///
 /// The graph walk, mutation, and stream filter handling are Hayro-native.
+/// This pass is intentionally usage-independent so byte-identical programs
+/// remain byte-identical for the exact deduplication stage that follows.
 pub fn strip_font_editing_tables(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let graph = collect_font_usage_graph(document)?;
-
-    let mut program_usage = graph.indirect_program_usage();
-    let legacy_subset_programs = program_usage.keys().copied().collect::<BTreeSet<_>>();
-    for (&program, &usage) in &graph.direct_program_usage {
-        merge_program_usage(&mut program_usage, program, usage);
-    }
-
+    let program_usage = graph.program_usage();
     if program_usage.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
 
-    let outline_subset_programs = legacy_subset_programs;
-    let (identity_glyph_usage, _) = if outline_subset_programs.is_empty() {
-        (HashMap::new(), HashMap::new())
-    } else {
-        font_glyph_usage(document)?
-    };
+    let mut ordered_programs = program_usage.keys().copied().collect::<Vec<_>>();
+    ordered_programs.sort_unstable();
     let mut stats = FontOptimizationStats::default();
-    for (&program, &usage) in &program_usage {
+    for program in ordered_programs {
         let Some(object) = document.current_owned_object(program)? else {
             continue;
         };
@@ -2215,33 +2506,20 @@ pub fn strip_font_editing_tables(
         let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
             continue;
         };
-        let allow_outline_subset = outline_subset_programs.contains(&program);
 
         let mut candidate = decoded;
-        let mut removed_decoded_bytes = 0usize;
-        let mut glyph_subset_removed_bytes = 0usize;
-        let mut changed = single_font_ttc_to_sfnt(&candidate).is_some_and(|unwrapped| {
+        let unwrapped = single_font_ttc_to_sfnt(&candidate).is_some_and(|unwrapped| {
             candidate = unwrapped;
             true
         });
-        let outline_subset_changed = if allow_outline_subset
-            && usage.cidfont_type0_only()
-            && let Some(cids) = identity_glyph_usage.get(&program)
-            && !cids.is_empty()
-            && let Some((subset, removed)) = crate::cff_cid::subset_cid_font(&candidate, cids)
-        {
-            candidate = subset;
-            glyph_subset_removed_bytes = removed;
-            true
-        } else {
-            false
-        };
-        changed |= outline_subset_changed;
-        if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate) {
-            candidate = trimmed;
-            removed_decoded_bytes = removed;
-            changed = true;
-        }
+        let (trimmed, removed_decoded_bytes) =
+            if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate) {
+                candidate = trimmed;
+                (true, removed)
+            } else {
+                (false, 0)
+            };
+        let changed = unwrapped || trimmed;
         if !changed {
             continue;
         }
@@ -2253,7 +2531,92 @@ pub fn strip_font_editing_tables(
         }
 
         stats.programs_optimized += 1;
-        stats.programs_glyph_subset += usize::from(glyph_subset_removed_bytes > 0);
+        stats.original_encoded_bytes += raw.len();
+        stats.optimized_encoded_bytes += encoded.len();
+        stats.decoded_table_bytes_removed += removed_decoded_bytes;
+        replace_current_stream_data(document, program, encoded, true)?;
+    }
+
+    Ok(stats)
+}
+
+/// Subset rendering outlines only after exact deduplication and sparse CID
+/// union have canonicalized equivalent embedded programs.
+///
+/// Usage-dependent subsetting before those canonicalization stages can turn
+/// byte-identical programs into per-caller variants and lose a much larger
+/// deduplication win. At this point every canonical program naturally receives
+/// the union of glyph use from all font dictionaries that reference it.
+pub fn subset_font_outlines_after_dedup(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    graph: &FontUsageGraph,
+) -> Result<FontOptimizationStats> {
+    let program_usage = graph.indirect_program_usage();
+    if program_usage.is_empty() {
+        return Ok(FontOptimizationStats::default());
+    }
+
+    let (identity_glyph_usage, _) = font_glyph_usage(document)?;
+    if identity_glyph_usage.is_empty() {
+        return Ok(FontOptimizationStats::default());
+    }
+
+    let mut ordered_programs = program_usage.into_iter().collect::<Vec<_>>();
+    ordered_programs.sort_unstable_by_key(|(program, _)| *program);
+    let mut stats = FontOptimizationStats::default();
+
+    for (program, usage) in ordered_programs {
+        let Some(gids) = identity_glyph_usage.get(&program) else {
+            continue;
+        };
+        if gids.is_empty() {
+            continue;
+        }
+
+        let Some(object) = document.current_owned_object(program)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, data } = object else {
+            continue;
+        };
+        if !dictionary.contains_key(b"Filter".as_slice())
+            || !is_unfiltered_or_lone_flate(document, &dictionary)?
+        {
+            continue;
+        }
+        let raw = data.bytes(document.source())?;
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+            continue;
+        };
+        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+        let subset = if usage.cidfont_type0_only() {
+            crate::cff_cid::subset_cid_font(&candidate, gids)
+        } else if usage.cidfont_type2_only() {
+            sfnt_blank_unused_glyph_outlines(&candidate, gids)
+        } else {
+            None
+        };
+        let Some((mut candidate, glyph_subset_removed_bytes)) = subset else {
+            continue;
+        };
+
+        let removed_decoded_bytes =
+            if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate) {
+                candidate = trimmed;
+                removed
+            } else {
+                0
+            };
+        let Ok(encoded) = encode_flate(&candidate, flate_level) else {
+            continue;
+        };
+        if encoded.len() >= raw.len() {
+            continue;
+        }
+
+        stats.programs_optimized += 1;
+        stats.programs_glyph_subset += 1;
         stats.original_encoded_bytes += raw.len();
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
@@ -2921,13 +3284,11 @@ mod tests {
             unsafe_programs: BTreeSet::new(),
             unknown_font_text: false,
         };
-        let stopped = crate::content_stream::visit_instructions(
-            b"/F1 10 Tf <0001> Tj q /F2 10 Tf <0002> Tj Q <0003> Tj",
-            |instruction| {
-                scanner.instruction(instruction);
-                Ok(())
-            },
-        )?;
+        let content = b"/F1 10 Tf <0001> Tj q /F2 10 Tf <0002> Tj Q <0003> Tj";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
         assert!(!stopped);
         assert_eq!(scanner.used.get(&first), Some(&BTreeSet::from([1_u16, 3])));
         assert_eq!(scanner.used.get(&second), Some(&BTreeSet::from([2_u16])));
@@ -2954,13 +3315,11 @@ mod tests {
             unsafe_programs: BTreeSet::new(),
             unknown_font_text: false,
         };
-        let stopped = crate::content_stream::visit_instructions(
-            b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj",
-            |instruction| {
-                scanner.instruction(instruction);
-                Ok(())
-            },
-        )?;
+        let content = b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
         assert!(!stopped);
         assert!(!scanner.unknown_font_text);
         assert_eq!(
@@ -2989,17 +3348,158 @@ mod tests {
             unsafe_programs: BTreeSet::new(),
             unknown_font_text: false,
         };
-        let stopped = crate::content_stream::visit_instructions(
-            b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj",
-            |instruction| {
-                scanner.instruction(instruction);
-                Ok(())
-            },
-        )?;
+        let content = b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
         assert!(!stopped);
         assert!(scanner.unknown_font_text);
         assert_eq!(scanner.used.get(&program), Some(&BTreeSet::from([1_u16])));
         Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_unions_raw_and_normalized_carriage_return_codes() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let content = b"/F1 10 Tf <0001> Tj (\x02\r) Tj <0002> Tj";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
+        assert!(!stopped);
+        assert_eq!(
+            scanner.used.get(&program),
+            Some(&BTreeSet::from([1_u16, 2, 0x020a, 0x020d]))
+        );
+        assert!(!scanner.unsafe_programs.contains(&program));
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_unions_raw_cr_codes_inside_tj_array() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let content = b"/F1 10 Tf [<0001> 20 (\x02\r) -10 <0002>] TJ";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
+        assert!(!stopped);
+        assert_eq!(
+            scanner.used.get(&program),
+            Some(&BTreeSet::from([1_u16, 2, 0x020a, 0x020d]))
+        );
+        assert!(!scanner.unsafe_programs.contains(&program));
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_unions_raw_cr_codes_in_double_quote_operator() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let content = b"/F1 10 Tf 0 0 (\x02\r) \"";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
+        assert!(!stopped);
+        assert_eq!(
+            scanner.used.get(&program),
+            Some(&BTreeSet::from([0x020a_u16, 0x020d]))
+        );
+        assert!(!scanner.unsafe_programs.contains(&program));
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_fails_closed_on_raw_crlf_literal() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let content = b"/F1 10 Tf (\x02\r\n\x03) Tj";
+        let stopped = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            Ok(())
+        })?;
+        assert!(!stopped);
+        assert!(scanner.unsafe_programs.contains(&program));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_literal_cr_decoder_preserves_raw_bytes_and_pdf_escapes() {
+        let raw = b"[(A\\(B\\)) 10 (\x02\r) (\\101\\n)]";
+        assert!(raw_operand_contains_unescaped_literal_cr(raw));
+        assert_eq!(
+            decode_raw_literal_strings_preserving_cr(raw),
+            Some(vec![b"A(B)".to_vec(), b"\x02\r".to_vec(), b"A\n".to_vec()])
+        );
+        assert!(!raw_operand_contains_unescaped_literal_cr(b"(\\rB)"));
+        assert!(!raw_operand_contains_unescaped_literal_cr(b"(A)\r(B)"));
+        assert!(!raw_operand_contains_unescaped_literal_cr(b"(A\\\rB)"));
+        assert_eq!(decode_raw_literal_strings_preserving_cr(b"(A\r\nB)"), None);
+        assert_eq!(decode_raw_literal_strings_preserving_cr(b"(\\777)"), None);
     }
 
     #[test]
@@ -3053,6 +3553,431 @@ mod tests {
         assert!(!stopped);
         assert!(scanner.unknown_font_text);
         assert_eq!(scanner.used.get(&program), Some(&BTreeSet::from(*b"A")));
+        Ok(())
+    }
+
+    fn composite_test_glyph(component_gid: u16) -> Vec<u8> {
+        let mut glyph = vec![0_u8; 18];
+        glyph[0..2].copy_from_slice(&(-1_i16).to_be_bytes());
+        // ARG_1_AND_2_ARE_WORDS; no MORE_COMPONENTS flag.
+        glyph[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        glyph[12..14].copy_from_slice(&component_gid.to_be_bytes());
+        glyph
+    }
+
+    #[test]
+    fn blank_unused_glyph_outlines_keeps_notdef_composite_dependencies() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
+        let component = simple_test_glyph(0x31);
+        let source = sparse_union_test_font(
+            &[
+                Some(composite_test_glyph(3)),
+                Some(simple_test_glyph(0x11)),
+                Some(simple_test_glyph(0x12)),
+                Some(component.clone()),
+            ],
+            [0, 0, 100, 100],
+        )?;
+        let Some((pruned, _)) = sfnt_blank_unused_glyph_outlines(&source, &BTreeSet::from([2_u16]))
+        else {
+            return Err(Error::Invalid(
+                "outline blanking should shrink composite fixture".to_owned(),
+            ));
+        };
+        let font = FontRef::new(&pruned)
+            .map_err(|_| Error::Invalid("pruned composite fixture should parse".to_owned()))?;
+        let offsets = sfnt_glyph_offsets(&pruned)
+            .ok_or_else(|| Error::Invalid("pruned composite loca should parse".to_owned()))?;
+        let glyf_table = font
+            .glyf()
+            .map_err(|_| Error::Invalid("pruned composite glyf should parse".to_owned()))?;
+        let glyf = glyf_table.offset_data().as_bytes();
+        assert_eq!(&glyf[offsets[3]..offsets[4]], component.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn blank_unused_glyph_outlines_preserves_gid_space_and_metrics() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
+        let glyph0 = simple_test_glyph(0x10);
+        let glyph2 = simple_test_glyph(0x12);
+        let glyph3 = simple_test_glyph(0x13);
+        let source = sparse_union_test_font(
+            &[
+                Some(glyph0.clone()),
+                None,
+                Some(glyph2.clone()),
+                Some(glyph3),
+            ],
+            [0, 0, 100, 100],
+        )?;
+        let Some((pruned, _)) =
+            sfnt_blank_unused_glyph_outlines(&source, &BTreeSet::from([1_u16, 2_u16]))
+        else {
+            return Err(Error::Invalid(
+                "outline blanking should shrink fixture".to_owned(),
+            ));
+        };
+        let source_font = FontRef::new(&source)
+            .map_err(|_| Error::Invalid("source fixture should parse".to_owned()))?;
+        let pruned_font = FontRef::new(&pruned)
+            .map_err(|_| Error::Invalid("pruned fixture should parse".to_owned()))?;
+        let source_maxp = source_font
+            .maxp()
+            .map_err(|_| Error::Invalid("source maxp should parse".to_owned()))?;
+        let pruned_maxp = pruned_font
+            .maxp()
+            .map_err(|_| Error::Invalid("pruned maxp should parse".to_owned()))?;
+        assert_eq!(source_maxp.num_glyphs(), pruned_maxp.num_glyphs());
+        let source_hmtx = source_font
+            .hmtx()
+            .map_err(|_| Error::Invalid("source hmtx should parse".to_owned()))?;
+        let pruned_hmtx = pruned_font
+            .hmtx()
+            .map_err(|_| Error::Invalid("pruned hmtx should parse".to_owned()))?;
+        assert_eq!(
+            source_hmtx.offset_data().as_bytes(),
+            pruned_hmtx.offset_data().as_bytes()
+        );
+        let offsets = sfnt_glyph_offsets(&pruned)
+            .ok_or_else(|| Error::Invalid("pruned loca should parse".to_owned()))?;
+        let pruned_glyf = pruned_font
+            .glyf()
+            .map_err(|_| Error::Invalid("pruned glyf should parse".to_owned()))?;
+        let glyf = pruned_glyf.offset_data().as_bytes();
+        assert_eq!(&glyf[offsets[0]..offsets[1]], glyph0.as_slice());
+        assert_eq!(&glyf[offsets[1]..offsets[2]], &[] as &[u8]);
+        assert_eq!(&glyf[offsets[2]..offsets[3]], glyph2.as_slice());
+        assert_eq!(&glyf[offsets[3]..offsets[4]], &[] as &[u8]);
+        Ok(())
+    }
+
+    fn identity_cid_outline_fixture() -> Result<Vec<u8>> {
+        let glyph0 = simple_test_glyph(0x10);
+        let glyph2 = simple_test_glyph(0x12);
+        let glyph3 = simple_test_glyph(0x13);
+        let font = sparse_union_test_font(
+            &[Some(glyph0), None, Some(glyph2), Some(glyph3)],
+            [0, 0, 100, 100],
+        )?;
+        let encoded = crate::stream_codec::encode_flate(&font, crate::FlateLevel::SIZE)?;
+        let content = b"BT /F1 10 Tf <00010002> Tj ET";
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                content.len(),
+                String::from_utf8_lossy(content)
+            )
+            .as_bytes(),
+        );
+        let mut font_stream = format!(
+            "5 0 obj\n<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
+            encoded.len(),
+            font.len()
+        )
+        .into_bytes();
+        font_stream.extend_from_slice(&encoded);
+        font_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &font_stream);
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /OutlineTest /Encoding /Identity-H /DescendantFonts [ << /Type /Font /Subtype /CIDFontType2 /BaseFont /OutlineTest /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 /W [1 [500 500]] >> ] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /FontDescriptor /FontName /OutlineTest /Flags 4 /FontBBox [0 0 100 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile2 5 0 R >>\nendobj\n",
+        );
+
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Ok(pdf)
+    }
+
+    #[test]
+    fn identity_cidfont_outline_blanking_is_wired_and_idempotent() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
+        let mut document = EditDocument::from_bytes(identity_cid_outline_fixture()?)?;
+        let stripped = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
+        assert_eq!(stripped.programs_glyph_subset, 0);
+        let graph = collect_font_usage_graph(&document)?;
+        let first =
+            subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        assert_eq!(first.programs_optimized, 1);
+        assert_eq!(first.programs_glyph_subset, 1);
+        assert!(first.glyph_subset_decoded_bytes_removed > 0);
+
+        let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
+        let decoded = document.decoded_stream_data(program)?;
+        let font = FontRef::new(decoded.as_ref())
+            .map_err(|_| Error::Invalid("outline-blanked fixture should parse".to_owned()))?;
+        let maxp = font
+            .maxp()
+            .map_err(|_| Error::Invalid("outline-blanked maxp should parse".to_owned()))?;
+        assert_eq!(maxp.num_glyphs(), 4);
+        let offsets = sfnt_glyph_offsets(decoded.as_ref())
+            .ok_or_else(|| Error::Invalid("outline-blanked loca should parse".to_owned()))?;
+        let glyf_table = font
+            .glyf()
+            .map_err(|_| Error::Invalid("outline-blanked glyf should parse".to_owned()))?;
+        let glyf = glyf_table.offset_data().as_bytes();
+        assert_eq!(&glyf[offsets[1]..offsets[2]], &[] as &[u8]);
+        assert_ne!(&glyf[offsets[2]..offsets[3]], &[] as &[u8]);
+        assert_eq!(&glyf[offsets[3]..offsets[4]], &[] as &[u8]);
+
+        let output = document.write_compact()?;
+        let mut reparsed = EditDocument::from_bytes(output)?;
+        let graph = collect_font_usage_graph(&reparsed)?;
+        let second =
+            subset_font_outlines_after_dedup(&mut reparsed, crate::FlateLevel::SIZE, &graph)?;
+        assert_eq!(second.programs_optimized, 0);
+        assert_eq!(second.programs_glyph_subset, 0);
+        Ok(())
+    }
+
+    fn identity_cid_duplicate_program_fixture() -> Result<Vec<u8>> {
+        let font = sparse_union_test_font(
+            &[
+                Some(simple_test_glyph(0x10)),
+                Some(simple_test_glyph(0x11)),
+                Some(simple_test_glyph(0x12)),
+                Some(simple_test_glyph(0x13)),
+            ],
+            [0, 0, 100, 100],
+        )?;
+        let encoded = crate::stream_codec::encode_flate(&font, crate::FlateLevel::SIZE)?;
+        let contents = [
+            b"BT /F1 10 Tf <0001> Tj ET".as_slice(),
+            b"BT /F2 10 Tf <0002> Tj ET".as_slice(),
+        ];
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 8 0 R] /Count 2 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                contents[0].len(),
+                String::from_utf8_lossy(contents[0])
+            )
+            .as_bytes(),
+        );
+        let mut first_stream = format!(
+            "5 0 obj\n<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
+            encoded.len(),
+            font.len()
+        )
+        .into_bytes();
+        first_stream.extend_from_slice(&encoded);
+        first_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &first_stream);
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /OutlineShared /Encoding /Identity-H /DescendantFonts [ << /Type /Font /Subtype /CIDFontType2 /BaseFont /OutlineShared /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 /W [1 [500 500]] >> ] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /FontDescriptor /FontName /OutlineShared /Flags 4 /FontBBox [0 0 100 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile2 5 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F2 11 0 R >> >> /Contents 9 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "9 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                contents[1].len(),
+                String::from_utf8_lossy(contents[1])
+            )
+            .as_bytes(),
+        );
+        let mut second_stream = format!(
+            "10 0 obj\n<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
+            encoded.len(),
+            font.len()
+        )
+        .into_bytes();
+        second_stream.extend_from_slice(&encoded);
+        second_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &second_stream);
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"11 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /OutlineShared /Encoding /Identity-H /DescendantFonts [ << /Type /Font /Subtype /CIDFontType2 /BaseFont /OutlineShared /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 12 0 R /DW 1000 /W [2 [500 500]] >> ] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"12 0 obj\n<< /Type /FontDescriptor /FontName /OutlineShared /Flags 4 /FontBBox [0 0 100 100] /ItalicAngle 0 /Ascent 100 /Descent 0 /CapHeight 100 /StemV 80 /FontFile2 10 0 R >>\nendobj\n",
+        );
+        Ok(finish_test_pdf(pdf, offsets, 1))
+    }
+
+    #[test]
+    fn outline_blanking_preserves_dedup_and_unions_shared_program_usage() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
+        let mut document = EditDocument::from_bytes(identity_cid_duplicate_program_fixture()?)?;
+        let _ = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
+        let dedup = crate::dedup::canonicalize_font_program_streams(&mut document)?;
+        assert_eq!(dedup.duplicate_streams_detected, 1);
+        assert_eq!(dedup.references_canonicalized, 1);
+
+        let first_descriptor = document
+            .current_owned_object(CowObjectHandle::Existing(ObjectId::new(7, 0)))?
+            .ok_or_else(|| Error::Invalid("first descriptor is missing".to_owned()))?;
+        let second_descriptor = document
+            .current_owned_object(CowObjectHandle::Existing(ObjectId::new(12, 0)))?
+            .ok_or_else(|| Error::Invalid("second descriptor is missing".to_owned()))?;
+        let first_program = first_descriptor
+            .as_dictionary()
+            .and_then(|dictionary| direct_owned_reference(dictionary.get(b"FontFile2".as_slice())));
+        let second_program = second_descriptor
+            .as_dictionary()
+            .and_then(|dictionary| direct_owned_reference(dictionary.get(b"FontFile2".as_slice())));
+        assert_eq!(first_program, second_program);
+        let program = first_program
+            .ok_or_else(|| Error::Invalid("deduplicated font program is missing".to_owned()))?;
+
+        let graph = collect_font_usage_graph(&document)?;
+        let subset =
+            subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        assert_eq!(subset.programs_glyph_subset, 1);
+        let decoded = document.decoded_stream_data(program)?;
+        let font = FontRef::new(decoded.as_ref())
+            .map_err(|_| Error::Invalid("deduplicated outline font should parse".to_owned()))?;
+        let offsets = sfnt_glyph_offsets(decoded.as_ref())
+            .ok_or_else(|| Error::Invalid("deduplicated outline loca should parse".to_owned()))?;
+        let glyf_table = font
+            .glyf()
+            .map_err(|_| Error::Invalid("deduplicated outline glyf should parse".to_owned()))?;
+        let glyf = glyf_table.offset_data().as_bytes();
+        assert_ne!(&glyf[offsets[1]..offsets[2]], &[] as &[u8]);
+        assert_ne!(&glyf[offsets[2]..offsets[3]], &[] as &[u8]);
+        assert_eq!(&glyf[offsets[3]..offsets[4]], &[] as &[u8]);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_post_dedup_graph_survives_sparse_union_redirects() -> Result<()> {
+        use write_fonts::read::{FontRef, TableProvider};
+
+        let mut document = EditDocument::from_bytes(identity_cid_duplicate_program_fixture()?)?;
+        let _ = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
+
+        // Turn the two otherwise-identical programs into complementary sparse
+        // variants. Sparse union must redirect the second descriptor to the
+        // first program; the pre-union usage graph must remain a valid subtype
+        // proof for the outline pass that follows. Glyph usage itself is
+        // intentionally rescanned after the redirect.
+        for (object_number, live_gid) in [(5_i32, 1_u16), (10_i32, 2_u16)] {
+            let program = CowObjectHandle::Existing(ObjectId::new(object_number, 0));
+            let decoded = document.decoded_stream_data(program)?;
+            let Some((sparse, _)) =
+                sfnt_blank_unused_glyph_outlines(decoded.as_ref(), &BTreeSet::from([live_gid]))
+            else {
+                return Err(Error::Invalid(
+                    "sparse-union fixture should blank unused outlines".to_owned(),
+                ));
+            };
+            let encoded = crate::stream_codec::encode_flate(&sparse, crate::FlateLevel::SIZE)
+                .map_err(|error| Error::Invalid(format!("fixture flate encode failed: {error}")))?;
+            replace_current_stream_data(&mut document, program, encoded, true)?;
+            set_font_program_length1(&mut document, program, sparse.len())?;
+        }
+
+        let dedup = crate::dedup::canonicalize_font_program_streams(&mut document)?;
+        assert_eq!(dedup.duplicate_streams_detected, 0);
+        let graph = collect_font_usage_graph(&document)?;
+        let union = union_sparse_cid_font_programs_after_dedup(
+            &mut document,
+            crate::FlateLevel::SIZE,
+            &graph,
+        )?;
+        assert_eq!(union.programs_optimized, 2);
+
+        let first_descriptor = document
+            .current_owned_object(CowObjectHandle::Existing(ObjectId::new(7, 0)))?
+            .ok_or_else(|| Error::Invalid("first descriptor is missing".to_owned()))?;
+        let second_descriptor = document
+            .current_owned_object(CowObjectHandle::Existing(ObjectId::new(12, 0)))?
+            .ok_or_else(|| Error::Invalid("second descriptor is missing".to_owned()))?;
+        let first_program = first_descriptor
+            .as_dictionary()
+            .and_then(|dictionary| direct_owned_reference(dictionary.get(b"FontFile2".as_slice())));
+        let second_program = second_descriptor
+            .as_dictionary()
+            .and_then(|dictionary| direct_owned_reference(dictionary.get(b"FontFile2".as_slice())));
+        assert_eq!(first_program, second_program);
+        let program = first_program
+            .ok_or_else(|| Error::Invalid("sparse-union program is missing".to_owned()))?;
+
+        let _ = subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        let decoded = document.decoded_stream_data(program)?;
+        let font = FontRef::new(decoded.as_ref())
+            .map_err(|_| Error::Invalid("sparse-union font should parse".to_owned()))?;
+        let offsets = sfnt_glyph_offsets(decoded.as_ref())
+            .ok_or_else(|| Error::Invalid("sparse-union loca should parse".to_owned()))?;
+        let glyf_table = font
+            .glyf()
+            .map_err(|_| Error::Invalid("sparse-union glyf should parse".to_owned()))?;
+        let glyf = glyf_table.offset_data().as_bytes();
+        assert_ne!(&glyf[offsets[1]..offsets[2]], &[] as &[u8]);
+        assert_ne!(&glyf[offsets[2]..offsets[3]], &[] as &[u8]);
+        assert_eq!(&glyf[offsets[3]..offsets[4]], &[] as &[u8]);
         Ok(())
     }
 
