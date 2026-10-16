@@ -8,7 +8,7 @@ use hayro_syntax::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::Hash,
 };
 
@@ -1517,7 +1517,7 @@ pub fn factor_duplicate_pattern_payloads(
     }
 
     let patterns = reachable_streams_with_type(document, b"Pattern")?;
-    let mut buckets = HashMap::<[u8; 32], Vec<Group>>::new();
+    let mut buckets = BTreeMap::<[u8; 32], Vec<Group>>::new();
     for pattern in patterns {
         let Some((fingerprint, raw_bytes)) = pattern_payload_fingerprint(document, pattern)? else {
             continue;
@@ -2840,6 +2840,68 @@ mod tests {
         pdf.stream(5, &first, &body)?;
         pdf.stream(6, &second, &body)?;
         Ok((pdf.finish(1)?, body.len()))
+    }
+
+    fn duplicate_pattern_payload_two_group_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /A 5 0 R /B 6 0 R /C 7 0 R /D 8 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(
+            4,
+            b"",
+            b"/Pattern cs /A scn 0 0 25 100 re f /B scn 25 0 25 100 re f /C scn 50 0 25 100 re f /D scn 75 0 25 100 re f",
+        )?;
+        let first_body = b"0 0 1 rg 0 0 10 10 re f\n".repeat(64);
+        let second_body = b"1 0 0 rg 0 0 10 10 re f\n".repeat(64);
+        let common = b"/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources <<>>";
+        for (object, matrix, body) in [
+            (
+                5_u32,
+                b" /Matrix [1 0 0 1 0 0]".as_slice(),
+                first_body.as_slice(),
+            ),
+            (
+                6,
+                b" /Matrix [1 0 0 1 3 4]".as_slice(),
+                first_body.as_slice(),
+            ),
+            (
+                7,
+                b" /Matrix [1 0 0 1 6 8]".as_slice(),
+                second_body.as_slice(),
+            ),
+            (
+                8,
+                b" /Matrix [1 0 0 1 9 12]".as_slice(),
+                second_body.as_slice(),
+            ),
+        ] {
+            let mut dictionary = common.to_vec();
+            dictionary.extend_from_slice(matrix);
+            pdf.stream(object, &dictionary, body)?;
+        }
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn pattern_payload_factoring_is_byte_deterministic_across_independent_groups() -> Result<()> {
+        let input = duplicate_pattern_payload_two_group_fixture()?;
+        let mut expected = None;
+        for _ in 0..16 {
+            let mut document = EditDocument::from_bytes(input.clone())?;
+            let stats = factor_duplicate_pattern_payloads(&mut document)?;
+            assert_eq!(stats.groups_factored, 2);
+            assert_eq!(stats.patterns_rewritten, 4);
+            assert_eq!(stats.forms_created, 2);
+            let output = document.write_compact()?;
+            if let Some(expected) = &expected {
+                assert_eq!(&output, expected);
+            } else {
+                expected = Some(output);
+            }
+        }
+        Ok(())
     }
 
     #[test]
