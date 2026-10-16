@@ -822,16 +822,84 @@ fn page_font_program(
     }
 }
 
+fn font_neutral_ext_gstates(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let Some(ext_gstates) =
+        resolved_owned_dictionary(document, resources.get(b"ExtGState".as_slice()))?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let mut neutral = BTreeSet::new();
+    for (name, value) in &ext_gstates {
+        let Some(dictionary) = resolved_owned_dictionary(document, Some(value))? else {
+            continue;
+        };
+        if !dictionary.contains_key(b"Font".as_slice()) {
+            neutral.insert(name.clone());
+        }
+    }
+    Ok(neutral)
+}
+
+struct FontSelectionState<T: Copy> {
+    current: Option<T>,
+    known: bool,
+    stack: Vec<(Option<T>, bool)>,
+}
+
+impl<T: Copy> Default for FontSelectionState<T> {
+    fn default() -> Self {
+        Self {
+            current: None,
+            known: false,
+            stack: Vec::new(),
+        }
+    }
+}
+
+impl<T: Copy> FontSelectionState<T> {
+    const fn select(&mut self, current: Option<T>) {
+        self.current = current;
+        self.known = true;
+    }
+
+    const fn invalidate(&mut self) {
+        self.current = None;
+        self.known = false;
+    }
+
+    fn save(&mut self) {
+        self.stack.push((self.current, self.known));
+    }
+
+    fn restore(&mut self) {
+        if let Some((current, known)) = self.stack.pop() {
+            self.current = current;
+            self.known = known;
+        } else {
+            self.invalidate();
+        }
+    }
+}
+
 struct IdentityCidGlyphScanner<'a> {
     fonts: &'a HashMap<Vec<u8>, CidFontGlyphSpec>,
-    current_font: Option<&'a CidFontGlyphSpec>,
+    font_neutral_ext_gstates: &'a BTreeSet<Vec<u8>>,
+    selection: FontSelectionState<&'a CidFontGlyphSpec>,
     used: HashMap<CowObjectHandle, BTreeSet<u16>>,
     unsafe_programs: BTreeSet<CowObjectHandle>,
+    unknown_font_text: bool,
 }
 
 impl IdentityCidGlyphScanner<'_> {
     fn record_string(&mut self, bytes: &[u8]) {
-        let Some(font) = self.current_font else {
+        if !self.selection.known {
+            self.unknown_font_text = true;
+            return;
+        }
+        let Some(font) = self.selection.current else {
             return;
         };
         let (pairs, remainder) = bytes.as_chunks::<2>();
@@ -858,11 +926,26 @@ impl IdentityCidGlyphScanner<'_> {
     fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         let mut operands = instruction.operands();
         match &instruction.operator[..] {
-            b"Tf" => {
-                self.current_font = operands
+            b"q" => self.selection.save(),
+            b"Q" => self.selection.restore(),
+            b"gs" => {
+                let neutral = operands
                     .next()
                     .and_then(crate::content_stream::operand_name)
-                    .and_then(|name| self.fonts.get(name));
+                    .is_some_and(|name| self.font_neutral_ext_gstates.contains(name));
+                if !neutral {
+                    self.selection.invalidate();
+                }
+            }
+            b"Tf" => {
+                if let Some(name) = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_name)
+                {
+                    self.selection.select(self.fonts.get(name));
+                } else {
+                    self.selection.invalidate();
+                }
             }
             b"Tj" | b"'" => {
                 if let Some(bytes) = operands
@@ -916,14 +999,20 @@ fn page_simple_truetype_program(
 
 struct WinAnsiCodeScanner<'a> {
     fonts: &'a HashMap<Vec<u8>, CowObjectHandle>,
-    current_program: Option<CowObjectHandle>,
+    font_neutral_ext_gstates: &'a BTreeSet<Vec<u8>>,
+    selection: FontSelectionState<CowObjectHandle>,
     used: HashMap<CowObjectHandle, BTreeSet<u8>>,
     unsafe_programs: BTreeSet<CowObjectHandle>,
+    unknown_font_text: bool,
 }
 
 impl WinAnsiCodeScanner<'_> {
     fn record_string(&mut self, bytes: &[u8]) {
-        let Some(program) = self.current_program else {
+        if !self.selection.known {
+            self.unknown_font_text = true;
+            return;
+        }
+        let Some(program) = self.selection.current else {
             return;
         };
         if bytes.iter().any(|byte| !(0x20..=0x7e).contains(byte)) {
@@ -939,11 +1028,26 @@ impl WinAnsiCodeScanner<'_> {
     fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         let mut operands = instruction.operands();
         match &instruction.operator[..] {
-            b"Tf" => {
-                self.current_program = operands
+            b"q" => self.selection.save(),
+            b"Q" => self.selection.restore(),
+            b"gs" => {
+                let neutral = operands
                     .next()
                     .and_then(crate::content_stream::operand_name)
-                    .and_then(|name| self.fonts.get(name).copied());
+                    .is_some_and(|name| self.font_neutral_ext_gstates.contains(name));
+                if !neutral {
+                    self.selection.invalidate();
+                }
+            }
+            b"Tf" => {
+                if let Some(name) = operands
+                    .next()
+                    .and_then(crate::content_stream::operand_name)
+                {
+                    self.selection.select(self.fonts.get(name).copied());
+                } else {
+                    self.selection.invalidate();
+                }
             }
             b"Tj" | b"'" => {
                 if let Some(bytes) = operands
@@ -1029,47 +1133,70 @@ fn eligible_identity_fonts(
     Ok(eligible)
 }
 
-fn scan_font_usage_scope(
-    content: &[u8],
-    identity_eligible: &HashMap<Vec<u8>, CidFontGlyphSpec>,
-    winansi_eligible: &HashMap<Vec<u8>, CowObjectHandle>,
-    identity_used: &mut HashMap<CowObjectHandle, BTreeSet<u16>>,
-    identity_unsafe: &mut BTreeSet<CowObjectHandle>,
-    winansi_used: &mut HashMap<CowObjectHandle, BTreeSet<u8>>,
-    winansi_unsafe: &mut BTreeSet<CowObjectHandle>,
-) {
-    if identity_eligible.is_empty() && winansi_eligible.is_empty() {
-        return;
-    }
-    let mut identity = IdentityCidGlyphScanner {
-        fonts: identity_eligible,
-        current_font: None,
-        used: HashMap::new(),
-        unsafe_programs: BTreeSet::new(),
-    };
-    let mut winansi = WinAnsiCodeScanner {
-        fonts: winansi_eligible,
-        current_program: None,
-        used: HashMap::new(),
-        unsafe_programs: BTreeSet::new(),
-    };
-    let parsed = crate::content_stream::visit_instructions(content, |instruction| {
-        identity.instruction(instruction);
-        winansi.instruction(instruction);
-        Ok(())
-    });
-    if !matches!(parsed, Ok(false)) {
-        identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
-        winansi_unsafe.extend(winansi_eligible.values().copied());
-        return;
-    }
-    identity_unsafe.extend(identity.unsafe_programs);
-    for (program, gids) in identity.used {
-        identity_used.entry(program).or_default().extend(gids);
-    }
-    winansi_unsafe.extend(winansi.unsafe_programs);
-    for (program, codes) in winansi.used {
-        winansi_used.entry(program).or_default().extend(codes);
+#[derive(Default)]
+struct FontUsageAccumulator {
+    identity_used: HashMap<CowObjectHandle, BTreeSet<u16>>,
+    identity_unsafe: BTreeSet<CowObjectHandle>,
+    winansi_used: HashMap<CowObjectHandle, BTreeSet<u8>>,
+    winansi_unsafe: BTreeSet<CowObjectHandle>,
+}
+
+impl FontUsageAccumulator {
+    fn scan_scope(
+        &mut self,
+        content: &[u8],
+        identity_eligible: &HashMap<Vec<u8>, CidFontGlyphSpec>,
+        winansi_eligible: &HashMap<Vec<u8>, CowObjectHandle>,
+        font_neutral_ext_gstates: &BTreeSet<Vec<u8>>,
+    ) -> bool {
+        if identity_eligible.is_empty() && winansi_eligible.is_empty() {
+            return false;
+        }
+
+        let mut identity = IdentityCidGlyphScanner {
+            fonts: identity_eligible,
+            font_neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let mut winansi = WinAnsiCodeScanner {
+            fonts: winansi_eligible,
+            font_neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+
+        let parsed = crate::content_stream::visit_instructions(content, |instruction| {
+            if !identity_eligible.is_empty() {
+                identity.instruction(instruction);
+            }
+            if !winansi_eligible.is_empty() {
+                winansi.instruction(instruction);
+            }
+            Ok(())
+        });
+        if !matches!(parsed, Ok(false)) {
+            self.identity_unsafe
+                .extend(identity_eligible.values().map(|spec| spec.program));
+            self.winansi_unsafe
+                .extend(winansi_eligible.values().copied());
+            return true;
+        }
+
+        let unknown_font_text = identity.unknown_font_text || winansi.unknown_font_text;
+        self.identity_unsafe.extend(identity.unsafe_programs);
+        for (program, gids) in identity.used {
+            self.identity_used.entry(program).or_default().extend(gids);
+        }
+        self.winansi_unsafe.extend(winansi.unsafe_programs);
+        for (program, codes) in winansi.used {
+            self.winansi_used.entry(program).or_default().extend(codes);
+        }
+        unknown_font_text
     }
 }
 
@@ -1099,10 +1226,7 @@ type WinAnsiCodeUsage = HashMap<CowObjectHandle, BTreeSet<u8>>;
 type FontGlyphUsage = (IdentityGlyphUsage, WinAnsiCodeUsage);
 
 fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
-    let mut identity_used = HashMap::<CowObjectHandle, BTreeSet<u16>>::new();
-    let mut identity_unsafe = BTreeSet::new();
-    let mut winansi_used = HashMap::<CowObjectHandle, BTreeSet<u8>>::new();
-    let mut winansi_unsafe = BTreeSet::new();
+    let mut usage = FontUsageAccumulator::default();
 
     for page in document.page_handles()? {
         let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
@@ -1112,8 +1236,10 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
             continue;
         };
         let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut identity_unsafe)?;
-        let winansi_eligible = eligible_winansi_fonts(document, &resources, &mut winansi_unsafe)?;
+            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
+        let winansi_eligible =
+            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
@@ -1128,15 +1254,14 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
         };
         let mut content = Vec::new();
         decoded_content_value(document, contents, &mut content)?;
-        scan_font_usage_scope(
+        if usage.scan_scope(
             &content,
             &identity_eligible,
             &winansi_eligible,
-            &mut identity_used,
-            &mut identity_unsafe,
-            &mut winansi_used,
-            &mut winansi_unsafe,
-        );
+            &font_neutral_ext_gstates,
+        ) {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
     }
 
     for form in form_xobject_handles(document)? {
@@ -1154,34 +1279,39 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
             return Ok((HashMap::new(), HashMap::new()));
         };
         let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut identity_unsafe)?;
-        let winansi_eligible = eligible_winansi_fonts(document, &resources, &mut winansi_unsafe)?;
+            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
+        let winansi_eligible =
+            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
         let Ok(content) = document.decoded_content_stream_data(form) else {
-            identity_unsafe.extend(identity_eligible.values().map(|spec| spec.program));
-            winansi_unsafe.extend(winansi_eligible.values().copied());
+            usage
+                .identity_unsafe
+                .extend(identity_eligible.values().map(|spec| spec.program));
+            usage
+                .winansi_unsafe
+                .extend(winansi_eligible.values().copied());
             continue;
         };
-        scan_font_usage_scope(
+        if usage.scan_scope(
             &content,
             &identity_eligible,
             &winansi_eligible,
-            &mut identity_used,
-            &mut identity_unsafe,
-            &mut winansi_used,
-            &mut winansi_unsafe,
-        );
+            &font_neutral_ext_gstates,
+        ) {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
     }
 
-    for program in &identity_unsafe {
-        identity_used.remove(program);
+    for program in &usage.identity_unsafe {
+        usage.identity_used.remove(program);
     }
-    for program in &winansi_unsafe {
-        winansi_used.remove(program);
+    for program in &usage.winansi_unsafe {
+        usage.winansi_used.remove(program);
     }
-    Ok((identity_used, winansi_used))
+    Ok((usage.identity_used, usage.winansi_used))
 }
 
 fn inspect_source_font_dictionary(
@@ -2385,6 +2515,170 @@ mod tests {
         assert!(
             sfnt_union_sparse_glyphs(&[(a.as_slice(), &used), (b.as_slice(), &used)]).is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_restores_font_across_graphics_state() -> Result<()> {
+        let first = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let second = CowObjectHandle::Existing(ObjectId::new(21, 0));
+        let fonts = HashMap::from([
+            (
+                b"F1".to_vec(),
+                CidFontGlyphSpec {
+                    program: first,
+                    mapping: CidToGidMapping::Identity,
+                },
+            ),
+            (
+                b"F2".to_vec(),
+                CidFontGlyphSpec {
+                    program: second,
+                    mapping: CidToGidMapping::Identity,
+                },
+            ),
+        ]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let stopped = crate::content_stream::visit_instructions(
+            b"/F1 10 Tf <0001> Tj q /F2 10 Tf <0002> Tj Q <0003> Tj",
+            |instruction| {
+                scanner.instruction(instruction);
+                Ok(())
+            },
+        )?;
+        assert!(!stopped);
+        assert_eq!(scanner.used.get(&first), Some(&BTreeSet::from([1_u16, 3])));
+        assert_eq!(scanner.used.get(&second), Some(&BTreeSet::from([2_u16])));
+        assert!(!scanner.unknown_font_text);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_keeps_font_across_font_neutral_ext_gstate() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::from([b"GS1".to_vec()]);
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let stopped = crate::content_stream::visit_instructions(
+            b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj",
+            |instruction| {
+                scanner.instruction(instruction);
+                Ok(())
+            },
+        )?;
+        assert!(!stopped);
+        assert!(!scanner.unknown_font_text);
+        assert_eq!(
+            scanner.used.get(&program),
+            Some(&BTreeSet::from([1_u16, 2]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_usage_scanner_fails_closed_after_unknown_ext_gstate_font() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(
+            b"F1".to_vec(),
+            CidFontGlyphSpec {
+                program,
+                mapping: CidToGidMapping::Identity,
+            },
+        )]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = IdentityCidGlyphScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let stopped = crate::content_stream::visit_instructions(
+            b"/F1 10 Tf <0001> Tj /GS1 gs <0002> Tj",
+            |instruction| {
+                scanner.instruction(instruction);
+                Ok(())
+            },
+        )?;
+        assert!(!stopped);
+        assert!(scanner.unknown_font_text);
+        assert_eq!(scanner.used.get(&program), Some(&BTreeSet::from([1_u16])));
+        Ok(())
+    }
+
+    #[test]
+    fn winansi_usage_scanner_restores_font_across_graphics_state() -> Result<()> {
+        let first = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let second = CowObjectHandle::Existing(ObjectId::new(21, 0));
+        let fonts = HashMap::from([(b"F1".to_vec(), first), (b"F2".to_vec(), second)]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = WinAnsiCodeScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let stopped = crate::content_stream::visit_instructions(
+            b"/F1 10 Tf (A) Tj q /F2 10 Tf (B) Tj Q (C) Tj",
+            |instruction| {
+                scanner.instruction(instruction);
+                Ok(())
+            },
+        )?;
+        assert!(!stopped);
+        assert_eq!(scanner.used.get(&first), Some(&BTreeSet::from(*b"AC")));
+        assert_eq!(scanner.used.get(&second), Some(&BTreeSet::from(*b"B")));
+        assert!(!scanner.unknown_font_text);
+        Ok(())
+    }
+
+    #[test]
+    fn winansi_usage_scanner_fails_closed_after_unknown_ext_gstate_font() -> Result<()> {
+        let program = CowObjectHandle::Existing(ObjectId::new(20, 0));
+        let fonts = HashMap::from([(b"F1".to_vec(), program)]);
+        let neutral_ext_gstates = BTreeSet::new();
+        let mut scanner = WinAnsiCodeScanner {
+            fonts: &fonts,
+            font_neutral_ext_gstates: &neutral_ext_gstates,
+            selection: FontSelectionState::default(),
+            used: HashMap::new(),
+            unsafe_programs: BTreeSet::new(),
+            unknown_font_text: false,
+        };
+        let stopped = crate::content_stream::visit_instructions(
+            b"/F1 10 Tf (A) Tj /GS1 gs (B) Tj",
+            |instruction| {
+                scanner.instruction(instruction);
+                Ok(())
+            },
+        )?;
+        assert!(!stopped);
+        assert!(scanner.unknown_font_text);
+        assert_eq!(scanner.used.get(&program), Some(&BTreeSet::from(*b"A")));
         Ok(())
     }
 
