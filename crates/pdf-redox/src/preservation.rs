@@ -407,7 +407,8 @@ const fn keep_page_key(key: &[u8], policy: &PreservationConfig) -> bool {
         b"StructParents" | b"Tabs" => policy.structure,
         b"B" => policy.navigation,
         b"Dur" | b"Trans" | b"AA" => policy.viewer_preferences,
-        b"Metadata" | b"PieceInfo" | b"LastModified" | b"Thumb" => policy.metadata,
+        b"Thumb" => false,
+        b"Metadata" | b"PieceInfo" | b"LastModified" => policy.metadata,
         b"SeparationInfo" | b"PresSteps" => policy.output_intents,
         _ => policy.unknown_objects,
     }
@@ -417,7 +418,8 @@ const fn keep_page_tree_key(key: &[u8], policy: &PreservationConfig) -> bool {
     match key {
         b"Type" | b"Parent" | b"Kids" | b"Count" | b"Resources" | b"MediaBox" | b"CropBox"
         | b"Rotate" => true,
-        b"Metadata" | b"PieceInfo" | b"LastModified" | b"Thumb" => policy.metadata,
+        b"Thumb" => false,
+        b"Metadata" | b"PieceInfo" | b"LastModified" => policy.metadata,
         b"StructParents" | b"Tabs" => policy.structure,
         b"B" => policy.navigation,
         b"Dur" | b"Trans" | b"AA" => policy.viewer_preferences,
@@ -1203,6 +1205,36 @@ fn process_annotations(
     Ok(())
 }
 
+/// Drop embedded page-thumbnail cache entries regardless of preservation policy.
+///
+/// `/Thumb` is an optional page-preview cache and is not part of page rendering.
+/// Normalized outputs deliberately do not carry producer thumbnail state; callers
+/// that need thumbnails can regenerate them from the final normalized pages.
+pub fn drop_page_thumbnails(
+    document: &mut EditDocument,
+    stats: &mut PreservationStats,
+) -> Result<()> {
+    // Use the source parser's recovered page list rather than recursively walking
+    // `/Pages`. Default optimization historically skipped preservation traversal,
+    // so thumbnail cleanup must not make malformed page-tree references a new
+    // failure mode.
+    for id in document.source().page_ids() {
+        let page = PreservationDictionaryTarget {
+            root: CowObjectHandle::Existing(id),
+            path: Vec::new(),
+        };
+        if let Some(dictionary) = preservation_target_mut(document, &page)?
+            && dictionary.remove(b"Thumb".as_slice()).is_some()
+        {
+            *stats
+                .dropped_page_keys
+                .entry("/Thumb".to_owned())
+                .or_default() += 1;
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_preservation_policy(
     document: &mut EditDocument,
     policy: &PreservationConfig,
@@ -1272,6 +1304,34 @@ mod tests {
         pdf.stream(6, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
         pdf.object(7, b"<< /Private true >>")?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn functional_policy_drops_thumbnail_but_keeps_other_auxiliary_state() -> Result<()> {
+        let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
+        let stats = apply_preservation_policy(&mut document, &PreservationConfig::functional())?;
+        assert_eq!(stats.dropped_page_keys.get("/Thumb"), Some(&1));
+
+        let source = SourcePdf::from_bytes(document.write_compact()?)?;
+        let catalog = source.materialize(source.catalog_id())?;
+        let catalog = catalog
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten catalog is not a dictionary".to_owned()))?;
+        assert!(catalog.contains_key(b"Metadata".as_slice()));
+        assert!(catalog.contains_key(b"UnknownCatalog".as_slice()));
+
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
     }
 
     #[test]
