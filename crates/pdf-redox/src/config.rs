@@ -41,11 +41,14 @@ pub struct PreservationConfig {
     pub output_intents: bool,
     /// Preserve viewer layout/mode/preferences.
     pub viewer_preferences: bool,
-    /// Preserve authoring/document metadata attached throughout the known
-    /// object graph, including XMP `/Metadata`, Form `/PieceInfo` and `/LastModified`,
-    /// and page/catalog metadata-like auxiliary entries. Privacy scrubbing is a
-    /// separate policy and may remove metadata afterward.
+    /// Preserve ordinary document metadata attached throughout the known
+    /// object graph, including XMP `/Metadata` and `/LastModified`. Privacy
+    /// scrubbing is a separate policy and may remove metadata afterward.
     pub metadata: bool,
+    /// Preserve producer-private authoring state such as `/PieceInfo`.
+    /// Practical normalized outputs drop this by default; the original PDF is
+    /// the source artifact when editor round-tripping is required.
+    pub private_authoring_data: bool,
     /// Preserve embedded-font tables used for later text editing/reflow but not
     /// for rendering already-positioned PDF text. Visible-surface mode can drop
     /// OpenType layout tables and sfnt vertical metrics that PDF consumers do
@@ -64,7 +67,7 @@ pub struct PreservationConfig {
 
 impl PreservationConfig {
     #[must_use]
-    /// Returns the preservation policy that retains normal document functionality and authoring semantics.
+    /// Returns the practical preservation policy for normal document functionality and ordinary metadata.
     pub const fn functional() -> Self {
         Self {
             links: true,
@@ -75,6 +78,7 @@ impl PreservationConfig {
             output_intents: true,
             viewer_preferences: true,
             metadata: true,
+            private_authoring_data: false,
             font_editing_support: true,
             annotations: AnnotationPolicy::Preserve,
             unknown_objects: true,
@@ -96,6 +100,7 @@ impl PreservationConfig {
             output_intents: true,
             viewer_preferences: true,
             metadata: false,
+            private_authoring_data: false,
             font_editing_support: false,
             annotations: AnnotationPolicy::Preserve,
             unknown_objects: false,
@@ -117,6 +122,7 @@ impl PreservationConfig {
             output_intents: true,
             viewer_preferences: false,
             metadata: false,
+            private_authoring_data: false,
             font_editing_support: false,
             annotations: AnnotationPolicy::AppearanceOnly,
             unknown_objects: false,
@@ -493,6 +499,13 @@ mod tests {
         assert!(raster.prune_hidden_paints);
         assert!(!raster.prune_occluded_raster_paints);
         assert!(!raster.exact_raster_rendering);
+    }
+
+    #[test]
+    fn practical_presets_drop_private_authoring_data() {
+        assert!(!Config::optimize_only().preservation.private_authoring_data);
+        assert!(!Config::perceptual().preservation.private_authoring_data);
+        assert!(!Config::print().preservation.private_authoring_data);
     }
 
     #[test]
