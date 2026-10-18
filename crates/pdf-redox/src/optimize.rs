@@ -36,7 +36,7 @@ use crate::{
     polyline_simplify::{
         MAX_POLYLINE_PAGE_ERROR_PT, PolylineSimplificationStats, simplify_page_polylines,
     },
-    preservation::{PreservationStats, apply_preservation_policy},
+    preservation::{PreservationStats, apply_preservation_policy, drop_page_thumbnails},
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
     raster_layout::normalize_raster_layout,
@@ -172,11 +172,18 @@ fn optimize_pdf_with_document(
     mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
-    let preservation = timed(&mut timings, "preservation", || {
+    let mut preservation = timed(&mut timings, "preservation", || {
         if cfg.preservation == crate::PreservationConfig::functional() {
             Ok(PreservationStats::default())
         } else {
             apply_preservation_policy(&mut document, &cfg.preservation)
+        }
+    })?;
+    timed(&mut timings, "thumbnail-elide", || {
+        if cfg.preservation == crate::PreservationConfig::functional() {
+            drop_page_thumbnails(&mut document, &mut preservation)
+        } else {
+            Ok(())
         }
     })?;
     let hidden_text = timed(&mut timings, "hidden-text", || {
@@ -611,6 +618,19 @@ fn optimize_pdf_with_document(
                 "Optional-content configuration (/OCProperties) was discarded by preservation policy; content whose default visibility depends on OCG state may render differently."
                     .to_owned(),
             );
+        }
+    }
+    if cfg.preservation == crate::PreservationConfig::functional() {
+        let thumbnails = preservation
+            .dropped_page_keys
+            .get("/Thumb")
+            .copied()
+            .unwrap_or_default();
+        if thumbnails > 0 {
+            notes.push(format!(
+                "Dropped {thumbnails} embedded page thumbnail cache entr{}; viewers can regenerate previews from final page content when needed.",
+                if thumbnails == 1 { "y" } else { "ies" }
+            ));
         }
     }
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
@@ -1219,7 +1239,19 @@ fn optimize_pdf_with_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Error, SourcePdf};
+    use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    fn thumbnail_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /UnknownPage 7 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0])?;
+        pdf.stream(6, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
+        pdf.object(7, b"<< /Private true >>")?;
+        pdf.finish(1)
+    }
 
     fn corrupt_xref_with_compressed_page_tree_fixture() -> Result<Vec<u8>> {
         fn offset_u32(offset: usize) -> Result<u32> {
@@ -1286,6 +1318,42 @@ mod tests {
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
         pdf.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
         Ok(pdf)
+    }
+
+    #[test]
+    fn default_optimize_drops_page_thumbnails_only() -> Result<()> {
+        let input = thumbnail_fixture()?;
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(
+            report.preservation_dropped_page_keys.get("/Thumb"),
+            Some(&1)
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("page thumbnail"))
+        );
+
+        let source = SourcePdf::from_bytes(output)?;
+        let catalog = source.materialize(source.catalog_id())?;
+        let catalog = catalog
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten catalog is not a dictionary".to_owned()))?;
+        assert!(catalog.contains_key(b"Metadata".as_slice()));
+
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
     }
 
     #[test]
