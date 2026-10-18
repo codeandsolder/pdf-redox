@@ -1283,6 +1283,17 @@ mod tests {
         pdf.finish(1)
     }
 
+    fn indirect_array_pieceinfo_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private 5 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"[ << /PieceInfo 6 0 R /Keep true >> ]")?;
+        pdf.object(6, b"<< /Illustrator true >>")?;
+        pdf.finish(1)
+    }
+
     fn corrupt_xref_with_compressed_page_tree_fixture() -> Result<Vec<u8>> {
         fn offset_u32(offset: usize) -> Result<u32> {
             u32::try_from(offset)
@@ -1390,6 +1401,24 @@ mod tests {
         assert!(!page.contains_key(b"PieceInfo".as_slice()));
         assert!(page.contains_key(b"LastModified".as_slice()));
         assert!(page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn default_optimize_drops_piece_info_inside_indirect_array() -> Result<()> {
+        let input = indirect_array_pieceinfo_fixture()?;
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            Some(&1)
+        );
+        let analysis = crate::analyze_pdf_preflight(&output)?;
+        assert!(
+            !analysis
+                .risks
+                .iter()
+                .any(|finding| finding.kind == crate::RiskKind::PieceInfo)
+        );
         Ok(())
     }
 

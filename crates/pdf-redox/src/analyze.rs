@@ -813,6 +813,18 @@ fn analyze_document_impl(
     let font_refs = collect_font_program_refs(&objects);
 
     for (handle, object) in &objects {
+        // `/PieceInfo` can legally sit inside a direct dictionary nested in an
+        // indirect array. Detect it before the dictionary-only metrics below so
+        // the fast cleanup path cannot miss that object shape.
+        if object_contains_direct_key(object, b"PieceInfo") {
+            push_risk(
+                &mut risks,
+                RiskKind::PieceInfo,
+                1,
+                "Adobe/private-piece metadata can contain authoring provenance and source paths",
+            );
+        }
+
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
@@ -828,15 +840,6 @@ fn analyze_document_impl(
                     .or_default()
                     .push(*handle);
             }
-        }
-
-        if object_contains_direct_key(object, b"PieceInfo") {
-            push_risk(
-                &mut risks,
-                RiskKind::PieceInfo,
-                1,
-                "Adobe/private-piece metadata can contain authoring provenance and source paths",
-            );
         }
         if dictionary.contains_key(b"Thumb".as_slice()) {
             push_risk(
@@ -1160,6 +1163,26 @@ mod tests {
                 .risks
                 .iter()
                 .any(|finding| { finding.kind == RiskKind::PieceInfo && finding.count == 1 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_piece_info_risk_covers_direct_dictionary_inside_indirect_array() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private 5 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"[ << /PieceInfo 6 0 R /Keep true >> ]")?;
+        pdf.object(6, b"<< /Illustrator true >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert!(
+            analysis
+                .risks
+                .iter()
+                .any(|finding| finding.kind == RiskKind::PieceInfo && finding.count == 1)
         );
         Ok(())
     }
