@@ -18,7 +18,7 @@ pub struct PreservationStats {
     pub dropped_page_keys: BTreeMap<String, usize>,
     pub dropped_page_tree_keys: BTreeMap<String, usize>,
     pub dropped_catalog_keys: BTreeMap<String, usize>,
-    pub dropped_authoring_metadata_keys: BTreeMap<String, usize>,
+    pub dropped_authoring_keys: BTreeMap<String, usize>,
     pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
 }
 
@@ -408,7 +408,8 @@ const fn keep_page_key(key: &[u8], policy: &PreservationConfig) -> bool {
         b"B" => policy.navigation,
         b"Dur" | b"Trans" | b"AA" => policy.viewer_preferences,
         b"Thumb" => false,
-        b"Metadata" | b"PieceInfo" | b"LastModified" => policy.metadata,
+        b"PieceInfo" => policy.private_authoring_data,
+        b"Metadata" | b"LastModified" => policy.metadata,
         b"SeparationInfo" | b"PresSteps" => policy.output_intents,
         _ => policy.unknown_objects,
     }
@@ -419,7 +420,8 @@ const fn keep_page_tree_key(key: &[u8], policy: &PreservationConfig) -> bool {
         b"Type" | b"Parent" | b"Kids" | b"Count" | b"Resources" | b"MediaBox" | b"CropBox"
         | b"Rotate" => true,
         b"Thumb" => false,
-        b"Metadata" | b"PieceInfo" | b"LastModified" => policy.metadata,
+        b"PieceInfo" => policy.private_authoring_data,
+        b"Metadata" | b"LastModified" => policy.metadata,
         b"StructParents" | b"Tabs" => policy.structure,
         b"B" => policy.navigation,
         b"Dur" | b"Trans" | b"AA" => policy.viewer_preferences,
@@ -439,34 +441,36 @@ const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
         b"StructTreeRoot" | b"MarkInfo" | b"Lang" => policy.structure,
         b"OutputIntents" => policy.output_intents,
         b"ViewerPreferences" | b"PageMode" | b"PageLayout" => policy.viewer_preferences,
-        b"Metadata" | b"PieceInfo" | b"LastModified" => policy.metadata,
+        b"PieceInfo" => policy.private_authoring_data,
+        b"Metadata" | b"LastModified" => policy.metadata,
         _ => policy.unknown_objects,
     }
 }
 
-fn collect_direct_authoring_metadata_removals(
+fn collect_direct_key_removals(
     root: CowObjectHandle,
     object: &OwnedObject,
     path: &mut Vec<PreservationPathStep>,
+    removable_key: &[u8],
     removals: &mut BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
 ) {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if dictionary.contains_key(b"Metadata".as_slice()) {
+            if dictionary.contains_key(removable_key) {
                 removals
                     .entry(PreservationDictionaryTarget {
                         root,
                         path: path.clone(),
                     })
                     .or_default()
-                    .insert(b"Metadata".to_vec());
+                    .insert(removable_key.to_vec());
             }
             for (key, value) in dictionary {
-                if key.as_slice() == b"Metadata" || matches!(value, OwnedObject::Reference(_)) {
+                if key.as_slice() == removable_key || matches!(value, OwnedObject::Reference(_)) {
                     continue;
                 }
                 path.push(PreservationPathStep::DictKey(key.clone()));
-                collect_direct_authoring_metadata_removals(root, value, path, removals);
+                collect_direct_key_removals(root, value, path, removable_key, removals);
                 path.pop();
             }
         }
@@ -476,7 +480,7 @@ fn collect_direct_authoring_metadata_removals(
                     continue;
                 }
                 path.push(PreservationPathStep::ArrayIndex(index));
-                collect_direct_authoring_metadata_removals(root, value, path, removals);
+                collect_direct_key_removals(root, value, path, removable_key, removals);
                 path.pop();
             }
         }
@@ -502,7 +506,7 @@ fn drop_authoring_metadata(
         let Some(snapshot) = document.current_owned_object(root)? else {
             continue;
         };
-        collect_direct_authoring_metadata_removals(root, &snapshot, &mut Vec::new(), &mut removals);
+        collect_direct_key_removals(root, &snapshot, &mut Vec::new(), b"Metadata", &mut removals);
 
         let Some(dictionary) = snapshot.as_dictionary() else {
             continue;
@@ -520,17 +524,21 @@ fn drop_authoring_metadata(
                 root,
                 path: Vec::new(),
             };
-            for key in [b"PieceInfo".as_slice(), b"LastModified".as_slice()] {
-                if dictionary.contains_key(key) {
-                    removals
-                        .entry(target.clone())
-                        .or_default()
-                        .insert(key.to_vec());
-                }
+            let key = b"LastModified".as_slice();
+            if dictionary.contains_key(key) {
+                removals.entry(target).or_default().insert(key.to_vec());
             }
         }
     }
 
+    apply_authoring_removals(document, removals, stats)
+}
+
+fn apply_authoring_removals(
+    document: &mut EditDocument,
+    removals: BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
+    stats: &mut PreservationStats,
+) -> Result<()> {
     for (target, keys) in removals {
         let root = document.edit_handle(target.root)?;
         let Some(dictionary) = preservation_object_at_path_mut(root, &target.path)
@@ -541,13 +549,35 @@ fn drop_authoring_metadata(
         for key in keys {
             if dictionary.remove(key.as_slice()).is_some() {
                 *stats
-                    .dropped_authoring_metadata_keys
+                    .dropped_authoring_keys
                     .entry(format!("/{}", String::from_utf8_lossy(&key)))
                     .or_default() += 1;
             }
         }
     }
     Ok(())
+}
+
+/// Drop producer-private authoring state such as `/PieceInfo` throughout the
+/// reachable object graph while leaving ordinary document metadata intact.
+pub fn drop_private_authoring_data(
+    document: &mut EditDocument,
+    stats: &mut PreservationStats,
+) -> Result<()> {
+    let mut removals = BTreeMap::<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>::new();
+    for root in document.reachable_output_objects()? {
+        let Some(snapshot) = document.current_owned_object(root)? else {
+            continue;
+        };
+        collect_direct_key_removals(
+            root,
+            &snapshot,
+            &mut Vec::new(),
+            b"PieceInfo",
+            &mut removals,
+        );
+    }
+    apply_authoring_removals(document, removals, stats)
 }
 
 fn prune_dictionary_target(
@@ -1245,6 +1275,9 @@ pub fn apply_preservation_policy(
         ..PreservationStats::default()
     };
     process_annotations(document, &pages, policy, &mut stats)?;
+    if !policy.private_authoring_data {
+        drop_private_authoring_data(document, &mut stats)?;
+    }
     if !policy.metadata {
         drop_authoring_metadata(document, &mut stats)?;
     }
@@ -1298,19 +1331,21 @@ mod tests {
             2,
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 /UnknownTree 7 0 R >>",
         )?;
-        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /UnknownPage 7 0 R >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /PieceInfo 8 0 R /LastModified (today) /UnknownPage 7 0 R >>")?;
         pdf.stream(4, b"", b"q Q")?;
         pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0])?;
         pdf.stream(6, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
         pdf.object(7, b"<< /Private true >>")?;
+        pdf.object(8, b"<< /Illustrator << /Private true >> >>")?;
         pdf.finish(1)
     }
 
     #[test]
-    fn functional_policy_drops_thumbnail_but_keeps_other_auxiliary_state() -> Result<()> {
+    fn functional_policy_drops_disposable_caches_but_keeps_ordinary_metadata() -> Result<()> {
         let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
         let stats = apply_preservation_policy(&mut document, &PreservationConfig::functional())?;
         assert_eq!(stats.dropped_page_keys.get("/Thumb"), Some(&1));
+        assert_eq!(stats.dropped_authoring_keys.get("/PieceInfo"), Some(&1));
 
         let source = SourcePdf::from_bytes(document.write_compact()?)?;
         let catalog = source.materialize(source.catalog_id())?;
@@ -1330,7 +1365,34 @@ mod tests {
             .as_dictionary()
             .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
         assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(!page.contains_key(b"PieceInfo".as_slice()));
+        assert!(page.contains_key(b"LastModified".as_slice()));
         assert!(page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_private_authoring_policy_keeps_piece_info_but_not_thumbnails() -> Result<()> {
+        let mut policy = PreservationConfig::functional();
+        policy.private_authoring_data = true;
+        let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
+        let stats = apply_preservation_policy(&mut document, &policy)?;
+        assert_eq!(stats.dropped_page_keys.get("/Thumb"), Some(&1));
+        assert!(!stats.dropped_authoring_keys.contains_key("/PieceInfo"));
+
+        let source = SourcePdf::from_bytes(document.write_compact()?)?;
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(page.contains_key(b"PieceInfo".as_slice()));
+        assert!(page.contains_key(b"LastModified".as_slice()));
         Ok(())
     }
 

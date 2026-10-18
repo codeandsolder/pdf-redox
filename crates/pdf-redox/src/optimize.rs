@@ -36,7 +36,10 @@ use crate::{
     polyline_simplify::{
         MAX_POLYLINE_PAGE_ERROR_PT, PolylineSimplificationStats, simplify_page_polylines,
     },
-    preservation::{PreservationStats, apply_preservation_policy, drop_page_thumbnails},
+    preservation::{
+        PreservationStats, apply_preservation_policy, drop_page_thumbnails,
+        drop_private_authoring_data,
+    },
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
     raster_layout::normalize_raster_layout,
@@ -172,16 +175,30 @@ fn optimize_pdf_with_document(
     mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
+    let mut fast_path_policy = crate::PreservationConfig::functional();
+    fast_path_policy.private_authoring_data = cfg.preservation.private_authoring_data;
+    let preservation_fast_path = cfg.preservation == fast_path_policy;
     let mut preservation = timed(&mut timings, "preservation", || {
-        if cfg.preservation == crate::PreservationConfig::functional() {
+        if preservation_fast_path {
             Ok(PreservationStats::default())
         } else {
             apply_preservation_policy(&mut document, &cfg.preservation)
         }
     })?;
     timed(&mut timings, "thumbnail-elide", || {
-        if cfg.preservation == crate::PreservationConfig::functional() {
+        if preservation_fast_path {
             drop_page_thumbnails(&mut document, &mut preservation)
+        } else {
+            Ok(())
+        }
+    })?;
+    timed(&mut timings, "private-authoring-elide", || {
+        let has_piece_info = before
+            .risks
+            .iter()
+            .any(|risk| risk.kind == crate::RiskKind::PieceInfo);
+        if preservation_fast_path && !cfg.preservation.private_authoring_data && has_piece_info {
+            drop_private_authoring_data(&mut document, &mut preservation)
         } else {
             Ok(())
         }
@@ -595,9 +612,9 @@ fn optimize_pdf_with_document(
     })?;
 
     let mut notes = Vec::new();
-    if cfg.preservation != crate::PreservationConfig::functional() {
+    if !preservation_fast_path {
         notes.push(format!(
-            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring metadata keys: {:?}.",
+            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring/metadata keys: {:?}.",
             preservation.pages,
             preservation.annotation_entries_flattened,
             preservation.annotation_entries_seen,
@@ -608,7 +625,7 @@ fn optimize_pdf_with_document(
             preservation.dropped_page_keys,
             preservation.dropped_page_tree_keys,
             preservation.dropped_catalog_keys,
-            preservation.dropped_authoring_metadata_keys
+            preservation.dropped_authoring_keys
         ));
         if preservation
             .dropped_catalog_keys
@@ -620,7 +637,7 @@ fn optimize_pdf_with_document(
             );
         }
     }
-    if cfg.preservation == crate::PreservationConfig::functional() {
+    if preservation_fast_path {
         let thumbnails = preservation
             .dropped_page_keys
             .get("/Thumb")
@@ -630,6 +647,17 @@ fn optimize_pdf_with_document(
             notes.push(format!(
                 "Dropped {thumbnails} embedded page thumbnail cache entr{}; viewers can regenerate previews from final page content when needed.",
                 if thumbnails == 1 { "y" } else { "ies" }
+            ));
+        }
+        let private_authoring = preservation
+            .dropped_authoring_keys
+            .get("/PieceInfo")
+            .copied()
+            .unwrap_or_default();
+        if private_authoring > 0 {
+            notes.push(format!(
+                "Dropped {private_authoring} producer-private /PieceInfo entr{}; use --preserve-authoring-data when editor round-tripping is explicitly required.",
+                if private_authoring == 1 { "y" } else { "ies" }
             ));
         }
     }
@@ -1230,6 +1258,7 @@ fn optimize_pdf_with_document(
         preservation_dropped_page_keys: preservation.dropped_page_keys,
         preservation_dropped_page_tree_keys: preservation.dropped_page_tree_keys,
         preservation_dropped_catalog_keys: preservation.dropped_catalog_keys,
+        preservation_dropped_authoring_keys: preservation.dropped_authoring_keys,
         preservation_spliced_unknown_wrapper_keys: preservation.spliced_unknown_wrapper_keys,
         notes,
     };
@@ -1241,15 +1270,16 @@ mod tests {
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
 
-    fn thumbnail_fixture() -> Result<Vec<u8>> {
+    fn practical_cleanup_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>")?;
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
-        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /UnknownPage 7 0 R >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources <<>> /Contents 4 0 R /Thumb 5 0 R /PieceInfo 8 0 R /LastModified (today) /UnknownPage 7 0 R >>")?;
         pdf.stream(4, b"", b"q Q")?;
         pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0])?;
         pdf.stream(6, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
         pdf.object(7, b"<< /Private true >>")?;
+        pdf.object(8, b"<< /Illustrator << /Private true >> >>")?;
         pdf.finish(1)
     }
 
@@ -1321,11 +1351,15 @@ mod tests {
     }
 
     #[test]
-    fn default_optimize_drops_page_thumbnails_only() -> Result<()> {
-        let input = thumbnail_fixture()?;
+    fn default_optimize_drops_disposable_preview_and_private_authoring_state() -> Result<()> {
+        let input = practical_cleanup_fixture()?;
         let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
         assert_eq!(
             report.preservation_dropped_page_keys.get("/Thumb"),
+            Some(&1)
+        );
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
             Some(&1)
         );
         assert!(
@@ -1334,6 +1368,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("page thumbnail"))
         );
+        assert!(report.notes.iter().any(|note| note.contains("/PieceInfo")));
 
         let source = SourcePdf::from_bytes(output)?;
         let catalog = source.materialize(source.catalog_id())?;
@@ -1352,7 +1387,40 @@ mod tests {
             .as_dictionary()
             .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
         assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(!page.contains_key(b"PieceInfo".as_slice()));
+        assert!(page.contains_key(b"LastModified".as_slice()));
         assert!(page.contains_key(b"UnknownPage".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_authoring_data_keeps_piece_info_without_keeping_thumbnail() -> Result<()> {
+        let input = practical_cleanup_fixture()?;
+        let mut config = Config::optimize_only();
+        config.preservation.private_authoring_data = true;
+        let (output, report) = optimize_pdf(&input, &config)?;
+        assert_eq!(
+            report.preservation_dropped_page_keys.get("/Thumb"),
+            Some(&1)
+        );
+        assert!(
+            !report
+                .preservation_dropped_authoring_keys
+                .contains_key("/PieceInfo")
+        );
+        let source = SourcePdf::from_bytes(output)?;
+        let page_id = source
+            .page_ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("rewritten fixture lost its page".to_owned()))?;
+        let page = source.materialize(page_id)?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("rewritten page is not a dictionary".to_owned()))?;
+        assert!(!page.contains_key(b"Thumb".as_slice()));
+        assert!(page.contains_key(b"PieceInfo".as_slice()));
+        assert!(page.contains_key(b"LastModified".as_slice()));
         Ok(())
     }
 

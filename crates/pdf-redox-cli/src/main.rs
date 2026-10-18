@@ -85,8 +85,8 @@ struct Args {
     /// Drop viewer layout/mode/preferences.
     #[arg(long)]
     drop_viewer_preferences: bool,
-    /// Drop authoring/document metadata throughout the known object graph.
-    /// Processing mode already does this unless --preserve-authoring-data is set.
+    /// Drop ordinary document metadata such as XMP and `/LastModified`.
+    /// Producer-private `/PieceInfo` is already dropped by default.
     #[arg(long)]
     drop_document_metadata: bool,
     /// Drop unrecognized entries under the currently classified known-semantics graph.
@@ -95,7 +95,8 @@ struct Args {
     /// Experimentally promote recognized child keys out of dropped unknown wrapper dictionaries.
     #[arg(long, requires = "drop_unknown_objects")]
     splice_unknown_wrappers: bool,
-    /// In processing mode, retain authoring metadata/editing support and unknown extensions.
+    /// Preserve producer-private `/PieceInfo`; in processing mode also retain
+    /// ordinary metadata, font editing support, and unknown extensions.
     #[arg(long)]
     preserve_authoring_data: bool,
     /// Drop embedded-font tables useful for later editing/reflow but unused by PDF page rendering.
@@ -196,6 +197,7 @@ fn config_from_args(args: &Args) -> Config {
     if matches!(args.optimize_for, OptimizeForArg::Processing) && !args.preserve_authoring_data {
         cfg.preservation = pdf_redox::PreservationConfig::known_functional();
     }
+    cfg.preservation.private_authoring_data = args.preserve_authoring_data;
     if args.drop_links {
         cfg.preservation.links = false;
     }
@@ -355,6 +357,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_authoring_data_is_explicit_opt_in() -> Result<(), clap::Error> {
+        let default = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
+        assert!(
+            !config_from_args(&default)
+                .preservation
+                .private_authoring_data
+        );
+
+        let keep = Args::try_parse_from(["pdf-redox", "input.pdf", "--preserve-authoring-data"])?;
+        assert!(config_from_args(&keep).preservation.private_authoring_data);
+
+        let processing =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
+        assert!(
+            !config_from_args(&processing)
+                .preservation
+                .private_authoring_data
+        );
+        Ok(())
+    }
 
     #[test]
     fn processing_uses_faster_flate_default() -> Result<(), clap::Error> {

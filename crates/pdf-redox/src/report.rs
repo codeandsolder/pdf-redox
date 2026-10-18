@@ -952,6 +952,9 @@ pub struct OptimizationReport {
     /// Dropped catalog keys and their occurrence counts.
     pub preservation_dropped_catalog_keys: BTreeMap<String, usize>,
     #[serde(default)]
+    /// Dropped ordinary-metadata or producer-private authoring keys and their occurrence counts.
+    pub preservation_dropped_authoring_keys: BTreeMap<String, usize>,
+    #[serde(default)]
     /// Unknown-wrapper keys promoted to a recognized parent and their occurrence counts.
     pub preservation_spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
     /// Human-readable non-fatal notes produced during optimization.

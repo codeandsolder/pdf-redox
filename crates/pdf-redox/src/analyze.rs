@@ -731,6 +731,28 @@ pub fn analyze_document_for_optimization(
     analyze_document_impl(input, document, false, false)
 }
 
+fn object_contains_direct_key(object: &OwnedObject, key: &[u8]) -> bool {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            dictionary.contains_key(key)
+                || dictionary.values().any(|value| {
+                    !matches!(value, OwnedObject::Reference(_))
+                        && object_contains_direct_key(value, key)
+                })
+        }
+        OwnedObject::Array(values) => values.iter().any(|value| {
+            !matches!(value, OwnedObject::Reference(_)) && object_contains_direct_key(value, key)
+        }),
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => false,
+    }
+}
+
 fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
     analyze_document_impl(input, &document, deep, content_density)
@@ -808,7 +830,7 @@ fn analyze_document_impl(
             }
         }
 
-        if dictionary.contains_key(b"PieceInfo".as_slice()) {
+        if object_contains_direct_key(object, b"PieceInfo") {
             push_risk(
                 &mut risks,
                 RiskKind::PieceInfo,
@@ -1122,6 +1144,24 @@ mod tests {
             b"0 0 m 5 5 l S",
         )?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn preflight_piece_info_risk_covers_nested_direct_dictionaries() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Private << /Nested << /PieceInfo 6 0 R >> >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(6, b"<< /Illustrator true >>")?;
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert!(
+            analysis
+                .risks
+                .iter()
+                .any(|finding| { finding.kind == RiskKind::PieceInfo && finding.count == 1 })
+        );
+        Ok(())
     }
 
     #[test]
