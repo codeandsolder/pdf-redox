@@ -70,6 +70,37 @@ pub fn strip_pdf_unused_tables(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     (result.1 > 0).then_some(result)
 }
 
+/// Remove the internal character-to-glyph map from a TrueType program that is
+/// embedded exclusively through PDF `CIDFontType2` dictionaries. PDF supplies
+/// CID→GID selection separately for embedded Type 2 `CIDFonts`, so retaining the
+/// sfnt `cmap` is both redundant and contrary to the embedded-CIDFont form.
+///
+/// This helper is intentionally usage-agnostic: callers must first prove that
+/// every live PDF user of the program is `CIDFontType2`. In particular, a
+/// program shared with a simple `/TrueType` font still needs its `cmap`.
+fn cidfont_type2_truetype_font(bytes: &[u8]) -> Option<FontRef<'_>> {
+    let font = FontRef::new(bytes).ok()?;
+    if font.table_directory().sfnt_version() != 0x0001_0000 {
+        return None;
+    }
+    for tag in [b"glyf", b"head", b"hhea", b"hmtx", b"loca", b"maxp"] {
+        font.data_for_tag(Tag::new(tag))?;
+    }
+    Some(font)
+}
+
+pub fn cidfont_type2_cmap_size(bytes: &[u8]) -> Option<usize> {
+    cidfont_type2_truetype_font(bytes)?
+        .data_for_tag(Tag::new(b"cmap"))
+        .map(|data| data.len())
+}
+
+pub fn strip_cidfont_type2_cmap(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let font = cidfont_type2_truetype_font(bytes)?;
+    let result = rebuild_font(&font, |tag| tag != Tag::new(b"cmap"))?;
+    (result.1 > 0).then_some(result)
+}
+
 /// Rebuild an SFNT using replacement `glyf`/`loca` tables while copying every
 /// other table from the canonical source font.
 pub fn replace_glyf_and_loca(bytes: &[u8], glyf: Vec<u8>, loca: Vec<u8>) -> Option<Vec<u8>> {

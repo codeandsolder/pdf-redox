@@ -627,6 +627,18 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Decoded bytes removed by embedded-font glyph subsetting.
     pub font_glyph_subset_decoded_bytes_removed: usize,
+    /// Number of embedded `CIDFontType2`-only TrueType programs whose internal `cmap` was removed.
+    #[serde(default)]
+    pub font_cid_cmaps_removed: usize,
+    /// Decoded bytes removed from redundant embedded TrueType `cmap` tables.
+    #[serde(default)]
+    pub font_cid_cmap_decoded_bytes_removed: usize,
+    /// Original encoded bytes of programs changed by `CIDFontType2` `cmap` removal.
+    #[serde(default)]
+    pub font_cid_cmap_original_encoded_bytes: usize,
+    /// Encoded bytes after `CIDFontType2` `cmap` removal.
+    #[serde(default)]
+    pub font_cid_cmap_optimized_encoded_bytes: usize,
     /// Number of `CIDFontType2` TrueType programs densely GID-remapped.
     #[serde(default)]
     pub font_dense_programs_remapped: usize,
