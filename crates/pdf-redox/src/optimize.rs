@@ -614,7 +614,11 @@ fn optimize_pdf_with_document(
         if cfg.preservation.font_editing_support {
             Ok(FontOptimizationStats::default())
         } else {
-            strip_cidfont_type2_cmaps_after_dedup(&mut document, flate_level)
+            strip_cidfont_type2_cmaps_after_dedup(
+                &mut document,
+                flate_level,
+                post_dedup_font_graph.as_ref(),
+            )
         }
     })?;
     let output = timed(&mut timings, "writer", || {
