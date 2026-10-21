@@ -65,6 +65,8 @@ pub struct FontOptimizationStats {
     pub programs_glyph_subset: usize,
     pub programs_dense_remapped: usize,
     pub cid_to_gid_maps_rewritten: usize,
+    pub cid_cmaps_removed: usize,
+    pub cid_cmap_decoded_bytes_removed: usize,
     pub dense_glyph_slots_removed: usize,
     pub dense_decoded_bytes_removed: usize,
     pub original_encoded_bytes: usize,
@@ -2540,6 +2542,160 @@ pub fn strip_font_editing_tables(
     Ok(stats)
 }
 
+const MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM: usize = 1024;
+const MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT: usize = 4 * 1024;
+
+fn cid_cmap_program_has_proven_owners(
+    graph: &FontUsageGraph,
+    incoming_references: &IncomingReferenceOwners,
+    program_descriptors: &HashMap<CowObjectHandle, BTreeSet<CowObjectHandle>>,
+    program: CowObjectHandle,
+) -> bool {
+    if graph.direct_program_usage.contains_key(&program)
+        || incoming_references.roots.contains(&program)
+    {
+        return false;
+    }
+    let Some(descriptors) = program_descriptors.get(&program) else {
+        return false;
+    };
+    descriptors.iter().all(|descriptor| {
+        graph
+            .descriptor_usage
+            .get(descriptor)
+            .copied()
+            .is_some_and(FontProgramUsage::cidfont_type2_only)
+    }) && incoming_references.owners.get(&program) == Some(descriptors)
+}
+
+fn cid_cmap_program_descriptors(
+    graph: &FontUsageGraph,
+) -> HashMap<CowObjectHandle, BTreeSet<CowObjectHandle>> {
+    let mut descriptors = HashMap::<CowObjectHandle, BTreeSet<CowObjectHandle>>::new();
+    for &(descriptor, program) in &graph.descriptor_program_edges {
+        descriptors.entry(program).or_default().insert(descriptor);
+    }
+    descriptors
+}
+
+struct CidCmapStripCandidate {
+    program: CowObjectHandle,
+    dictionary: OwnedDictionary,
+    raw_len: usize,
+    cmap_len: usize,
+    had_length1: bool,
+}
+
+/// Remove the sfnt `cmap` only from programs whose complete current PDF usage
+/// is `CIDFontType2`. This is deliberately post-dedup and usage-dependent.
+pub fn strip_cidfont_type2_cmaps_after_dedup(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+) -> Result<FontOptimizationStats> {
+    let graph = collect_font_usage_graph(document)?;
+    let program_usage = graph.indirect_program_usage();
+    let mut ordered_programs = program_usage.into_iter().collect::<Vec<_>>();
+    ordered_programs.sort_unstable_by_key(|(program, _)| *program);
+    if !ordered_programs.iter().any(|(program, usage)| {
+        usage.cidfont_type2_only() && !graph.direct_program_usage.contains_key(program)
+    }) {
+        return Ok(FontOptimizationStats::default());
+    }
+
+    let incoming_references = incoming_reference_owners(document)?;
+    let program_descriptors = cid_cmap_program_descriptors(&graph);
+    let mut candidates = Vec::<CidCmapStripCandidate>::new();
+    let mut total_cmap_len = 0_usize;
+    for (program, usage) in ordered_programs {
+        if !usage.cidfont_type2_only()
+            || !cid_cmap_program_has_proven_owners(
+                &graph,
+                &incoming_references,
+                &program_descriptors,
+                program,
+            )
+        {
+            continue;
+        }
+        let Some(object) = document.current_owned_object(program)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, data } = object else {
+            continue;
+        };
+        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
+            continue;
+        }
+        let had_length1 = dictionary.contains_key(b"Length1".as_slice());
+        let raw = data.bytes(document.source())?;
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+            continue;
+        };
+        let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
+            continue;
+        };
+        if cmap_len < MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM {
+            continue;
+        }
+        total_cmap_len = total_cmap_len.saturating_add(cmap_len);
+        candidates.push(CidCmapStripCandidate {
+            program,
+            dictionary,
+            raw_len: raw.len(),
+            cmap_len,
+            had_length1,
+        });
+    }
+    if total_cmap_len < MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT {
+        return Ok(FontOptimizationStats::default());
+    }
+
+    let mut stats = FontOptimizationStats::default();
+    for info in candidates {
+        let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(info.program)?
+        else {
+            continue;
+        };
+        let raw = data.bytes(document.source())?;
+        if raw.len() != info.raw_len {
+            return Err(Error::Invalid(
+                "CIDFontType2 program changed between cmap measurement and rewrite".to_owned(),
+            ));
+        }
+        let Ok(decoded) = decode_stream(document, &info.dictionary, raw.as_ref()) else {
+            continue;
+        };
+        let Some((candidate, removed_decoded_bytes)) =
+            crate::font_subset::strip_cidfont_type2_cmap(&decoded)
+        else {
+            continue;
+        };
+        if removed_decoded_bytes != info.cmap_len {
+            return Err(Error::Invalid(
+                "CIDFontType2 cmap measurement changed during rewrite".to_owned(),
+            ));
+        }
+        let Some((encoded, plain_flate)) =
+            encode_like_stream(document, &info.dictionary, &candidate, flate_level)?
+        else {
+            continue;
+        };
+        if encoded.len() >= info.raw_len {
+            continue;
+        }
+        stats.programs_optimized += 1;
+        stats.cid_cmaps_removed += 1;
+        stats.cid_cmap_decoded_bytes_removed += removed_decoded_bytes;
+        stats.original_encoded_bytes += info.raw_len;
+        stats.optimized_encoded_bytes += encoded.len();
+        replace_current_stream_data(document, info.program, encoded, plain_flate)?;
+        if info.had_length1 {
+            set_font_program_length1(document, info.program, candidate.len())?;
+        }
+    }
+    Ok(stats)
+}
+
 /// Subset rendering outlines only after exact deduplication and sparse CID
 /// union have canonicalized equivalent embedded programs.
 ///
@@ -2837,7 +2993,7 @@ mod tests {
         append_pdf_object(
             &mut pdf,
             &mut offsets,
-            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+            b"4 0 obj\n<< /Length 25 >>\nstream\nBT /CID 1 Tf <0000> Tj ET\nendstream\nendobj\n",
         );
         append_pdf_object(
             &mut pdf,
@@ -3046,6 +3202,182 @@ mod tests {
         let second = dense_compact_cidfont_type2_programs(&mut reparsed, crate::FlateLevel::SIZE)?;
         assert_eq!(second.programs_dense_remapped, 0);
         assert_eq!(second.cid_to_gid_maps_rewritten, 0);
+        Ok(())
+    }
+
+    fn cid_cmap_fixture(
+        mixed_simple_usage: bool,
+        extra_unknown_owner: bool,
+        cmap_len: usize,
+    ) -> Result<Vec<u8>> {
+        let mut head = [0_u8; 54];
+        head[50..52].copy_from_slice(&1_i16.to_be_bytes()); // long loca
+        let mut maxp = vec![0, 1, 0, 0, 0, 1];
+        maxp.resize(32, 0);
+        let mut hhea = vec![0_u8; 36];
+        hhea[34..36].copy_from_slice(&1_u16.to_be_bytes());
+        let hmtx = [0_u8; 4];
+        let glyf = [0_u8; 12];
+        let loca = [0_u8, 0, 0, 0, 0, 0, 0, 12];
+        let cmap_len = u32::try_from(cmap_len)
+            .map_err(|_| Error::Invalid("cmap fixture length exceeds u32".to_owned()))?;
+        let cmap = (0..cmap_len)
+            .map(|index| index.wrapping_mul(73).to_le_bytes()[0] ^ (index >> 3).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let source_font = sfnt(&[
+            (*b"head", &head),
+            (*b"maxp", &maxp),
+            (*b"hhea", &hhea),
+            (*b"hmtx", &hmtx),
+            (*b"loca", &loca),
+            (*b"glyf", &glyf),
+            (*b"cmap", cmap.as_slice()),
+            (*b"post", b"post-data"),
+        ]);
+        let encoded = crate::stream_codec::encode_flate(&source_font, crate::FlateLevel::SIZE)?;
+
+        let resources = if mixed_simple_usage {
+            b"<< /Font << /CID 5 0 R /Simple 8 0 R >> >>".as_slice()
+        } else {
+            b"<< /Font << /CID 5 0 R >> >>".as_slice()
+        };
+        let unknown_program_entry = if extra_unknown_owner {
+            b" /UnknownProgram 10 0 R".as_slice()
+        } else {
+            b"".as_slice()
+        };
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            format!(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources {} /Contents 4 0 R{} >>\nendobj\n",
+                String::from_utf8_lossy(resources),
+                String::from_utf8_lossy(unknown_program_entry)
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /CidMapTest /Encoding /Identity-H /DescendantFonts [6 0 R] >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"6 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CidMapTest /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /CIDToGIDMap /Identity >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"7 0 obj\n<< /Type /FontDescriptor /FontName /CidMapTest /FontFile2 10 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"8 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /CidMapTest /FontDescriptor 9 0 R >>\nendobj\n",
+        );
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            b"9 0 obj\n<< /Type /FontDescriptor /FontName /CidMapTest /FontFile2 10 0 R >>\nendobj\n",
+        );
+        let mut font_stream = format!(
+            "10 0 obj\n<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
+            encoded.len(),
+            source_font.len()
+        )
+        .into_bytes();
+        font_stream.extend_from_slice(&encoded);
+        font_stream.extend_from_slice(b"\nendstream\nendobj\n");
+        append_pdf_object(&mut pdf, &mut offsets, &font_stream);
+        Ok(finish_test_pdf(pdf, offsets, 1))
+    }
+
+    #[test]
+    fn cidfont_type2_only_cmap_is_removed_and_idempotent() -> Result<()> {
+        let mut document = EditDocument::from_bytes(cid_cmap_fixture(false, false, 8192)?)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(10, 0));
+        assert!(tags(document.decoded_stream_data(program)?.as_ref()).contains(b"cmap"));
+
+        let first = strip_cidfont_type2_cmaps_after_dedup(&mut document, crate::FlateLevel::SIZE)?;
+        assert_eq!(first.programs_optimized, 1);
+        assert_eq!(first.cid_cmaps_removed, 1);
+        assert_eq!(first.cid_cmap_decoded_bytes_removed, 8192);
+        assert!(first.optimized_encoded_bytes < first.original_encoded_bytes);
+        let decoded = document.decoded_stream_data(program)?;
+        assert!(!tags(decoded.as_ref()).contains(b"cmap"));
+        let program_object = document
+            .current_owned_object(program)?
+            .ok_or_else(|| Error::Invalid("cmap-stripped program vanished".to_owned()))?;
+        let length1 = program_object
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get(b"Length1".as_slice()))
+            .and_then(|value| match value {
+                OwnedObject::Integer(value) => Some(*value),
+                _ => None,
+            })
+            .ok_or_else(|| Error::Invalid("cmap-stripped program lost Length1".to_owned()))?;
+        assert_eq!(usize::try_from(length1).ok(), Some(decoded.len()));
+
+        let output = document.write_compact()?;
+        let mut reparsed = EditDocument::from_bytes(output)?;
+        let second = strip_cidfont_type2_cmaps_after_dedup(&mut reparsed, crate::FlateLevel::SIZE)?;
+        assert_eq!(second.programs_optimized, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_preserves_cmap_when_font_editing_support_is_enabled() -> Result<()> {
+        let input = cid_cmap_fixture(false, false, 8192)?;
+        let (_, report) = crate::optimize_pdf(&input, &crate::Config::optimize_only())?;
+        assert_eq!(report.font_cid_cmaps_removed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cmap_is_preserved_when_program_is_shared_with_simple_truetype() -> Result<()> {
+        let mut document = EditDocument::from_bytes(cid_cmap_fixture(true, false, 8192)?)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(10, 0));
+        let first = strip_cidfont_type2_cmaps_after_dedup(&mut document, crate::FlateLevel::SIZE)?;
+        assert_eq!(first.programs_optimized, 0);
+        assert!(tags(document.decoded_stream_data(program)?.as_ref()).contains(b"cmap"));
+        Ok(())
+    }
+
+    #[test]
+    fn small_cidfont_cmap_opportunity_is_skipped() -> Result<()> {
+        let mut document = EditDocument::from_bytes(cid_cmap_fixture(false, false, 1024)?)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(10, 0));
+        let first = strip_cidfont_type2_cmaps_after_dedup(&mut document, crate::FlateLevel::SIZE)?;
+        assert_eq!(first.cid_cmaps_removed, 0);
+        assert!(tags(document.decoded_stream_data(program)?.as_ref()).contains(b"cmap"));
+        Ok(())
+    }
+
+    #[test]
+    fn cmap_is_preserved_when_program_has_unproven_owner() -> Result<()> {
+        let mut document = EditDocument::from_bytes(cid_cmap_fixture(false, true, 8192)?)?;
+        let program = CowObjectHandle::Existing(ObjectId::new(10, 0));
+        let first = strip_cidfont_type2_cmaps_after_dedup(&mut document, crate::FlateLevel::SIZE)?;
+        assert_eq!(first.cid_cmaps_removed, 0);
+        assert!(tags(document.decoded_stream_data(program)?.as_ref()).contains(b"cmap"));
         Ok(())
     }
 

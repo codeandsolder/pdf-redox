@@ -13,8 +13,8 @@ use crate::{
     flate::{compress_unfiltered_streams, optimize_flate_streams},
     font::{
         FontOptimizationStats, collect_font_usage_graph, dense_compact_cidfont_type2_programs,
-        strip_font_editing_tables, subset_font_outlines_after_dedup,
-        union_sparse_cid_font_programs_after_dedup,
+        strip_cidfont_type2_cmaps_after_dedup, strip_font_editing_tables,
+        subset_font_outlines_after_dedup, union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
         HiddenTextApplyStats, apply_hidden_text_policy, prune_physically_hidden_text,
@@ -607,6 +607,16 @@ fn optimize_pdf_with_document(
     let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
         compress_unfiltered_streams(&mut document, flate_level)
     })?;
+    // Cmap removal is deliberately the final graph transform. By this point
+    // resource pruning has removed dead fonts and Flate policy has established
+    // the stream bytes against which the rewrite's actual size win is gated.
+    let font_cid_cmap_strip = timed(&mut timings, "font-cid-cmap-strip", || {
+        if cfg.preservation.font_editing_support {
+            Ok(FontOptimizationStats::default())
+        } else {
+            strip_cidfont_type2_cmaps_after_dedup(&mut document, flate_level)
+        }
+    })?;
     let output = timed(&mut timings, "writer", || {
         crate::writer::write_pdf_with_object_streams(&document, flate_level)
     })?;
@@ -822,6 +832,15 @@ fn optimize_pdf_with_document(
             font_rendering.original_encoded_bytes,
             font_rendering.optimized_encoded_bytes,
             font_rendering.decoded_table_bytes_removed
+        ));
+    }
+    if font_cid_cmap_strip.cid_cmaps_removed > 0 {
+        notes.push(format!(
+            "Removed redundant internal cmap table(s) from {} CIDFontType2-only TrueType program(s): {} -> {} encoded bytes ({} decoded cmap bytes removed).",
+            font_cid_cmap_strip.cid_cmaps_removed,
+            font_cid_cmap_strip.original_encoded_bytes,
+            font_cid_cmap_strip.optimized_encoded_bytes,
+            font_cid_cmap_strip.cid_cmap_decoded_bytes_removed
         ));
     }
     if font_rendering.programs_glyph_subset > 0 {
@@ -1130,6 +1149,10 @@ fn optimize_pdf_with_document(
         font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
         font_programs_glyph_subset: font_rendering.programs_glyph_subset,
         font_glyph_subset_decoded_bytes_removed: font_rendering.glyph_subset_decoded_bytes_removed,
+        font_cid_cmaps_removed: font_cid_cmap_strip.cid_cmaps_removed,
+        font_cid_cmap_decoded_bytes_removed: font_cid_cmap_strip.cid_cmap_decoded_bytes_removed,
+        font_cid_cmap_original_encoded_bytes: font_cid_cmap_strip.original_encoded_bytes,
+        font_cid_cmap_optimized_encoded_bytes: font_cid_cmap_strip.optimized_encoded_bytes,
         font_dense_programs_remapped: font_dense.programs_dense_remapped,
         font_dense_cid_to_gid_maps_rewritten: font_dense.cid_to_gid_maps_rewritten,
         font_dense_glyph_slots_removed: font_dense.dense_glyph_slots_removed,
