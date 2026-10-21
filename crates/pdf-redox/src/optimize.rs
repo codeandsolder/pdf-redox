@@ -13,8 +13,9 @@ use crate::{
     flate::{compress_unfiltered_streams, optimize_flate_streams},
     font::{
         FontOptimizationStats, collect_font_usage_graph, dense_compact_cidfont_type2_programs,
-        strip_cidfont_type2_cmaps_after_dedup, strip_font_editing_tables,
-        subset_font_outlines_after_dedup, union_sparse_cid_font_programs_after_dedup,
+        dense_compact_cidfont_type2_programs_with_graph, strip_cidfont_type2_cmaps_after_dedup,
+        strip_font_editing_tables, subset_font_outlines_after_dedup,
+        union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
         HiddenTextApplyStats, apply_hidden_text_policy, prune_physically_hidden_text,
@@ -284,6 +285,11 @@ fn optimize_pdf_with_document(
             || cfg.optimization_goal != crate::OptimizationGoal::Processing
         {
             Ok(FontOptimizationStats::default())
+        } else if font_sparse_union.programs_optimized == 0 {
+            let Some(graph) = post_dedup_font_graph.as_ref() else {
+                return Ok(FontOptimizationStats::default());
+            };
+            dense_compact_cidfont_type2_programs_with_graph(&mut document, flate_level, graph)
         } else {
             dense_compact_cidfont_type2_programs(&mut document, flate_level)
         }

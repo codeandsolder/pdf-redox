@@ -2277,15 +2277,32 @@ fn set_font_program_length1(
 /// user has an explicit rewritable `CIDToGIDMap`. Every GID addressable by those
 /// maps is retained (plus composite dependencies), so page text codes and CID
 /// widths stay unchanged; only the embedded SFNT and CID-to-GID map values move.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dense CID remapping keeps whole-program eligibility, map preparation, SFNT rewrite, and atomic size gating together for auditability"
-)]
 pub fn dense_compact_cidfont_type2_programs(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let program_usage = current_font_program_usage(document)?;
+    dense_compact_cidfont_type2_programs_with_usage(document, flate_level, &program_usage)
+}
+
+pub fn dense_compact_cidfont_type2_programs_with_graph(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    graph: &FontUsageGraph,
+) -> Result<FontOptimizationStats> {
+    let program_usage = graph.program_usage();
+    dense_compact_cidfont_type2_programs_with_usage(document, flate_level, &program_usage)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "dense CID remapping keeps whole-program eligibility, map preparation, SFNT rewrite, and atomic size gating together for auditability"
+)]
+fn dense_compact_cidfont_type2_programs_with_usage(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
+) -> Result<FontOptimizationStats> {
     let users = dense_cid_program_users(document)?;
     if users.is_empty() {
         return Ok(FontOptimizationStats::default());
@@ -3232,6 +3249,29 @@ mod tests {
                 .as_bytes(),
         );
         Ok(pdf)
+    }
+
+    #[test]
+    fn dense_cidfont_reused_graph_matches_fresh_usage_scan() -> Result<()> {
+        let input = dense_cidfont_fixture()?;
+
+        let mut reused = EditDocument::from_bytes(input.clone())?;
+        let graph = collect_font_usage_graph(&reused)?;
+        let reused_stats = dense_compact_cidfont_type2_programs_with_graph(
+            &mut reused,
+            crate::FlateLevel::SIZE,
+            &graph,
+        )?;
+        let reused_output = reused.write_compact()?;
+
+        let mut fresh = EditDocument::from_bytes(input)?;
+        let fresh_stats =
+            dense_compact_cidfont_type2_programs(&mut fresh, crate::FlateLevel::SIZE)?;
+        let fresh_output = fresh.write_compact()?;
+
+        assert_eq!(reused_stats, fresh_stats);
+        assert_eq!(reused_output, fresh_output);
+        Ok(())
     }
 
     #[test]
