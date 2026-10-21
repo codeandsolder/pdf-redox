@@ -731,25 +731,41 @@ pub fn analyze_document_for_optimization(
     analyze_document_impl(input, document, false, false)
 }
 
-fn object_contains_direct_key(object: &OwnedObject, key: &[u8]) -> bool {
+fn count_direct_preservation_keys(
+    object: &OwnedObject,
+    piece_info: &mut usize,
+    authoring_metadata: &mut usize,
+) {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            dictionary.contains_key(key)
-                || dictionary.values().any(|value| {
-                    !matches!(value, OwnedObject::Reference(_))
-                        && object_contains_direct_key(value, key)
-                })
+            *piece_info = piece_info.saturating_add(usize::from(
+                dictionary.contains_key(b"PieceInfo".as_slice()),
+            ));
+            *authoring_metadata = authoring_metadata
+                .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
+            *authoring_metadata = authoring_metadata.saturating_add(usize::from(
+                dictionary.contains_key(b"LastModified".as_slice()),
+            ));
+            for value in dictionary.values() {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    count_direct_preservation_keys(value, piece_info, authoring_metadata);
+                }
+            }
         }
-        OwnedObject::Array(values) => values.iter().any(|value| {
-            !matches!(value, OwnedObject::Reference(_)) && object_contains_direct_key(value, key)
-        }),
+        OwnedObject::Array(values) => {
+            for value in values {
+                if !matches!(value, OwnedObject::Reference(_)) {
+                    count_direct_preservation_keys(value, piece_info, authoring_metadata);
+                }
+            }
+        }
         OwnedObject::Reference(_)
         | OwnedObject::Null
         | OwnedObject::Boolean(_)
         | OwnedObject::Integer(_)
         | OwnedObject::Real(_)
         | OwnedObject::Name(_)
-        | OwnedObject::String(_) => false,
+        | OwnedObject::String(_) => {}
     }
 }
 
@@ -811,12 +827,20 @@ fn analyze_document_impl(
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let font_refs = collect_font_program_refs(&objects);
+    out.preservation_key_inventory_complete = true;
 
     for (handle, object) in &objects {
-        // `/PieceInfo` can legally sit inside a direct dictionary nested in an
-        // indirect array. Detect it before the dictionary-only metrics below so
-        // the fast cleanup path cannot miss that object shape.
-        if object_contains_direct_key(object, b"PieceInfo") {
+        // These keys may legally sit inside direct dictionaries/arrays nested
+        // under any indirect object. Inventory them during the preflight's
+        // existing source-object walk so preservation can later skip redundant
+        // whole-reachable-graph scans only when absence is proven.
+        let piece_info_before = out.piece_info_key_count;
+        count_direct_preservation_keys(
+            object,
+            &mut out.piece_info_key_count,
+            &mut out.authoring_metadata_key_count,
+        );
+        if out.piece_info_key_count > piece_info_before {
             push_risk(
                 &mut risks,
                 RiskKind::PieceInfo,
@@ -1164,6 +1188,8 @@ mod tests {
                 .iter()
                 .any(|finding| { finding.kind == RiskKind::PieceInfo && finding.count == 1 })
         );
+        assert!(analysis.preservation_key_inventory_complete);
+        assert_eq!(analysis.piece_info_key_count, 1);
         Ok(())
     }
 
@@ -1184,6 +1210,23 @@ mod tests {
                 .iter()
                 .any(|finding| finding.kind == RiskKind::PieceInfo && finding.count == 1)
         );
+        assert!(analysis.preservation_key_inventory_complete);
+        assert_eq!(analysis.piece_info_key_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_preservation_inventory_counts_metadata_keys() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /LastModified (now) /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert!(analysis.preservation_key_inventory_complete);
+        assert_eq!(analysis.piece_info_key_count, 0);
+        assert_eq!(analysis.authoring_metadata_key_count, 2);
         Ok(())
     }
 

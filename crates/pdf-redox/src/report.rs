@@ -216,6 +216,17 @@ pub struct PdfAnalysis {
     pub metadata_stream_count: usize,
     /// Total bytes represented by metadata stream.
     pub metadata_stream_bytes: usize,
+    /// True when the preflight scanned every source object for preservation-only keys.
+    /// Older/deserialized analyses default to false and therefore cannot authorize
+    /// preservation fast rejects.
+    #[serde(default)]
+    pub preservation_key_inventory_complete: bool,
+    /// Number of `/PieceInfo` keys found in indirect objects or their direct children.
+    #[serde(default)]
+    pub piece_info_key_count: usize,
+    /// Number of `/Metadata` or `/LastModified` keys found in indirect objects or their direct children.
+    #[serde(default)]
+    pub authoring_metadata_key_count: usize,
     /// Number of duplicate metadata payload groups.
     pub duplicate_metadata_payload_groups: usize,
     /// Encoded metadata bytes wasted by exact duplicate payloads.

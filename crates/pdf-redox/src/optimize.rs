@@ -37,8 +37,8 @@ use crate::{
         MAX_POLYLINE_PAGE_ERROR_PT, PolylineSimplificationStats, simplify_page_polylines,
     },
     preservation::{
-        PreservationStats, apply_preservation_policy, drop_page_thumbnails,
-        drop_private_authoring_data,
+        PreservationScanHints, PreservationStats, apply_preservation_policy,
+        apply_preservation_policy_with_hints, drop_page_thumbnails, drop_private_authoring_data,
     },
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
@@ -178,9 +178,19 @@ fn optimize_pdf_with_document(
     let mut fast_path_policy = crate::PreservationConfig::functional();
     fast_path_policy.private_authoring_data = cfg.preservation.private_authoring_data;
     let preservation_fast_path = cfg.preservation == fast_path_policy;
+    let preservation_scan_hints = PreservationScanHints {
+        no_piece_info: before.piece_info_key_count == 0,
+        no_authoring_metadata: before.authoring_metadata_key_count == 0,
+    };
     let mut preservation = timed(&mut timings, "preservation", || {
         if preservation_fast_path {
             Ok(PreservationStats::default())
+        } else if before.preservation_key_inventory_complete {
+            apply_preservation_policy_with_hints(
+                &mut document,
+                &cfg.preservation,
+                preservation_scan_hints,
+            )
         } else {
             apply_preservation_policy(&mut document, &cfg.preservation)
         }
@@ -1490,6 +1500,58 @@ mod tests {
         assert_eq!(report.before.page_count, 1);
         let rewritten = SourcePdf::from_bytes(output)?;
         assert_eq!(rewritten.page_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_preservation_inventory_keeps_cleanup_for_present_keys() -> Result<()> {
+        let input = practical_cleanup_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let analysis = analyze_document_for_optimization(&input, &document)?;
+        assert!(analysis.preservation_key_inventory_complete);
+        assert!(analysis.piece_info_key_count > 0);
+        assert!(analysis.authoring_metadata_key_count > 0);
+
+        let mut config = Config::optimize_only();
+        config.preservation = crate::PreservationConfig::known_functional();
+        let (output, report) = optimize_pdf_with_analysis(&input, &config, &analysis)?;
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            Some(&1)
+        );
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/Metadata"),
+            Some(&1)
+        );
+        let preflight = crate::analyze_pdf_preflight(&output)?;
+        assert_eq!(preflight.piece_info_key_count, 0);
+        assert_eq!(preflight.authoring_metadata_key_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_cached_preservation_inventory_falls_back_to_full_cleanup() -> Result<()> {
+        let input = practical_cleanup_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        analysis.preservation_key_inventory_complete = false;
+        analysis.piece_info_key_count = 0;
+        analysis.authoring_metadata_key_count = 0;
+
+        let mut config = Config::optimize_only();
+        config.preservation = crate::PreservationConfig::known_functional();
+        let (output, report) = optimize_pdf_with_analysis(&input, &config, &analysis)?;
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            Some(&1)
+        );
+        assert_eq!(
+            report.preservation_dropped_authoring_keys.get("/Metadata"),
+            Some(&1)
+        );
+        let preflight = crate::analyze_pdf_preflight(&output)?;
+        assert_eq!(preflight.piece_info_key_count, 0);
+        assert_eq!(preflight.authoring_metadata_key_count, 0);
         Ok(())
     }
 
