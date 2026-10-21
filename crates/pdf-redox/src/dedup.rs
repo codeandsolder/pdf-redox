@@ -133,11 +133,33 @@ where
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
 fn font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
-    let mut holders = Vec::new();
-    for key in HAYRO_FONT_FILE_KEYS {
-        holders.extend(direct_reference_holders(document, key)?);
-    }
-    Ok(holders)
+    // Preserve the previous key-major holder ordering while paying for only one
+    // reachable-object traversal. Each per-key recursive inspector is unchanged,
+    // so direct/nested reference semantics remain exactly the same.
+    let mut holders_by_key: [Vec<DirectReferenceHolder>; HAYRO_FONT_FILE_KEYS.len()] =
+        std::array::from_fn(|_| Vec::new());
+    document.walk_output_objects(|handle, object| {
+        for (index, key) in HAYRO_FONT_FILE_KEYS.iter().copied().enumerate() {
+            match &object {
+                CurrentObject::Source(object) => inspect_source_direct_reference_holders(
+                    handle,
+                    object,
+                    key,
+                    &mut Vec::new(),
+                    &mut holders_by_key[index],
+                ),
+                CurrentObject::Owned(object) => inspect_owned_direct_reference_holders(
+                    handle,
+                    object,
+                    key,
+                    &mut Vec::new(),
+                    &mut holders_by_key[index],
+                ),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(holders_by_key.into_iter().flatten().collect())
 }
 
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
@@ -2753,6 +2775,35 @@ mod tests {
         pdf.stream(5, b"", b"0 0 m 10 10 l S")?;
         pdf.stream(6, b"", b"0 0 m 10 10 l S")?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn font_program_holder_single_walk_matches_three_legacy_scans() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Private << /FontFile 5 0 R /Nested << /FontFile2 6 0 R /Deeper [<< /FontFile3 7 0 R >>] >> >> >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"", b"font-one")?;
+        pdf.stream(6, b"", b"font-two")?;
+        pdf.stream(7, b"", b"font-three")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        let expected = HAYRO_FONT_FILE_KEYS
+            .into_iter()
+            .map(|key| direct_reference_holders(&document, key))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(font_program_holders(&document)?, expected);
+        Ok(())
     }
 
     #[test]
