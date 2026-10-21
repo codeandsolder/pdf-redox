@@ -6,6 +6,12 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const SCREEN_HIDDEN_ANNOTATION_FLAGS: i64 = 0x02 | 0x20;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreservationScanHints {
+    pub no_piece_info: bool,
+    pub no_authoring_metadata: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PreservationStats {
     pub pages: usize,
@@ -1269,16 +1275,24 @@ pub fn apply_preservation_policy(
     document: &mut EditDocument,
     policy: &PreservationConfig,
 ) -> Result<PreservationStats> {
+    apply_preservation_policy_with_hints(document, policy, PreservationScanHints::default())
+}
+
+pub fn apply_preservation_policy_with_hints(
+    document: &mut EditDocument,
+    policy: &PreservationConfig,
+    hints: PreservationScanHints,
+) -> Result<PreservationStats> {
     let (pages, page_tree_nodes) = preservation_page_tree_targets(document)?;
     let mut stats = PreservationStats {
         pages: pages.len(),
         ..PreservationStats::default()
     };
     process_annotations(document, &pages, policy, &mut stats)?;
-    if !policy.private_authoring_data {
+    if !policy.private_authoring_data && !hints.no_piece_info {
         drop_private_authoring_data(document, &mut stats)?;
     }
-    if !policy.metadata {
+    if !policy.metadata && !hints.no_authoring_metadata {
         drop_authoring_metadata(document, &mut stats)?;
     }
     for page in &pages {
