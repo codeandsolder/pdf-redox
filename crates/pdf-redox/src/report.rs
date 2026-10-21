@@ -227,6 +227,15 @@ pub struct PdfAnalysis {
     /// Number of `/Metadata` or `/LastModified` keys found in indirect objects or their direct children.
     #[serde(default)]
     pub authoring_metadata_key_count: usize,
+    /// True when preflight inspected every source `/FontFile*` stream for
+    /// rendering-unused OpenType table tags. Older cached analyses default to
+    /// false and therefore cannot authorize the font-table fast reject.
+    #[serde(default)]
+    pub font_rendering_table_inventory_complete: bool,
+    /// Conservative number of referenced font programs whose decoded SFNT
+    /// directory contains at least one table the rendering-only strip pass may remove.
+    #[serde(default)]
+    pub font_rendering_table_candidate_count: usize,
     /// Number of duplicate metadata payload groups.
     pub duplicate_metadata_payload_groups: usize,
     /// Encoded metadata bytes wasted by exact duplicate payloads.

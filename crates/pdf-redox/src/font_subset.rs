@@ -64,6 +64,23 @@ pub fn unwrap_single_face_collection(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Rebuild a standalone OpenType font while omitting tables that an already-
 /// positioned PDF text stream does not use for rendering.
+pub fn has_pdf_rendering_unused_tables(bytes: &[u8]) -> bool {
+    let Ok(file) = FileRef::new(bytes) else {
+        return false;
+    };
+    match file {
+        FileRef::Font(font) => font
+            .table_directory()
+            .table_records()
+            .iter()
+            .any(|record| PDF_RENDERING_UNUSED_TABLES.contains(&record.tag())),
+        // The existing strip pass unwraps any single-face collection
+        // even when it has no removable tables, so it is conservatively
+        // a candidate. Multi-face collections are left untouched.
+        FileRef::Collection(collection) => collection.len() == 1,
+    }
+}
+
 pub fn strip_pdf_unused_tables(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let font = FontRef::new(bytes).ok()?;
     let result = rebuild_font(&font, |tag| !PDF_RENDERING_UNUSED_TABLES.contains(&tag))?;

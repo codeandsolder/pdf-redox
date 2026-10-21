@@ -231,7 +231,10 @@ fn optimize_pdf_with_document(
     // Strip rendering-irrelevant editing/layout state before font-program
     // dedup so producer subsets can converge to the same program.
     let mut font_rendering = timed(&mut timings, "font-table-strip", || {
-        if cfg.preservation.font_editing_support {
+        if cfg.preservation.font_editing_support
+            || before.font_rendering_table_inventory_complete
+                && before.font_rendering_table_candidate_count == 0
+        {
             Ok(FontOptimizationStats::default())
         } else {
             strip_font_editing_tables(&mut document, flate_level)
