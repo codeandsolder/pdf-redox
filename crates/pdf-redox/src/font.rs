@@ -4517,6 +4517,21 @@ mod tests {
     fn rendering_sfnt_is_noop_without_removable_tables() {
         let head = [0_u8; 54];
         let source = sfnt(&[(*b"head", &head), (*b"glyf", b"glyphs")]);
+        assert!(!crate::font_subset::has_pdf_rendering_unused_tables(
+            &source
+        ));
         assert!(sfnt_for_pdf_rendering(&source).is_none());
+    }
+
+    #[test]
+    fn rendering_sfnt_fast_reject_detects_removable_table_tag() {
+        let head = [0_u8; 54];
+        let source = sfnt(&[
+            (*b"head", &head),
+            (*b"glyf", b"glyphs"),
+            (*b"GSUB", b"substitution"),
+        ]);
+        assert!(crate::font_subset::has_pdf_rendering_unused_tables(&source));
+        assert!(sfnt_for_pdf_rendering(&source).is_some());
     }
 }
