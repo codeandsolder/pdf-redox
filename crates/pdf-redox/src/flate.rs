@@ -1,5 +1,7 @@
-use crate::Result;
 use crate::stream_codec::{encode_flate, set_plain_flate};
+use crate::{ObjectHandle, Result};
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlateOptimizationStats {
@@ -14,6 +16,57 @@ const MIN_FLATE_SAVINGS_BYTES: usize = 1024;
 const MIN_FLATE_SAVINGS_PERCENT: usize = 5;
 const ADAPTIVE_FLATE_MIN_DECODED_BYTES: usize = 1024 * 1024;
 const ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT: usize = 10;
+const MAX_REUSED_FLATE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct FlateReuseEntry {
+    level: crate::FlateLevel,
+    decoded_sha256: [u8; 32],
+    encoded: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+pub struct FlateReuseCache {
+    entries: BTreeMap<ObjectHandle, FlateReuseEntry>,
+    retained_bytes: usize,
+}
+
+impl FlateReuseCache {
+    pub(crate) fn insert(
+        &mut self,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+        decoded: &[u8],
+        encoded: Vec<u8>,
+    ) {
+        if encoded.len() > MAX_REUSED_FLATE_BYTES.saturating_sub(self.retained_bytes)
+            || self.entries.contains_key(&handle)
+        {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(encoded.len());
+        self.entries.insert(
+            handle,
+            FlateReuseEntry {
+                level,
+                decoded_sha256: Sha256::digest(decoded).into(),
+                encoded,
+            },
+        );
+    }
+
+    fn take_matching(
+        &mut self,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+        decoded: &[u8],
+    ) -> Option<Vec<u8>> {
+        let entry = self.entries.remove(&handle)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
+        let decoded_sha256: [u8; 32] = Sha256::digest(decoded).into();
+        (entry.level == level && entry.decoded_sha256 == decoded_sha256).then_some(entry.encoded)
+    }
+}
 
 struct AdaptiveFlateEncoding {
     bytes: Vec<u8>,
@@ -85,9 +138,10 @@ fn is_safe_lone_flate(
     Ok(true)
 }
 
-pub fn optimize_flate_streams(
+pub fn optimize_flate_streams_with_cache(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
 ) -> Result<FlateOptimizationStats> {
     let mut stats = FlateOptimizationStats::default();
     for handle in document.reachable_streams()? {
@@ -107,8 +161,18 @@ pub fn optimize_flate_streams(
         // real documents. Processing mode deliberately honors its requested
         // level 6 here instead of paying for an opportunistic second level-9
         // encode; Size mode already requests level 9 as its baseline.
-        let Ok(encoded) = adaptive_flate_encode(&decoded, level, false) else {
-            continue;
+        let encoded = if let Some(encoded) = reuse_cache.take_matching(handle, level, &decoded) {
+            AdaptiveFlateEncoding {
+                bytes: encoded,
+                high_effort_tested: false,
+                high_effort_selected: false,
+                high_effort_extra_savings_bytes: 0,
+            }
+        } else {
+            let Ok(encoded) = adaptive_flate_encode(&decoded, level, false) else {
+                continue;
+            };
+            encoded
         };
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
@@ -204,6 +268,41 @@ pub fn compress_unfiltered_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flate_reuse_cache_requires_matching_level_and_decoded_bytes() {
+        let handle = crate::ObjectHandle::Existing(crate::ObjectId::new(1, 0));
+        let decoded = b"BT /F1 12 Tf (hello) Tj ET";
+        let encoded = vec![1, 2, 3, 4];
+
+        let mut cache = FlateReuseCache::default();
+        cache.insert(
+            handle,
+            crate::FlateLevel::PROCESSING,
+            decoded,
+            encoded.clone(),
+        );
+        assert_eq!(
+            cache.take_matching(handle, crate::FlateLevel::PROCESSING, decoded),
+            Some(encoded)
+        );
+
+        cache.insert(handle, crate::FlateLevel::PROCESSING, decoded, vec![5, 6]);
+        assert_eq!(
+            cache.take_matching(handle, crate::FlateLevel::SIZE, decoded),
+            None
+        );
+
+        cache.insert(handle, crate::FlateLevel::PROCESSING, decoded, vec![7, 8]);
+        assert_eq!(
+            cache.take_matching(
+                handle,
+                crate::FlateLevel::PROCESSING,
+                b"BT /F1 12 Tf (changed) Tj ET"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn adaptive_size_probe_can_be_disabled_for_processing() -> crate::Result<()> {
