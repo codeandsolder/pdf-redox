@@ -291,6 +291,18 @@ pub struct PdfAnalysis {
     /// Conservative number of source stream objects whose `/Type` may be `/Pattern`.
     #[serde(default)]
     pub pattern_stream_count: usize,
+    /// Version of the source/direct-child inventory that mirrors the extra font-glyph
+    /// usage scopes scanned by the optimizer. Version 1 covers Type3 font dictionaries
+    /// and tiling-pattern streams. Older cached analyses default to 0 and cannot
+    /// authorize skipping either scope scan.
+    #[serde(default)]
+    pub font_glyph_scope_inventory_version: u8,
+    /// Number of source dictionaries/direct children whose resolved `/Subtype` is `/Type3`.
+    #[serde(default)]
+    pub type3_font_scope_count: usize,
+    /// Number of source stream objects/direct children whose resolved `/PatternType` is `1`.
+    #[serde(default)]
+    pub tiling_pattern_scope_count: usize,
     /// Number of duplicate metadata payload groups.
     pub duplicate_metadata_payload_groups: usize,
     /// Encoded metadata bytes wasted by exact duplicate payloads.

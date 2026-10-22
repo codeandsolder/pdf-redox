@@ -750,59 +750,99 @@ struct DirectKeyInventory {
     char_procs: usize,
     appearance: usize,
     icc_based_arrays: usize,
+    type3_font_scopes: usize,
+    tiling_pattern_scopes: usize,
+    font_glyph_scope_inventory_complete: bool,
 }
 
 fn count_direct_preflight_keys(
     document: &EditDocument,
     object: &OwnedObject,
     inventory: &mut DirectKeyInventory,
+    count_targeted_keys: bool,
 ) {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
-                dictionary.contains_key(b"PieceInfo".as_slice()),
-            ));
-            inventory.authoring_metadata = inventory
-                .authoring_metadata
-                .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
-            inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
-                usize::from(dictionary.contains_key(b"LastModified".as_slice())),
-            );
-            inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
-                dictionary.contains_key(b"ToUnicode".as_slice()),
-            ));
-            inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
-                dictionary.contains_key(b"ExtGState".as_slice()),
-            ));
-            inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
-                dictionary.contains_key(b"CharProcs".as_slice()),
-            ));
-            inventory.appearance = inventory
-                .appearance
-                .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
+            if dictionary.contains_key(b"Subtype".as_slice()) {
+                match dictionary_name(document, dictionary, b"Subtype") {
+                    Ok(Some(name)) if name == b"Type3" => {
+                        inventory.type3_font_scopes = inventory.type3_font_scopes.saturating_add(1);
+                    }
+                    Ok(_) => {}
+                    Err(_) => inventory.font_glyph_scope_inventory_complete = false,
+                }
+            }
+            if matches!(object, OwnedObject::Stream { .. })
+                && let Some(pattern_type) = dictionary.get(b"PatternType".as_slice())
+            {
+                match document.resolve_owned_value(pattern_type) {
+                    Ok(Some(OwnedObject::Integer(1))) => {
+                        inventory.tiling_pattern_scopes =
+                            inventory.tiling_pattern_scopes.saturating_add(1);
+                    }
+                    Ok(_) => {}
+                    Err(_) => inventory.font_glyph_scope_inventory_complete = false,
+                }
+            }
+
+            if count_targeted_keys {
+                inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
+                    dictionary.contains_key(b"PieceInfo".as_slice()),
+                ));
+                inventory.authoring_metadata = inventory
+                    .authoring_metadata
+                    .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
+                inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
+                    usize::from(dictionary.contains_key(b"LastModified".as_slice())),
+                );
+                inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
+                    dictionary.contains_key(b"ToUnicode".as_slice()),
+                ));
+                inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
+                    dictionary.contains_key(b"ExtGState".as_slice()),
+                ));
+                inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
+                    dictionary.contains_key(b"CharProcs".as_slice()),
+                ));
+                inventory.appearance = inventory
+                    .appearance
+                    .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
+            }
             for value in dictionary.values() {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(document, value, inventory);
+                    count_direct_preflight_keys(document, value, inventory, count_targeted_keys);
                 }
             }
         }
         OwnedObject::Array(values) => {
-            let icc_status =
-                values
-                    .first()
-                    .map(|first| match document.resolve_owned_value(first) {
-                        Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
-                        Ok(_) => false,
-                        Err(_) => true,
-                    });
-            if icc_status == Some(true) && matches!(values.get(1), Some(OwnedObject::Reference(_)))
-            {
-                inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
-                return;
+            let mut count_child_targeted_keys = count_targeted_keys;
+            if count_targeted_keys {
+                let icc_status =
+                    values
+                        .first()
+                        .map(|first| match document.resolve_owned_value(first) {
+                            Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
+                            Ok(_) => false,
+                            Err(_) => true,
+                        });
+                if icc_status == Some(true)
+                    && matches!(values.get(1), Some(OwnedObject::Reference(_)))
+                {
+                    inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
+                    // Preserve the old targeted-key inventory's ICCBased terminal
+                    // semantics, but continue the physical walk for the independent
+                    // glyph-scope proof below.
+                    count_child_targeted_keys = false;
+                }
             }
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(document, value, inventory);
+                    count_direct_preflight_keys(
+                        document,
+                        value,
+                        inventory,
+                        count_child_targeted_keys,
+                    );
                 }
             }
         }
@@ -877,6 +917,7 @@ fn analyze_document_impl(
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
+    let mut font_glyph_scope_inventory_complete = true;
     let (font_refs, to_unicode_refs) = collect_stream_dedup_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
@@ -889,8 +930,11 @@ fn analyze_document_impl(
         // under any indirect object. Inventory them during the preflight's
         // existing source-object walk so later passes can skip redundant
         // whole-reachable-graph scans only when absence is proven.
-        let mut keys = DirectKeyInventory::default();
-        count_direct_preflight_keys(document, object, &mut keys);
+        let mut keys = DirectKeyInventory {
+            font_glyph_scope_inventory_complete: true,
+            ..DirectKeyInventory::default()
+        };
+        count_direct_preflight_keys(document, object, &mut keys, true);
         out.piece_info_key_count = out.piece_info_key_count.saturating_add(keys.piece_info);
         out.authoring_metadata_key_count = out
             .authoring_metadata_key_count
@@ -902,6 +946,13 @@ fn analyze_document_impl(
         out.icc_based_array_count = out
             .icc_based_array_count
             .saturating_add(keys.icc_based_arrays);
+        out.type3_font_scope_count = out
+            .type3_font_scope_count
+            .saturating_add(keys.type3_font_scopes);
+        out.tiling_pattern_scope_count = out
+            .tiling_pattern_scope_count
+            .saturating_add(keys.tiling_pattern_scopes);
+        font_glyph_scope_inventory_complete &= keys.font_glyph_scope_inventory_complete;
         if let Some(dictionary) = object.as_dictionary()
             && matches!(
                 dictionary.get(b"A".as_slice()),
@@ -1111,6 +1162,7 @@ fn analyze_document_impl(
         }
     }
 
+    out.font_glyph_scope_inventory_version = u8::from(font_glyph_scope_inventory_complete);
     out.font_dictionary_fingerprint_inventory_version =
         u8::from(font_dictionary_fingerprint_inventory_complete);
     out.font_dictionary_duplicate_fingerprint_groups = font_dictionary_fingerprints
@@ -1359,6 +1411,40 @@ mod tests {
         assert_eq!(analysis.appearance_key_count, 1);
         assert_eq!(analysis.icc_based_array_count, 0);
         assert_eq!(analysis.structure_attribute_ref_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_font_glyph_scope_inventory_matches_actual_scope_scanners() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Private [/ICCBased 6 0 R << /Subtype /Type3 >>] >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Pattern << /P 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(
+            5,
+            b"/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 1 1] /XStep 1 /YStep 1 /Resources <<>>",
+            b"",
+        )?;
+        pdf.stream(6, b"/N 3 /Alternate /DeviceRGB", b"profile")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.font_glyph_scope_inventory_version, 1);
+        assert_eq!(analysis.type3_font_scope_count, 1);
+        assert_eq!(analysis.tiling_pattern_scope_count, 1);
+        // These older inventories are intentionally weaker proofs: the Type3
+        // scope has no /CharProcs and the tiling Pattern has no /Type /Pattern.
+        assert_eq!(analysis.char_procs_key_count, 0);
+        assert_eq!(analysis.pattern_stream_count, 0);
+        // The direct Type3 dictionary sits after an ICC profile reference; the
+        // independent glyph-scope walk must continue where targeted-key counting stops.
+        assert_eq!(analysis.icc_based_array_count, 1);
         Ok(())
     }
 

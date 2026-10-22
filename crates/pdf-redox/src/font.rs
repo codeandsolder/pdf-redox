@@ -458,6 +458,7 @@ fn union_sparse_cid_font_programs(
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
     program_descriptors: &HashMap<CowObjectHandle, Vec<CowObjectHandle>>,
     union_unsafe_programs: &BTreeSet<CowObjectHandle>,
+    glyph_usage_hints: FontGlyphUsageHints,
 ) -> Result<FontOptimizationStats> {
     let mut candidates = Vec::<SparseCidUnionCandidate>::new();
     let mut ordered_programs = program_usage
@@ -548,7 +549,7 @@ fn union_sparse_cid_font_programs(
 
     // Only pay the page-content glyph-usage scan after proving that at least
     // one 2+ program rendering-skeleton group exists.
-    let (identity_glyph_usage, _) = font_glyph_usage(document)?;
+    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
     let incoming_references = incoming_reference_owners(document)?;
 
     let mut stats = FontOptimizationStats::default();
@@ -1699,7 +1700,16 @@ type IdentityGlyphUsage = HashMap<CowObjectHandle, BTreeSet<u16>>;
 type WinAnsiCodeUsage = HashMap<CowObjectHandle, BTreeSet<u8>>;
 type FontGlyphUsage = (IdentityGlyphUsage, WinAnsiCodeUsage);
 
-fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FontGlyphUsageHints {
+    pub no_tiling_pattern_scopes: bool,
+    pub no_type3_font_scopes: bool,
+}
+
+fn font_glyph_usage_with_hints(
+    document: &EditDocument,
+    hints: FontGlyphUsageHints,
+) -> Result<FontGlyphUsage> {
     let mut usage = FontUsageAccumulator::default();
 
     for page in document.page_handles()? {
@@ -1779,8 +1789,8 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
         }
     }
 
-    if scan_tiling_pattern_font_usage(document, &mut usage)?
-        || scan_type3_charproc_font_usage(document, &mut usage)?
+    if !hints.no_tiling_pattern_scopes && scan_tiling_pattern_font_usage(document, &mut usage)?
+        || !hints.no_type3_font_scopes && scan_type3_charproc_font_usage(document, &mut usage)?
     {
         return Ok((HashMap::new(), HashMap::new()));
     }
@@ -1792,6 +1802,11 @@ fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
         usage.winansi_used.remove(program);
     }
     Ok((usage.identity_used, usage.winansi_used))
+}
+
+#[cfg(test)]
+fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
+    font_glyph_usage_with_hints(document, FontGlyphUsageHints::default())
 }
 
 fn inspect_source_font_dictionary(
@@ -2568,6 +2583,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
+    glyph_usage_hints: FontGlyphUsageHints,
 ) -> Result<FontOptimizationStats> {
     let mut program_usage = HashMap::<CowObjectHandle, FontProgramUsage>::new();
     let mut program_descriptors = HashMap::<CowObjectHandle, Vec<CowObjectHandle>>::new();
@@ -2602,6 +2618,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
         &program_usage,
         &program_descriptors,
         &union_unsafe_programs,
+        glyph_usage_hints,
     )
 }
 
@@ -2899,13 +2916,14 @@ pub fn subset_font_outlines_after_dedup(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
+    glyph_usage_hints: FontGlyphUsageHints,
 ) -> Result<FontOptimizationStats> {
     let program_usage = graph.indirect_program_usage();
     if program_usage.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
 
-    let (identity_glyph_usage, _) = font_glyph_usage(document)?;
+    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
     if identity_glyph_usage.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
@@ -3804,7 +3822,13 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_tiling_patterns() -> Result<()> {
         let document = EditDocument::from_bytes(pattern_font_usage_fixture())?;
-        let (identity, winansi) = font_glyph_usage(&document)?;
+        let (identity, winansi) = font_glyph_usage_with_hints(
+            &document,
+            FontGlyphUsageHints {
+                no_type3_font_scopes: true,
+                ..FontGlyphUsageHints::default()
+            },
+        )?;
         let program = CowObjectHandle::Existing(ObjectId::new(9, 0));
         assert_eq!(identity.get(&program), Some(&BTreeSet::from([2_u16])));
         assert!(winansi.is_empty());
@@ -3814,7 +3838,13 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_type3_charprocs() -> Result<()> {
         let document = EditDocument::from_bytes(type3_font_usage_fixture(true))?;
-        let (identity, winansi) = font_glyph_usage(&document)?;
+        let (identity, winansi) = font_glyph_usage_with_hints(
+            &document,
+            FontGlyphUsageHints {
+                no_tiling_pattern_scopes: true,
+                ..FontGlyphUsageHints::default()
+            },
+        )?;
         let program = CowObjectHandle::Existing(ObjectId::new(9, 0));
         assert_eq!(identity.get(&program), Some(&BTreeSet::from([3_u16])));
         assert!(winansi.is_empty());
@@ -4308,8 +4338,12 @@ mod tests {
         let stripped = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(stripped.programs_glyph_subset, 0);
         let graph = collect_font_usage_graph(&document)?;
-        let first =
-            subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        let first = subset_font_outlines_after_dedup(
+            &mut document,
+            crate::FlateLevel::SIZE,
+            &graph,
+            FontGlyphUsageHints::default(),
+        )?;
         assert_eq!(first.programs_optimized, 1);
         assert_eq!(first.programs_glyph_subset, 1);
         assert!(first.glyph_subset_decoded_bytes_removed > 0);
@@ -4335,8 +4369,12 @@ mod tests {
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
         let graph = collect_font_usage_graph(&reparsed)?;
-        let second =
-            subset_font_outlines_after_dedup(&mut reparsed, crate::FlateLevel::SIZE, &graph)?;
+        let second = subset_font_outlines_after_dedup(
+            &mut reparsed,
+            crate::FlateLevel::SIZE,
+            &graph,
+            FontGlyphUsageHints::default(),
+        )?;
         assert_eq!(second.programs_optimized, 0);
         assert_eq!(second.programs_glyph_subset, 0);
         Ok(())
@@ -4468,8 +4506,12 @@ mod tests {
             .ok_or_else(|| Error::Invalid("deduplicated font program is missing".to_owned()))?;
 
         let graph = collect_font_usage_graph(&document)?;
-        let subset =
-            subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        let subset = subset_font_outlines_after_dedup(
+            &mut document,
+            crate::FlateLevel::SIZE,
+            &graph,
+            FontGlyphUsageHints::default(),
+        )?;
         assert_eq!(subset.programs_glyph_subset, 1);
         let decoded = document.decoded_stream_data(program)?;
         let font = FontRef::new(decoded.as_ref())
@@ -4521,6 +4563,7 @@ mod tests {
             &mut document,
             crate::FlateLevel::SIZE,
             &graph,
+            FontGlyphUsageHints::default(),
         )?;
         assert_eq!(union.programs_optimized, 2);
 
@@ -4540,7 +4583,12 @@ mod tests {
         let program = first_program
             .ok_or_else(|| Error::Invalid("sparse-union program is missing".to_owned()))?;
 
-        let _ = subset_font_outlines_after_dedup(&mut document, crate::FlateLevel::SIZE, &graph)?;
+        let _ = subset_font_outlines_after_dedup(
+            &mut document,
+            crate::FlateLevel::SIZE,
+            &graph,
+            FontGlyphUsageHints::default(),
+        )?;
         let decoded = document.decoded_stream_data(program)?;
         let font = FontRef::new(decoded.as_ref())
             .map_err(|_| Error::Invalid("sparse-union font should parse".to_owned()))?;
