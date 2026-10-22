@@ -686,6 +686,51 @@ fn raw_stream_bytes<'a>(
     data.bytes(document.source())
 }
 
+fn record_to_unicode_stream_payload(
+    document: &EditDocument,
+    object: &OwnedObject,
+    raw_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
+) -> Result<()> {
+    if !matches!(object, OwnedObject::Stream { .. }) {
+        return Ok(());
+    }
+    let raw = raw_stream_bytes(document, object)?;
+    record_payload(raw_payloads, raw.as_ref());
+    Ok(())
+}
+
+fn record_font_program_stream(
+    document: &EditDocument,
+    object: &OwnedObject,
+    deep: bool,
+    out: &mut PdfAnalysis,
+    raw_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
+    decoded_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
+) -> Result<()> {
+    if !matches!(object, OwnedObject::Stream { .. }) {
+        return Ok(());
+    }
+    let raw = raw_stream_bytes(document, object)?;
+    out.font_program_count += 1;
+    out.font_program_bytes += raw.len();
+    record_payload(raw_payloads, raw.as_ref());
+    if document
+        .decoded_owned_stream_data(object)
+        .ok()
+        .as_deref()
+        .is_some_and(crate::font_subset::has_pdf_rendering_unused_tables)
+    {
+        out.font_rendering_table_candidate_count += 1;
+    }
+    if deep {
+        let duplicate_basis = document
+            .decoded_owned_stream_data(object)
+            .unwrap_or_else(|_| raw.as_ref().to_vec());
+        record_payload(decoded_payloads, &duplicate_basis);
+    }
+    Ok(())
+}
+
 fn filter_value_name(document: &EditDocument, value: &OwnedObject) -> Result<String> {
     let Some(value) = document.resolve_owned_value(value)? else {
         return Ok("null".to_owned());
@@ -871,7 +916,11 @@ fn analyze_document_impl(
     deep: bool,
     content_density: bool,
 ) -> Result<PdfAnalysis> {
-    let objects = all_source_objects(document)?;
+    let objects = if deep {
+        Some(all_source_objects(document)?)
+    } else {
+        None
+    };
     let mut out = PdfAnalysis {
         input_bytes: input.len(),
         analysis_complete: deep,
@@ -918,14 +967,25 @@ fn analyze_document_impl(
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
     let mut font_glyph_scope_inventory_complete = true;
-    let (font_refs, to_unicode_refs) = collect_stream_dedup_refs(&objects);
+    let (mut font_refs, mut to_unicode_refs) = objects.as_deref().map_or_else(
+        || (HashSet::new(), HashSet::new()),
+        collect_stream_dedup_refs,
+    );
+    let mut processed_font_refs = HashSet::new();
+    let mut processed_to_unicode_refs = HashSet::new();
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
     out.font_raw_payload_inventory_version = 1;
     out.to_unicode_raw_payload_inventory_version = 1;
     out.targeted_dedup_key_inventory_version = 3;
 
-    for (handle, object) in &objects {
+    let mut analyze_object = |handle: CowObjectHandle,
+                              object: &OwnedObject,
+                              font_refs: &HashSet<CowObjectHandle>,
+                              to_unicode_refs: &HashSet<CowObjectHandle>,
+                              processed_font_refs: &mut HashSet<CowObjectHandle>,
+                              processed_to_unicode_refs: &mut HashSet<CowObjectHandle>|
+     -> Result<()> {
         // These keys may legally sit inside direct dictionaries/arrays nested
         // under any indirect object. Inventory them during the preflight's
         // existing source-object walk so later passes can skip redundant
@@ -979,7 +1039,7 @@ fn analyze_document_impl(
         }
 
         let Some(dictionary) = object.as_dictionary() else {
-            continue;
+            return Ok(());
         };
         match dictionary_name(document, dictionary, b"Type") {
             Ok(Some(name)) if name == b"Font" => {
@@ -1009,10 +1069,7 @@ fn analyze_document_impl(
             out.stream_raw_bytes += raw.len();
             if deep {
                 let hash = record_payload(&mut stream_payloads, raw.as_ref());
-                stream_payload_members
-                    .entry(hash)
-                    .or_default()
-                    .push(*handle);
+                stream_payload_members.entry(hash).or_default().push(handle);
             }
         }
         if dictionary.contains_key(b"Thumb".as_slice()) {
@@ -1058,34 +1115,25 @@ fn analyze_document_impl(
             );
         }
 
-        if is_stream && to_unicode_refs.contains(handle) {
-            let raw = raw_stream_bytes(document, object)?;
-            record_payload(&mut to_unicode_raw_payloads, raw.as_ref());
+        if is_stream && to_unicode_refs.contains(&handle) {
+            record_to_unicode_stream_payload(document, object, &mut to_unicode_raw_payloads)?;
+            processed_to_unicode_refs.insert(handle);
         }
 
-        if is_stream && font_refs.contains(handle) {
-            let raw = raw_stream_bytes(document, object)?;
-            out.font_program_count += 1;
-            out.font_program_bytes += raw.len();
-            record_payload(&mut font_raw_payloads, raw.as_ref());
-            if document
-                .decoded_owned_stream_data(object)
-                .ok()
-                .as_deref()
-                .is_some_and(crate::font_subset::has_pdf_rendering_unused_tables)
-            {
-                out.font_rendering_table_candidate_count += 1;
-            }
-            if deep {
-                let duplicate_basis = document
-                    .decoded_owned_stream_data(object)
-                    .unwrap_or_else(|_| raw.as_ref().to_vec());
-                record_payload(&mut font_payloads, &duplicate_basis);
-            }
+        if is_stream && font_refs.contains(&handle) {
+            record_font_program_stream(
+                document,
+                object,
+                deep,
+                &mut out,
+                &mut font_raw_payloads,
+                &mut font_payloads,
+            )?;
+            processed_font_refs.insert(handle);
         }
 
         if !is_stream {
-            continue;
+            return Ok(());
         }
         let filter = filter_name(document, dictionary)?;
         *out.filter_counts.entry(filter.clone()).or_default() += 1;
@@ -1160,6 +1208,62 @@ fn analyze_document_impl(
                 }
             }
         }
+        Ok(())
+    };
+
+    if let Some(objects) = objects.as_deref() {
+        for (handle, object) in objects {
+            analyze_object(
+                *handle,
+                object,
+                &font_refs,
+                &to_unicode_refs,
+                &mut processed_font_refs,
+                &mut processed_to_unicode_refs,
+            )?;
+        }
+    } else {
+        for id in document.source().object_ids() {
+            let handle = CowObjectHandle::Existing(id);
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            collect_stream_dedup_refs_from_value(&object, &mut font_refs, &mut to_unicode_refs);
+            analyze_object(
+                handle,
+                &object,
+                &font_refs,
+                &to_unicode_refs,
+                &mut processed_font_refs,
+                &mut processed_to_unicode_refs,
+            )?;
+        }
+    }
+    drop(analyze_object);
+
+    if !deep {
+        for handle in to_unicode_refs
+            .difference(&processed_to_unicode_refs)
+            .copied()
+        {
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            record_to_unicode_stream_payload(document, &object, &mut to_unicode_raw_payloads)?;
+        }
+        for handle in font_refs.difference(&processed_font_refs).copied() {
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            record_font_program_stream(
+                document,
+                &object,
+                false,
+                &mut out,
+                &mut font_raw_payloads,
+                &mut font_payloads,
+            )?;
+        }
     }
 
     out.font_glyph_scope_inventory_version = u8::from(font_glyph_scope_inventory_complete);
@@ -1174,10 +1278,13 @@ fn analyze_document_impl(
         duplicate_payload_stats(to_unicode_raw_payloads);
 
     if deep {
-        let incoming_roles = collect_incoming_roles(&objects);
-        let icc_profile_refs = collect_icc_profile_refs(document, &objects)?;
+        let objects = objects.as_deref().ok_or_else(|| {
+            crate::Error::Invalid("deep analysis object table is missing".to_owned())
+        })?;
+        let incoming_roles = collect_incoming_roles(objects);
+        let icc_profile_refs = collect_icc_profile_refs(document, objects)?;
         let mut stream_roles = HashMap::new();
-        for (handle, object) in &objects {
+        for (handle, object) in objects {
             if !matches!(object, OwnedObject::Stream { .. }) {
                 continue;
             }
@@ -1200,7 +1307,7 @@ fn analyze_document_impl(
             out.duplicate_stream_role_groups,
             out.duplicate_stream_role_wasted_bytes,
         ) = duplicate_payload_role_stats(&stream_payloads, &stream_payload_members, &stream_roles);
-        record_object_graph_inventory(document, &objects, &stream_roles, &mut out)?;
+        record_object_graph_inventory(document, objects, &stream_roles, &mut out)?;
 
         (
             out.duplicate_metadata_payload_groups,
@@ -1480,6 +1587,35 @@ mod tests {
         let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
         assert_eq!(analysis.to_unicode_key_count, 2);
         assert_eq!(analysis.to_unicode_raw_payload_inventory_version, 1);
+        assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_streaming_recovers_targets_seen_before_holders() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"", b"same-font-program")?;
+        pdf.stream(6, b"", b"same-font-program")?;
+        pdf.stream(7, b"", b"same-to-unicode")?;
+        pdf.stream(8, b"", b"same-to-unicode")?;
+        // Both target pairs sort before the holder dictionaries in xref order.
+        // Shallow analysis must recover them after the streaming object walk
+        // instead of depending on holder-before-target numbering.
+        pdf.object(9, b"<< /FontFile2 5 0 R /ToUnicode 7 0 R >>")?;
+        pdf.object(10, b"<< /FontFile2 6 0 R /ToUnicode 8 0 R >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.font_program_count, 2);
+        assert_eq!(analysis.font_program_bytes, b"same-font-program".len() * 2);
+        assert_eq!(analysis.font_raw_duplicate_payload_groups, 1);
+        assert_eq!(analysis.to_unicode_key_count, 2);
         assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 1);
         Ok(())
     }
