@@ -127,50 +127,139 @@ fn collect_content_stream_refs(
     Ok(())
 }
 
-fn collect_stream_dedup_refs_from_value(
+#[derive(Default)]
+struct PreflightInventory {
+    piece_info: usize,
+    piece_info_source_objects: usize,
+    authoring_metadata: usize,
+    to_unicode: usize,
+    ext_gstate: usize,
+    char_procs: usize,
+    appearance: usize,
+    icc_based_arrays: usize,
+    font_refs: HashSet<CowObjectHandle>,
+    to_unicode_refs: HashSet<CowObjectHandle>,
+}
+
+fn collect_preflight_inventory_from_value(
+    document: &EditDocument,
     value: &OwnedObject,
-    font_refs: &mut HashSet<CowObjectHandle>,
-    to_unicode_refs: &mut HashSet<CowObjectHandle>,
+    inventory: &mut PreflightInventory,
+    count_direct_keys: bool,
+    collect_stream_refs: bool,
 ) {
     match value {
         OwnedObject::Array(values) => {
+            let mut count_child_keys = count_direct_keys;
+            if count_direct_keys {
+                let icc_status =
+                    values
+                        .first()
+                        .map(|first| match document.resolve_owned_value(first) {
+                            Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
+                            Ok(_) => false,
+                            Err(_) => true,
+                        });
+                if icc_status == Some(true)
+                    && matches!(values.get(1), Some(OwnedObject::Reference(_)))
+                {
+                    inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
+                    // The old direct-key scan treated an ICCBased array as terminal.
+                    // Keep holder discovery active below, but stop counting keys under it.
+                    count_child_keys = false;
+                }
+            }
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    collect_stream_dedup_refs_from_value(value, font_refs, to_unicode_refs);
+                    collect_preflight_inventory_from_value(
+                        document,
+                        value,
+                        inventory,
+                        count_child_keys,
+                        collect_stream_refs,
+                    );
                 }
             }
         }
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            if count_direct_keys {
+                inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
+                    dictionary.contains_key(b"PieceInfo".as_slice()),
+                ));
+                inventory.authoring_metadata = inventory
+                    .authoring_metadata
+                    .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
+                inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
+                    usize::from(dictionary.contains_key(b"LastModified".as_slice())),
+                );
+                inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
+                    dictionary.contains_key(b"ToUnicode".as_slice()),
+                ));
+                inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
+                    dictionary.contains_key(b"ExtGState".as_slice()),
+                ));
+                inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
+                    dictionary.contains_key(b"CharProcs".as_slice()),
+                ));
+                inventory.appearance = inventory
+                    .appearance
+                    .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
+            }
+
             for (key, child) in dictionary {
-                if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
-                    if let OwnedObject::Reference(handle) = child {
-                        font_refs.insert(*handle);
-                    }
-                } else if key.as_slice() == b"ToUnicode" {
-                    if let OwnedObject::Reference(handle) = child {
-                        to_unicode_refs.insert(*handle);
-                    }
-                } else if !matches!(child, OwnedObject::Reference(_)) {
-                    // Indirect dictionaries are visited as top-level objects. Only recurse
-                    // through direct children here so nested direct holders are not missed
-                    // and cyclic object graphs cannot recurse forever.
-                    collect_stream_dedup_refs_from_value(child, font_refs, to_unicode_refs);
+                let is_font_holder =
+                    matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3");
+                let is_to_unicode_holder = key.as_slice() == b"ToUnicode";
+                if collect_stream_refs
+                    && is_font_holder
+                    && let OwnedObject::Reference(handle) = child
+                {
+                    inventory.font_refs.insert(*handle);
+                } else if collect_stream_refs
+                    && is_to_unicode_holder
+                    && let OwnedObject::Reference(handle) = child
+                {
+                    inventory.to_unicode_refs.insert(*handle);
+                }
+
+                if !matches!(child, OwnedObject::Reference(_)) {
+                    // The old holder scan did not descend through direct values of
+                    // FontFile*/ToUnicode keys; the key inventory did. Preserve both
+                    // behaviors while sharing the physical traversal.
+                    collect_preflight_inventory_from_value(
+                        document,
+                        child,
+                        inventory,
+                        count_direct_keys,
+                        collect_stream_refs && !is_font_holder && !is_to_unicode_holder,
+                    );
                 }
             }
         }
-        _ => {}
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
     }
 }
 
-fn collect_stream_dedup_refs(
+fn collect_preflight_inventory(
+    document: &EditDocument,
     objects: &[(CowObjectHandle, OwnedObject)],
-) -> (HashSet<CowObjectHandle>, HashSet<CowObjectHandle>) {
-    let mut font_refs = HashSet::new();
-    let mut to_unicode_refs = HashSet::new();
+) -> PreflightInventory {
+    let mut inventory = PreflightInventory::default();
     for (_, object) in objects {
-        collect_stream_dedup_refs_from_value(object, &mut font_refs, &mut to_unicode_refs);
+        let piece_info_before = inventory.piece_info;
+        collect_preflight_inventory_from_value(document, object, &mut inventory, true, true);
+        if inventory.piece_info > piece_info_before {
+            inventory.piece_info_source_objects =
+                inventory.piece_info_source_objects.saturating_add(1);
+        }
     }
-    (font_refs, to_unicode_refs)
+    inventory
 }
 
 fn collect_page_content_refs(document: &EditDocument) -> Result<HashSet<CowObjectHandle>> {
@@ -212,9 +301,12 @@ const fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
 fn collect_incoming_roles(
     objects: &[(CowObjectHandle, OwnedObject)],
 ) -> HashMap<CowObjectHandle, HashSet<&'static str>> {
-    let objects_by_handle: HashMap<_, _> = objects.iter().cloned().collect();
+    let objects_by_handle: HashMap<_, _> = objects
+        .iter()
+        .map(|(handle, object)| (*handle, object))
+        .collect();
     let mut roles: HashMap<CowObjectHandle, HashSet<&'static str>> = HashMap::new();
-    let mut queue = VecDeque::new();
+    let mut queue: VecDeque<(&OwnedObject, &'static str)> = VecDeque::new();
     let mut seen = HashSet::new();
 
     for (_, object) in objects {
@@ -223,7 +315,7 @@ fn collect_incoming_roles(
         };
         for (key, value) in dictionary {
             if let Some(role) = incoming_role_for_key(key) {
-                queue.push_back((value.clone(), role));
+                queue.push_back((value, role));
             }
         }
     }
@@ -231,27 +323,24 @@ fn collect_incoming_roles(
     while let Some((value, role)) = queue.pop_front() {
         match value {
             OwnedObject::Reference(handle) => {
-                if !seen.insert((handle, role)) {
+                if !seen.insert((*handle, role)) {
                     continue;
                 }
-                let Some(target) = objects_by_handle.get(&handle) else {
+                let Some(target) = objects_by_handle.get(handle).copied() else {
                     continue;
                 };
                 match target {
                     OwnedObject::Stream { .. } => {
-                        roles.entry(handle).or_default().insert(role);
+                        roles.entry(*handle).or_default().insert(role);
                     }
                     OwnedObject::Array(values) => {
                         for value in values {
-                            queue.push_back((value.clone(), role));
+                            queue.push_back((value, role));
                         }
                     }
                     OwnedObject::Dictionary(dictionary) => {
                         for (key, child) in dictionary {
-                            queue.push_back((
-                                child.clone(),
-                                incoming_role_for_key(key).unwrap_or(role),
-                            ));
+                            queue.push_back((child, incoming_role_for_key(key).unwrap_or(role)));
                         }
                     }
                     _ => {}
@@ -264,7 +353,7 @@ fn collect_incoming_roles(
             }
             OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
                 for (key, child) in dictionary {
-                    queue.push_back((child, incoming_role_for_key(&key).unwrap_or(role)));
+                    queue.push_back((child, incoming_role_for_key(key).unwrap_or(role)));
                 }
             }
             _ => {}
@@ -459,10 +548,7 @@ fn record_object_graph_inventory(
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
-        let source_role = roles
-            .get(handle)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_owned());
+        let source_role = roles.get(handle).map_or("unknown", String::as_str);
         for (key, value) in dictionary {
             let key_text = String::from_utf8_lossy(key);
             *out.object_key_counts
@@ -741,81 +827,6 @@ pub fn analyze_document_for_optimization(
     analyze_document_impl(input, document, false, false)
 }
 
-#[derive(Default)]
-struct DirectKeyInventory {
-    piece_info: usize,
-    authoring_metadata: usize,
-    to_unicode: usize,
-    ext_gstate: usize,
-    char_procs: usize,
-    appearance: usize,
-    icc_based_arrays: usize,
-}
-
-fn count_direct_preflight_keys(
-    document: &EditDocument,
-    object: &OwnedObject,
-    inventory: &mut DirectKeyInventory,
-) {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
-                dictionary.contains_key(b"PieceInfo".as_slice()),
-            ));
-            inventory.authoring_metadata = inventory
-                .authoring_metadata
-                .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
-            inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
-                usize::from(dictionary.contains_key(b"LastModified".as_slice())),
-            );
-            inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
-                dictionary.contains_key(b"ToUnicode".as_slice()),
-            ));
-            inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
-                dictionary.contains_key(b"ExtGState".as_slice()),
-            ));
-            inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
-                dictionary.contains_key(b"CharProcs".as_slice()),
-            ));
-            inventory.appearance = inventory
-                .appearance
-                .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
-            for value in dictionary.values() {
-                if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(document, value, inventory);
-                }
-            }
-        }
-        OwnedObject::Array(values) => {
-            let icc_status =
-                values
-                    .first()
-                    .map(|first| match document.resolve_owned_value(first) {
-                        Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
-                        Ok(_) => false,
-                        Err(_) => true,
-                    });
-            if icc_status == Some(true) && matches!(values.get(1), Some(OwnedObject::Reference(_)))
-            {
-                inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
-                return;
-            }
-            for value in values {
-                if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(document, value, inventory);
-                }
-            }
-        }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
-    }
-}
-
 fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
     analyze_document_impl(input, &document, deep, content_density)
@@ -877,31 +888,38 @@ fn analyze_document_impl(
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
-    let (font_refs, to_unicode_refs) = collect_stream_dedup_refs(&objects);
+    let PreflightInventory {
+        piece_info,
+        piece_info_source_objects,
+        authoring_metadata,
+        to_unicode,
+        ext_gstate,
+        char_procs,
+        appearance,
+        icc_based_arrays,
+        font_refs,
+        to_unicode_refs,
+    } = collect_preflight_inventory(document, &objects);
     out.preservation_key_inventory_complete = true;
+    out.piece_info_key_count = piece_info;
+    out.authoring_metadata_key_count = authoring_metadata;
     out.font_rendering_table_inventory_complete = true;
     out.font_raw_payload_inventory_version = 1;
     out.to_unicode_raw_payload_inventory_version = 1;
     out.targeted_dedup_key_inventory_version = 3;
+    out.to_unicode_key_count = to_unicode;
+    out.ext_gstate_key_count = ext_gstate;
+    out.char_procs_key_count = char_procs;
+    out.appearance_key_count = appearance;
+    out.icc_based_array_count = icc_based_arrays;
+    push_risk(
+        &mut risks,
+        RiskKind::PieceInfo,
+        piece_info_source_objects,
+        "Adobe/private-piece metadata can contain authoring provenance and source paths",
+    );
 
     for (handle, object) in &objects {
-        // These keys may legally sit inside direct dictionaries/arrays nested
-        // under any indirect object. Inventory them during the preflight's
-        // existing source-object walk so later passes can skip redundant
-        // whole-reachable-graph scans only when absence is proven.
-        let mut keys = DirectKeyInventory::default();
-        count_direct_preflight_keys(document, object, &mut keys);
-        out.piece_info_key_count = out.piece_info_key_count.saturating_add(keys.piece_info);
-        out.authoring_metadata_key_count = out
-            .authoring_metadata_key_count
-            .saturating_add(keys.authoring_metadata);
-        out.to_unicode_key_count = out.to_unicode_key_count.saturating_add(keys.to_unicode);
-        out.ext_gstate_key_count = out.ext_gstate_key_count.saturating_add(keys.ext_gstate);
-        out.char_procs_key_count = out.char_procs_key_count.saturating_add(keys.char_procs);
-        out.appearance_key_count = out.appearance_key_count.saturating_add(keys.appearance);
-        out.icc_based_array_count = out
-            .icc_based_array_count
-            .saturating_add(keys.icc_based_arrays);
         if let Some(dictionary) = object.as_dictionary()
             && matches!(
                 dictionary.get(b"A".as_slice()),
@@ -918,15 +936,6 @@ fn analyze_document_impl(
                     out.structure_attribute_ref_count.saturating_add(1);
             }
         }
-        if keys.piece_info > 0 {
-            push_risk(
-                &mut risks,
-                RiskKind::PieceInfo,
-                1,
-                "Adobe/private-piece metadata can contain authoring provenance and source paths",
-            );
-        }
-
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
