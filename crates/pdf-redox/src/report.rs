@@ -245,6 +245,14 @@ pub struct PdfAnalysis {
     /// source inventory. Dictionary/key differences may make these false positives.
     #[serde(default)]
     pub font_raw_duplicate_payload_groups: usize,
+    /// Version of the source `/Type /Font` exact-fingerprint inventory.
+    /// Older/incomplete analyses default to 0 and cannot authorize the fast reject.
+    #[serde(default)]
+    pub font_dictionary_fingerprint_inventory_version: u8,
+    /// Number of source exact-font-dictionary fingerprint groups containing at
+    /// least two objects. Hash collisions only cause conservative false positives.
+    #[serde(default)]
+    pub font_dictionary_duplicate_fingerprint_groups: usize,
     /// Version of the preflight source/direct-child inventory used to locate
     /// graph-wide optimization holders. Older cached analyses default to 0 and
     /// therefore cannot authorize these fast rejects. Version 1 covers the four
