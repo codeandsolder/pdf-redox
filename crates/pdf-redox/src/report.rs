@@ -236,6 +236,23 @@ pub struct PdfAnalysis {
     /// directory contains at least one table the rendering-only strip pass may remove.
     #[serde(default)]
     pub font_rendering_table_candidate_count: usize,
+    /// Version of the preflight source/direct-child key inventory used
+    /// only to locate targeted deduplication holders. Older cached analyses
+    /// default to 0 and therefore cannot authorize these fast rejects; version 1 covers the four counts below.
+    #[serde(default)]
+    pub targeted_dedup_key_inventory_version: u8,
+    /// Number of `/ToUnicode` holder keys in source objects/direct children.
+    #[serde(default)]
+    pub to_unicode_key_count: usize,
+    /// Number of `/ExtGState` resource keys in source objects/direct children.
+    #[serde(default)]
+    pub ext_gstate_key_count: usize,
+    /// Number of `/CharProcs` keys in source objects/direct children.
+    #[serde(default)]
+    pub char_procs_key_count: usize,
+    /// Number of annotation `/AP` keys in source objects/direct children.
+    #[serde(default)]
+    pub appearance_key_count: usize,
     /// Number of duplicate metadata payload groups.
     pub duplicate_metadata_payload_groups: usize,
     /// Encoded metadata bytes wasted by exact duplicate payloads.
