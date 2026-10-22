@@ -739,9 +739,14 @@ struct DirectKeyInventory {
     ext_gstate: usize,
     char_procs: usize,
     appearance: usize,
+    icc_based_arrays: usize,
 }
 
-fn count_direct_preflight_keys(object: &OwnedObject, inventory: &mut DirectKeyInventory) {
+fn count_direct_preflight_keys(
+    document: &EditDocument,
+    object: &OwnedObject,
+    inventory: &mut DirectKeyInventory,
+) {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
             inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
@@ -767,14 +772,27 @@ fn count_direct_preflight_keys(object: &OwnedObject, inventory: &mut DirectKeyIn
                 .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
             for value in dictionary.values() {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(value, inventory);
+                    count_direct_preflight_keys(document, value, inventory);
                 }
             }
         }
         OwnedObject::Array(values) => {
+            let icc_status =
+                values
+                    .first()
+                    .map(|first| match document.resolve_owned_value(first) {
+                        Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
+                        Ok(_) => false,
+                        Err(_) => true,
+                    });
+            if icc_status == Some(true) && matches!(values.get(1), Some(OwnedObject::Reference(_)))
+            {
+                inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
+                return;
+            }
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preflight_keys(value, inventory);
+                    count_direct_preflight_keys(document, value, inventory);
                 }
             }
         }
@@ -848,7 +866,7 @@ fn analyze_document_impl(
     let font_refs = collect_font_program_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
-    out.targeted_dedup_key_inventory_version = 1;
+    out.targeted_dedup_key_inventory_version = 2;
 
     for (handle, object) in &objects {
         // These keys may legally sit inside direct dictionaries/arrays nested
@@ -856,7 +874,7 @@ fn analyze_document_impl(
         // existing source-object walk so later passes can skip redundant
         // whole-reachable-graph scans only when absence is proven.
         let mut keys = DirectKeyInventory::default();
-        count_direct_preflight_keys(object, &mut keys);
+        count_direct_preflight_keys(document, object, &mut keys);
         out.piece_info_key_count = out.piece_info_key_count.saturating_add(keys.piece_info);
         out.authoring_metadata_key_count = out
             .authoring_metadata_key_count
@@ -865,6 +883,25 @@ fn analyze_document_impl(
         out.ext_gstate_key_count = out.ext_gstate_key_count.saturating_add(keys.ext_gstate);
         out.char_procs_key_count = out.char_procs_key_count.saturating_add(keys.char_procs);
         out.appearance_key_count = out.appearance_key_count.saturating_add(keys.appearance);
+        out.icc_based_array_count = out
+            .icc_based_array_count
+            .saturating_add(keys.icc_based_arrays);
+        if let Some(dictionary) = object.as_dictionary()
+            && matches!(
+                dictionary.get(b"A".as_slice()),
+                Some(OwnedObject::Reference(_))
+            )
+        {
+            let may_be_struct_elem = match dictionary_name(document, dictionary, b"Type") {
+                Ok(Some(name)) => name == b"StructElem",
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if may_be_struct_elem {
+                out.structure_attribute_ref_count =
+                    out.structure_attribute_ref_count.saturating_add(1);
+            }
+        }
         if keys.piece_info > 0 {
             push_risk(
                 &mut risks,
@@ -1260,11 +1297,33 @@ mod tests {
         assert!(analysis.preservation_key_inventory_complete);
         assert_eq!(analysis.piece_info_key_count, 0);
         assert_eq!(analysis.authoring_metadata_key_count, 2);
-        assert_eq!(analysis.targeted_dedup_key_inventory_version, 1);
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 2);
         assert_eq!(analysis.to_unicode_key_count, 1);
         assert_eq!(analysis.ext_gstate_key_count, 1);
         assert_eq!(analysis.char_procs_key_count, 1);
         assert_eq!(analysis.appearance_key_count, 1);
+        assert_eq!(analysis.icc_based_array_count, 0);
+        assert_eq!(analysis.structure_attribute_ref_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_inventory_counts_icc_and_structure_attribute_holders() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /CS [/ICCBased 5 0 R] >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/N 3 /Alternate /DeviceRGB", b"profile")?;
+        pdf.object(6, b"<< /Type /StructElem /A 7 0 R >>")?;
+        pdf.object(7, b"<< /O /Layout >>")?;
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 2);
+        assert_eq!(analysis.icc_based_array_count, 1);
+        assert_eq!(analysis.structure_attribute_ref_count, 1);
         Ok(())
     }
 
