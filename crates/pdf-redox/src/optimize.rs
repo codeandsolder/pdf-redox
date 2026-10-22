@@ -12,10 +12,10 @@ use crate::{
     },
     flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
-        FontOptimizationStats, collect_font_usage_graph, dense_compact_cidfont_type2_programs,
-        dense_compact_cidfont_type2_programs_with_graph, strip_cidfont_type2_cmaps_after_dedup,
-        strip_font_editing_tables, subset_font_outlines_after_dedup,
-        union_sparse_cid_font_programs_after_dedup,
+        FontGlyphUsageHints, FontOptimizationStats, collect_font_usage_graph,
+        dense_compact_cidfont_type2_programs, dense_compact_cidfont_type2_programs_with_graph,
+        strip_cidfont_type2_cmaps_after_dedup, strip_font_editing_tables,
+        subset_font_outlines_after_dedup, union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
         HiddenTextApplyStats, apply_hidden_text_policy, prune_physically_hidden_text,
@@ -259,6 +259,17 @@ fn optimize_pdf_with_document(
             canonicalize_font_program_streams(&mut document)
         }
     })?;
+    // These source inventories mirror the two extra scopes scanned by
+    // `font_glyph_usage`. Earlier stages may delete or rewrite those scopes but
+    // do not create new Type3 fonts or tiling Pattern streams, so a complete
+    // source-negative inventory remains a valid negative hint here. Old cached
+    // analyses default to version 0 and therefore take both full scans.
+    let font_glyph_usage_hints = FontGlyphUsageHints {
+        no_tiling_pattern_scopes: before.font_glyph_scope_inventory_version >= 1
+            && before.tiling_pattern_scope_count == 0,
+        no_type3_font_scopes: before.font_glyph_scope_inventory_version >= 1
+            && before.type3_font_scope_count == 0,
+    };
     // Sparse union only redirects indirect CIDFontType2 descriptors between
     // compatible CIDFontType2 programs. The subtype proof in this graph stays
     // valid across those redirects; outline subsetting rescans live glyph usage
@@ -274,7 +285,12 @@ fn optimize_pdf_with_document(
         let Some(graph) = post_dedup_font_graph.as_ref() else {
             return Ok(FontOptimizationStats::default());
         };
-        union_sparse_cid_font_programs_after_dedup(&mut document, flate_level, graph)
+        union_sparse_cid_font_programs_after_dedup(
+            &mut document,
+            flate_level,
+            graph,
+            font_glyph_usage_hints,
+        )
     })?;
     font_rendering.programs_optimized += font_sparse_union.programs_optimized;
     font_rendering.programs_glyph_subset += font_sparse_union.programs_glyph_subset;
@@ -287,7 +303,7 @@ fn optimize_pdf_with_document(
         let Some(graph) = post_dedup_font_graph.as_ref() else {
             return Ok(FontOptimizationStats::default());
         };
-        subset_font_outlines_after_dedup(&mut document, flate_level, graph)
+        subset_font_outlines_after_dedup(&mut document, flate_level, graph, font_glyph_usage_hints)
     })?;
     font_rendering.programs_optimized += font_outline_subset.programs_optimized;
     font_rendering.programs_glyph_subset += font_outline_subset.programs_glyph_subset;
