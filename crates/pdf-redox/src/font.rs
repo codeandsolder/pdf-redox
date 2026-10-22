@@ -1872,11 +1872,64 @@ fn source_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage 
     )
 }
 
+fn record_source_dense_cid_program_user(
+    document: &EditDocument,
+    dictionary: &HayroDict<'_>,
+    users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
+) -> Result<()> {
+    if !source_dictionary_font_usage(dictionary).cidfont_type2 {
+        return Ok(());
+    }
+    let mut program = None;
+    for (name, value) in dictionary.entries() {
+        if name.as_ref() != b"FontDescriptor" {
+            continue;
+        }
+        program = match value {
+            HayroMaybeRef::Ref(descriptor) => {
+                let handle = CowObjectHandle::Existing(descriptor.into());
+                document
+                    .current_owned_object(handle)?
+                    .and_then(|object| object.as_dictionary().cloned())
+                    .and_then(|descriptor| {
+                        direct_owned_reference(descriptor.get(b"FontFile2".as_slice()))
+                    })
+            }
+            HayroMaybeRef::NotRef(HayroObject::Dict(descriptor)) => descriptor
+                .get_ref(b"FontFile2")
+                .map(|program| CowObjectHandle::Existing(program.into())),
+            HayroMaybeRef::NotRef(_) => None,
+        };
+        break;
+    }
+    let Some(program) = program else {
+        return Ok(());
+    };
+    let entry = users.entry(program).or_default();
+    let Some(map) = dictionary.get_ref(b"CIDToGIDMap") else {
+        entry.unsafe_mapping = true;
+        return Ok(());
+    };
+    let map = CowObjectHandle::Existing(map.into());
+    if document
+        .current_object(map)?
+        .is_some_and(|object| object.is_stream())
+    {
+        entry.maps.insert(map);
+    } else {
+        entry.unsafe_mapping = true;
+    }
+    Ok(())
+}
+
 fn inspect_source_direct_font_dictionary(
+    document: &EditDocument,
     dictionary: &HayroDict<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-) {
+    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
+) -> Result<()> {
+    record_source_dense_cid_program_user(document, dictionary, dense_users)?;
     let usage = source_dictionary_font_usage(dictionary);
     if usage != FontProgramUsage::default() {
         for (name, value) in dictionary.entries() {
@@ -1909,36 +1962,55 @@ fn inspect_source_direct_font_dictionary(
         let HayroMaybeRef::NotRef(value) = value else {
             continue;
         };
-        inspect_source_direct_font_object(&value, program_usage, descriptor_usage_edges);
+        inspect_source_direct_font_object(
+            document,
+            &value,
+            program_usage,
+            descriptor_usage_edges,
+            dense_users,
+        )?;
     }
+    Ok(())
 }
 
 fn inspect_source_direct_font_object(
+    document: &EditDocument,
     object: &HayroObject<'_>,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-) {
+    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
+) -> Result<()> {
     match object {
         HayroObject::Dict(dictionary) => {
             inspect_source_direct_font_dictionary(
+                document,
                 dictionary,
                 program_usage,
                 descriptor_usage_edges,
-            );
+                dense_users,
+            )?;
         }
         HayroObject::Stream(stream) => {
             inspect_source_direct_font_dictionary(
+                document,
                 stream.dict(),
                 program_usage,
                 descriptor_usage_edges,
-            );
+                dense_users,
+            )?;
         }
         HayroObject::Array(array) => {
             for value in array.raw_iter() {
                 let HayroMaybeRef::NotRef(value) = value else {
                     continue;
                 };
-                inspect_source_direct_font_object(&value, program_usage, descriptor_usage_edges);
+                inspect_source_direct_font_object(
+                    document,
+                    &value,
+                    program_usage,
+                    descriptor_usage_edges,
+                    dense_users,
+                )?;
             }
         }
         HayroObject::Null(_)
@@ -1947,6 +2019,7 @@ fn inspect_source_direct_font_object(
         | HayroObject::String(_)
         | HayroObject::Name(_) => {}
     }
+    Ok(())
 }
 
 fn owned_dictionary_font_usage(
@@ -1962,8 +2035,25 @@ fn inspect_owned_direct_font_dictionary(
     dictionary: &OwnedDictionary,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
+    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
 ) -> Result<()> {
     let usage = owned_dictionary_font_usage(document, dictionary)?;
+    if usage.cidfont_type2
+        && let Some(program) =
+            descriptor_program_ref(document, dictionary.get(b"FontDescriptor".as_slice()))?
+    {
+        let entry = dense_users.entry(program).or_default();
+        match dictionary.get(b"CIDToGIDMap".as_slice()) {
+            Some(OwnedObject::Reference(map))
+                if document
+                    .current_object(*map)?
+                    .is_some_and(|object| object.is_stream()) =>
+            {
+                entry.maps.insert(*map);
+            }
+            _ => entry.unsafe_mapping = true,
+        }
+    }
     if usage != FontProgramUsage::default()
         && let Some(descriptor) = dictionary.get(b"FontDescriptor".as_slice())
     {
@@ -1986,7 +2076,13 @@ fn inspect_owned_direct_font_dictionary(
         if matches!(value, OwnedObject::Reference(_)) {
             continue;
         }
-        inspect_owned_direct_font_object(document, value, program_usage, descriptor_usage_edges)?;
+        inspect_owned_direct_font_object(
+            document,
+            value,
+            program_usage,
+            descriptor_usage_edges,
+            dense_users,
+        )?;
     }
     Ok(())
 }
@@ -1996,6 +2092,7 @@ fn inspect_owned_direct_font_object(
     object: &OwnedObject,
     program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
+    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
 ) -> Result<()> {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
@@ -2004,6 +2101,7 @@ fn inspect_owned_direct_font_object(
                 dictionary,
                 program_usage,
                 descriptor_usage_edges,
+                dense_users,
             )?;
         }
         OwnedObject::Array(values) => {
@@ -2016,6 +2114,7 @@ fn inspect_owned_direct_font_object(
                     value,
                     program_usage,
                     descriptor_usage_edges,
+                    dense_users,
                 )?;
             }
         }
@@ -2035,6 +2134,7 @@ pub struct FontUsageGraph {
     descriptor_usage: HashMap<CowObjectHandle, FontProgramUsage>,
     descriptor_program_edges: Vec<(CowObjectHandle, CowObjectHandle)>,
     direct_program_usage: HashMap<CowObjectHandle, FontProgramUsage>,
+    dense_cid_program_users: HashMap<CowObjectHandle, DenseCidProgramUsers>,
 }
 
 impl FontUsageGraph {
@@ -2079,11 +2179,12 @@ pub fn collect_font_usage_graph(document: &EditDocument) -> Result<FontUsageGrap
                 _ => {}
             }
             inspect_source_direct_font_object(
+                document,
                 &object,
                 &mut graph.direct_program_usage,
                 &mut descriptor_usage_edges,
-            );
-            Ok(())
+                &mut graph.dense_cid_program_users,
+            )
         }
         CurrentObject::Owned(object) => {
             if let Some(dictionary) = object.as_dictionary() {
@@ -2100,6 +2201,7 @@ pub fn collect_font_usage_graph(document: &EditDocument) -> Result<FontUsageGrap
                 object,
                 &mut graph.direct_program_usage,
                 &mut descriptor_usage_edges,
+                &mut graph.dense_cid_program_users,
             )
         }
     })?;
@@ -2282,7 +2384,7 @@ pub fn dense_compact_cidfont_type2_programs(
     flate_level: crate::FlateLevel,
 ) -> Result<FontOptimizationStats> {
     let program_usage = current_font_program_usage(document)?;
-    dense_compact_cidfont_type2_programs_with_usage(document, flate_level, &program_usage)
+    dense_compact_cidfont_type2_programs_with_usage(document, flate_level, &program_usage, None)
 }
 
 pub fn dense_compact_cidfont_type2_programs_with_graph(
@@ -2291,7 +2393,12 @@ pub fn dense_compact_cidfont_type2_programs_with_graph(
     graph: &FontUsageGraph,
 ) -> Result<FontOptimizationStats> {
     let program_usage = graph.program_usage();
-    dense_compact_cidfont_type2_programs_with_usage(document, flate_level, &program_usage)
+    dense_compact_cidfont_type2_programs_with_usage(
+        document,
+        flate_level,
+        &program_usage,
+        Some(&graph.dense_cid_program_users),
+    )
 }
 
 #[expect(
@@ -2302,21 +2409,28 @@ fn dense_compact_cidfont_type2_programs_with_usage(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
+    users_hint: Option<&HashMap<CowObjectHandle, DenseCidProgramUsers>>,
 ) -> Result<FontOptimizationStats> {
-    let users = dense_cid_program_users(document)?;
+    let fresh_users;
+    let users = if let Some(users) = users_hint {
+        users
+    } else {
+        fresh_users = dense_cid_program_users(document)?;
+        &fresh_users
+    };
     if users.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
 
     let mut map_programs = HashMap::<CowObjectHandle, BTreeSet<CowObjectHandle>>::new();
-    for (program, program_users) in &users {
+    for (program, program_users) in users {
         for map in &program_users.maps {
             map_programs.entry(*map).or_default().insert(*program);
         }
     }
 
     let mut stats = FontOptimizationStats::default();
-    for (program, program_users) in users {
+    for (&program, program_users) in users {
         if program_users.unsafe_mapping || program_users.maps.is_empty() {
             continue;
         }
