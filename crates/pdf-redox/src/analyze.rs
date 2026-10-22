@@ -866,7 +866,7 @@ fn analyze_document_impl(
     let font_refs = collect_font_program_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
-    out.targeted_dedup_key_inventory_version = 2;
+    out.targeted_dedup_key_inventory_version = 3;
 
     for (handle, object) in &objects {
         // These keys may legally sit inside direct dictionaries/arrays nested
@@ -916,6 +916,14 @@ fn analyze_document_impl(
         };
         let is_stream = matches!(object, OwnedObject::Stream { .. });
         if is_stream {
+            let may_be_pattern = match dictionary_name(document, dictionary, b"Type") {
+                Ok(Some(name)) => name == b"Pattern",
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if may_be_pattern {
+                out.pattern_stream_count = out.pattern_stream_count.saturating_add(1);
+            }
             out.stream_count += 1;
             let raw = raw_stream_bytes(document, object)?;
             out.stream_raw_bytes += raw.len();
@@ -1297,7 +1305,7 @@ mod tests {
         assert!(analysis.preservation_key_inventory_complete);
         assert_eq!(analysis.piece_info_key_count, 0);
         assert_eq!(analysis.authoring_metadata_key_count, 2);
-        assert_eq!(analysis.targeted_dedup_key_inventory_version, 2);
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 3);
         assert_eq!(analysis.to_unicode_key_count, 1);
         assert_eq!(analysis.ext_gstate_key_count, 1);
         assert_eq!(analysis.char_procs_key_count, 1);
@@ -1321,9 +1329,30 @@ mod tests {
         pdf.object(6, b"<< /Type /StructElem /A 7 0 R >>")?;
         pdf.object(7, b"<< /O /Layout >>")?;
         let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
-        assert_eq!(analysis.targeted_dedup_key_inventory_version, 2);
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 3);
         assert_eq!(analysis.icc_based_array_count, 1);
         assert_eq!(analysis.structure_attribute_ref_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_inventory_counts_pattern_streams() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Pattern << /P 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"/Pattern cs /P scn 0 0 10 10 re f")?;
+        pdf.stream(
+            5,
+            b"/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 1 1] /XStep 1 /YStep 1 /Resources <<>>",
+            b"0 0 1 1 re f",
+        )?;
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 3);
+        assert_eq!(analysis.pattern_stream_count, 1);
         Ok(())
     }
 

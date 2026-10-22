@@ -240,7 +240,8 @@ pub struct PdfAnalysis {
     /// graph-wide optimization holders. Older cached analyses default to 0 and
     /// therefore cannot authorize these fast rejects. Version 1 covers the four
     /// targeted-dedup key counts; version 2 additionally covers `ICCBased` arrays
-    /// and indirect `StructElem` attribute dictionaries.
+    /// and indirect `StructElem` attribute dictionaries; version 3 additionally
+    /// covers source Pattern streams.
     #[serde(default)]
     pub targeted_dedup_key_inventory_version: u8,
     /// Number of `/ToUnicode` holder keys in source objects/direct children.
@@ -262,6 +263,9 @@ pub struct PdfAnalysis {
     /// indirect structure-attribute dictionary.
     #[serde(default)]
     pub structure_attribute_ref_count: usize,
+    /// Conservative number of source stream objects whose `/Type` may be `/Pattern`.
+    #[serde(default)]
+    pub pattern_stream_count: usize,
     /// Number of duplicate metadata payload groups.
     pub duplicate_metadata_payload_groups: usize,
     /// Encoded metadata bytes wasted by exact duplicate payloads.
