@@ -25,9 +25,11 @@ struct AdaptiveFlateEncoding {
 fn adaptive_flate_encode(
     decoded: &[u8],
     level: crate::FlateLevel,
+    allow_high_effort: bool,
 ) -> crate::Result<AdaptiveFlateEncoding> {
     let baseline = encode_flate(decoded, level)?;
-    if level == crate::FlateLevel::SIZE
+    if !allow_high_effort
+        || level == crate::FlateLevel::SIZE
         || decoded.len() < ADAPTIVE_FLATE_MIN_DECODED_BYTES
         || baseline.len().saturating_mul(100)
             > decoded
@@ -101,7 +103,11 @@ pub fn optimize_flate_streams(
         let Ok(decoded) = document.decoded_stream_data(handle) else {
             continue;
         };
-        let Ok(encoded) = adaptive_flate_encode(&decoded, level) else {
+        // Existing filtered streams are already compressed and are numerous in
+        // real documents. Processing mode deliberately honors its requested
+        // level 6 here instead of paying for an opportunistic second level-9
+        // encode; Size mode already requests level 9 as its baseline.
+        let Ok(encoded) = adaptive_flate_encode(&decoded, level, false) else {
             continue;
         };
         if encoded.high_effort_tested {
@@ -170,7 +176,7 @@ pub fn compress_unfiltered_streams(
         }
         // The writer's historical StreamDataMode::Compress behavior always
         // applies Flate to non-empty unfiltered streams, even when a tiny stream grows.
-        let encoded = adaptive_flate_encode(&raw, level)?;
+        let encoded = adaptive_flate_encode(&raw, level, true)?;
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }
@@ -193,4 +199,22 @@ pub fn compress_unfiltered_streams(
         }
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_size_probe_can_be_disabled_for_processing() -> crate::Result<()> {
+        let decoded = vec![0_u8; ADAPTIVE_FLATE_MIN_DECODED_BYTES];
+        let baseline = encode_flate(&decoded, crate::FlateLevel::PROCESSING)?;
+        let processing = adaptive_flate_encode(&decoded, crate::FlateLevel::PROCESSING, false)?;
+        assert_eq!(processing.bytes, baseline);
+        assert!(!processing.high_effort_tested);
+
+        let adaptive = adaptive_flate_encode(&decoded, crate::FlateLevel::PROCESSING, true)?;
+        assert!(adaptive.high_effort_tested);
+        Ok(())
+    }
 }
