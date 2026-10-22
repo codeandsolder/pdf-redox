@@ -421,7 +421,11 @@ fn optimize_pdf_with_document(
         canonicalize_image_xobjects(&mut document)
     })?;
     let pattern_payload_factor = timed(&mut timings, "pattern-payload-factor", || {
-        factor_duplicate_pattern_payloads(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 3 && before.pattern_stream_count == 0 {
+            Ok(crate::dedup::PatternPayloadFactorStats::default())
+        } else {
+            factor_duplicate_pattern_payloads(&mut document)
+        }
     })?;
     let form_dedup = timed(&mut timings, "form-dedup", || {
         canonicalize_form_xobjects(&mut document)
