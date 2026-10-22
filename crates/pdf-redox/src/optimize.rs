@@ -309,7 +309,10 @@ fn optimize_pdf_with_document(
         }
     })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
-        if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0 {
+        if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
+            || before.to_unicode_raw_payload_inventory_version >= 1
+                && before.to_unicode_raw_duplicate_payload_groups == 0
+        {
             Ok(crate::dedup::TargetedDedupStats::default())
         } else {
             canonicalize_to_unicode_cmaps(&mut document)
@@ -1375,6 +1378,20 @@ mod tests {
         pdf.finish(1)
     }
 
+    fn duplicate_to_unicode_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private << /A << /ToUnicode 5 0 R >> /B << /ToUnicode 6 0 R >> >> >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"", b"/CIDInit /ProcSet findresource begin")?;
+        pdf.stream(6, b"", b"/CIDInit /ProcSet findresource begin")?;
+        pdf.finish(1)
+    }
+
     fn indirect_array_pieceinfo_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private 5 0 R >>")?;
@@ -1607,6 +1624,22 @@ mod tests {
         let preflight = crate::analyze_pdf_preflight(&output)?;
         assert_eq!(preflight.piece_info_key_count, 0);
         assert_eq!(preflight.authoring_metadata_key_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn old_cached_to_unicode_inventory_falls_back_to_exact_dedup() -> Result<()> {
+        let input = duplicate_to_unicode_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.to_unicode_raw_payload_inventory_version, 1);
+        assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 1);
+        analysis.to_unicode_raw_payload_inventory_version = 0;
+        analysis.to_unicode_raw_duplicate_payload_groups = 0;
+
+        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
+        assert_eq!(report.to_unicode_duplicate_streams_detected, 1);
+        assert_eq!(report.to_unicode_references_canonicalized, 1);
         Ok(())
     }
 

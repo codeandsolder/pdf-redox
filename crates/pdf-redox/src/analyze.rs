@@ -126,12 +126,16 @@ fn collect_content_stream_refs(
     Ok(())
 }
 
-fn collect_font_program_refs_from_value(value: &OwnedObject, refs: &mut HashSet<CowObjectHandle>) {
+fn collect_stream_dedup_refs_from_value(
+    value: &OwnedObject,
+    font_refs: &mut HashSet<CowObjectHandle>,
+    to_unicode_refs: &mut HashSet<CowObjectHandle>,
+) {
     match value {
         OwnedObject::Array(values) => {
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    collect_font_program_refs_from_value(value, refs);
+                    collect_stream_dedup_refs_from_value(value, font_refs, to_unicode_refs);
                 }
             }
         }
@@ -139,13 +143,17 @@ fn collect_font_program_refs_from_value(value: &OwnedObject, refs: &mut HashSet<
             for (key, child) in dictionary {
                 if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
                     if let OwnedObject::Reference(handle) = child {
-                        refs.insert(*handle);
+                        font_refs.insert(*handle);
+                    }
+                } else if key.as_slice() == b"ToUnicode" {
+                    if let OwnedObject::Reference(handle) = child {
+                        to_unicode_refs.insert(*handle);
                     }
                 } else if !matches!(child, OwnedObject::Reference(_)) {
                     // Indirect dictionaries are visited as top-level objects. Only recurse
-                    // through direct children here so nested direct FontDescriptors are not
-                    // missed and cyclic object graphs cannot recurse forever.
-                    collect_font_program_refs_from_value(child, refs);
+                    // through direct children here so nested direct holders are not missed
+                    // and cyclic object graphs cannot recurse forever.
+                    collect_stream_dedup_refs_from_value(child, font_refs, to_unicode_refs);
                 }
             }
         }
@@ -153,14 +161,15 @@ fn collect_font_program_refs_from_value(value: &OwnedObject, refs: &mut HashSet<
     }
 }
 
-fn collect_font_program_refs(
+fn collect_stream_dedup_refs(
     objects: &[(CowObjectHandle, OwnedObject)],
-) -> HashSet<CowObjectHandle> {
-    let mut refs = HashSet::new();
+) -> (HashSet<CowObjectHandle>, HashSet<CowObjectHandle>) {
+    let mut font_refs = HashSet::new();
+    let mut to_unicode_refs = HashSet::new();
     for (_, object) in objects {
-        collect_font_program_refs_from_value(object, &mut refs);
+        collect_stream_dedup_refs_from_value(object, &mut font_refs, &mut to_unicode_refs);
     }
-    refs
+    (font_refs, to_unicode_refs)
 }
 
 fn collect_page_content_refs(document: &EditDocument) -> Result<HashSet<CowObjectHandle>> {
@@ -864,10 +873,12 @@ fn analyze_document_impl(
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let font_refs = collect_font_program_refs(&objects);
+    let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+    let (font_refs, to_unicode_refs) = collect_stream_dedup_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
     out.font_raw_payload_inventory_version = 1;
+    out.to_unicode_raw_payload_inventory_version = 1;
     out.targeted_dedup_key_inventory_version = 3;
 
     for (handle, object) in &objects {
@@ -980,6 +991,11 @@ fn analyze_document_impl(
             );
         }
 
+        if is_stream && to_unicode_refs.contains(handle) {
+            let raw = raw_stream_bytes(document, object)?;
+            record_payload(&mut to_unicode_raw_payloads, raw.as_ref());
+        }
+
         if is_stream && font_refs.contains(handle) {
             let raw = raw_stream_bytes(document, object)?;
             out.font_program_count += 1;
@@ -1080,6 +1096,8 @@ fn analyze_document_impl(
     }
 
     (out.font_raw_duplicate_payload_groups, _) = duplicate_payload_stats(font_raw_payloads);
+    (out.to_unicode_raw_duplicate_payload_groups, _) =
+        duplicate_payload_stats(to_unicode_raw_payloads);
 
     if deep {
         let incoming_roles = collect_incoming_roles(&objects);
@@ -1312,11 +1330,33 @@ mod tests {
         assert_eq!(analysis.authoring_metadata_key_count, 2);
         assert_eq!(analysis.targeted_dedup_key_inventory_version, 3);
         assert_eq!(analysis.to_unicode_key_count, 1);
+        assert_eq!(analysis.to_unicode_raw_payload_inventory_version, 1);
+        assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 0);
         assert_eq!(analysis.ext_gstate_key_count, 1);
         assert_eq!(analysis.char_procs_key_count, 1);
         assert_eq!(analysis.appearance_key_count, 1);
         assert_eq!(analysis.icc_based_array_count, 0);
         assert_eq!(analysis.structure_attribute_ref_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_to_unicode_raw_payload_inventory_detects_duplicates() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private << /A << /ToUnicode 5 0 R >> /B << /ToUnicode 6 0 R >> >> >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"", b"/CIDInit /ProcSet findresource begin")?;
+        pdf.stream(6, b"", b"/CIDInit /ProcSet findresource begin")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.to_unicode_key_count, 2);
+        assert_eq!(analysis.to_unicode_raw_payload_inventory_version, 1);
+        assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 1);
         Ok(())
     }
 
