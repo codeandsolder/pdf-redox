@@ -256,6 +256,14 @@ pub struct PdfAnalysis {
     /// Number of `/ToUnicode` holder keys in source objects/direct children.
     #[serde(default)]
     pub to_unicode_key_count: usize,
+    /// Version of the preflight inventory that hashes raw stream payloads referenced
+    /// by direct `/ToUnicode` holders. Older cached analyses default to 0.
+    #[serde(default)]
+    pub to_unicode_raw_payload_inventory_version: u8,
+    /// Number of duplicate raw `ToUnicode` target-stream payload groups in the
+    /// conservative source inventory.
+    #[serde(default)]
+    pub to_unicode_raw_duplicate_payload_groups: usize,
     /// Number of `/ExtGState` resource keys in source objects/direct children.
     #[serde(default)]
     pub ext_gstate_key_count: usize,
