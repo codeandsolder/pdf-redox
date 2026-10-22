@@ -474,7 +474,7 @@ fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Re
                     generation: id.generation(),
                 });
             }
-            None => matches!(document.source().object(id)?, Object::Stream(_)),
+            None => document.source().source_object_is_stream(id)?,
         },
         ObjectHandle::New(id) => matches!(
             document
