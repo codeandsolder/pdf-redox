@@ -493,12 +493,8 @@ impl<'a> PageScanner<'a> {
         self.marked.iter().any(|state| state.optional_hidden)
     }
 
-    fn font(&self) -> FontInfo {
-        self.resources
-            .fonts
-            .get(&self.text.font)
-            .cloned()
-            .unwrap_or_default()
+    fn font(&self) -> Option<&FontInfo> {
+        self.resources.fonts.get(&self.text.font)
     }
 
     fn combined_text_matrix(&self) -> Matrix {
@@ -533,7 +529,8 @@ impl<'a> PageScanner<'a> {
         span_start: usize,
         span_end: usize,
     ) {
-        let font = self.font();
+        let fallback_font = FontInfo::default();
+        let font = self.font().unwrap_or(&fallback_font);
         let mut raw = Vec::new();
         let mut decoded = String::new();
         let mut advance = 0.0;
