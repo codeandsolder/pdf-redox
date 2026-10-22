@@ -319,14 +319,29 @@ fn optimize_pdf_with_document(
         }
     })?;
     let structure_attribute_dedup = timed(&mut timings, "structure-attribute-dedup", || {
-        canonicalize_exact_structure_attribute_dictionaries(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 2
+            && before.structure_attribute_ref_count == 0
+        {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_structure_attribute_dictionaries(&mut document)
+        }
     })?;
     let icc_dedup = timed(&mut timings, "icc-dedup", || {
-        canonicalize_icc_profiles(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_icc_profiles(&mut document)
+        }
     })?;
     let icc_alternate = timed(&mut timings, "icc-alternate-elision", || {
         if cfg.elide_icc_profiles_to_alternate {
-            elide_icc_profiles_to_alternates(&mut document)
+            if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0
+            {
+                Ok(IccAlternateElisionStats::default())
+            } else {
+                elide_icc_profiles_to_alternates(&mut document)
+            }
         } else {
             Ok(IccAlternateElisionStats::default())
         }
