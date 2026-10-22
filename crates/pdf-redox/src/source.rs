@@ -152,6 +152,17 @@ impl SourcePdf {
         Ok(kind)
     }
 
+    pub(crate) fn source_object_is_stream(&self, id: ObjectId) -> Result<bool> {
+        if let Some(kind) = self.stream_kind_cache.borrow().get(&id) {
+            return Ok(matches!(kind, SourceStreamKind::Stream(_)));
+        }
+        let object = self.object(id)?;
+        let kind = Self::source_stream_kind_from_object(&object);
+        let is_stream = matches!(kind, SourceStreamKind::Stream(_));
+        self.stream_kind_cache.borrow_mut().insert(id, kind);
+        Ok(is_stream)
+    }
+
     pub(crate) fn object_with_references(
         &self,
         id: ObjectId,
@@ -1535,6 +1546,19 @@ mod tests {
         overlay.delete(id);
         assert_eq!(overlay.change(id), Some(&ExistingObjectChange::Delete));
         assert!(!overlay.is_empty());
+    }
+
+    #[test]
+    fn source_object_stream_classification_covers_cached_stream_and_non_stream() -> Result<()> {
+        let source = SourcePdf::from_bytes(sample_pdf())?;
+        let stream = ObjectId::new(4, 0);
+        let dictionary = ObjectId::new(1, 0);
+
+        let _ = source.object_with_references(stream)?;
+        let _ = source.object_with_references(dictionary)?;
+        assert!(source.source_object_is_stream(stream)?);
+        assert!(!source.source_object_is_stream(dictionary)?);
+        Ok(())
     }
 
     #[test]
