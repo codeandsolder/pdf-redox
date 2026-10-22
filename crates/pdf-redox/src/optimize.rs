@@ -241,7 +241,11 @@ fn optimize_pdf_with_document(
         }
     })?;
     let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
-        canonicalize_metadata_streams(&mut document)
+        if before.preservation_key_inventory_complete && before.authoring_metadata_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_metadata_streams(&mut document)
+        }
     })?;
     let font_dedup = timed(&mut timings, "font-dedup", || {
         canonicalize_font_program_streams(&mut document)
