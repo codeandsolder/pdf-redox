@@ -236,6 +236,15 @@ pub struct PdfAnalysis {
     /// directory contains at least one table the rendering-only strip pass may remove.
     #[serde(default)]
     pub font_rendering_table_candidate_count: usize,
+    /// Version of the preflight inventory that hashes the raw encoded payload of every referenced source
+    /// `/FontFile*` stream. Older cached analyses default to 0 and cannot
+    /// authorize the font-program dedup fast reject.
+    #[serde(default)]
+    pub font_raw_payload_inventory_version: u8,
+    /// Number of duplicate raw font-program payload groups in the conservative
+    /// source inventory. Dictionary/key differences may make these false positives.
+    #[serde(default)]
+    pub font_raw_duplicate_payload_groups: usize,
     /// Version of the preflight source/direct-child inventory used to locate
     /// graph-wide optimization holders. Older cached analyses default to 0 and
     /// therefore cannot authorize these fast rejects. Version 1 covers the four

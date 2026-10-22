@@ -248,7 +248,14 @@ fn optimize_pdf_with_document(
         }
     })?;
     let font_dedup = timed(&mut timings, "font-dedup", || {
-        canonicalize_font_program_streams(&mut document)
+        if before.font_raw_payload_inventory_version >= 1
+            && before.font_raw_duplicate_payload_groups == 0
+            && font_rendering.programs_optimized == 0
+        {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_font_program_streams(&mut document)
+        }
     })?;
     // Sparse union only redirects indirect CIDFontType2 descriptors between
     // compatible CIDFontType2 programs. The subtype proof in this graph stays

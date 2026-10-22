@@ -863,9 +863,11 @@ fn analyze_document_impl(
     let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+    let mut font_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let font_refs = collect_font_program_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
+    out.font_raw_payload_inventory_version = 1;
     out.targeted_dedup_key_inventory_version = 3;
 
     for (handle, object) in &objects {
@@ -982,6 +984,7 @@ fn analyze_document_impl(
             let raw = raw_stream_bytes(document, object)?;
             out.font_program_count += 1;
             out.font_program_bytes += raw.len();
+            record_payload(&mut font_raw_payloads, raw.as_ref());
             if document
                 .decoded_owned_stream_data(object)
                 .ok()
@@ -1075,6 +1078,8 @@ fn analyze_document_impl(
             }
         }
     }
+
+    (out.font_raw_duplicate_payload_groups, _) = duplicate_payload_stats(font_raw_payloads);
 
     if deep {
         let incoming_roles = collect_incoming_roles(&objects);
@@ -1388,10 +1393,47 @@ mod tests {
         let clean = analyze_pdf_preflight(&font_table_inventory_fixture(false)?)?;
         assert!(clean.font_rendering_table_inventory_complete);
         assert_eq!(clean.font_rendering_table_candidate_count, 0);
+        assert_eq!(clean.font_raw_payload_inventory_version, 1);
+        assert_eq!(clean.font_raw_duplicate_payload_groups, 0);
 
         let removable = analyze_pdf_preflight(&font_table_inventory_fixture(true)?)?;
         assert!(removable.font_rendering_table_inventory_complete);
         assert_eq!(removable.font_rendering_table_candidate_count, 1);
+        assert_eq!(removable.font_raw_payload_inventory_version, 1);
+        assert_eq!(removable.font_raw_duplicate_payload_groups, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_font_raw_payload_inventory_detects_duplicates() -> Result<()> {
+        use write_fonts::{FontBuilder, types::Tag};
+
+        let mut builder = FontBuilder::new();
+        builder.add_raw(Tag::new(b"head"), vec![0_u8; 54]);
+        builder.add_raw(Tag::new(b"glyf"), b"glyphs".to_vec());
+        let font = builder.build();
+        let encoded =
+            crate::stream_codec::encode_flate(&font, crate::FlateLevel::SIZE).map_err(|error| {
+                crate::Error::Invalid(format!("fixture flate encode failed: {error}"))
+            })?;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Font << /F1 6 0 R /F2 10 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"BT /F1 10 Tf <0000> Tj /F2 10 Tf <0000> Tj ET")?;
+        pdf.stream(5, b"/Filter /FlateDecode", &encoded)?;
+        pdf.object(6, b"<< /Type /Font /Subtype /Type0 /BaseFont /InventoryA /Encoding /Identity-H /DescendantFonts [7 0 R] >>")?;
+        pdf.object(7, b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /InventoryA /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 8 0 R >>")?;
+        pdf.object(8, b"<< /Type /FontDescriptor /FontName /InventoryA /Flags 4 /FontBBox [0 0 10 10] /ItalicAngle 0 /Ascent 10 /Descent 0 /CapHeight 10 /StemV 80 /FontFile2 5 0 R >>")?;
+        pdf.stream(9, b"/Filter /FlateDecode", &encoded)?;
+        pdf.object(10, b"<< /Type /Font /Subtype /Type0 /BaseFont /InventoryB /Encoding /Identity-H /DescendantFonts [11 0 R] >>")?;
+        pdf.object(11, b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /InventoryB /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 12 0 R >>")?;
+        pdf.object(12, b"<< /Type /FontDescriptor /FontName /InventoryB /Flags 4 /FontBBox [0 0 10 10] /ItalicAngle 0 /Ascent 10 /Descent 0 /CapHeight 10 /StemV 80 /FontFile2 9 0 R >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.font_raw_payload_inventory_version, 1);
+        assert_eq!(analysis.font_raw_duplicate_payload_groups, 1);
         Ok(())
     }
 
