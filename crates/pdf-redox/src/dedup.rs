@@ -1908,6 +1908,19 @@ fn rewrite_all_references(
     Ok(rewritten)
 }
 
+pub fn exact_dictionary_fingerprint(
+    object: &OwnedObject,
+    domain: &[u8],
+) -> Result<Option<[u8; 32]>> {
+    if !matches!(object, OwnedObject::Dictionary(_)) {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hash_owned_object(&mut hasher, object)?;
+    Ok(Some(hasher.finalize().into()))
+}
+
 fn exact_dictionary_redirects(
     document: &EditDocument,
     handles: impl IntoIterator<Item = CowObjectHandle>,
@@ -1921,13 +1934,9 @@ fn exact_dictionary_redirects(
         let Some(object) = document.current_owned_object(handle)? else {
             continue;
         };
-        if !matches!(object, OwnedObject::Dictionary(_)) {
+        let Some(fingerprint) = exact_dictionary_fingerprint(&object, domain)? else {
             continue;
-        }
-        let mut hasher = Sha256::new();
-        hash_len_prefixed(&mut hasher, domain);
-        hash_owned_object(&mut hasher, &object)?;
-        let fingerprint: [u8; 32] = hasher.finalize().into();
+        };
 
         let candidates = canonical_by_fingerprint.entry(fingerprint).or_default();
         if let Some((canonical, _)) = candidates

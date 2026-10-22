@@ -1,6 +1,7 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
-    RiskKind, content::page_content, hidden_text::analyze_hidden_text,
+    RiskKind, content::page_content, dedup::exact_dictionary_fingerprint,
+    hidden_text::analyze_hidden_text,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -874,6 +875,8 @@ fn analyze_document_impl(
     let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+    let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
+    let mut font_dictionary_fingerprint_inventory_complete = true;
     let (font_refs, to_unicode_refs) = collect_stream_dedup_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
@@ -927,6 +930,19 @@ fn analyze_document_impl(
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
+        match dictionary_name(document, dictionary, b"Type") {
+            Ok(Some(name)) if name == b"Font" => {
+                match exact_dictionary_fingerprint(object, b"exact-font-dictionary") {
+                    Ok(Some(fingerprint)) => {
+                        *font_dictionary_fingerprints.entry(fingerprint).or_default() += 1;
+                    }
+                    Ok(None) => {}
+                    Err(_) => font_dictionary_fingerprint_inventory_complete = false,
+                }
+            }
+            Ok(_) => {}
+            Err(_) => font_dictionary_fingerprint_inventory_complete = false,
+        }
         let is_stream = matches!(object, OwnedObject::Stream { .. });
         if is_stream {
             let may_be_pattern = match dictionary_name(document, dictionary, b"Type") {
@@ -1095,6 +1111,12 @@ fn analyze_document_impl(
         }
     }
 
+    out.font_dictionary_fingerprint_inventory_version =
+        u8::from(font_dictionary_fingerprint_inventory_complete);
+    out.font_dictionary_duplicate_fingerprint_groups = font_dictionary_fingerprints
+        .values()
+        .filter(|&&count| count > 1)
+        .count();
     (out.font_raw_duplicate_payload_groups, _) = duplicate_payload_stats(font_raw_payloads);
     (out.to_unicode_raw_duplicate_payload_groups, _) =
         duplicate_payload_stats(to_unicode_raw_payloads);
@@ -1337,6 +1359,22 @@ mod tests {
         assert_eq!(analysis.appearance_key_count, 1);
         assert_eq!(analysis.icc_based_array_count, 0);
         assert_eq!(analysis.structure_attribute_ref_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_font_dictionary_inventory_detects_exact_duplicate_fingerprints() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+        pdf.object(6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.font_dictionary_fingerprint_inventory_version, 1);
+        assert_eq!(analysis.font_dictionary_duplicate_fingerprint_groups, 1);
         Ok(())
     }
 

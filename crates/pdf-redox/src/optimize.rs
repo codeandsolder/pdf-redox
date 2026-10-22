@@ -319,7 +319,19 @@ fn optimize_pdf_with_document(
         }
     })?;
     let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
-        canonicalize_exact_font_dictionaries(&mut document)
+        let source_uniqueness_still_exact = before.font_dictionary_fingerprint_inventory_version
+            >= 1
+            && before.font_dictionary_duplicate_fingerprint_groups == 0
+            && preservation.dropped_authoring_keys.is_empty()
+            && scrub.removed.is_empty()
+            && metadata_dedup.references_canonicalized == 0
+            && font_dedup.references_canonicalized == 0
+            && to_unicode_dedup.references_canonicalized == 0;
+        if source_uniqueness_still_exact {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_font_dictionaries(&mut document)
+        }
     })?;
     let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0 {
@@ -1378,6 +1390,17 @@ mod tests {
         pdf.finish(1)
     }
 
+    fn duplicate_font_dictionary_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+        pdf.object(6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+        pdf.finish(1)
+    }
+
     fn duplicate_to_unicode_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private << /A << /ToUnicode 5 0 R >> /B << /ToUnicode 6 0 R >> >> >>")?;
@@ -1624,6 +1647,22 @@ mod tests {
         let preflight = crate::analyze_pdf_preflight(&output)?;
         assert_eq!(preflight.piece_info_key_count, 0);
         assert_eq!(preflight.authoring_metadata_key_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn old_cached_font_dictionary_inventory_falls_back_to_exact_dedup() -> Result<()> {
+        let input = duplicate_font_dictionary_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.font_dictionary_fingerprint_inventory_version, 1);
+        assert_eq!(analysis.font_dictionary_duplicate_fingerprint_groups, 1);
+        analysis.font_dictionary_fingerprint_inventory_version = 0;
+        analysis.font_dictionary_duplicate_fingerprint_groups = 0;
+
+        let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
+        assert_eq!(report.font_duplicate_dictionaries_detected, 1);
+        assert_eq!(report.font_dictionary_references_canonicalized, 1);
         Ok(())
     }
 
