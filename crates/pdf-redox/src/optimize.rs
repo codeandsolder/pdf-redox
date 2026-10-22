@@ -10,7 +10,7 @@ use crate::{
         canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
         factor_duplicate_pattern_payloads,
     },
-    flate::{compress_unfiltered_streams, optimize_flate_streams},
+    flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
         FontOptimizationStats, collect_font_usage_graph, dense_compact_cidfont_type2_programs,
         dense_compact_cidfont_type2_programs_with_graph, strip_cidfont_type2_cmaps_after_dedup,
@@ -51,7 +51,9 @@ use crate::{
     },
     scrub::scrub_edit_document_cos_privacy,
     structure_compact::compact_structure,
-    vector_compact::{VectorCompactionStats, compact_vector_paths, processing_factor_candidate},
+    vector_compact::{
+        VectorCompactionStats, compact_vector_paths_with_flate_cache, processing_factor_candidate,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -546,6 +548,7 @@ fn optimize_pdf_with_document(
         }
     })?;
 
+    let mut flate_reuse_cache = FlateReuseCache::default();
     let vector_compaction = timed(&mut timings, "vector-compaction", || {
         let raster_proved_no_vector_candidate = cfg.optimization_goal
             != crate::OptimizationGoal::Processing
@@ -578,11 +581,12 @@ fn optimize_pdf_with_document(
             } else {
                 BTreeMap::new()
             };
-            compact_vector_paths(
+            compact_vector_paths_with_flate_cache(
                 &mut document,
                 flate_level,
                 cfg.optimization_goal,
                 vector_cache,
+                &mut flate_reuse_cache,
             )
         } else {
             Ok(VectorCompactionStats::default())
@@ -665,7 +669,7 @@ fn optimize_pdf_with_document(
         }
     })?;
     let flate = timed(&mut timings, "flate-policy", || {
-        optimize_flate_streams(&mut document, flate_level)
+        optimize_flate_streams_with_cache(&mut document, flate_level, &mut flate_reuse_cache)
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {

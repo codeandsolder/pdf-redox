@@ -6,6 +6,7 @@ use crate::{
         replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
+    flate::FlateReuseCache,
 };
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
@@ -3084,6 +3085,7 @@ fn canonicalize_page_path_coordinates(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    reuse_cache: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut stats = VectorCompactionStats::default();
     for &page in pages {
@@ -3105,7 +3107,8 @@ fn canonicalize_page_path_coordinates(
         else {
             continue;
         };
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_encoded = crate::stream_codec::encode_flate(&decoded, flate_level)?;
+        let before_flate = before_encoded.len();
         let after_flate = compressed_len(&canonicalized, flate_level)?;
         let savings = before_flate.saturating_sub(after_flate);
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
@@ -3118,6 +3121,9 @@ fn canonicalize_page_path_coordinates(
             );
         }
         if savings < required {
+            if let OwnedObject::Reference(handle) = contents {
+                reuse_cache.insert(*handle, flate_level, &decoded, before_encoded);
+            }
             continue;
         }
         replace_page_content(document, page, canonicalized.clone())?;
@@ -3147,11 +3153,12 @@ fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize>
     clippy::too_many_lines,
     reason = "vector compaction coordinates scan, factoring, rewrite, and statistics stages over shared document state"
 )]
-pub fn compact_vector_paths(
+pub fn compact_vector_paths_with_flate_cache(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
     mut raster_pre_scanned: BTreeMap<ObjectHandle, ProcessingVectorAnalysis>,
+    flate_reuse_cache: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     let mut pre_scanned_processing =
@@ -3276,7 +3283,8 @@ pub fn compact_vector_paths(
                 .extend(names.iter().cloned());
         }
 
-        let path_coordinates = canonicalize_page_path_coordinates(document, flate_level, &pages)?;
+        let path_coordinates =
+            canonicalize_page_path_coordinates(document, flate_level, &pages, flate_reuse_cache)?;
         total.pages_compacted += path_coordinates.pages_compacted;
         total.decoded_bytes_removed += path_coordinates.decoded_bytes_removed;
         total.estimated_flate_bytes_saved += path_coordinates.estimated_flate_bytes_saved;
