@@ -302,13 +302,21 @@ fn optimize_pdf_with_document(
         }
     })?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
-        canonicalize_to_unicode_cmaps(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_to_unicode_cmaps(&mut document)
+        }
     })?;
     let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
         canonicalize_exact_font_dictionaries(&mut document)
     })?;
     let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
-        canonicalize_exact_extgstate_dictionaries(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0 {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_extgstate_dictionaries(&mut document)
+        }
     })?;
     let structure_attribute_dedup = timed(&mut timings, "structure-attribute-dedup", || {
         canonicalize_exact_structure_attribute_dictionaries(&mut document)
@@ -404,10 +412,18 @@ fn optimize_pdf_with_document(
         canonicalize_form_xobjects(&mut document)
     })?;
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
-        canonicalize_appearance_streams(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 1 && before.appearance_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_appearance_streams(&mut document)
+        }
     })?;
     let type3_charproc_dedup = timed(&mut timings, "type3-dedup", || {
-        canonicalize_type3_charprocs(&mut document)
+        if before.targeted_dedup_key_inventory_version >= 1 && before.char_procs_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_type3_charprocs(&mut document)
+        }
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {

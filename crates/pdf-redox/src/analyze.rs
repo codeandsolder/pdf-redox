@@ -731,31 +731,50 @@ pub fn analyze_document_for_optimization(
     analyze_document_impl(input, document, false, false)
 }
 
-fn count_direct_preservation_keys(
-    object: &OwnedObject,
-    piece_info: &mut usize,
-    authoring_metadata: &mut usize,
-) {
+#[derive(Default)]
+struct DirectKeyInventory {
+    piece_info: usize,
+    authoring_metadata: usize,
+    to_unicode: usize,
+    ext_gstate: usize,
+    char_procs: usize,
+    appearance: usize,
+}
+
+fn count_direct_preflight_keys(object: &OwnedObject, inventory: &mut DirectKeyInventory) {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            *piece_info = piece_info.saturating_add(usize::from(
+            inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
                 dictionary.contains_key(b"PieceInfo".as_slice()),
             ));
-            *authoring_metadata = authoring_metadata
+            inventory.authoring_metadata = inventory
+                .authoring_metadata
                 .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
-            *authoring_metadata = authoring_metadata.saturating_add(usize::from(
-                dictionary.contains_key(b"LastModified".as_slice()),
+            inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
+                usize::from(dictionary.contains_key(b"LastModified".as_slice())),
+            );
+            inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
+                dictionary.contains_key(b"ToUnicode".as_slice()),
             ));
+            inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
+                dictionary.contains_key(b"ExtGState".as_slice()),
+            ));
+            inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
+                dictionary.contains_key(b"CharProcs".as_slice()),
+            ));
+            inventory.appearance = inventory
+                .appearance
+                .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
             for value in dictionary.values() {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preservation_keys(value, piece_info, authoring_metadata);
+                    count_direct_preflight_keys(value, inventory);
                 }
             }
         }
         OwnedObject::Array(values) => {
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    count_direct_preservation_keys(value, piece_info, authoring_metadata);
+                    count_direct_preflight_keys(value, inventory);
                 }
             }
         }
@@ -829,19 +848,24 @@ fn analyze_document_impl(
     let font_refs = collect_font_program_refs(&objects);
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
+    out.targeted_dedup_key_inventory_version = 1;
 
     for (handle, object) in &objects {
         // These keys may legally sit inside direct dictionaries/arrays nested
         // under any indirect object. Inventory them during the preflight's
-        // existing source-object walk so preservation can later skip redundant
+        // existing source-object walk so later passes can skip redundant
         // whole-reachable-graph scans only when absence is proven.
-        let piece_info_before = out.piece_info_key_count;
-        count_direct_preservation_keys(
-            object,
-            &mut out.piece_info_key_count,
-            &mut out.authoring_metadata_key_count,
-        );
-        if out.piece_info_key_count > piece_info_before {
+        let mut keys = DirectKeyInventory::default();
+        count_direct_preflight_keys(object, &mut keys);
+        out.piece_info_key_count = out.piece_info_key_count.saturating_add(keys.piece_info);
+        out.authoring_metadata_key_count = out
+            .authoring_metadata_key_count
+            .saturating_add(keys.authoring_metadata);
+        out.to_unicode_key_count = out.to_unicode_key_count.saturating_add(keys.to_unicode);
+        out.ext_gstate_key_count = out.ext_gstate_key_count.saturating_add(keys.ext_gstate);
+        out.char_procs_key_count = out.char_procs_key_count.saturating_add(keys.char_procs);
+        out.appearance_key_count = out.appearance_key_count.saturating_add(keys.appearance);
+        if keys.piece_info > 0 {
             push_risk(
                 &mut risks,
                 RiskKind::PieceInfo,
@@ -1227,15 +1251,20 @@ mod tests {
     #[test]
     fn preflight_preservation_inventory_counts_metadata_keys() -> Result<()> {
         let mut pdf = ClassicPdfBuilder::new();
-        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>")?;
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R /Private << /ToUnicode 5 0 R /AP << /N 4 0 R >> >> >>")?;
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
-        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /LastModified (now) /Contents 4 0 R >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /LastModified (now) /Resources << /ExtGState <<>> >> /CharProcs <<>> /Contents 4 0 R >>")?;
         pdf.stream(4, b"", b"q Q")?;
         pdf.stream(5, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
         let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
         assert!(analysis.preservation_key_inventory_complete);
         assert_eq!(analysis.piece_info_key_count, 0);
         assert_eq!(analysis.authoring_metadata_key_count, 2);
+        assert_eq!(analysis.targeted_dedup_key_inventory_version, 1);
+        assert_eq!(analysis.to_unicode_key_count, 1);
+        assert_eq!(analysis.ext_gstate_key_count, 1);
+        assert_eq!(analysis.char_procs_key_count, 1);
+        assert_eq!(analysis.appearance_key_count, 1);
         Ok(())
     }
 
