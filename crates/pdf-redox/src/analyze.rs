@@ -128,19 +128,55 @@ fn collect_content_stream_refs(
 }
 
 #[derive(Default)]
-struct StreamPreflightRefs {
+struct PreflightRefs {
     font: HashSet<CowObjectHandle>,
     font_file2: HashSet<CowObjectHandle>,
     to_unicode: HashSet<CowObjectHandle>,
     cid_to_gid: HashSet<CowObjectHandle>,
+    ext_gstate_maps: HashSet<CowObjectHandle>,
+    ext_gstates: HashSet<CowObjectHandle>,
 }
 
-fn collect_stream_dedup_refs_from_value(value: &OwnedObject, refs: &mut StreamPreflightRefs) {
+fn collect_ext_g_state_map_refs(value: &OwnedObject, refs: &mut PreflightRefs) {
+    match value {
+        OwnedObject::Reference(handle) => {
+            refs.ext_gstate_maps.insert(*handle);
+        }
+        OwnedObject::Dictionary(dictionary) => {
+            for child in dictionary.values() {
+                if let OwnedObject::Reference(handle) = child {
+                    refs.ext_gstates.insert(*handle);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_ext_g_state_map_refs(document: &EditDocument, refs: &mut PreflightRefs) -> Result<()> {
+    let maps: Vec<_> = refs.ext_gstate_maps.iter().copied().collect();
+    for handle in maps {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        for child in dictionary.values() {
+            if let OwnedObject::Reference(target) = child {
+                refs.ext_gstates.insert(*target);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_preflight_refs_from_value(value: &OwnedObject, refs: &mut PreflightRefs) {
     match value {
         OwnedObject::Array(values) => {
             for value in values {
                 if !matches!(value, OwnedObject::Reference(_)) {
-                    collect_stream_dedup_refs_from_value(value, refs);
+                    collect_preflight_refs_from_value(value, refs);
                 }
             }
         }
@@ -161,11 +197,13 @@ fn collect_stream_dedup_refs_from_value(value: &OwnedObject, refs: &mut StreamPr
                     if let OwnedObject::Reference(handle) = child {
                         refs.cid_to_gid.insert(*handle);
                     }
+                } else if key.as_slice() == b"ExtGState" {
+                    collect_ext_g_state_map_refs(child, refs);
                 } else if !matches!(child, OwnedObject::Reference(_)) {
                     // Indirect dictionaries are visited as top-level objects. Only recurse
                     // through direct children here so nested direct holders are not missed
                     // and cyclic object graphs cannot recurse forever.
-                    collect_stream_dedup_refs_from_value(child, refs);
+                    collect_preflight_refs_from_value(child, refs);
                 }
             }
         }
@@ -173,10 +211,10 @@ fn collect_stream_dedup_refs_from_value(value: &OwnedObject, refs: &mut StreamPr
     }
 }
 
-fn collect_stream_dedup_refs(objects: &[(CowObjectHandle, OwnedObject)]) -> StreamPreflightRefs {
-    let mut refs = StreamPreflightRefs::default();
+fn collect_preflight_refs(objects: &[(CowObjectHandle, OwnedObject)]) -> PreflightRefs {
+    let mut refs = PreflightRefs::default();
     for (_, object) in objects {
-        collect_stream_dedup_refs_from_value(object, &mut refs);
+        collect_preflight_refs_from_value(object, &mut refs);
     }
     refs
 }
@@ -996,10 +1034,12 @@ fn analyze_document_impl(
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
+    let mut ext_gstate_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
+    let mut ext_gstate_dictionary_fingerprint_inventory_complete = true;
     let mut font_glyph_scope_inventory_complete = true;
-    let mut stream_refs = objects
+    let mut preflight_refs = objects
         .as_deref()
-        .map_or_else(StreamPreflightRefs::default, collect_stream_dedup_refs);
+        .map_or_else(PreflightRefs::default, collect_preflight_refs);
     let mut processed_font_refs = HashSet::new();
     let mut processed_font_file2_refs = HashSet::new();
     let mut processed_to_unicode_refs = HashSet::new();
@@ -1013,7 +1053,7 @@ fn analyze_document_impl(
 
     let mut analyze_object = |handle: CowObjectHandle,
                               object: &OwnedObject,
-                              stream_refs: &StreamPreflightRefs,
+                              preflight_refs: &PreflightRefs,
                               processed_font_refs: &mut HashSet<CowObjectHandle>,
                               processed_font_file2_refs: &mut HashSet<CowObjectHandle>,
                               processed_to_unicode_refs: &mut HashSet<CowObjectHandle>|
@@ -1147,12 +1187,12 @@ fn analyze_document_impl(
             );
         }
 
-        if is_stream && stream_refs.to_unicode.contains(&handle) {
+        if is_stream && preflight_refs.to_unicode.contains(&handle) {
             record_to_unicode_stream_payload(document, object, &mut to_unicode_raw_payloads)?;
             processed_to_unicode_refs.insert(handle);
         }
 
-        if is_stream && stream_refs.font.contains(&handle) {
+        if is_stream && preflight_refs.font.contains(&handle) {
             let decoded = record_font_program_stream(
                 document,
                 object,
@@ -1162,7 +1202,7 @@ fn analyze_document_impl(
                 &mut font_payloads,
             )?;
             processed_font_refs.insert(handle);
-            if stream_refs.font_file2.contains(&handle) {
+            if preflight_refs.font_file2.contains(&handle) {
                 if let Some(decoded) = decoded.as_deref() {
                     record_font_file2_opportunity(
                         decoded,
@@ -1258,7 +1298,7 @@ fn analyze_document_impl(
             analyze_object(
                 *handle,
                 object,
-                &stream_refs,
+                &preflight_refs,
                 &mut processed_font_refs,
                 &mut processed_font_file2_refs,
                 &mut processed_to_unicode_refs,
@@ -1270,11 +1310,11 @@ fn analyze_document_impl(
             let Some(object) = document.current_owned_object(handle)? else {
                 continue;
             };
-            collect_stream_dedup_refs_from_value(&object, &mut stream_refs);
+            collect_preflight_refs_from_value(&object, &mut preflight_refs);
             analyze_object(
                 handle,
                 &object,
-                &stream_refs,
+                &preflight_refs,
                 &mut processed_font_refs,
                 &mut processed_font_file2_refs,
                 &mut processed_to_unicode_refs,
@@ -1283,8 +1323,24 @@ fn analyze_document_impl(
     }
     drop(analyze_object);
 
+    resolve_ext_g_state_map_refs(document, &mut preflight_refs)?;
+    for handle in &preflight_refs.ext_gstates {
+        let Some(object) = document.current_owned_object(*handle)? else {
+            continue;
+        };
+        match exact_dictionary_fingerprint(&object, b"exact-extgstate-dictionary") {
+            Ok(Some(fingerprint)) => {
+                *ext_gstate_dictionary_fingerprints
+                    .entry(fingerprint)
+                    .or_default() += 1;
+            }
+            Ok(None) => {}
+            Err(_) => ext_gstate_dictionary_fingerprint_inventory_complete = false,
+        }
+    }
+
     if !deep {
-        for handle in stream_refs
+        for handle in preflight_refs
             .to_unicode
             .difference(&processed_to_unicode_refs)
             .copied()
@@ -1294,7 +1350,11 @@ fn analyze_document_impl(
             };
             record_to_unicode_stream_payload(document, &object, &mut to_unicode_raw_payloads)?;
         }
-        for handle in stream_refs.font.difference(&processed_font_refs).copied() {
+        for handle in preflight_refs
+            .font
+            .difference(&processed_font_refs)
+            .copied()
+        {
             let Some(object) = document.current_owned_object(handle)? else {
                 continue;
             };
@@ -1306,7 +1366,7 @@ fn analyze_document_impl(
                 &mut font_raw_payloads,
                 &mut font_payloads,
             )?;
-            if stream_refs.font_file2.contains(&handle) {
+            if preflight_refs.font_file2.contains(&handle) {
                 if let Some(decoded) = decoded.as_deref() {
                     record_font_file2_opportunity(
                         decoded,
@@ -1320,7 +1380,7 @@ fn analyze_document_impl(
         // A target can be discovered as a generic FontFile before a later holder
         // identifies the same stream specifically as FontFile2. Revisit only
         // those File2 targets whose opportunity inventory was not recorded yet.
-        for handle in stream_refs
+        for handle in preflight_refs
             .font_file2
             .difference(&processed_font_file2_refs)
             .copied()
@@ -1344,11 +1404,17 @@ fn analyze_document_impl(
         .filter(|&&count| count > 1)
         .count();
     out.font_material_cid_cmap_decoded_bytes = font_material_cmap_bytes;
-    out.font_explicit_cid_to_gid_ref_count = stream_refs.cid_to_gid.len();
+    out.font_explicit_cid_to_gid_ref_count = preflight_refs.cid_to_gid.len();
     out.font_glyph_scope_inventory_version = u8::from(font_glyph_scope_inventory_complete);
     out.font_dictionary_fingerprint_inventory_version =
         u8::from(font_dictionary_fingerprint_inventory_complete);
     out.font_dictionary_duplicate_fingerprint_groups = font_dictionary_fingerprints
+        .values()
+        .filter(|&&count| count > 1)
+        .count();
+    out.ext_gstate_dictionary_fingerprint_inventory_version =
+        u8::from(ext_gstate_dictionary_fingerprint_inventory_complete);
+    out.ext_gstate_dictionary_duplicate_fingerprint_groups = ext_gstate_dictionary_fingerprints
         .values()
         .filter(|&&count| count > 1)
         .count();
@@ -1371,7 +1437,7 @@ fn analyze_document_impl(
                 document,
                 object,
                 *handle,
-                &stream_refs.font,
+                &preflight_refs.font,
                 &page_content_refs,
                 &icc_profile_refs,
                 &incoming_roles,
@@ -1597,6 +1663,80 @@ mod tests {
         assert_eq!(analysis.appearance_key_count, 1);
         assert_eq!(analysis.icc_based_array_count, 0);
         assert_eq!(analysis.structure_attribute_ref_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_extgstate_inventory_fingerprints_only_indirect_resource_entries() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState << /GS1 5 0 R /GS2 6 0 R /Inline1 << /CA 0.25 >> /Inline2 << /CA 0.25 >> >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /CA 0.5 /ca 0.5 >>")?;
+        pdf.object(6, b"<< /CA 0.5 /ca 0.5 >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(
+            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
+            1
+        );
+        assert_eq!(
+            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_extgstate_inventory_recovers_targets_before_indirect_resource_map() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState 9 0 R >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /BM /Multiply /CA 0.5 >>")?;
+        pdf.object(6, b"<< /BM /Multiply /CA 0.5 >>")?;
+        pdf.object(9, b"<< /GS1 5 0 R /GS2 6 0 R >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(
+            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
+            1
+        );
+        assert_eq!(
+            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_extgstate_inventory_ignores_duplicate_inline_entries() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState << /GS1 << /CA 0.5 >> /GS2 << /CA 0.5 >> >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(
+            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
+            1
+        );
+        assert_eq!(
+            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
+            0
+        );
         Ok(())
     }
 

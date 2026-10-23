@@ -295,6 +295,14 @@ pub struct PdfAnalysis {
     /// Number of `/ExtGState` resource keys in source objects/direct children.
     #[serde(default)]
     pub ext_gstate_key_count: usize,
+    /// Version of the source exact-fingerprint inventory for indirect dictionaries
+    /// actually referenced from `/ExtGState` resource maps.
+    #[serde(default)]
+    pub ext_gstate_dictionary_fingerprint_inventory_version: u8,
+    /// Number of exact fingerprint groups containing at least two referenced
+    /// `ExtGState` dictionaries. Hash collisions only cause conservative false positives.
+    #[serde(default)]
+    pub ext_gstate_dictionary_duplicate_fingerprint_groups: usize,
     /// Number of `/CharProcs` keys in source objects/direct children.
     #[serde(default)]
     pub char_procs_key_count: usize,
