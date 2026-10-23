@@ -1266,84 +1266,7 @@ pub struct ProcessingVectorAnalysis {
     fills: Vec<FillPaint>,
     path_blocks: Vec<PathBlock>,
     transformed_blocks: Vec<TransformedBlock>,
-    path_coordinate_candidate: bool,
-}
-
-#[derive(Default)]
-struct PathCoordinateCandidateScanner {
-    operands: Vec<(Option<f64>, usize)>,
-    candidate: bool,
-}
-
-impl PathCoordinateCandidateScanner {
-    fn process_operator(&mut self, operator: &[u8]) {
-        let expected = match operator {
-            b"m" | b"l" => 2,
-            b"c" => 6,
-            b"v" | b"y" | b"re" => 4,
-            _ => {
-                self.operands.clear();
-                return;
-            }
-        };
-        if self.operands.len() == expected {
-            self.candidate |= self.operands.iter().any(|(value, length)| {
-                let Some(value) = *value else {
-                    return false;
-                };
-                if !value.is_finite() {
-                    return false;
-                }
-                let scaled = value * PATH_COORDINATE_SCALE;
-                if !scaled.is_finite() {
-                    return false;
-                }
-                let rounded = scaled.round() / PATH_COORDINATE_SCALE;
-                if rounded.to_bits() == value.to_bits()
-                    || (rounded - value).abs() > MAX_PATH_COORDINATE_PAGE_ERROR_PT
-                {
-                    return false;
-                }
-                let mut rendered = format!("{rounded:.4}");
-                while rendered.contains('.') && rendered.ends_with('0') {
-                    rendered.pop();
-                }
-                if rendered.ends_with('.') {
-                    rendered.pop();
-                }
-                if rendered == "-0" {
-                    "0".clone_into(&mut rendered);
-                }
-                rendered.len() < *length
-            });
-        }
-        self.operands.clear();
-    }
-
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        if &instruction.operator[..] == b"BI" {
-            self.operands.clear();
-            return;
-        }
-        self.operands = instruction
-            .operands()
-            .zip(instruction.operand_spans())
-            .map(|(object, span)| {
-                (
-                    crate::content_stream::operand_number(
-                        object,
-                        input.get(span.clone()).unwrap_or_default(),
-                    ),
-                    span.len(),
-                )
-            })
-            .collect();
-        self.process_operator(&instruction.operator[..]);
-    }
+    path_coordinate_plan: Option<PathCoordinatePlan>,
 }
 
 const fn processing_transformed_factor_candidate(
@@ -1385,7 +1308,7 @@ pub fn processing_factor_candidate(
     repeated_path
         || cache
             .values()
-            .any(|analysis| analysis.path_coordinate_candidate)
+            .any(|analysis| analysis.path_coordinate_plan.is_some())
         || transformed.values().any(|(count, body_len, operators)| {
             processing_transformed_factor_candidate(*body_len, *operators, *count)
         })
@@ -1394,23 +1317,27 @@ pub fn processing_factor_candidate(
 pub struct ProcessingPageScanner {
     fill: FillScanner,
     factor: ProcessingFactorScanner,
-    path_coordinates: PathCoordinateCandidateScanner,
+    path_coordinates: Option<PathCoordinateScanner>,
 }
 
 impl ProcessingPageScanner {
-    fn new(ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>) -> Self {
+    fn new(ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>, user_unit: Option<f64>) -> Self {
         Self {
             fill: FillScanner::new(ext_gstates),
             factor: ProcessingFactorScanner::new(),
-            path_coordinates: PathCoordinateCandidateScanner::default(),
+            path_coordinates: user_unit.map(PathCoordinateScanner::new),
         }
     }
 
     pub(crate) fn for_resources(
         document: &EditDocument,
         resources: &OwnedDictionary,
+        user_unit: Option<f64>,
     ) -> Result<Self> {
-        Ok(Self::new(ext_gstate_patches(document, resources)?))
+        Ok(Self::new(
+            ext_gstate_patches(document, resources)?,
+            user_unit,
+        ))
     }
 
     pub(crate) fn finish(self) -> ProcessingVectorAnalysis {
@@ -1418,7 +1345,9 @@ impl ProcessingPageScanner {
             fills: self.fill.fills,
             path_blocks: self.factor.path.blocks,
             transformed_blocks: self.factor.transformed.blocks,
-            path_coordinate_candidate: self.path_coordinates.candidate,
+            path_coordinate_plan: self
+                .path_coordinates
+                .and_then(PathCoordinateScanner::finish),
         }
     }
 
@@ -1427,7 +1356,9 @@ impl ProcessingPageScanner {
         input: &[u8],
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
     ) {
-        self.path_coordinates.instruction(input, instruction);
+        if let Some(path_coordinates) = &mut self.path_coordinates {
+            path_coordinates.instruction(input, instruction);
+        }
         self.fill.instruction(input, instruction);
         self.factor.instruction(input, instruction);
     }
@@ -1443,8 +1374,9 @@ impl ProcessingPageScanner {
 fn scan_processing_page(
     input: &[u8],
     ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>,
+    user_unit: Option<f64>,
 ) -> Option<ProcessingVectorAnalysis> {
-    let mut scanner = ProcessingPageScanner::new(ext_gstates);
+    let mut scanner = ProcessingPageScanner::new(ext_gstates, user_unit);
     matches!(scanner.scan(input), Ok(false)).then(|| scanner.finish())
 }
 
@@ -2840,8 +2772,19 @@ struct PathCoordinateOperand {
     length: usize,
 }
 
-struct PathCoordinateScanner<'a> {
-    input: &'a [u8],
+#[derive(Debug, Clone)]
+struct PathCoordinatePlan {
+    replacements: Vec<(usize, usize, Vec<u8>)>,
+    coordinates_canonicalized: usize,
+}
+
+impl PathCoordinatePlan {
+    fn apply(&self, input: &[u8]) -> Option<Vec<u8>> {
+        apply_span_replacements(input, &self.replacements)
+    }
+}
+
+struct PathCoordinateScanner {
     operands: Vec<PathCoordinateOperand>,
     ctm: Option<Matrix>,
     state_stack: Vec<Option<Matrix>>,
@@ -2850,10 +2793,9 @@ struct PathCoordinateScanner<'a> {
     coordinates_canonicalized: usize,
 }
 
-impl<'a> PathCoordinateScanner<'a> {
-    fn new(input: &'a [u8], user_unit: f64) -> Self {
+impl PathCoordinateScanner {
+    fn new(user_unit: f64) -> Self {
         Self {
-            input,
             operands: Vec::new(),
             ctm: Some(Matrix::default()),
             state_stack: Vec::new(),
@@ -2943,7 +2885,7 @@ impl<'a> PathCoordinateScanner<'a> {
         }
     }
 
-    fn canonicalize_path_operands(&mut self, operator: &[u8]) {
+    fn canonicalize_path_operands(&mut self, input: &[u8], operator: &[u8]) {
         let expected = match operator {
             b"m" | b"l" => 2,
             b"c" => 6,
@@ -2982,7 +2924,7 @@ impl<'a> PathCoordinateScanner<'a> {
                 return;
             };
             let end = operand.offset.saturating_add(operand.length);
-            let Some(original) = self.input.get(operand.offset..end) else {
+            let Some(original) = input.get(operand.offset..end) else {
                 return;
             };
             if replacement.len() >= original.len() {
@@ -3013,7 +2955,7 @@ impl<'a> PathCoordinateScanner<'a> {
         }
     }
 
-    fn process_operator(&mut self, operator: &[u8]) {
+    fn process_operator(&mut self, input: &[u8], operator: &[u8]) {
         match operator {
             b"q" => self.state_stack.push(self.ctm),
             b"Q" => {
@@ -3021,14 +2963,18 @@ impl<'a> PathCoordinateScanner<'a> {
             }
             b"cm" => self.concat_ctm(),
             b"m" | b"l" | b"c" | b"v" | b"y" | b"re" => {
-                self.canonicalize_path_operands(operator);
+                self.canonicalize_path_operands(input, operator);
             }
             _ => {}
         }
         self.operands.clear();
     }
 
-    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+    fn instruction(
+        &mut self,
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
         if &instruction.operator[..] == b"BI" {
             self.operands.clear();
             return;
@@ -3039,19 +2985,29 @@ impl<'a> PathCoordinateScanner<'a> {
             .map(|(object, span)| PathCoordinateOperand {
                 value: crate::content_stream::operand_number(
                     object,
-                    self.input.get(span.clone()).unwrap_or_default(),
+                    input.get(span.clone()).unwrap_or_default(),
                 ),
                 offset: span.start,
                 length: span.len(),
             })
             .collect();
-        self.process_operator(&instruction.operator[..]);
+        self.process_operator(input, &instruction.operator[..]);
     }
 
-    fn scan(&mut self) -> crate::Result<bool> {
-        crate::content_stream::visit_instructions(self.input, |instruction| {
-            self.instruction(instruction);
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(input, instruction);
             Ok(())
+        })
+    }
+
+    fn finish(self) -> Option<PathCoordinatePlan> {
+        if !self.state_stack.is_empty() || self.replacements.is_empty() {
+            return None;
+        }
+        Some(PathCoordinatePlan {
+            replacements: self.replacements,
+            coordinates_canonicalized: self.coordinates_canonicalized,
         })
     }
 }
@@ -3060,8 +3016,8 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
     if !user_unit.is_finite() || user_unit <= 0.0 {
         return None;
     }
-    let mut scanner = PathCoordinateScanner::new(input, user_unit);
-    let parsed = scanner.scan();
+    let mut scanner = PathCoordinateScanner::new(user_unit);
+    let parsed = scanner.scan(input);
     if *DEBUG_VECTOR {
         eprintln!(
             "path-coordinate-scan parsed={} stack={} replacements={} coordinates={}",
@@ -3071,20 +3027,20 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
             scanner.coordinates_canonicalized
         );
     }
-    if !matches!(parsed, Ok(false))
-        || !scanner.state_stack.is_empty()
-        || scanner.replacements.is_empty()
-    {
+    if !matches!(parsed, Ok(false)) {
         return None;
     }
-    let output = apply_span_replacements(input, &scanner.replacements)?;
-    Some((output, scanner.coordinates_canonicalized))
+    let plan = scanner.finish()?;
+    let coordinates = plan.coordinates_canonicalized;
+    Some((plan.apply(input)?, coordinates))
 }
 
 fn canonicalize_page_path_coordinates(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    mut pre_scanned: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
+    rewritten_pages: &BTreeSet<ObjectHandle>,
     reuse_cache: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut stats = VectorCompactionStats::default();
@@ -3103,8 +3059,18 @@ fn canonicalize_page_path_coordinates(
         };
         let mut decoded = Vec::new();
         decoded_content_value(document, contents, &mut decoded)?;
-        let Some((canonicalized, coordinates)) = canonicalize_path_coordinates(&decoded, user_unit)
-        else {
+        let cached = (!rewritten_pages.contains(&page))
+            .then(|| pre_scanned.remove(&page))
+            .flatten();
+        let candidate = match cached {
+            Some(Some(plan)) => {
+                let coordinates = plan.coordinates_canonicalized;
+                plan.apply(&decoded).map(|output| (output, coordinates))
+            }
+            Some(None) => continue,
+            None => canonicalize_path_coordinates(&decoded, user_unit),
+        };
+        let Some((canonicalized, coordinates)) = candidate else {
             continue;
         };
         let before_encoded = crate::stream_codec::encode_flate(&decoded, flate_level)?;
@@ -3163,6 +3129,8 @@ pub fn compact_vector_paths_with_flate_cache(
     let mut total = VectorCompactionStats::default();
     let mut pre_scanned_processing =
         BTreeMap::<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>::new();
+    let mut path_coordinate_plans = BTreeMap::<ObjectHandle, Option<PathCoordinatePlan>>::new();
+    let mut vector_rewritten_pages = BTreeSet::<ObjectHandle>::new();
     let pages = document.page_handles()?;
     for &page in &pages {
         let Some(object) = document.current_owned_object(page)? else {
@@ -3182,20 +3150,36 @@ pub fn compact_vector_paths_with_flate_cache(
         };
         let ext_gstates = ext_gstate_patches(document, &resources)?;
         let ((compacted, stats), factor_cache) = if goal == OptimizationGoal::Processing {
-            let analysis = raster_pre_scanned
-                .remove(&page)
-                .or_else(|| scan_processing_page(&decoded, ext_gstates.clone()));
-            if let Some(analysis) = analysis {
-                (
-                    compact_content_from_fill_scan(&decoded, &ext_gstates, &analysis.fills),
-                    Some((analysis.path_blocks, analysis.transformed_blocks)),
-                )
+            let analysis = if let Some(analysis) = raster_pre_scanned.remove(&page) {
+                Some(analysis)
             } else {
-                (
-                    compact_content_with_ext_gstates(&decoded, &ext_gstates),
-                    None,
+                scan_processing_page(
+                    &decoded,
+                    ext_gstates.clone(),
+                    page_user_unit(document, page)?,
                 )
-            }
+            };
+            analysis.map_or_else(
+                || {
+                    (
+                        compact_content_with_ext_gstates(&decoded, &ext_gstates),
+                        None,
+                    )
+                },
+                |analysis| {
+                    let ProcessingVectorAnalysis {
+                        fills,
+                        path_blocks,
+                        transformed_blocks,
+                        path_coordinate_plan,
+                    } = analysis;
+                    path_coordinate_plans.insert(page, path_coordinate_plan);
+                    (
+                        compact_content_from_fill_scan(&decoded, &ext_gstates, &fills),
+                        Some((path_blocks, transformed_blocks)),
+                    )
+                },
+            )
         } else {
             (
                 compact_content_with_ext_gstates(&decoded, &ext_gstates),
@@ -3214,6 +3198,7 @@ pub fn compact_vector_paths_with_flate_cache(
             continue;
         }
         replace_page_content(document, page, compacted)?;
+        vector_rewritten_pages.insert(page);
         total.pages_compacted += 1;
         total.fill_groups_batched += stats.fill_groups_batched;
         total.covered_fills_pruned += stats.covered_fills_pruned;
@@ -3240,6 +3225,7 @@ pub fn compact_vector_paths_with_flate_cache(
                 .extend(names.iter().cloned());
         }
 
+        vector_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
         let transformed = factor_repeated_transformed_blocks(
             document,
             flate_level,
@@ -3257,6 +3243,7 @@ pub fn compact_vector_paths_with_flate_cache(
         total.transformed_form_estimated_flate_bytes_saved +=
             transformed.transformed_form_estimated_flate_bytes_saved;
         total.estimated_flate_bytes_saved += transformed.estimated_flate_bytes_saved;
+        vector_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
         for (page, names) in &transformed.generated_page_xobjects {
             total
                 .generated_page_xobjects
@@ -3275,6 +3262,7 @@ pub fn compact_vector_paths_with_flate_cache(
         total.shared_run_decoded_bytes_factored += shared_runs.shared_run_decoded_bytes_factored;
         total.shared_run_estimated_flate_bytes_saved +=
             shared_runs.shared_run_estimated_flate_bytes_saved;
+        vector_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
         for (page, names) in &shared_runs.generated_page_xobjects {
             total
                 .generated_page_xobjects
@@ -3283,8 +3271,14 @@ pub fn compact_vector_paths_with_flate_cache(
                 .extend(names.iter().cloned());
         }
 
-        let path_coordinates =
-            canonicalize_page_path_coordinates(document, flate_level, &pages, flate_reuse_cache)?;
+        let path_coordinates = canonicalize_page_path_coordinates(
+            document,
+            flate_level,
+            &pages,
+            path_coordinate_plans,
+            &vector_rewritten_pages,
+            flate_reuse_cache,
+        )?;
         total.pages_compacted += path_coordinates.pages_compacted;
         total.decoded_bytes_removed += path_coordinates.decoded_bytes_removed;
         total.estimated_flate_bytes_saved += path_coordinates.estimated_flate_bytes_saved;
@@ -3335,7 +3329,7 @@ mod tests {
                     operator_count: 8,
                 })
                 .collect(),
-            path_coordinate_candidate: false,
+            path_coordinate_plan: None,
         }
     }
 
@@ -3372,7 +3366,10 @@ mod tests {
                 fills: Vec::new(),
                 path_blocks: Vec::new(),
                 transformed_blocks: Vec::new(),
-                path_coordinate_candidate: true,
+                path_coordinate_plan: Some(PathCoordinatePlan {
+                    replacements: vec![(0, 1, b"0".to_vec())],
+                    coordinates_canonicalized: 1,
+                }),
             },
         )]);
         assert!(processing_factor_candidate(&cache));
@@ -3398,7 +3395,7 @@ mod tests {
                 semantic_key: key.to_vec(),
                 operator_count: 32,
             }],
-            path_coordinate_candidate: false,
+            path_coordinate_plan: None,
         };
         let cache = BTreeMap::from([
             (first, tiny(b"same-transform")),
@@ -3755,6 +3752,26 @@ mod tests {
         assert!(output.contains("0.123456 rg"));
         assert!(output.contains("255.96 518.76 m"));
         assert!(output.contains("254.16 518.76 l"));
+    }
+
+    #[test]
+    fn shared_path_coordinate_plan_matches_standalone_scanner() {
+        let input = b"q 100 0 0 100 0 0 cm 1.004 2 m S Q 5.003 6.003 m 7.004 8.004 l S";
+        let standalone = canonicalize_path_coordinates(input, 1.0);
+        assert!(standalone.is_some());
+
+        let mut scanner = ProcessingPageScanner::new(BTreeMap::new(), Some(1.0));
+        assert!(matches!(scanner.scan(input), Ok(false)));
+        let analysis = scanner.finish();
+        assert!(analysis.path_coordinate_plan.is_some());
+        let Some(plan) = analysis.path_coordinate_plan else {
+            return;
+        };
+        let cached = plan
+            .apply(input)
+            .map(|output| (output, plan.coordinates_canonicalized));
+
+        assert_eq!(cached, standalone);
     }
 
     #[test]
