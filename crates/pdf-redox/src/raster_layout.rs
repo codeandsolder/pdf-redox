@@ -909,14 +909,18 @@ struct RasterVectorScanner {
 }
 
 impl RasterVectorScanner {
-    fn new(document: &EditDocument, resources: &OwnedDictionary) -> Result<Self> {
+    fn new(
+        document: &EditDocument,
+        resources: &OwnedDictionary,
+        user_unit: Option<f64>,
+    ) -> Result<Self> {
         let mut raster = new_raster_scanner(document, resources)?;
         if raster.image_names.is_empty() {
             raster.analysis_only_no_images = true;
         }
         Ok(Self {
             raster,
-            vector: ProcessingPageScanner::for_resources(document, resources)?,
+            vector: ProcessingPageScanner::for_resources(document, resources, user_unit)?,
         })
     }
 
@@ -1192,7 +1196,8 @@ fn scan_target_shared(
 
     let page_number = page_numbers.get(&page).copied().unwrap_or(1);
     if collect_vector {
-        let mut scanner = RasterVectorScanner::new(document, resources)?;
+        let mut scanner =
+            RasterVectorScanner::new(document, resources, page_user_unit(document, page)?)?;
         let hidden_ranges = if let Some(context) = hidden_context {
             let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
             if scanner.scan_with_hidden(content, &mut hidden)? {
