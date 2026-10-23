@@ -46,10 +46,7 @@ use crate::{
     prune::{prune_resources, prune_resources_with_usage},
     raster_layout::normalize_raster_layout,
     repeated_clip::{RepeatedClipStats, hoist_repeated_clip_prefixes},
-    repeated_page_objects::{
-        RepeatedPageObjectStats, remove_repeated_page_objects,
-        repeated_page_objects_prefix_possible,
-    },
+    repeated_page_objects::{RepeatedPageObjectStats, remove_repeated_page_objects},
     scrub::scrub_edit_document_cos_privacy,
     structure_compact::compact_structure,
     vector_compact::{
@@ -440,17 +437,11 @@ fn optimize_pdf_with_document(
             Ok(IccAlternateElisionStats::default())
         }
     })?;
-    let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
-        && cfg.optimization_goal == crate::OptimizationGoal::Processing
-    {
-        repeated_page_objects_prefix_possible(&document)?
-    } else {
-        false
-    };
     let mut raster_vector_cache = BTreeMap::new();
     let raster_layout = timed(&mut timings, "raster-layout", || {
-        let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
-            && !repeated_page_objects_may_rewrite)
+        // Keep per-page vector analysis even when repeated-page cleanup is enabled.
+        // Pages that cleanup actually rewrites are evicted before vector reuse below.
+        let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing)
             .then_some(&mut raster_vector_cache);
         normalize_raster_layout(&mut document, &cfg.raster_layout, flate_level, vector_cache)
     })?;

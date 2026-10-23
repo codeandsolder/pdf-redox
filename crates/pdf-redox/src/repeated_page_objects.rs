@@ -534,26 +534,6 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
-pub fn repeated_page_objects_prefix_possible(document: &EditDocument) -> Result<bool> {
-    let pages = document.page_handles()?;
-    if pages.len() < MIN_SUPPORT_PAGES {
-        return Ok(false);
-    }
-    let seed_pages = pages.len().min(MIN_SUPPORT_PAGES.saturating_add(1));
-    let mut candidates = Vec::new();
-    for (page_index, &page) in pages.iter().take(seed_pages).enumerate() {
-        let content = page_content(document, page)?;
-        let xobjects = page_xobjects(document, page)?;
-        let mut scanner = PageScanner::new(page_index, &xobjects);
-        if scanner.scan(&content).is_ok() {
-            candidates.extend(scanner.candidates);
-        }
-    }
-    Ok(!select_persistent_candidates(&candidates, seed_pages)
-        .0
-        .is_empty())
-}
-
 pub fn remove_repeated_page_objects(
     document: &mut EditDocument,
 ) -> Result<RepeatedPageObjectStats> {
