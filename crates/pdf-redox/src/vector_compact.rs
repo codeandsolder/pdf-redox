@@ -2065,6 +2065,10 @@ fn factor_repeated_transformed_blocks(
 const MIN_SHARED_RUN_DECODED_BYTES: usize = 64 * 1024;
 const MIN_SHARED_RUN_ESTIMATED_SAVINGS: usize = 4 * 1024;
 
+const fn shared_q_page_can_reach_minimum(decoded_len: usize) -> bool {
+    decoded_len >= MIN_SHARED_RUN_DECODED_BYTES
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum SharedResourceKind {
     ColorSpace,
@@ -2571,8 +2575,7 @@ fn factor_shared_q_prefix_runs(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
 ) -> Result<VectorCompactionStats> {
-    let mut page_data = Vec::new();
-    let mut occupied_names = BTreeSet::new();
+    let mut eligible_pages = Vec::new();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
@@ -2583,11 +2586,26 @@ fn factor_shared_q_prefix_runs(
         let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
             continue;
         };
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
+        // Every selected shared run is a span inside one page content stream.
+        // A page shorter than the run floor cannot possibly contribute.
+        if shared_q_page_can_reach_minimum(decoded.len()) {
+            eligible_pages.push((page, decoded));
+        }
+    }
+    // A shared run must occur on at least two pages. Prove the whole stage
+    // impossible before resolving resources or parsing/hashing any q blocks.
+    if eligible_pages.len() < 2 {
+        return Ok(VectorCompactionStats::default());
+    }
+
+    let mut page_data = Vec::new();
+    let mut occupied_names = BTreeSet::new();
+    for (page, decoded) in eligible_pages {
         let Some(bounds) = shared_page_visible_box(document, page)? else {
             continue;
         };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let targets = shared_resource_targets(document, page)?;
         let blocks = factorable_shared_q_blocks(&decoded, &targets);
         if blocks.is_empty() {
@@ -3675,6 +3693,16 @@ mod tests {
         let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 0);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn shared_q_page_length_gate_matches_run_floor() {
+        assert!(!shared_q_page_can_reach_minimum(
+            MIN_SHARED_RUN_DECODED_BYTES - 1
+        ));
+        assert!(shared_q_page_can_reach_minimum(
+            MIN_SHARED_RUN_DECODED_BYTES
+        ));
     }
 
     #[test]
