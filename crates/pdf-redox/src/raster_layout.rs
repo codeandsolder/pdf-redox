@@ -8,7 +8,7 @@ use crate::{
         resolved_dictionary, resolved_number,
     },
     content_stream::{InstructionOperand, instruction_operands, operand_numbers},
-    hidden_text::{HiddenTextSharedContext, hidden_text_shared_context, scan_physical_hidden_text},
+    hidden_text::{HiddenTextSharedContext, PhysicalHiddenTextScanner, hidden_text_shared_context},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
         cleanup_fragmented_inline_staging, externalize_fragmented_inline_target,
@@ -930,6 +930,21 @@ impl RasterVectorScanner {
         Ok(incomplete)
     }
 
+    fn scan_with_hidden(
+        &mut self,
+        content: &[u8],
+        hidden: &mut PhysicalHiddenTextScanner<'_>,
+    ) -> Result<bool> {
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            self.raster.instruction(content, instruction);
+            self.vector.instruction(content, instruction);
+            hidden.instruction(content, instruction);
+            Ok(())
+        })?;
+        self.raster.finish_scan();
+        Ok(incomplete)
+    }
+
     fn finish(self) -> (RasterScanner, ProcessingVectorAnalysis) {
         (self.raster, self.vector.finish())
     }
@@ -1179,15 +1194,11 @@ fn scan_target_shared(
     if collect_vector {
         let mut scanner = RasterVectorScanner::new(document, resources)?;
         let hidden_ranges = if let Some(context) = hidden_context {
-            let Some(hidden_ranges) =
-                scan_physical_hidden_text(document, page, page_number, context, content)?
-            else {
-                return Ok(None);
-            };
-            if scanner.scan(content)? {
+            let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
+            if scanner.scan_with_hidden(content, &mut hidden)? {
                 return Ok(None);
             }
-            Some(hidden_ranges)
+            Some(hidden.finish())
         } else {
             let stopped_on_container_eof = scanner.scan(content)?;
             if stopped_on_container_eof {
@@ -1208,15 +1219,17 @@ fn scan_target_shared(
 
     let mut scanner = new_raster_scanner(document, resources)?;
     let hidden_ranges = if let Some(context) = hidden_context {
-        let Some(hidden_ranges) =
-            scan_physical_hidden_text(document, page, page_number, context, content)?
-        else {
-            return Ok(None);
-        };
-        if scanner.scan(content)? {
+        let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
+        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+            scanner.instruction(content, instruction);
+            hidden.instruction(content, instruction);
+            Ok(())
+        })?;
+        scanner.finish_scan();
+        if incomplete {
             return Ok(None);
         }
-        Some(hidden_ranges)
+        Some(hidden.finish())
     } else {
         let stopped_on_container_eof = scanner.scan(content)?;
         if stopped_on_container_eof {
