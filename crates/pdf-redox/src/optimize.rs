@@ -12,10 +12,11 @@ use crate::{
     },
     flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
-        FontGlyphUsageHints, FontOptimizationStats, collect_font_usage_graph,
+        FontGlyphUsageHints, FontOptimizationStats, FontUsageGraph, collect_font_usage_graph,
         dense_compact_cidfont_type2_programs, dense_compact_cidfont_type2_programs_with_graph,
-        strip_cidfont_type2_cmaps_after_dedup, strip_font_editing_tables,
-        subset_font_outlines_after_dedup, union_sparse_cid_font_programs_after_dedup,
+        has_profitable_font_outline_subset_candidate, strip_cidfont_type2_cmaps_after_dedup,
+        strip_font_editing_tables, subset_font_outlines_after_dedup,
+        union_sparse_cid_font_programs_after_dedup,
     },
     hidden_text::{
         HiddenTextApplyStats, apply_hidden_text_policy, prune_physically_hidden_text,
@@ -65,6 +66,22 @@ fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() ->
     let value = f();
     timings.insert(name.to_owned(), started.elapsed().as_secs_f64() * 1000.0);
     value
+}
+
+fn ensure_font_usage_graph<'a>(
+    document: &EditDocument,
+    graph: &'a mut Option<FontUsageGraph>,
+    timings: &mut BTreeMap<String, f64>,
+) -> Result<&'a FontUsageGraph> {
+    if graph.is_none() {
+        let collected = timed(timings, "font-post-dedup-usage-graph", || {
+            collect_font_usage_graph(document)
+        })?;
+        *graph = Some(collected);
+    }
+    graph
+        .as_ref()
+        .ok_or_else(|| crate::Error::Invalid("font usage graph was not materialized".to_owned()))
 }
 
 fn signed_size_delta(before: usize, after: usize) -> isize {
@@ -270,28 +287,33 @@ fn optimize_pdf_with_document(
         no_type3_font_scopes: before.font_glyph_scope_inventory_version >= 1
             && before.type3_font_scope_count == 0,
     };
-    // Sparse union only redirects indirect CIDFontType2 descriptors between
-    // compatible CIDFontType2 programs. The subtype proof in this graph stays
-    // valid across those redirects; outline subsetting rescans live glyph usage
-    // after union, so both stages can safely share one expensive object walk.
-    let post_dedup_font_graph = if cfg.preservation.font_editing_support {
-        None
+    // The authoritative font ownership/subtype graph is expensive and most
+    // documents have no profitable consumer for it. Source preflight records
+    // conservative negative-only opportunities; old/incomplete analyses fall
+    // back to the historical eager proofs. Any possible winner still uses the
+    // same graph before mutation.
+    let font_opportunity_inventory_complete = before.font_opportunity_inventory_version >= 1;
+    let sparse_union_possible = !cfg.preservation.font_editing_support
+        && (!font_opportunity_inventory_complete
+            || before.font_sparse_union_duplicate_skeleton_groups > 0);
+    let dense_gid_possible =
+        !font_opportunity_inventory_complete || before.font_explicit_cid_to_gid_ref_count > 0;
+    let mut post_dedup_font_graph = None::<FontUsageGraph>;
+
+    let font_sparse_union = if sparse_union_possible {
+        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
+        timed(&mut timings, "font-sparse-union", || {
+            union_sparse_cid_font_programs_after_dedup(
+                &mut document,
+                flate_level,
+                graph,
+                font_glyph_usage_hints,
+            )
+        })?
     } else {
-        Some(timed(&mut timings, "font-post-dedup-usage-graph", || {
-            collect_font_usage_graph(&document)
-        })?)
+        timings.insert("font-sparse-union".to_owned(), 0.0);
+        FontOptimizationStats::default()
     };
-    let font_sparse_union = timed(&mut timings, "font-sparse-union", || {
-        let Some(graph) = post_dedup_font_graph.as_ref() else {
-            return Ok(FontOptimizationStats::default());
-        };
-        union_sparse_cid_font_programs_after_dedup(
-            &mut document,
-            flate_level,
-            graph,
-            font_glyph_usage_hints,
-        )
-    })?;
     font_rendering.programs_optimized += font_sparse_union.programs_optimized;
     font_rendering.programs_glyph_subset += font_sparse_union.programs_glyph_subset;
     font_rendering.original_encoded_bytes += font_sparse_union.original_encoded_bytes;
@@ -299,12 +321,38 @@ fn optimize_pdf_with_document(
     font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
     font_rendering.glyph_subset_decoded_bytes_removed +=
         font_sparse_union.glyph_subset_decoded_bytes_removed;
-    let font_outline_subset = timed(&mut timings, "font-outline-subset", || {
-        let Some(graph) = post_dedup_font_graph.as_ref() else {
-            return Ok(FontOptimizationStats::default());
-        };
-        subset_font_outlines_after_dedup(&mut document, flate_level, graph, font_glyph_usage_hints)
-    })?;
+
+    let outline_subset_possible = if cfg.preservation.font_editing_support {
+        false
+    } else if post_dedup_font_graph.is_some() {
+        // Another font stage already paid for the authoritative graph; running
+        // the negative-only subset probe first would only duplicate the same
+        // glyph/subsetter work before the full proof below.
+        timings.insert("font-outline-opportunity".to_owned(), 0.0);
+        true
+    } else {
+        timed(&mut timings, "font-outline-opportunity", || {
+            has_profitable_font_outline_subset_candidate(
+                &document,
+                flate_level,
+                font_glyph_usage_hints,
+            )
+        })?
+    };
+    let font_outline_subset = if outline_subset_possible {
+        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
+        timed(&mut timings, "font-outline-subset", || {
+            subset_font_outlines_after_dedup(
+                &mut document,
+                flate_level,
+                graph,
+                font_glyph_usage_hints,
+            )
+        })?
+    } else {
+        timings.insert("font-outline-subset".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    };
     font_rendering.programs_optimized += font_outline_subset.programs_optimized;
     font_rendering.programs_glyph_subset += font_outline_subset.programs_glyph_subset;
     font_rendering.original_encoded_bytes += font_outline_subset.original_encoded_bytes;
@@ -312,20 +360,26 @@ fn optimize_pdf_with_document(
     font_rendering.decoded_table_bytes_removed += font_outline_subset.decoded_table_bytes_removed;
     font_rendering.glyph_subset_decoded_bytes_removed +=
         font_outline_subset.glyph_subset_decoded_bytes_removed;
-    let font_dense = timed(&mut timings, "font-dense-gid", || {
-        if cfg.preservation.font_editing_support
-            || cfg.optimization_goal != crate::OptimizationGoal::Processing
-        {
-            Ok(FontOptimizationStats::default())
-        } else if font_sparse_union.programs_optimized == 0 {
-            let Some(graph) = post_dedup_font_graph.as_ref() else {
-                return Ok(FontOptimizationStats::default());
-            };
+
+    let font_dense = if cfg.preservation.font_editing_support
+        || cfg.optimization_goal != crate::OptimizationGoal::Processing
+        || !dense_gid_possible
+    {
+        timings.insert("font-dense-gid".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    } else if font_sparse_union.programs_optimized == 0 {
+        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
+        timed(&mut timings, "font-dense-gid", || {
             dense_compact_cidfont_type2_programs_with_graph(&mut document, flate_level, graph)
-        } else {
+        })?
+    } else {
+        timed(&mut timings, "font-dense-gid", || {
             dense_compact_cidfont_type2_programs(&mut document, flate_level)
-        }
-    })?;
+        })?
+    };
+    if post_dedup_font_graph.is_none() {
+        timings.insert("font-post-dedup-usage-graph".to_owned(), 0.0);
+    }
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
             || before.to_unicode_raw_payload_inventory_version >= 1
@@ -710,17 +764,26 @@ fn optimize_pdf_with_document(
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
     // the stream bytes against which the rewrite's actual size win is gated.
-    let font_cid_cmap_strip = timed(&mut timings, "font-cid-cmap-strip", || {
-        if cfg.preservation.font_editing_support {
-            Ok(FontOptimizationStats::default())
-        } else {
+    let cid_cmap_source_inventory_still_valid = font_sparse_union.programs_optimized == 0
+        && font_outline_subset.programs_optimized == 0
+        && font_dense.programs_optimized == 0;
+    let cid_cmap_possible = !cfg.preservation.font_editing_support
+        && (!font_opportunity_inventory_complete
+            || !cid_cmap_source_inventory_still_valid
+            || before.font_material_cid_cmap_decoded_bytes
+                >= crate::font::MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT);
+    let font_cid_cmap_strip = if cid_cmap_possible {
+        timed(&mut timings, "font-cid-cmap-strip", || {
             strip_cidfont_type2_cmaps_after_dedup(
                 &mut document,
                 flate_level,
                 post_dedup_font_graph.as_ref(),
             )
-        }
-    })?;
+        })?
+    } else {
+        timings.insert("font-cid-cmap-strip".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    };
     let output = timed(&mut timings, "writer", || {
         crate::writer::write_pdf_with_object_streams(&document, flate_level)
     })?;
