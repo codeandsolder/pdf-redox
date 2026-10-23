@@ -115,7 +115,8 @@ struct Args {
     max_image_ppi: Option<u16>,
     #[arg(long, value_enum, default_value = "none")]
     privacy: PrivacyArg,
-    /// Choose whether conflicting rewrites favor encoded bytes or a simpler display list.
+    /// Choose whether optimization favors encoded size or processing-friendly structure.
+    /// Processing may skip expensive searches that only reduce encoded bytes.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.

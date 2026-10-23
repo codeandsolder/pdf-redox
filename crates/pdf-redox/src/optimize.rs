@@ -68,6 +68,14 @@ fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() ->
     value
 }
 
+/// The standalone outline-opportunity probe is a pure encoded-font size
+/// search. Processing avoids paying for that search, but still runs the normal
+/// subset proof when another font stage already materialized the usage graph.
+#[must_use]
+const fn search_font_outline_subset(cfg: &Config) -> bool {
+    !matches!(cfg.optimization_goal, crate::OptimizationGoal::Processing)
+}
+
 fn ensure_font_usage_graph<'a>(
     document: &EditDocument,
     graph: &'a mut Option<FontUsageGraph>,
@@ -330,6 +338,9 @@ fn optimize_pdf_with_document(
         // glyph/subsetter work before the full proof below.
         timings.insert("font-outline-opportunity".to_owned(), 0.0);
         true
+    } else if !search_font_outline_subset(cfg) {
+        timings.insert("font-outline-opportunity".to_owned(), 0.0);
+        false
     } else {
         timed(&mut timings, "font-outline-opportunity", || {
             has_profitable_font_outline_subset_candidate(
@@ -1459,6 +1470,15 @@ fn optimize_pdf_with_document(
 mod tests {
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn processing_skips_pure_size_outline_search() {
+        let mut config = Config::optimize_only();
+        assert!(search_font_outline_subset(&config));
+
+        config.optimization_goal = crate::OptimizationGoal::Processing;
+        assert!(!search_font_outline_subset(&config));
+    }
 
     fn practical_cleanup_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();

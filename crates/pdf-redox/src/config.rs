@@ -336,7 +336,8 @@ pub enum OptimizationGoal {
     #[default]
     Size,
     /// Prefer a simpler display list / fewer paint operations, even when that
-    /// costs some encoded bytes. Geometry and semantic-preservation gates still apply.
+    /// costs some encoded bytes. Expensive pure-size searches may be skipped;
+    /// geometry and semantic-preservation gates still apply.
     Processing,
 }
 
