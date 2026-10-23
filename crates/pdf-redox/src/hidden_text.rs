@@ -407,7 +407,7 @@ impl PathState {
 struct PageScanner<'a> {
     page_number: usize,
     crop: Rect,
-    resources: &'a Resources,
+    resources: Resources,
     hidden_ocgs: &'a BTreeSet<ObjectKey>,
     base_ocg_off: bool,
     on_ocgs: &'a BTreeSet<ObjectKey>,
@@ -427,7 +427,7 @@ impl<'a> PageScanner<'a> {
     fn new(
         page_number: usize,
         crop: Rect,
-        resources: &'a Resources,
+        resources: Resources,
         hidden_ocgs: &'a BTreeSet<ObjectKey>,
         base_ocg_off: bool,
         on_ocgs: &'a BTreeSet<ObjectKey>,
@@ -1991,32 +1991,46 @@ fn physical_hidden_ranges(scan: PageScan) -> Vec<(usize, usize)> {
     ranges
 }
 
-pub fn scan_physical_hidden_text(
-    document: &EditDocument,
-    page: CowObjectHandle,
-    page_number: usize,
-    shared_context: &HiddenTextSharedContext,
-    content: &[u8],
-) -> Result<Option<Vec<(usize, usize)>>> {
-    let crop = page_crop(document, page)?;
-    let resources = build_resources(
-        document,
-        document.inherited_page_value(page, b"Resources")?,
-        &shared_context.ocg,
-    )?;
-    let mut scanner = PageScanner::new(
-        page_number,
-        crop,
-        &resources,
-        &shared_context.ocg.off,
-        shared_context.ocg.base_off,
-        &shared_context.ocg.on,
-    );
-    let stopped_on_container_eof = scanner.scan(content)?;
-    if stopped_on_container_eof {
-        return Ok(None);
+pub struct PhysicalHiddenTextScanner<'a> {
+    scanner: PageScanner<'a>,
+}
+
+impl<'a> PhysicalHiddenTextScanner<'a> {
+    pub fn new(
+        document: &EditDocument,
+        page: CowObjectHandle,
+        page_number: usize,
+        shared_context: &'a HiddenTextSharedContext,
+    ) -> Result<Self> {
+        let crop = page_crop(document, page)?;
+        let resources = build_resources(
+            document,
+            document.inherited_page_value(page, b"Resources")?,
+            &shared_context.ocg,
+        )?;
+        Ok(Self {
+            scanner: PageScanner::new(
+                page_number,
+                crop,
+                resources,
+                &shared_context.ocg.off,
+                shared_context.ocg.base_off,
+                &shared_context.ocg.on,
+            ),
+        })
     }
-    Ok(Some(physical_hidden_ranges(scanner.finish())))
+
+    pub fn instruction(
+        &mut self,
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        self.scanner.instruction(input, instruction);
+    }
+
+    pub fn finish(self) -> Vec<(usize, usize)> {
+        physical_hidden_ranges(self.scanner.finish())
+    }
 }
 
 fn scan_page(
@@ -2035,7 +2049,7 @@ fn scan_page(
     let mut scanner = PageScanner::new(
         page_number,
         crop,
-        &resources,
+        resources,
         &ocg.off,
         ocg.base_off,
         &ocg.on,
@@ -2393,7 +2407,7 @@ BT /F1 20 Tf 0.93969 0.34202 -0.34202 0.93969 70 70 Tm (tile08) Tj ET";
         let mut scanner = PageScanner::new(
             1,
             Rect::new(0.0, 0.0, 100.0, 100.0),
-            &resources,
+            resources,
             &ocgs,
             false,
             &ocgs,
