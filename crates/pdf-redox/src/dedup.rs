@@ -1954,6 +1954,29 @@ fn exact_dictionary_redirects(
     Ok(redirects)
 }
 
+pub fn has_exact_duplicate_extgstate_dictionaries(
+    document: &EditDocument,
+    handles: &[CowObjectHandle],
+) -> Result<bool> {
+    let mut fingerprints = HashSet::new();
+    for handle in handles {
+        let Some(object) = document.current_owned_object(*handle)? else {
+            continue;
+        };
+        let Some(fingerprint) =
+            exact_dictionary_fingerprint(&object, b"exact-extgstate-dictionary")?
+        else {
+            continue;
+        };
+        if !fingerprints.insert(fingerprint) {
+            // A real duplicate or a hash collision both conservatively require
+            // the authoritative full pass.
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn canonicalize_exact_extgstate_dictionaries(
     document: &mut EditDocument,
 ) -> Result<ExactObjectDedupStats> {

@@ -8,7 +8,7 @@ use crate::{
         canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
         canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
-        factor_duplicate_pattern_payloads,
+        factor_duplicate_pattern_payloads, has_exact_duplicate_extgstate_dictionaries,
     },
     flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
@@ -164,10 +164,16 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    let before = timed(&mut timings, "analysis", || {
+    let analysis = timed(&mut timings, "analysis", || {
         analyze_document_for_optimization(input, &document)
     })?;
-    optimize_pdf_with_document(document, cfg, before, timings)
+    optimize_pdf_with_document(
+        document,
+        cfg,
+        analysis.report,
+        Some(&analysis.ext_gstate_dictionary_handles),
+        timings,
+    )
 }
 
 /// Optimize `input` using a previously computed analysis of these exact bytes.
@@ -189,7 +195,7 @@ pub fn optimize_pdf_with_analysis(
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    optimize_pdf_with_document(document, cfg, analysis.clone(), timings)
+    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings)
 }
 
 #[expect(
@@ -200,6 +206,7 @@ fn optimize_pdf_with_document(
     mut document: EditDocument,
     cfg: &Config,
     before: PdfAnalysis,
+    ext_gstate_dictionary_handles: Option<&[crate::ObjectHandle]>,
     mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
@@ -417,7 +424,18 @@ fn optimize_pdf_with_document(
         }
     })?;
     let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
-        if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0 {
+        let source_candidates_still_prove_uniqueness = match ext_gstate_dictionary_handles {
+            Some(handles) => !has_exact_duplicate_extgstate_dictionaries(&document, handles)?,
+            None => false,
+        };
+        // No earlier optimizer stage synthesizes `/ExtGState` resource entries.
+        // Re-checking the source candidates in their current state therefore
+        // catches convergence caused by earlier reference canonicalization;
+        // deletions can only leave conservative stale candidates. Cached analyses
+        // deliberately lack this non-serialized handle inventory and fall back.
+        if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0
+            || source_candidates_still_prove_uniqueness
+        {
             Ok(crate::dedup::ExactObjectDedupStats::default())
         } else {
             canonicalize_exact_extgstate_dictionaries(&mut document)
@@ -1504,6 +1522,30 @@ mod tests {
         pdf.finish(1)
     }
 
+    fn duplicate_extgstate_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState << /GS1 5 0 R /GS2 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /CA 0.5 /ca 0.5 >>")?;
+        pdf.object(6, b"<< /CA 0.5 /ca 0.5 >>")?;
+        pdf.finish(1)
+    }
+
+    fn extgstate_converges_after_font_dedup_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState << /GS1 5 0 R /GS2 6 0 R >> /Font << /F1 7 0 R /F2 8 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /CA 0.5 /Font [7 0 R 12] >>")?;
+        pdf.object(6, b"<< /CA 0.5 /Font [8 0 R 12] >>")?;
+        pdf.object(7, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+        pdf.object(8, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")?;
+        pdf.finish(1)
+    }
+
     fn duplicate_to_unicode_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private << /A << /ToUnicode 5 0 R >> /B << /ToUnicode 6 0 R >> >> >>")?;
@@ -1705,7 +1747,7 @@ mod tests {
     fn complete_preservation_inventory_keeps_cleanup_for_present_keys() -> Result<()> {
         let input = practical_cleanup_fixture()?;
         let document = EditDocument::from_bytes(input.clone())?;
-        let analysis = analyze_document_for_optimization(&input, &document)?;
+        let analysis = analyze_document_for_optimization(&input, &document)?.report;
         assert!(analysis.preservation_key_inventory_complete);
         assert!(analysis.piece_info_key_count > 0);
         assert!(analysis.authoring_metadata_key_count > 0);
@@ -1731,7 +1773,7 @@ mod tests {
     fn incomplete_cached_preservation_inventory_falls_back_to_full_cleanup() -> Result<()> {
         let input = practical_cleanup_fixture()?;
         let document = EditDocument::from_bytes(input.clone())?;
-        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?.report;
         analysis.preservation_key_inventory_complete = false;
         analysis.piece_info_key_count = 0;
         analysis.authoring_metadata_key_count = 0;
@@ -1754,10 +1796,37 @@ mod tests {
     }
 
     #[test]
+    fn extgstate_current_state_proof_detects_convergence_after_font_dedup() -> Result<()> {
+        let input = extgstate_converges_after_font_dedup_fixture()?;
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert!(report.font_dictionary_references_canonicalized > 0);
+        assert_eq!(report.extgstate_duplicate_dictionaries_detected, 1);
+        assert_eq!(report.extgstate_dictionary_references_canonicalized, 1);
+
+        let (_, second) = optimize_pdf(&output, &Config::optimize_only())?;
+        assert_eq!(second.extgstate_duplicate_dictionaries_detected, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_analysis_api_without_extgstate_handles_falls_back_to_full_dedup() -> Result<()> {
+        let input = duplicate_extgstate_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.ext_gstate_dictionary_handles.len(), 2);
+
+        let (_, report) =
+            optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis.report)?;
+        assert_eq!(report.extgstate_duplicate_dictionaries_detected, 1);
+        assert_eq!(report.extgstate_dictionary_references_canonicalized, 1);
+        Ok(())
+    }
+
+    #[test]
     fn old_cached_font_dictionary_inventory_falls_back_to_exact_dedup() -> Result<()> {
         let input = duplicate_font_dictionary_fixture()?;
         let document = EditDocument::from_bytes(input.clone())?;
-        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?.report;
         assert_eq!(analysis.font_dictionary_fingerprint_inventory_version, 1);
         assert_eq!(analysis.font_dictionary_duplicate_fingerprint_groups, 1);
         analysis.font_dictionary_fingerprint_inventory_version = 0;
@@ -1773,7 +1842,7 @@ mod tests {
     fn old_cached_to_unicode_inventory_falls_back_to_exact_dedup() -> Result<()> {
         let input = duplicate_to_unicode_fixture()?;
         let document = EditDocument::from_bytes(input.clone())?;
-        let mut analysis = analyze_document_for_optimization(&input, &document)?;
+        let mut analysis = analyze_document_for_optimization(&input, &document)?.report;
         assert_eq!(analysis.to_unicode_raw_payload_inventory_version, 1);
         assert_eq!(analysis.to_unicode_raw_duplicate_payload_groups, 1);
         analysis.to_unicode_raw_payload_inventory_version = 0;
@@ -1789,7 +1858,8 @@ mod tests {
     fn matching_cached_analysis_is_reused() -> Result<()> {
         let input = corrupt_xref_with_compressed_page_tree_fixture()?;
         let mut analysis =
-            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?;
+            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?
+                .report;
         analysis.warnings.push("cached-analysis-marker".to_owned());
         let (_, report) = optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis)?;
         assert!(
@@ -1806,7 +1876,8 @@ mod tests {
     fn stale_cached_analysis_is_rejected() -> Result<()> {
         let input = corrupt_xref_with_compressed_page_tree_fixture()?;
         let mut analysis =
-            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?;
+            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?
+                .report;
         analysis.input_sha256 = "00".repeat(32);
         assert!(matches!(
             optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis),

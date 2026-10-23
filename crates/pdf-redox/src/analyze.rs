@@ -847,10 +847,18 @@ pub fn analyze_pdf_preflight(input: &[u8]) -> Result<PdfAnalysis> {
     analyze_pdf_impl(input, false, true)
 }
 
+/// Internal optimizer analysis plus non-serialized source-handle hints.
+pub struct OptimizationAnalysis {
+    /// Public analysis/report data.
+    pub report: PdfAnalysis,
+    /// Indirect dictionaries referenced from source `/ExtGState` resource maps.
+    pub ext_gstate_dictionary_handles: Vec<CowObjectHandle>,
+}
+
 pub fn analyze_document_for_optimization(
     input: &[u8],
     document: &EditDocument,
-) -> Result<PdfAnalysis> {
+) -> Result<OptimizationAnalysis> {
     analyze_document_impl(input, document, false, false)
 }
 
@@ -971,7 +979,7 @@ fn count_direct_preflight_keys(
 
 fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
-    analyze_document_impl(input, &document, deep, content_density)
+    Ok(analyze_document_impl(input, &document, deep, content_density)?.report)
 }
 
 #[expect(
@@ -983,7 +991,7 @@ fn analyze_document_impl(
     document: &EditDocument,
     deep: bool,
     content_density: bool,
-) -> Result<PdfAnalysis> {
+) -> Result<OptimizationAnalysis> {
     let objects = if deep {
         Some(all_source_objects(document)?)
     } else {
@@ -1034,8 +1042,6 @@ fn analyze_document_impl(
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
-    let mut ext_gstate_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
-    let mut ext_gstate_dictionary_fingerprint_inventory_complete = true;
     let mut font_glyph_scope_inventory_complete = true;
     let mut preflight_refs = objects
         .as_deref()
@@ -1324,20 +1330,9 @@ fn analyze_document_impl(
     drop(analyze_object);
 
     resolve_ext_g_state_map_refs(document, &mut preflight_refs)?;
-    for handle in &preflight_refs.ext_gstates {
-        let Some(object) = document.current_owned_object(*handle)? else {
-            continue;
-        };
-        match exact_dictionary_fingerprint(&object, b"exact-extgstate-dictionary") {
-            Ok(Some(fingerprint)) => {
-                *ext_gstate_dictionary_fingerprints
-                    .entry(fingerprint)
-                    .or_default() += 1;
-            }
-            Ok(None) => {}
-            Err(_) => ext_gstate_dictionary_fingerprint_inventory_complete = false,
-        }
-    }
+    let mut ext_gstate_dictionary_handles: Vec<_> =
+        preflight_refs.ext_gstates.iter().copied().collect();
+    ext_gstate_dictionary_handles.sort_unstable();
 
     if !deep {
         for handle in preflight_refs
@@ -1409,12 +1404,6 @@ fn analyze_document_impl(
     out.font_dictionary_fingerprint_inventory_version =
         u8::from(font_dictionary_fingerprint_inventory_complete);
     out.font_dictionary_duplicate_fingerprint_groups = font_dictionary_fingerprints
-        .values()
-        .filter(|&&count| count > 1)
-        .count();
-    out.ext_gstate_dictionary_fingerprint_inventory_version =
-        u8::from(ext_gstate_dictionary_fingerprint_inventory_complete);
-    out.ext_gstate_dictionary_duplicate_fingerprint_groups = ext_gstate_dictionary_fingerprints
         .values()
         .filter(|&&count| count > 1)
         .count();
@@ -1578,7 +1567,10 @@ fn analyze_document_impl(
         .into_iter()
         .map(|(kind, (count, note))| RiskFinding { kind, count, note })
         .collect();
-    Ok(out)
+    Ok(OptimizationAnalysis {
+        report: out,
+        ext_gstate_dictionary_handles,
+    })
 }
 
 #[cfg(test)]
@@ -1667,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_extgstate_inventory_fingerprints_only_indirect_resource_entries() -> Result<()> {
+    fn preflight_extgstate_inventory_collects_only_indirect_resource_entries() -> Result<()> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
@@ -1679,15 +1671,10 @@ mod tests {
         pdf.object(5, b"<< /CA 0.5 /ca 0.5 >>")?;
         pdf.object(6, b"<< /CA 0.5 /ca 0.5 >>")?;
 
-        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
-        assert_eq!(
-            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
-            1
-        );
-        assert_eq!(
-            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
-            1
-        );
+        let input = pdf.finish(1)?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.ext_gstate_dictionary_handles.len(), 2);
         Ok(())
     }
 
@@ -1705,15 +1692,10 @@ mod tests {
         pdf.object(6, b"<< /BM /Multiply /CA 0.5 >>")?;
         pdf.object(9, b"<< /GS1 5 0 R /GS2 6 0 R >>")?;
 
-        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
-        assert_eq!(
-            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
-            1
-        );
-        assert_eq!(
-            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
-            1
-        );
+        let input = pdf.finish(1)?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.ext_gstate_dictionary_handles.len(), 2);
         Ok(())
     }
 
@@ -1728,15 +1710,10 @@ mod tests {
         )?;
         pdf.stream(4, b"", b"q Q")?;
 
-        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
-        assert_eq!(
-            analysis.ext_gstate_dictionary_fingerprint_inventory_version,
-            1
-        );
-        assert_eq!(
-            analysis.ext_gstate_dictionary_duplicate_fingerprint_groups,
-            0
-        );
+        let input = pdf.finish(1)?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let analysis = analyze_document_for_optimization(&input, &document)?;
+        assert_eq!(analysis.ext_gstate_dictionary_handles.len(), 0);
         Ok(())
     }
 
