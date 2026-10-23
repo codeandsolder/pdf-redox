@@ -2340,6 +2340,25 @@ fn draw_paint_state(
         .unwrap_or_default()
 }
 
+fn image_may_have_pixel_transparency(
+    document: &EditDocument,
+    handle: ObjectHandle,
+) -> Result<bool> {
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+    else {
+        return Ok(true);
+    };
+    if resolved_bool(document, dictionary.get(b"ImageMask".as_slice()))?.unwrap_or(false)
+        || resolved_bool(document, dictionary.get(b"IM".as_slice()))?.unwrap_or(false)
+        || resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+            .is_some_and(|value| value != 0.0)
+    {
+        return Ok(true);
+    }
+    Ok(is_non_null(document, dictionary.get(b"SMask".as_slice()))?
+        || is_non_null(document, dictionary.get(b"Mask".as_slice()))?)
+}
+
 fn image_fully_transparent(image: &SampleImage) -> bool {
     image
         .alpha
@@ -2663,10 +2682,16 @@ fn prune_hidden_raster_paints(
         if visibility.contains_key(&draw.target) {
             continue;
         }
-        visibility.insert(
-            draw.target,
-            image_cache.get_or_decode(document, draw.target)?,
-        );
+        // Without occlusion pruning, decoded pixels are used here only to prove full
+        // transparency. An image dictionary with no pixel-alpha mechanism cannot satisfy
+        // that predicate; cached None still lets merge planning decode it later if needed.
+        let decoded =
+            if !prune_occluded && !image_may_have_pixel_transparency(document, draw.target)? {
+                None
+            } else {
+                image_cache.get_or_decode(document, draw.target)?
+            };
+        visibility.insert(draw.target, decoded);
     }
     stats.hidden_visibility_us = stats
         .hidden_visibility_us
@@ -6199,6 +6224,42 @@ mod tests {
         assert!((rect.y0 - 3.0).abs() < 1.0e-9);
         assert!((rect.x1 - 8.0).abs() < 1.0e-9);
         assert!((rect.y1 - 9.0).abs() < 1.0e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn unmasked_image_skips_transparency_decode_but_alpha_sources_do_not() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 9 0 R >>")?;
+        pdf.object(9, b"<< /Type /Pages /Kids [] /Count 0 >>")?;
+        let base = b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+        pdf.stream(2, base, &[0])?;
+        pdf.stream(3, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R", &[0])?;
+        pdf.stream(4, base, &[255])?;
+        pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask [0 0]", &[0])?;
+        pdf.stream(6, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMaskInData 1", &[0])?;
+        pdf.stream(7, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true /BitsPerComponent 1", &[0])?;
+        pdf.stream(8, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask null", &[0])?;
+        pdf.stream(
+            10,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /IM true /BitsPerComponent 1",
+            &[0],
+        )?;
+        pdf.stream(11, b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMaskInData 0", &[0])?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        let handle = |number| ObjectHandle::Existing(ObjectId::new(number, 0));
+        assert!(!image_may_have_pixel_transparency(&document, handle(2))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(3))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(5))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(6))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(7))?);
+        assert!(!image_may_have_pixel_transparency(&document, handle(8))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(10))?);
+        assert!(!image_may_have_pixel_transparency(&document, handle(11))?);
+        assert!(image_may_have_pixel_transparency(&document, handle(1))?);
         Ok(())
     }
 
