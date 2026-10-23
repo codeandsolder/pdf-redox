@@ -245,6 +245,26 @@ pub struct PdfAnalysis {
     /// source inventory. Dictionary/key differences may make these false positives.
     #[serde(default)]
     pub font_raw_duplicate_payload_groups: usize,
+    /// Version of the negative-only font opportunity inventory. Version 1
+    /// covers rendering-normalized TrueType sparse-union skeleton groups,
+    /// material `CIDFontType2` cmap bytes, and explicit `CIDToGIDMap` references.
+    /// Older cached analyses default to 0 and cannot authorize these skips.
+    #[serde(default)]
+    pub font_opportunity_inventory_version: u8,
+    /// Number of rendering-normalized TrueType skeleton hashes shared by at
+    /// least two referenced `FontFile2` programs. This is deliberately a
+    /// conservative superset of actual sparse-CID union groups.
+    #[serde(default)]
+    pub font_sparse_union_duplicate_skeleton_groups: usize,
+    /// Sum of decoded cmap bytes from referenced `FontFile2` programs whose cmap
+    /// individually reaches the optimizer's per-program materiality threshold.
+    /// The final CID cmap pass still proves subtype/ownership before mutation.
+    #[serde(default)]
+    pub font_material_cid_cmap_decoded_bytes: usize,
+    /// Number of distinct indirect targets referenced by any source/direct-child
+    /// `CIDToGIDMap` key. Zero is a safe negative proof for dense GID remapping.
+    #[serde(default)]
+    pub font_explicit_cid_to_gid_ref_count: usize,
     /// Version of the source `/Type /Font` exact-fingerprint inventory.
     /// Older/incomplete analyses default to 0 and cannot authorize the fast reject.
     #[serde(default)]

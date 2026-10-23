@@ -122,7 +122,7 @@ fn descriptor_base_font_name(
     )
 }
 
-fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
+pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     use write_fonts::read::{FontRef, TableProvider};
 
     let font = FontRef::new(bytes).ok()?;
@@ -2690,8 +2690,8 @@ pub fn strip_font_editing_tables(
     Ok(stats)
 }
 
-const MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM: usize = 1024;
-const MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT: usize = 4 * 1024;
+pub const MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM: usize = 1024;
+pub const MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT: usize = 4 * 1024;
 
 fn cid_cmap_program_has_proven_owners(
     graph: &FontUsageGraph,
@@ -2912,6 +2912,57 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 /// byte-identical programs into per-caller variants and lose a much larger
 /// deduplication win. At this point every canonical program naturally receives
 /// the union of glyph use from all font dictionaries that reference it.
+/// Cheap negative-only proof for outline subsetting.
+///
+/// This deliberately does not try to authorize a rewrite: it uses the existing
+/// live-GID scanner, tries both supported embedded-font backends, and applies
+/// the same final Flate size gate. If neither backend can produce a smaller
+/// stream for any live program, the authoritative ownership/subtype graph
+/// cannot make an outline rewrite possible and may be skipped entirely.
+pub fn has_profitable_font_outline_subset_candidate(
+    document: &EditDocument,
+    flate_level: crate::FlateLevel,
+    glyph_usage_hints: FontGlyphUsageHints,
+) -> Result<bool> {
+    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
+    for (program, gids) in identity_glyph_usage {
+        if gids.is_empty() {
+            continue;
+        }
+        let Some(OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(program)?
+        else {
+            continue;
+        };
+        if !dictionary.contains_key(b"Filter".as_slice())
+            || !is_unfiltered_or_lone_flate(document, &dictionary)?
+        {
+            continue;
+        }
+        let raw = data.bytes(document.source())?;
+        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+            continue;
+        };
+        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+        let subsets = [
+            crate::cff_cid::subset_cid_font(&candidate, &gids),
+            sfnt_blank_unused_glyph_outlines(&candidate, &gids),
+        ];
+        for (mut subset, _) in subsets.into_iter().flatten() {
+            if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
+                subset = trimmed;
+            }
+            let Ok(encoded) = encode_flate(&subset, flate_level) else {
+                continue;
+            };
+            if encoded.len() < raw.len() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn subset_font_outlines_after_dedup(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -4335,8 +4386,18 @@ mod tests {
         use write_fonts::read::{FontRef, TableProvider};
 
         let mut document = EditDocument::from_bytes(identity_cid_outline_fixture()?)?;
+        assert!(has_profitable_font_outline_subset_candidate(
+            &document,
+            crate::FlateLevel::SIZE,
+            FontGlyphUsageHints::default(),
+        )?);
         let stripped = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(stripped.programs_glyph_subset, 0);
+        assert!(has_profitable_font_outline_subset_candidate(
+            &document,
+            crate::FlateLevel::SIZE,
+            FontGlyphUsageHints::default(),
+        )?);
         let graph = collect_font_usage_graph(&document)?;
         let first = subset_font_outlines_after_dedup(
             &mut document,
@@ -4369,6 +4430,11 @@ mod tests {
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
         let graph = collect_font_usage_graph(&reparsed)?;
+        assert!(!has_profitable_font_outline_subset_candidate(
+            &reparsed,
+            crate::FlateLevel::SIZE,
+            FontGlyphUsageHints::default(),
+        )?);
         let second = subset_font_outlines_after_dedup(
             &mut reparsed,
             crate::FlateLevel::SIZE,
