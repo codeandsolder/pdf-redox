@@ -412,6 +412,11 @@ pub struct Config {
     /// This intentionally drops embedded color-management transforms and is therefore lossy.
     #[serde(default)]
     pub elide_icc_profiles_to_alternate: bool,
+    /// Experimental coverage probe: recursively prune dictionary entries whose semantics are
+    /// not positively recognized by pdf-redox. This is intentionally destructive and exists to
+    /// expose missing semantic coverage against a validation corpus.
+    #[serde(default)]
+    pub fun_safe_pruning: bool,
 }
 
 impl Config {
@@ -430,6 +435,7 @@ impl Config {
             optimization_goal: OptimizationGoal::Size,
             rasterize_excessive_small_vectors: false,
             elide_icc_profiles_to_alternate: false,
+            fun_safe_pruning: false,
         }
     }
 

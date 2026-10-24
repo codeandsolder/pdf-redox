@@ -41,6 +41,7 @@ use crate::{
     preservation::{
         PreservationScanHints, PreservationStats, apply_preservation_policy,
         apply_preservation_policy_with_hints, drop_page_thumbnails, drop_private_authoring_data,
+        fun_safe_prune_unknown_semantics,
     },
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
@@ -233,6 +234,13 @@ fn optimize_pdf_with_document(
     timed(&mut timings, "thumbnail-elide", || {
         if preservation_fast_path {
             drop_page_thumbnails(&mut document, &mut preservation)
+        } else {
+            Ok(())
+        }
+    })?;
+    timed(&mut timings, "fun-safe-pruning", || {
+        if cfg.fun_safe_pruning {
+            fun_safe_prune_unknown_semantics(&mut document, &mut preservation)
         } else {
             Ok(())
         }
@@ -1479,6 +1487,7 @@ fn optimize_pdf_with_document(
         preservation_dropped_catalog_keys: preservation.dropped_catalog_keys,
         preservation_dropped_authoring_keys: preservation.dropped_authoring_keys,
         preservation_spliced_unknown_wrapper_keys: preservation.spliced_unknown_wrapper_keys,
+        fun_safe_pruned_keys: preservation.fun_safe_pruned_keys,
         notes,
     };
     Ok((output, report))

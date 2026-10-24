@@ -26,6 +26,7 @@ pub struct PreservationStats {
     pub dropped_catalog_keys: BTreeMap<String, usize>,
     pub dropped_authoring_keys: BTreeMap<String, usize>,
     pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
+    pub fun_safe_pruned_keys: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1241,6 +1242,386 @@ fn process_annotations(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FunSafeContext {
+    Schema,
+    Resources,
+    ArbitraryMap,
+    Opaque,
+}
+
+const fn merge_fun_safe_context(left: FunSafeContext, right: FunSafeContext) -> FunSafeContext {
+    use FunSafeContext::{ArbitraryMap, Opaque, Resources, Schema};
+    match (left, right) {
+        (Opaque, _) | (_, Opaque) => Opaque,
+        (ArbitraryMap, _) | (_, ArbitraryMap) => ArbitraryMap,
+        (Resources, _) | (_, Resources) => Resources,
+        (Schema, Schema) => Schema,
+    }
+}
+
+const fn fun_safe_resource_category(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"ExtGState"
+            | b"ColorSpace"
+            | b"Pattern"
+            | b"Shading"
+            | b"XObject"
+            | b"Font"
+            | b"Properties"
+    )
+}
+
+const fn fun_safe_document_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"Type"
+            | b"Subtype"
+            | b"Pages"
+            | b"PageLabels"
+            | b"Names"
+            | b"Dests"
+            | b"Outlines"
+            | b"OpenAction"
+            | b"Threads"
+            | b"AcroForm"
+            | b"OCProperties"
+            | b"StructTreeRoot"
+            | b"MarkInfo"
+            | b"Lang"
+            | b"OutputIntents"
+            | b"ViewerPreferences"
+            | b"PageMode"
+            | b"PageLayout"
+            | b"Version"
+            | b"Extensions"
+            | b"Kids"
+            | b"Count"
+            | b"Parent"
+            | b"MediaBox"
+            | b"CropBox"
+            | b"BleedBox"
+            | b"TrimBox"
+            | b"ArtBox"
+            | b"Rotate"
+            | b"UserUnit"
+            | b"Resources"
+            | b"Contents"
+            | b"Group"
+            | b"Annots"
+            | b"StructParents"
+            | b"Tabs"
+            | b"B"
+            | b"Dur"
+            | b"Trans"
+            | b"AA"
+            | b"Thumb"
+            | b"PieceInfo"
+            | b"Metadata"
+            | b"LastModified"
+            | b"SeparationInfo"
+            | b"PresSteps"
+    )
+}
+
+const fn fun_safe_stream_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"Length"
+            | b"Length1"
+            | b"Length2"
+            | b"Length3"
+            | b"Filter"
+            | b"DecodeParms"
+            | b"FFilter"
+            | b"FDecodeParms"
+            | b"DL"
+    )
+}
+
+const fn fun_safe_graphics_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"ExtGState"
+            | b"ColorSpace"
+            | b"Pattern"
+            | b"Shading"
+            | b"XObject"
+            | b"Font"
+            | b"Properties"
+            | b"ProcSet"
+            | b"BBox"
+            | b"Matrix"
+            | b"FormType"
+            | b"Width"
+            | b"Height"
+            | b"BitsPerComponent"
+            | b"Decode"
+            | b"Interpolate"
+            | b"ImageMask"
+            | b"Mask"
+            | b"SMask"
+            | b"SMaskInData"
+            | b"Matte"
+            | b"BM"
+            | b"AIS"
+            | b"OP"
+            | b"op"
+            | b"OPM"
+            | b"SA"
+            | b"ca"
+            | b"RI"
+            | b"BPC"
+            | b"CS"
+            | b"D"
+            | b"I"
+            | b"IM"
+            | b"Normal"
+    )
+}
+
+const fn fun_safe_font_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"BaseFont"
+            | b"FirstChar"
+            | b"LastChar"
+            | b"Widths"
+            | b"FontDescriptor"
+            | b"Encoding"
+            | b"ToUnicode"
+            | b"DescendantFonts"
+            | b"CIDToGIDMap"
+            | b"CIDSet"
+            | b"CharProcs"
+            | b"FontBBox"
+            | b"FontMatrix"
+            | b"FontName"
+            | b"FontFile"
+            | b"FontFile2"
+            | b"FontFile3"
+            | b"DW"
+            | b"W"
+            | b"CIDSystemInfo"
+            | b"Differences"
+    )
+}
+
+const fn fun_safe_color_function_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"PatternType"
+            | b"PaintType"
+            | b"TilingType"
+            | b"XStep"
+            | b"YStep"
+            | b"ShadingType"
+            | b"Function"
+            | b"FunctionType"
+            | b"Domain"
+            | b"Range"
+            | b"Size"
+            | b"Alternate"
+            | b"N"
+    )
+}
+
+const fn fun_safe_interactive_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"AP"
+            | b"AS"
+            | b"Rect"
+            | b"Border"
+            | b"BS"
+            | b"C"
+            | b"F"
+            | b"CA"
+            | b"Fields"
+            | b"NeedAppearances"
+            | b"DR"
+            | b"FT"
+            | b"Ff"
+            | b"DV"
+            | b"MK"
+            | b"Limits"
+            | b"A"
+            | b"S"
+            | b"Dest"
+            | b"JavaScript"
+            | b"EmbeddedFiles"
+            | b"AF"
+            | b"V"
+    )
+}
+
+const fn fun_safe_misc_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"Info"
+            | b"ID"
+            | b"Root"
+            | b"Prev"
+            | b"XRefStm"
+            | b"Index"
+            | b"ActualText"
+            | b"BaseState"
+            | b"Producer"
+    )
+}
+
+const fn fun_safe_known_schema_key(key: &[u8]) -> bool {
+    fun_safe_document_key(key)
+        || fun_safe_stream_key(key)
+        || fun_safe_graphics_key(key)
+        || fun_safe_font_key(key)
+        || fun_safe_color_function_key(key)
+        || fun_safe_interactive_key(key)
+        || fun_safe_misc_key(key)
+}
+
+fn fun_safe_child_context(key: &[u8]) -> FunSafeContext {
+    if key == b"Resources" {
+        FunSafeContext::Resources
+    } else if fun_safe_resource_category(key) || key == b"CharProcs" || key == b"Dests" {
+        FunSafeContext::ArbitraryMap
+    } else if matches!(key, b"DecodeParms" | b"FDecodeParms") {
+        FunSafeContext::Opaque
+    } else {
+        FunSafeContext::Schema
+    }
+}
+
+fn fun_safe_keep_key(context: FunSafeContext, key: &[u8]) -> bool {
+    match context {
+        FunSafeContext::Schema => fun_safe_known_schema_key(key),
+        FunSafeContext::Resources => fun_safe_resource_category(key) || key == b"ProcSet",
+        FunSafeContext::ArbitraryMap | FunSafeContext::Opaque => true,
+    }
+}
+
+fn fun_safe_nested_context(context: FunSafeContext, key: &[u8]) -> FunSafeContext {
+    match context {
+        FunSafeContext::Opaque => FunSafeContext::Opaque,
+        FunSafeContext::ArbitraryMap => FunSafeContext::Schema,
+        FunSafeContext::Resources | FunSafeContext::Schema => fun_safe_child_context(key),
+    }
+}
+
+fn collect_fun_safe_contexts_in_value(
+    value: &OwnedObject,
+    context: FunSafeContext,
+    contexts: &mut BTreeMap<CowObjectHandle, FunSafeContext>,
+    queue: &mut Vec<CowObjectHandle>,
+) {
+    match value {
+        OwnedObject::Reference(handle) => {
+            let next = contexts
+                .get(handle)
+                .copied()
+                .map_or(context, |old| merge_fun_safe_context(old, context));
+            if contexts.get(handle).copied() != Some(next) {
+                contexts.insert(*handle, next);
+                queue.push(*handle);
+            }
+        }
+        OwnedObject::Array(values) => {
+            for child in values {
+                collect_fun_safe_contexts_in_value(child, context, contexts, queue);
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for (key, child) in dictionary {
+                if !fun_safe_keep_key(context, key) {
+                    continue;
+                }
+                collect_fun_safe_contexts_in_value(
+                    child,
+                    fun_safe_nested_context(context, key),
+                    contexts,
+                    queue,
+                );
+            }
+        }
+        OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+fn prune_fun_safe_value(
+    value: &mut OwnedObject,
+    context: FunSafeContext,
+    stats: &mut BTreeMap<String, usize>,
+) {
+    match value {
+        OwnedObject::Array(values) => {
+            for child in values {
+                prune_fun_safe_value(child, context, stats);
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            let remove = dictionary
+                .keys()
+                .filter(|key| !fun_safe_keep_key(context, key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in remove {
+                if dictionary.remove(key.as_slice()).is_some() {
+                    *stats
+                        .entry(format!("/{}", String::from_utf8_lossy(&key)))
+                        .or_default() += 1;
+                }
+            }
+            for (key, child) in dictionary {
+                prune_fun_safe_value(child, fun_safe_nested_context(context, key), stats);
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
+/// Experimental coverage probe that recursively removes dictionary entries whose semantics are
+/// not positively recognized by pdf-redox. It deliberately favors false-positive deletion over
+/// preservation: corpus regressions are the output of this experiment.
+pub fn fun_safe_prune_unknown_semantics(
+    document: &mut EditDocument,
+    stats: &mut PreservationStats,
+) -> Result<()> {
+    let catalog = CowObjectHandle::Existing(document.source().catalog_id());
+    let mut contexts = BTreeMap::from([(catalog, FunSafeContext::Schema)]);
+    let mut queue = vec![catalog];
+    while let Some(handle) = queue.pop() {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let context = contexts
+            .get(&handle)
+            .copied()
+            .unwrap_or(FunSafeContext::Schema);
+        collect_fun_safe_contexts_in_value(&object, context, &mut contexts, &mut queue);
+    }
+
+    for (handle, context) in contexts {
+        let Some(mut object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        prune_fun_safe_value(&mut object, context, &mut stats.fun_safe_pruned_keys);
+        *document.edit_handle(handle)? = object;
+    }
+    Ok(())
+}
+
 /// Drop embedded page-thumbnail cache entries regardless of preservation policy.
 ///
 /// `/Thumb` is an optional page-preview cache and is not part of page rendering.
@@ -1407,6 +1788,60 @@ mod tests {
         assert!(!page.contains_key(b"Thumb".as_slice()));
         assert!(page.contains_key(b"PieceInfo".as_slice()));
         assert!(page.contains_key(b"LastModified".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn fun_safe_pruning_keeps_resource_names_but_drops_unknown_nested_semantics() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /CustomName 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"/CustomName Do")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>> /Mystery 6 0 R",
+            b"q Q",
+        )?;
+        pdf.object(6, b"<< /PrivatePayload true >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut stats = PreservationStats::default();
+        fun_safe_prune_unknown_semantics(&mut document, &mut stats)?;
+
+        assert_eq!(stats.fun_safe_pruned_keys.get("/Mystery"), Some(&1));
+        let page = document
+            .page_handles()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("fixture lost its page".to_owned()))?;
+        let page = document
+            .current_owned_object(page)?
+            .ok_or_else(|| Error::Invalid("fixture page disappeared".to_owned()))?;
+        let page = page
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("fixture page is not a dictionary".to_owned()))?;
+        let resources = document
+            .resolve_owned_value(
+                page.get(b"Resources".as_slice())
+                    .ok_or_else(|| Error::Invalid("fixture page lost resources".to_owned()))?,
+            )?
+            .ok_or_else(|| Error::Invalid("fixture page resources did not resolve".to_owned()))?;
+        let resources = resources
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("fixture resources are not a dictionary".to_owned()))?;
+        let xobjects =
+            document
+                .resolve_owned_value(resources.get(b"XObject".as_slice()).ok_or_else(|| {
+                    Error::Invalid("fixture resources lost XObject map".to_owned())
+                })?)?
+                .ok_or_else(|| Error::Invalid("fixture XObject map did not resolve".to_owned()))?;
+        let xobjects = xobjects
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("fixture XObject map is not a dictionary".to_owned()))?;
+        assert!(xobjects.contains_key(b"CustomName".as_slice()));
         Ok(())
     }
 

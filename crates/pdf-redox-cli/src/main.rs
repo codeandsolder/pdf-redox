@@ -92,6 +92,10 @@ struct Args {
     /// Drop unrecognized entries under the currently classified known-semantics graph.
     #[arg(long)]
     drop_unknown_objects: bool,
+    /// EXPERIMENTAL: recursively prune dictionary entries pdf-redox does not positively
+    /// recognize. Intended as a corpus coverage probe, not a safe production transform.
+    #[arg(long)]
+    fun_safe_pruning: bool,
     /// Experimentally promote recognized child keys out of dropped unknown wrapper dictionaries.
     #[arg(long, requires = "drop_unknown_objects")]
     splice_unknown_wrappers: bool,
@@ -224,6 +228,10 @@ fn config_from_args(args: &Args) -> Config {
     }
     if args.drop_unknown_objects {
         cfg.preservation.unknown_objects = false;
+    }
+    if args.fun_safe_pruning {
+        cfg.preservation.unknown_objects = false;
+        cfg.fun_safe_pruning = true;
     }
     cfg.preservation.splice_unknown_wrappers = args.splice_unknown_wrappers;
     if args.drop_font_editing_support {
