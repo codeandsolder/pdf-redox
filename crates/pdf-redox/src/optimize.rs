@@ -198,6 +198,13 @@ pub fn optimize_pdf_with_analysis(
     optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings)
 }
 
+fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
+    let mut fast_path_policy = crate::PreservationConfig::functional();
+    fast_path_policy.private_authoring_data = policy.private_authoring_data;
+    fast_path_policy.font_editing_support = policy.font_editing_support;
+    *policy == fast_path_policy
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the optimization pipeline intentionally keeps stage ordering, shared document state, timings, and report accounting together"
@@ -210,9 +217,7 @@ fn optimize_pdf_with_document(
     mut timings: BTreeMap<String, f64>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
-    let mut fast_path_policy = crate::PreservationConfig::functional();
-    fast_path_policy.private_authoring_data = cfg.preservation.private_authoring_data;
-    let preservation_fast_path = cfg.preservation == fast_path_policy;
+    let preservation_fast_path = preservation_uses_fast_path(&cfg.preservation);
     let preservation_scan_hints = PreservationScanHints {
         no_piece_info: before.piece_info_key_count == 0,
         no_authoring_metadata: before.authoring_metadata_key_count == 0,
@@ -1486,6 +1491,21 @@ fn optimize_pdf_with_document(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn font_editing_policy_is_orthogonal_to_preservation_fast_path() {
+        let mut policy = crate::PreservationConfig::functional();
+        assert!(super::preservation_uses_fast_path(&policy));
+
+        policy.font_editing_support = !policy.font_editing_support;
+        assert!(super::preservation_uses_fast_path(&policy));
+
+        policy.private_authoring_data = !policy.private_authoring_data;
+        assert!(super::preservation_uses_fast_path(&policy));
+
+        policy.metadata = !policy.metadata;
+        assert!(!super::preservation_uses_fast_path(&policy));
+    }
+
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
 

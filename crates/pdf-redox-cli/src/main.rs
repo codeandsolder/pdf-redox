@@ -99,9 +99,9 @@ struct Args {
     /// ordinary metadata, font editing support, and unknown extensions.
     #[arg(long)]
     preserve_authoring_data: bool,
-    /// Drop embedded-font tables useful for later editing/reflow but unused by PDF page rendering.
+    /// Preserve embedded-font tables and unused glyph data useful for later text editing/reflow.
     #[arg(long)]
-    drop_font_editing_support: bool,
+    preserve_font_editing_support: bool,
     /// Override handling of non-Link/non-Widget annotations.
     #[arg(long, value_enum)]
     annotations: Option<AnnotationPolicyArg>,
@@ -199,6 +199,9 @@ fn config_from_args(args: &Args) -> Config {
         cfg.preservation = pdf_redox::PreservationConfig::known_functional();
     }
     cfg.preservation.private_authoring_data = args.preserve_authoring_data;
+    if args.preserve_authoring_data || args.preserve_font_editing_support {
+        cfg.preservation.font_editing_support = true;
+    }
     if args.drop_links {
         cfg.preservation.links = false;
     }
@@ -226,9 +229,6 @@ fn config_from_args(args: &Args) -> Config {
         cfg.preservation.unknown_objects = false;
     }
     cfg.preservation.splice_unknown_wrappers = args.splice_unknown_wrappers;
-    if args.drop_font_editing_support {
-        cfg.preservation.font_editing_support = false;
-    }
     if let Some(policy) = args.annotations {
         cfg.preservation.annotations = match policy {
             AnnotationPolicyArg::Preserve => AnnotationPolicy::Preserve,
@@ -370,6 +370,14 @@ mod tests {
 
         let keep = Args::try_parse_from(["pdf-redox", "input.pdf", "--preserve-authoring-data"])?;
         assert!(config_from_args(&keep).preservation.private_authoring_data);
+        assert!(config_from_args(&keep).preservation.font_editing_support);
+
+        assert!(!config_from_args(&default).preservation.font_editing_support);
+        let keep_fonts =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--preserve-font-editing-support"])?;
+        let keep_fonts_cfg = config_from_args(&keep_fonts);
+        assert!(keep_fonts_cfg.preservation.font_editing_support);
+        assert!(!keep_fonts_cfg.preservation.private_authoring_data);
 
         let processing =
             Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
@@ -474,6 +482,7 @@ mod tests {
             &["pdf-redox", "input.pdf", "--normalize-content"][..],
             &["pdf-redox", "input.pdf", "--prune-resources"][..],
             &["pdf-redox", "input.pdf", "--compact-vector-paths"][..],
+            &["pdf-redox", "input.pdf", "--drop-font-editing-support"][..],
             &[
                 "pdf-redox",
                 "input.pdf",

@@ -68,6 +68,9 @@ pub struct PreservationConfig {
 impl PreservationConfig {
     #[must_use]
     /// Returns the practical preservation policy for normal document functionality and ordinary metadata.
+    ///
+    /// Embedded fonts are preserved for faithful PDF rendering and text extraction,
+    /// but authoring-only font data for future editing/reflow is not retained by default.
     pub const fn functional() -> Self {
         Self {
             links: true,
@@ -79,7 +82,7 @@ impl PreservationConfig {
             viewer_preferences: true,
             metadata: true,
             private_authoring_data: false,
-            font_editing_support: true,
+            font_editing_support: false,
             annotations: AnnotationPolicy::Preserve,
             unknown_objects: true,
             splice_unknown_wrappers: false,
@@ -503,10 +506,15 @@ mod tests {
     }
 
     #[test]
-    fn practical_presets_drop_private_authoring_data() {
-        assert!(!Config::optimize_only().preservation.private_authoring_data);
-        assert!(!Config::perceptual().preservation.private_authoring_data);
-        assert!(!Config::print().preservation.private_authoring_data);
+    fn practical_presets_drop_authoring_only_state() {
+        for config in [
+            Config::optimize_only(),
+            Config::perceptual(),
+            Config::print(),
+        ] {
+            assert!(!config.preservation.private_authoring_data);
+            assert!(!config.preservation.font_editing_support);
+        }
     }
 
     #[test]
