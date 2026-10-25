@@ -21,6 +21,7 @@ mod jpeg;
 mod jpeg_optimize;
 mod microstroke;
 mod optimize;
+mod page_representation;
 mod paint_batch;
 mod polyline_simplify;
 mod preservation;
@@ -49,8 +50,9 @@ pub use error::{Error, Result, SourceLoadError};
 pub use microstroke::MicrostrokeRasterStats;
 pub use optimize::{analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis};
 pub use report::{
-    HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism,
-    OptimizationReport, PageRect, PdfAnalysis, RiskFinding, RiskKind,
+    DocumentRepresentation, HiddenTextAction, HiddenTextCategory, HiddenTextFinding,
+    HiddenTextMechanism, OptimizationReport, PageRect, PageRepresentation, PdfAnalysis,
+    RiskFinding, RiskKind,
 };
 pub use source::{
     EditDocument, ExistingObjectChange, NewObjectId, ObjectHandle, ObjectId, ObjectOverlay,

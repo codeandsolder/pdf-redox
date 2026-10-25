@@ -1,4 +1,7 @@
-use pdf_redox::{HiddenTextCategory, HiddenTextMechanism, PdfAnalysis, RiskKind, analyze_pdf};
+use pdf_redox::{
+    DocumentRepresentation, HiddenTextCategory, HiddenTextMechanism, PdfAnalysis, RiskKind,
+    analyze_pdf,
+};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +17,12 @@ pub struct CorpusFileSummary {
     producer: Option<String>,
     creator: Option<String>,
     pages: usize,
+    representation: DocumentRepresentation,
+    raster_pages: usize,
+    native_pages: usize,
+    mixed_pages: usize,
+    blank_pages: usize,
+    unknown_pages: usize,
     objects: usize,
     streams: usize,
     image_bytes: usize,
@@ -41,6 +50,12 @@ impl CorpusFileSummary {
             producer: analysis.producer.clone(),
             creator: analysis.creator.clone(),
             pages: analysis.page_count,
+            representation: analysis.document_representation,
+            raster_pages: analysis.raster_page_count,
+            native_pages: analysis.native_page_count,
+            mixed_pages: analysis.mixed_page_count,
+            blank_pages: analysis.blank_page_count,
+            unknown_pages: analysis.unknown_page_count,
             objects: analysis.object_count,
             streams: analysis.stream_count,
             image_bytes: analysis.image_raw_bytes,
@@ -93,6 +108,11 @@ struct CorpusTotals {
     documents_with_producer: u64,
     documents_with_creator: u64,
     pages: u64,
+    raster_pages: u64,
+    native_pages: u64,
+    mixed_pages: u64,
+    blank_pages: u64,
+    unknown_pages: u64,
     objects: u64,
     streams: u64,
     stream_raw_bytes: u64,
@@ -155,6 +175,8 @@ pub struct CorpusReport {
     hidden_text_mechanisms: BTreeMap<HiddenTextMechanism, u64>,
     documents_with_hidden_text_mechanism: BTreeMap<HiddenTextMechanism, u64>,
     warning_counts: BTreeMap<String, u64>,
+    document_representation_counts: BTreeMap<DocumentRepresentation, u64>,
+    page_representation_unknown_reasons: BTreeMap<String, u64>,
     largest_files: Vec<CorpusFileSummary>,
     top_flate_recompress_savings: Vec<CorpusFileSummary>,
     top_non_image_flate_recompress_savings: Vec<CorpusFileSummary>,
@@ -199,6 +221,8 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
     let mut hidden_text_mechanisms = BTreeMap::new();
     let mut documents_with_hidden_text_mechanism = BTreeMap::new();
     let mut warning_counts = BTreeMap::new();
+    let mut document_representation_counts = BTreeMap::new();
+    let mut page_representation_unknown_reasons = BTreeMap::new();
     let mut summaries = Vec::new();
     let mut failure_examples = Vec::new();
     let mut failed = 0_usize;
@@ -222,6 +246,14 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
         };
 
         accumulate_totals(&mut totals, &analysis);
+        *document_representation_counts
+            .entry(analysis.document_representation)
+            .or_default() += 1;
+        for (reason, count) in &analysis.page_representation_unknown_reasons {
+            *page_representation_unknown_reasons
+                .entry(reason.clone())
+                .or_default() += *count as u64;
+        }
         accumulate_producer_context(
             &analysis,
             &mut producer_counts,
@@ -293,6 +325,8 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
         hidden_text_mechanisms,
         documents_with_hidden_text_mechanism,
         warning_counts,
+        document_representation_counts,
+        page_representation_unknown_reasons,
         largest_files,
         top_flate_recompress_savings,
         top_non_image_flate_recompress_savings,
@@ -351,6 +385,11 @@ fn accumulate_totals(totals: &mut CorpusTotals, analysis: &PdfAnalysis) {
     totals.documents_with_producer += u64::from(analysis.producer.is_some());
     totals.documents_with_creator += u64::from(analysis.creator.is_some());
     totals.pages += analysis.page_count as u64;
+    totals.raster_pages += analysis.raster_page_count as u64;
+    totals.native_pages += analysis.native_page_count as u64;
+    totals.mixed_pages += analysis.mixed_page_count as u64;
+    totals.blank_pages += analysis.blank_page_count as u64;
+    totals.unknown_pages += analysis.unknown_page_count as u64;
     totals.objects += analysis.object_count as u64;
     totals.streams += analysis.stream_count as u64;
     totals.stream_raw_bytes += analysis.stream_raw_bytes as u64;

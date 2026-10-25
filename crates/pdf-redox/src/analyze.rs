@@ -1,6 +1,8 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
-    RiskKind, content::page_content, dedup::exact_dictionary_fingerprint,
+    RiskKind,
+    content::{page_content, page_resources},
+    dedup::exact_dictionary_fingerprint,
     hidden_text::analyze_hidden_text,
 };
 use sha2::{Digest, Sha256};
@@ -557,6 +559,7 @@ fn duplicate_payload_role_stats(
 
 #[derive(Debug, Default)]
 struct ContentAnalysisStats {
+    representation: crate::page_representation::PageRepresentationSummary,
     inline_count: usize,
     inline_bytes: usize,
     inline_payloads: HashMap<[u8; 32], (usize, usize)>,
@@ -595,9 +598,15 @@ fn scan_content(
     inline_bytes: &mut usize,
     inline_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
     mut page: Option<&mut PageInstructionCounter>,
+    mut classifier: Option<&mut crate::page_representation::PageClassifier<'_>>,
+    resources: Option<&crate::OwnedDictionary>,
 ) -> Result<bool> {
     crate::content_stream::visit_instructions(content, |instruction| {
         let operator = &instruction.operator[..];
+        if let (Some(classifier), Some(resources)) = (classifier.as_deref_mut(), resources) {
+            let operands = crate::content_stream::instruction_operands(content, instruction);
+            classifier.observe_operator(operator, &operands, resources)?;
+        }
         if let Some(page) = page.as_deref_mut() {
             page.instructions = page.instructions.saturating_add(1);
             if matches!(operator, b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re") {
@@ -647,6 +656,8 @@ fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
     let mut out = ContentAnalysisStats::default();
     for page in document.page_handles()? {
         let content = page_content(document, page)?;
+        let resources = page_resources(document, page)?.unwrap_or_default();
+        let mut classifier = crate::page_representation::begin_page_classifier(document, page)?;
         let mut page_stats = PageInstructionCounter::default();
         let incomplete = scan_content(
             &content,
@@ -654,7 +665,14 @@ fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
             &mut out.inline_bytes,
             &mut out.inline_payloads,
             Some(&mut page_stats),
+            classifier.as_mut(),
+            Some(&resources),
         )?;
+        if let Some(classifier) = classifier {
+            out.representation.record(classifier.finish(incomplete));
+        } else {
+            out.representation.record_unknown_page();
+        }
         out.page_instruction_count = out
             .page_instruction_count
             .saturating_add(page_stats.instructions);
@@ -702,6 +720,8 @@ fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
             &mut out.inline_bytes,
             &mut out.inline_payloads,
             Some(&mut form_stats),
+            None,
+            None,
         )?;
         out.form_instruction_count = out
             .form_instruction_count
@@ -719,6 +739,7 @@ fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
             .form_incomplete_parse_count
             .saturating_add(usize::from(incomplete));
     }
+    out.representation.finish_document();
     Ok(out)
 }
 
@@ -1468,6 +1489,19 @@ fn analyze_document_impl(
     if content_density {
         match analyze_content(document) {
             Ok(content) => {
+                out.page_representation_inventory_version = 1;
+                out.document_representation = content.representation.document;
+                out.raster_page_count = content.representation.raster_pages;
+                out.native_page_count = content.representation.native_pages;
+                out.mixed_page_count = content.representation.mixed_pages;
+                out.blank_page_count = content.representation.blank_pages;
+                out.unknown_page_count = content.representation.unknown_pages;
+                out.page_representation_unknown_reasons = content
+                    .representation
+                    .unknown_reasons
+                    .iter()
+                    .map(|(&reason, &count)| (reason.to_owned(), count))
+                    .collect();
                 let (duplicate_groups, duplicate_wasted_bytes) =
                     duplicate_payload_stats(content.inline_payloads);
                 out.inline_image_count = content.inline_count;
