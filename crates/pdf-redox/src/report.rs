@@ -135,6 +135,44 @@ impl PageRect {
     }
 }
 
+/// Conservative page-level representation class used to route optimization work.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PageRepresentation {
+    /// Classification could not be proven safely.
+    #[default]
+    Unknown,
+    /// The page has no visible paint.
+    Blank,
+    /// The page is primarily ordinary PDF text/vector/content, possibly with incidental images.
+    Native,
+    /// Images provably cover essentially the full page with no visible native paint.
+    Raster,
+    /// A raster-like page background is combined with visible native PDF paint.
+    Mixed,
+}
+
+/// Document-level representation class derived from page classifications.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocumentRepresentation {
+    /// Classification could not be proven safely.
+    #[default]
+    Unknown,
+    /// The document has no nonblank pages.
+    Blank,
+    /// Every nonblank page is native PDF content.
+    Native,
+    /// Every nonblank page is a proven raster page.
+    Raster,
+    /// At least 90% of nonblank pages are proven raster pages.
+    MostlyRaster,
+    /// The document contains a meaningful mixture of representation classes.
+    Mixed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// One text paint classified as invisible in the default page appearance.
 pub struct HiddenTextFinding {
@@ -181,6 +219,30 @@ pub struct PdfAnalysis {
     pub creator: Option<String>,
     /// Number of page entries.
     pub page_count: usize,
+    /// Version of the conservative page-representation inventory.
+    #[serde(default)]
+    pub page_representation_inventory_version: u8,
+    /// Document-level representation class derived from page classifications.
+    #[serde(default)]
+    pub document_representation: DocumentRepresentation,
+    /// Number of pages proven to be essentially full-page raster paint.
+    #[serde(default)]
+    pub raster_page_count: usize,
+    /// Number of pages classified as ordinary/native PDF content.
+    #[serde(default)]
+    pub native_page_count: usize,
+    /// Number of raster-backed pages that also contain visible native PDF paint.
+    #[serde(default)]
+    pub mixed_page_count: usize,
+    /// Number of pages with no visible paint.
+    #[serde(default)]
+    pub blank_page_count: usize,
+    /// Number of pages whose representation could not be proven safely.
+    #[serde(default)]
+    pub unknown_page_count: usize,
+    /// Reasons that prevented conservative page-representation proof.
+    #[serde(default)]
+    pub page_representation_unknown_reasons: BTreeMap<String, usize>,
     /// Number of object entries.
     pub object_count: usize,
     /// Reachable indirect COS objects grouped by intrinsic structural role.
