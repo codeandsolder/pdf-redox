@@ -6,7 +6,13 @@ use crate::{
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
 };
-use libjpeg_turbo_rs::{PixelFormat, Subsampling, compress};
+use libjpeg_turbo_rs::{
+    PixelFormat, Subsampling, compress,
+    encode::tables::{
+        STD_CHROMINANCE_QUANT_TABLE, STD_LUMINANCE_QUANT_TABLE, quality_scale_quant_table,
+    },
+    read_coefficients,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -360,6 +366,24 @@ fn passes_savings(options: ImageOptimizationOptions, original: u64, optimized: u
             >= u128::from(original) * u128::from(options.min_savings_percent)
 }
 
+fn finalize_jpeg_candidate(
+    encoded: Vec<u8>,
+    original: u64,
+    options: ImageOptimizationOptions,
+) -> Option<Vec<u8>> {
+    // Lossy eligibility is decided on the raw encoder output. Coefficient-preserving
+    // entropy optimization may shrink an already-admitted JPEG, but must never make
+    // a visually marginal candidate cross the material-savings threshold.
+    if !passes_savings(options, original, encoded.len()) {
+        return None;
+    }
+    Some(
+        crate::jpeg_optimize::optimized_jpeg_bytes(&encoded)
+            .filter(|optimized| optimized.len() < encoded.len())
+            .unwrap_or(encoded),
+    )
+}
+
 fn decoded_pixels(
     document: &EditDocument,
     image: &OwnedObject,
@@ -391,6 +415,50 @@ fn decoded_pixels(
     Ok((expected == Some(decoded.len())).then_some(decoded))
 }
 
+fn direct_jpeg_is_strictly_finer_than_target(
+    encoded: &[u8],
+    expected_components: usize,
+    target_quality: u8,
+) -> bool {
+    if !matches!(expected_components, 1 | 3) {
+        return false;
+    }
+    let Ok(coefficients) = read_coefficients(encoded) else {
+        return false;
+    };
+    if coefficients.effective_precision() != 8
+        || coefficients.components.len() != expected_components
+    {
+        return false;
+    }
+
+    let target_luma =
+        quality_scale_quant_table(&STD_LUMINANCE_QUANT_TABLE, target_quality.clamp(1, 100));
+    let target_chroma =
+        quality_scale_quant_table(&STD_CHROMINANCE_QUANT_TABLE, target_quality.clamp(1, 100));
+    let mut strictly_finer = false;
+    for (component_index, component) in coefficients.components.iter().enumerate() {
+        let Some(source) = coefficients
+            .quant_tables
+            .get(usize::from(component.quant_table_index))
+        else {
+            return false;
+        };
+        let target = if expected_components == 1 || component_index == 0 {
+            &target_luma
+        } else {
+            &target_chroma
+        };
+        for (&source_value, &target_value) in source.iter().zip(target.iter()) {
+            if source_value > target_value {
+                return false;
+            }
+            strictly_finer |= source_value < target_value;
+        }
+    }
+    strictly_finer
+}
+
 fn transcode_image(
     document: &EditDocument,
     image: &OwnedObject,
@@ -411,12 +479,6 @@ fn transcode_image(
     let Some((components, _, _)) = color_info(document, dictionary)? else {
         return Ok(None);
     };
-    if matches!(
-        source_filter(document, dictionary)?.as_deref(),
-        Some(b"DCTDecode" | b"DCT")
-    ) {
-        return Ok(None);
-    }
     let area = width.wrapping_mul(height);
     if (options.min_width > 0 && width <= options.min_width)
         || (options.min_height > 0 && height <= options.min_height)
@@ -424,14 +486,34 @@ fn transcode_image(
     {
         return Ok(None);
     }
+    let source_filter = source_filter(document, dictionary)?;
+    let source_bytes = data.bytes(document.source())?;
+    if matches!(source_filter.as_deref(), Some(b"DCTDecode" | b"DCT")) {
+        for key in [
+            b"DecodeParms".as_slice(),
+            b"Decode".as_slice(),
+            b"Mask".as_slice(),
+        ] {
+            if is_non_null(document, dictionary.get(key))? {
+                return Ok(None);
+            }
+        }
+        if !direct_jpeg_is_strictly_finer_than_target(
+            source_bytes.as_ref(),
+            components,
+            options.jpeg_quality,
+        ) {
+            return Ok(None);
+        }
+    }
     let Some(decoded) = decoded_pixels(document, image, width, height, components)? else {
         return Ok(None);
     };
     let encoded = encode_jpeg_raster(width, height, components, &decoded, options.jpeg_quality)?;
-    let original = u64::try_from(data.bytes(document.source())?.len()).unwrap_or(u64::MAX);
-    if !passes_savings(options, original, encoded.len()) {
+    let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
+    let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) else {
         return Ok(None);
-    }
+    };
     let pixels = u64::from(width) * u64::from(height);
     Ok(Some(ImageTransform {
         encoded,
@@ -677,4 +759,174 @@ pub fn optimize_images_with_resize_targets(
         }
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb_jpeg(quality: u8) -> Result<Vec<u8>> {
+        let width = 64usize;
+        let height = 64usize;
+        let mut pixels = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push(
+                    u8::try_from(x * 255 / width)
+                        .map_err(|_| Error::Invalid("test x gradient exceeds u8".to_owned()))?,
+                );
+                pixels.push(
+                    u8::try_from(y * 255 / height)
+                        .map_err(|_| Error::Invalid("test y gradient exceeds u8".to_owned()))?,
+                );
+                pixels.push(
+                    u8::try_from((x + y) * 255 / (width + height)).map_err(|_| {
+                        Error::Invalid("test diagonal gradient exceeds u8".to_owned())
+                    })?,
+                );
+            }
+        }
+        compress(
+            &pixels,
+            width,
+            height,
+            PixelFormat::Rgb,
+            quality,
+            Subsampling::S420,
+        )
+        .map_err(|error| Error::Invalid(format!("test JPEG encode failed: {error}")))
+    }
+
+    fn direct_jpeg_pdf(jpeg: &[u8], extra_image_dictionary: &[u8]) -> Result<Vec<u8>> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q 64 0 0 64 0 0 cm /Im0 Do Q")?;
+        let mut dictionary = b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode".to_vec();
+        if !extra_image_dictionary.is_empty() {
+            dictionary.push(b' ');
+            dictionary.extend_from_slice(extra_image_dictionary);
+        }
+        pdf.stream(5, &dictionary, jpeg)?;
+        pdf.finish(1)
+    }
+
+    fn direct_jpeg_transform(
+        jpeg: &[u8],
+        extra_image_dictionary: &[u8],
+    ) -> Result<Option<ImageTransform>> {
+        let pdf = direct_jpeg_pdf(jpeg, extra_image_dictionary)?;
+        let document = EditDocument::from_bytes(pdf)?;
+        let Some(handle) = document
+            .reachable_streams_with_subtype(b"Image")?
+            .into_iter()
+            .next()
+        else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let Some(image) = document.current_owned_object(handle)? else {
+            return Err(Error::Invalid("test image object is missing".to_owned()));
+        };
+        transcode_image(
+            &document,
+            &image,
+            ImageOptimizationOptions {
+                min_width: 0,
+                min_height: 0,
+                min_area: 0,
+                jpeg_quality: 85,
+                min_savings_bytes: 1,
+                min_savings_percent: 0,
+                ..ImageOptimizationOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn entropy_optimization_cannot_admit_lossy_candidate() -> Result<()> {
+        let raw = rgb_jpeg(85)?;
+        let Some(entropy_optimized) = crate::jpeg_optimize::optimized_jpeg_bytes(&raw)
+            .filter(|optimized| optimized.len() < raw.len())
+        else {
+            return Err(Error::Invalid(
+                "test JPEG has no entropy-optimization opportunity".to_owned(),
+            ));
+        };
+        let options = ImageOptimizationOptions {
+            min_savings_bytes: 1,
+            min_savings_percent: 20,
+            ..ImageOptimizationOptions::default()
+        };
+        let raw_len = u64::try_from(raw.len())
+            .map_err(|_| Error::Invalid("test JPEG length exceeds u64".to_owned()))?;
+        let entropy_len = u64::try_from(entropy_optimized.len())
+            .map_err(|_| Error::Invalid("optimized test JPEG length exceeds u64".to_owned()))?;
+        let Some(original) =
+            (raw_len.saturating_add(1)..=raw_len.saturating_mul(2)).find(|&size| {
+                !passes_savings(options, size, raw.len())
+                    && passes_savings(options, size, entropy_optimized.len())
+            })
+        else {
+            return Err(Error::Invalid(format!(
+                "unable to construct admission boundary for raw={raw_len}, entropy={entropy_len}"
+            )));
+        };
+
+        assert!(!passes_savings(options, original, raw.len()));
+        assert!(passes_savings(options, original, entropy_optimized.len()));
+        assert!(finalize_jpeg_candidate(raw, original, options).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_jpeg_quality_gate_is_monotone_and_idempotent() -> Result<()> {
+        let q100 = rgb_jpeg(100)?;
+        let q90 = rgb_jpeg(90)?;
+        let q85 = rgb_jpeg(85)?;
+        let q75 = rgb_jpeg(75)?;
+
+        assert!(direct_jpeg_is_strictly_finer_than_target(&q100, 3, 85));
+        assert!(direct_jpeg_is_strictly_finer_than_target(&q90, 3, 85));
+        assert!(!direct_jpeg_is_strictly_finer_than_target(&q85, 3, 85));
+        assert!(!direct_jpeg_is_strictly_finer_than_target(&q75, 3, 85));
+        assert!(!direct_jpeg_is_strictly_finer_than_target(&q100, 4, 85));
+        assert!(!direct_jpeg_is_strictly_finer_than_target(
+            b"not jpeg",
+            3,
+            85
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_jpeg_transcode_only_requantizes_safe_finer_sources() -> Result<()> {
+        let q100 = rgb_jpeg(100)?;
+        let q85 = rgb_jpeg(85)?;
+        let q75 = rgb_jpeg(75)?;
+
+        let Some(transform) = direct_jpeg_transform(&q100, b"")? else {
+            return Err(Error::Invalid("q100 JPEG was not transcoded".to_owned()));
+        };
+        assert_eq!(transform.width, 64);
+        assert_eq!(transform.height, 64);
+        assert_eq!(transform.filter, b"DCTDecode");
+        assert!(transform.encoded.len() < q100.len());
+        assert!(
+            crate::jpeg_optimize::optimized_jpeg_bytes(&transform.encoded)
+                .is_none_or(|optimized| optimized.len() >= transform.encoded.len())
+        );
+
+        assert!(direct_jpeg_transform(&q85, b"")?.is_none());
+        assert!(direct_jpeg_transform(&q75, b"")?.is_none());
+        assert!(direct_jpeg_transform(&q100, b"/Mask [0 0 0 0 0 0]")?.is_none());
+        assert!(direct_jpeg_transform(&q100, b"/Decode [0 1 0 1 0 1]")?.is_none());
+        assert!(direct_jpeg_transform(&q100, b"/DecodeParms << /ColorTransform 1 >>")?.is_none());
+        Ok(())
+    }
 }

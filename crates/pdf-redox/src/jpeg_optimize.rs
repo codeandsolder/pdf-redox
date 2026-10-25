@@ -146,7 +146,7 @@ fn restore_source_app_com_markers(source: &[u8], transformed: &[u8]) -> Option<V
     None
 }
 
-fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
+pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let optimized = transform_jpeg_with_options(
         data,
         &TransformOptions {
