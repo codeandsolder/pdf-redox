@@ -901,9 +901,11 @@ fn optimize_pdf_with_document(
         && let ImagePolicy::Perceptual { jpeg_quality, .. } = &cfg.image_policy
     {
         let images_optimized = raster_transform.images_optimized;
+        let paper_indexed_images = raster_transform.paper_indexed_images;
+        let jpeg_images = images_optimized.saturating_sub(paper_indexed_images);
         let saved_bytes = raster_transform.saved_bytes();
         notes.push(format!(
-            "Transcoded {images_optimized} eligible raster image(s) to JPEG at quality {jpeg_quality} and reduced their encoded payload by {saved_bytes} bytes."
+            "Transformed {images_optimized} eligible raster image(s): {jpeg_images} to JPEG at quality {jpeg_quality} and {paper_indexed_images} paper-like RGB image(s) to Indexed color; reduced their encoded payload by {saved_bytes} bytes."
         ));
     }
     if jpeg_entropy.streams_optimized > 0 {
@@ -1396,6 +1398,7 @@ fn optimize_pdf_with_document(
         icc_alternate_references_rewritten: icc_alternate.references_rewritten,
         icc_alternate_encoded_bytes_elided: icc_alternate.encoded_profile_bytes_elided,
         raster_images_transcoded: raster_transform.images_optimized,
+        raster_paper_indexed_images: raster_transform.paper_indexed_images,
         raster_images_resized: raster_transform.images_resized,
         raster_jpeg_images_resized: raster_transform.jpeg_images_resized,
         raster_flate_images_resized: raster_transform.flate_images_resized,
