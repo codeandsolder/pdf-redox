@@ -907,6 +907,9 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of paper-like RGB raster images rewritten as Indexed color.
     pub raster_paper_indexed_images: usize,
+    #[serde(default)]
+    /// Number of those Indexed rewrites emitted as several source-grid local-palette layers.
+    pub raster_paper_indexed_layered_images: usize,
     /// Number of raster images resized.
     pub raster_images_resized: usize,
     /// Number of raster JPEG images resized.

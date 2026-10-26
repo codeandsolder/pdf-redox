@@ -1,7 +1,10 @@
 use color_quant::NeuQuant;
 
 const PALETTE_COLORS: usize = 256;
+const LOCAL_PALETTE_COLORS: usize = 255;
+pub const LOCAL_LAYER_COUNTS: [usize; 3] = [2, 4, 8];
 const QUANTIZER_SAMPLE_FACTOR: i32 = 10;
+pub const LOCAL_QUANTIZER_SAMPLE_FACTORS: [i32; 2] = [20, 10];
 const MIN_PIXELS: usize = 500_000;
 const PAPER_POOL_MIN_PIXELS: u64 = 100;
 const MAX_CHANNEL_DELTA: u8 = 128;
@@ -13,6 +16,19 @@ const THRESHOLDS: [u8; 5] = [44, 32, 20, 12, 0];
 pub struct IndexedPaperImage {
     pub indices: Vec<u8>,
     pub palette: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct IndexedPaperLayer {
+    pub row_start: usize,
+    pub row_end: usize,
+    pub indices: Vec<u8>,
+    pub palette: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct LayeredIndexedPaperImage {
+    pub layers: Vec<IndexedPaperLayer>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +49,114 @@ pub fn quantize_rgb(rgb: &[u8]) -> Option<IndexedPaperImage> {
         }
     }
     None
+}
+
+/// Quantize one full-grid sparse Indexed layer partition.
+pub fn quantize_rgb_layer_count_with_sample_factor(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    layer_count: usize,
+    sample_factor: i32,
+) -> Option<LayeredIndexedPaperImage> {
+    let stats = paper_stats(rgb)?;
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    if width.checked_mul(height)? != stats.pixels {
+        return None;
+    }
+    quantize_local_layers(rgb, width, height, stats, layer_count, sample_factor)
+}
+
+fn quantize_local_layers(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    stats: PaperStats,
+    layer_count: usize,
+    sample_factor: i32,
+) -> Option<LayeredIndexedPaperImage> {
+    let mut layers = Vec::with_capacity(layer_count);
+    let mut whole_sse = 0_u64;
+    let mut foreground_sse = 0_u64;
+    let mut foreground_samples = 0_u64;
+    let mut max_delta = 0_u8;
+    let background_rgba = [
+        stats.background[0],
+        stats.background[1],
+        stats.background[2],
+        255,
+    ];
+
+    for layer_index in 0..layer_count {
+        let row_start = height.checked_mul(layer_index)?.checked_div(layer_count)?;
+        let row_end = height
+            .checked_mul(layer_index.checked_add(1)?)?
+            .checked_div(layer_count)?;
+        if row_start >= row_end {
+            return None;
+        }
+        let pixel_start = row_start.checked_mul(width)?;
+        let pixel_end = row_end.checked_mul(width)?;
+        let byte_start = pixel_start.checked_mul(3)?;
+        let byte_end = pixel_end.checked_mul(3)?;
+        let tile = rgb.get(byte_start..byte_end)?;
+        let tile_pixels = tile.len().checked_div(3)?;
+        let mut rgba = Vec::with_capacity(tile_pixels.checked_mul(4)?);
+        for pixel in tile.as_chunks::<3>().0 {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        }
+        let quantizer = NeuQuant::new(sample_factor, LOCAL_PALETTE_COLORS, &rgba);
+        let mut palette = quantizer.color_map_rgb();
+        if palette.len() != LOCAL_PALETTE_COLORS * 3 {
+            return None;
+        }
+        let background_index = quantizer.index_of(&background_rgba);
+        let background_start = background_index.checked_mul(3)?;
+        palette
+            .get_mut(background_start..background_start.checked_add(3)?)?
+            .copy_from_slice(&stats.background);
+
+        let mut indices = Vec::with_capacity(tile_pixels);
+        for original in tile.as_chunks::<3>().0 {
+            let index = if *original == stats.background {
+                background_index
+            } else {
+                quantizer.index_of(&[original[0], original[1], original[2], 255])
+            };
+            let index_u8 = u8::try_from(index).ok()?;
+            indices.push(index_u8);
+            let palette_start = index.checked_mul(3)?;
+            let reconstructed = palette.get(palette_start..palette_start.checked_add(3)?)?;
+            let foreground = channel_distance(original, stats.background) > 0;
+            for (&source, &sample) in original.iter().zip(reconstructed) {
+                let delta = source.abs_diff(sample);
+                max_delta = max_delta.max(delta);
+                let square = u64::from(delta) * u64::from(delta);
+                whole_sse = whole_sse.checked_add(square)?;
+                if foreground {
+                    foreground_sse = foreground_sse.checked_add(square)?;
+                    foreground_samples = foreground_samples.checked_add(1)?;
+                }
+            }
+        }
+        layers.push(IndexedPaperLayer {
+            row_start,
+            row_end,
+            indices,
+            palette,
+        });
+    }
+
+    let whole_samples = u64::try_from(stats.pixels).ok()?.checked_mul(3)?;
+    if whole_sse > whole_samples.checked_mul(WHOLE_MSE_LIMIT)?
+        || foreground_samples == 0
+        || foreground_sse > foreground_samples.checked_mul(FOREGROUND_MSE_LIMIT)?
+        || max_delta > MAX_CHANNEL_DELTA
+    {
+        return None;
+    }
+    Some(LayeredIndexedPaperImage { layers })
 }
 
 fn paper_stats(rgb: &[u8]) -> Option<PaperStats> {
@@ -233,6 +357,41 @@ mod tests {
         if let Some(candidate) = candidate {
             assert_eq!(candidate.indices.len(), 800 * 700);
             assert_eq!(candidate.palette.len(), PALETTE_COLORS * 3);
+        }
+    }
+
+    #[test]
+    fn paper_scan_quantizes_into_full_grid_local_palette_layers() {
+        let width = 800_u32;
+        let height = 700_u32;
+        let rgb = paper_scan(800, 700);
+        let candidate = LOCAL_LAYER_COUNTS.iter().copied().find_map(|layer_count| {
+            quantize_rgb_layer_count_with_sample_factor(
+                &rgb,
+                width,
+                height,
+                layer_count,
+                QUANTIZER_SAMPLE_FACTOR,
+            )
+        });
+        assert!(candidate.is_some());
+        if let Some(candidate) = candidate {
+            assert!(matches!(candidate.layers.len(), 2 | 4 | 8));
+            let mut next_row = 0_usize;
+            for layer in candidate.layers {
+                assert_eq!(layer.row_start, next_row);
+                assert!(layer.row_end > layer.row_start);
+                assert_eq!(layer.palette.len(), LOCAL_PALETTE_COLORS * 3);
+                assert_eq!(layer.indices.len(), (layer.row_end - layer.row_start) * 800);
+                assert!(
+                    layer
+                        .indices
+                        .iter()
+                        .all(|&index| usize::from(index) < LOCAL_PALETTE_COLORS)
+                );
+                next_row = layer.row_end;
+            }
+            assert_eq!(next_row, 700);
         }
     }
 

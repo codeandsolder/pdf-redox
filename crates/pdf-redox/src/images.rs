@@ -2,7 +2,7 @@ use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::resolved_number,
     paper_indexed,
-    stream_codec::{decode_image_stream, encode_flate},
+    stream_codec::{decode_image_stream, encode_flate, is_unfiltered_or_lone_flate},
 };
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
@@ -15,6 +15,32 @@ use libjpeg_turbo_rs::{
     read_coefficients,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+const LOCAL_PALETTE_LAYER_OVERHEAD_BYTES: usize = 512;
+const LOCAL_PALETTE_FORM_OVERHEAD_BYTES: usize = 256;
+const LOCAL_PALETTE_ALLOWED_SOURCE_KEYS: [&[u8]; 10] = [
+    b"Type",
+    b"Subtype",
+    b"Width",
+    b"Height",
+    b"ColorSpace",
+    b"BitsPerComponent",
+    b"Filter",
+    b"DecodeParms",
+    b"SMask",
+    b"Length",
+];
+const OPAQUE_SMASK_ALLOWED_KEYS: [&[u8]; 9] = [
+    b"Type",
+    b"Subtype",
+    b"Width",
+    b"Height",
+    b"ColorSpace",
+    b"BitsPerComponent",
+    b"Filter",
+    b"DecodeParms",
+    b"Length",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageResizeEncoding {
@@ -78,6 +104,7 @@ impl Default for ImageOptimizationOptions {
 pub struct ImageOptimizationStats {
     pub images_optimized: usize,
     pub paper_indexed_images: usize,
+    pub paper_indexed_layered_images: usize,
     pub images_resized: usize,
     pub jpeg_images_resized: usize,
     pub flate_images_resized: usize,
@@ -96,12 +123,24 @@ impl ImageOptimizationStats {
 }
 
 #[derive(Debug)]
+struct LayeredIndexedLayerTransform {
+    encoded: Vec<u8>,
+    palette: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct LayeredIndexedTransform {
+    layers: Vec<LayeredIndexedLayerTransform>,
+}
+
+#[derive(Debug)]
 struct ImageTransform {
     encoded: Vec<u8>,
     width: u32,
     height: u32,
     filter: Vec<u8>,
     color_space: Option<OwnedObject>,
+    layered_indexed: Option<LayeredIndexedTransform>,
     original_encoded_bytes: u64,
     optimized_encoded_bytes: u64,
     original_pixels: u64,
@@ -288,6 +327,77 @@ fn dimension(
     Ok(Some(value.clamp(0.0, f64::from(u32::MAX)) as u32))
 }
 
+fn direct_resource_owner(object: &OwnedObject) -> bool {
+    let Some(dictionary) = object.as_dictionary() else {
+        return false;
+    };
+    matches!(
+        dictionary.get(b"Type".as_slice()),
+        Some(OwnedObject::Name(name)) if matches!(name.as_slice(), b"Page" | b"Pages")
+    ) || matches!(
+        dictionary.get(b"Subtype".as_slice()),
+        Some(OwnedObject::Name(name)) if name.as_slice() == b"Form"
+    )
+}
+
+fn collect_resource_references(resources: &OwnedDictionary, out: &mut HashSet<ObjectHandle>) {
+    for (key, value) in resources {
+        if key.as_slice() == b"XObject"
+            && let OwnedObject::Dictionary(xobjects) = value
+        {
+            for entry in xobjects.values() {
+                if !matches!(entry, OwnedObject::Reference(_)) {
+                    collect_non_xobject_references(entry, false, out);
+                }
+            }
+            continue;
+        }
+        collect_non_xobject_references(value, false, out);
+    }
+}
+
+fn collect_non_xobject_references(
+    value: &OwnedObject,
+    allow_direct_resources: bool,
+    out: &mut HashSet<ObjectHandle>,
+) {
+    match value {
+        OwnedObject::Reference(handle) => {
+            out.insert(*handle);
+        }
+        OwnedObject::Array(values) => {
+            for value in values {
+                collect_non_xobject_references(value, false, out);
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for (key, value) in dictionary {
+                if allow_direct_resources
+                    && key.as_slice() == b"Resources"
+                    && let OwnedObject::Dictionary(resources) = value
+                {
+                    collect_resource_references(resources, out);
+                    continue;
+                }
+                collect_non_xobject_references(value, false, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn non_xobject_reference_targets(document: &EditDocument) -> Result<HashSet<ObjectHandle>> {
+    let mut unsafe_targets = document.output_roots().into_iter().collect::<HashSet<_>>();
+    for handle in document.reachable_output_objects()? {
+        let Some(object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let allow_direct_resources = direct_resource_owner(&object);
+        collect_non_xobject_references(&object, allow_direct_resources, &mut unsafe_targets);
+    }
+    Ok(unsafe_targets)
+}
+
 fn resolved_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
     let Some(value) = value else {
         return Ok(None);
@@ -338,11 +448,106 @@ fn source_filter(document: &EditDocument, dictionary: &OwnedDictionary) -> Resul
     resolved_name(document, dictionary.get(b"Filter".as_slice()))
 }
 
+fn indexed_color_space_with_transparent_zero(palette: &[u8]) -> Result<OwnedObject> {
+    let mut lookup = vec![0_u8; 3];
+    lookup.extend_from_slice(palette);
+    let colors = lookup.len() / 3;
+    let hival = colors
+        .checked_sub(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| Error::Invalid("Indexed palette is empty or too large".to_owned()))?;
+    if colors > 256 {
+        return Err(Error::Invalid(
+            "Indexed palette exceeds 256 colors".to_owned(),
+        ));
+    }
+    Ok(OwnedObject::Array(vec![
+        OwnedObject::Name(b"Indexed".to_vec()),
+        OwnedObject::Name(b"DeviceRGB".to_vec()),
+        OwnedObject::Integer(hival),
+        OwnedObject::String(lookup),
+    ]))
+}
+
+fn install_layered_indexed_transform(
+    document: &mut EditDocument,
+    handle: ObjectHandle,
+    width: u32,
+    height: u32,
+    transform: LayeredIndexedTransform,
+) -> Result<()> {
+    let mut resources = OwnedDictionary::new();
+    let mut content = Vec::new();
+    for (index, layer) in transform.layers.into_iter().enumerate() {
+        let name = format!("PdfRedoxLocalPalette{index}").into_bytes();
+        let color_space = indexed_color_space_with_transparent_zero(&layer.palette)?;
+        let child = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary: OwnedDictionary::from([
+                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+                (b"ColorSpace".to_vec(), color_space),
+                (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
+                (
+                    b"Filter".to_vec(),
+                    OwnedObject::Name(b"FlateDecode".to_vec()),
+                ),
+                (
+                    b"Mask".to_vec(),
+                    OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
+                ),
+            ]),
+            data: StreamData::Owned(layer.encoded),
+        }));
+        resources.insert(name.clone(), OwnedObject::Reference(child));
+        content.push(b'/');
+        content.extend_from_slice(&name);
+        content.extend_from_slice(b" Do\n");
+    }
+
+    let object = document.edit_handle(handle)?;
+    *object = OwnedObject::Stream {
+        dictionary: OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
+            (b"FormType".to_vec(), OwnedObject::Integer(1)),
+            (
+                b"BBox".to_vec(),
+                OwnedObject::Array(vec![
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(1),
+                    OwnedObject::Integer(1),
+                ]),
+            ),
+            (
+                b"Resources".to_vec(),
+                OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"XObject".to_vec(),
+                    OwnedObject::Dictionary(resources),
+                )])),
+            ),
+        ]),
+        data: StreamData::Owned(content),
+    };
+    Ok(())
+}
+
 fn install_transform(
     document: &mut EditDocument,
     handle: ObjectHandle,
     transform: ImageTransform,
 ) -> Result<()> {
+    if let Some(layered) = transform.layered_indexed {
+        return install_layered_indexed_transform(
+            document,
+            handle,
+            transform.width,
+            transform.height,
+            layered,
+        );
+    }
     let object = document.edit_handle(handle)?;
     let OwnedObject::Stream { dictionary, data } = object else {
         return Ok(());
@@ -413,6 +618,90 @@ fn paper_indexed_source_safe(
     Ok(true)
 }
 
+fn redundant_opaque_smask(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
+    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
+        return Ok(true);
+    };
+    let Some(smask) = document.resolve_owned_value(smask)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Stream {
+        dictionary: mask_dictionary,
+        data,
+    } = smask
+    else {
+        return Ok(match smask {
+            OwnedObject::Null => true,
+            OwnedObject::Name(name) => name.as_slice() == b"None",
+            _ => false,
+        });
+    };
+    if !mask_dictionary
+        .keys()
+        .all(|key| OPAQUE_SMASK_ALLOWED_KEYS.contains(&key.as_slice()))
+        || resolved_name(document, mask_dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            != Some(b"Image")
+        || resolved_name(document, mask_dictionary.get(b"ColorSpace".as_slice()))?.as_deref()
+            != Some(b"DeviceGray")
+        || !bpc_is_8(document, &mask_dictionary)?
+        || !mask_dictionary.contains_key(b"Filter".as_slice())
+        || !is_unfiltered_or_lone_flate(document, &mask_dictionary)?
+    {
+        return Ok(false);
+    }
+    let Some(width) = dimension(document, &mask_dictionary, b"Width")? else {
+        return Ok(false);
+    };
+    let Some(height) = dimension(document, &mask_dictionary, b"Height")? else {
+        return Ok(false);
+    };
+    let encoded = data.bytes(document.source())?;
+    let Ok(decoded) = decode_image_stream(
+        document,
+        &mask_dictionary,
+        encoded.as_ref(),
+        width,
+        height,
+        8,
+        1,
+    ) else {
+        return Ok(false);
+    };
+    let Some(expected) = usize::try_from(width)
+        .ok()
+        .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+    else {
+        return Ok(false);
+    };
+    Ok(decoded.len() == expected && decoded.iter().all(|&sample| sample == u8::MAX))
+}
+
+fn paper_indexed_layered_source_safe(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<bool> {
+    if !dictionary.contains_key(b"Filter".as_slice())
+        || !is_unfiltered_or_lone_flate(document, dictionary)?
+    {
+        return Ok(false);
+    }
+    for key in [
+        b"Decode".as_slice(),
+        b"Mask".as_slice(),
+        b"SMaskInData".as_slice(),
+    ] {
+        if is_non_null(document, dictionary.get(key))? {
+            return Ok(false);
+        }
+    }
+    if !redundant_opaque_smask(document, dictionary)? {
+        return Ok(false);
+    }
+    Ok(dictionary
+        .keys()
+        .all(|key| LOCAL_PALETTE_ALLOWED_SOURCE_KEYS.contains(&key.as_slice())))
+}
+
 fn paper_indexed_transform(
     decoded: &[u8],
     width: u32,
@@ -452,6 +741,7 @@ fn paper_indexed_transform(
         height,
         filter: b"FlateDecode".to_vec(),
         color_space: Some(color_space),
+        layered_indexed: None,
         original_encoded_bytes: original,
         optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
         original_pixels: pixels,
@@ -460,6 +750,99 @@ fn paper_indexed_transform(
         paper_indexed: true,
         encoding: ImageResizeEncoding::Flate,
     }))
+}
+
+fn paper_indexed_layered_transform(
+    decoded: &[u8],
+    width: u32,
+    height: u32,
+    original: u64,
+    options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
+) -> Result<Option<ImageTransform>> {
+    let width_usize = usize::try_from(width)
+        .map_err(|_| Error::Invalid("local palette width exceeds usize".to_owned()))?;
+    let height_usize = usize::try_from(height)
+        .map_err(|_| Error::Invalid("local palette height exceeds usize".to_owned()))?;
+    let pixels = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| Error::Invalid("local palette dimensions overflow".to_owned()))?;
+
+    for layer_count in paper_indexed::LOCAL_LAYER_COUNTS {
+        for sample_factor in paper_indexed::LOCAL_QUANTIZER_SAMPLE_FACTORS {
+            let Some(candidate) = paper_indexed::quantize_rgb_layer_count_with_sample_factor(
+                decoded,
+                width,
+                height,
+                layer_count,
+                sample_factor,
+            ) else {
+                continue;
+            };
+            let mut layers = Vec::with_capacity(candidate.layers.len());
+            let mut optimized_payload = LOCAL_PALETTE_FORM_OVERHEAD_BYTES;
+            for layer in candidate.layers {
+                let row_pixels = layer
+                    .row_end
+                    .checked_sub(layer.row_start)
+                    .and_then(|rows| rows.checked_mul(width_usize))
+                    .ok_or_else(|| Error::Invalid("local palette row range overflow".to_owned()))?;
+                if layer.indices.len() != row_pixels {
+                    return Ok(None);
+                }
+                let start = layer
+                    .row_start
+                    .checked_mul(width_usize)
+                    .ok_or_else(|| Error::Invalid("local palette start overflow".to_owned()))?;
+                let end = start
+                    .checked_add(row_pixels)
+                    .ok_or_else(|| Error::Invalid("local palette end overflow".to_owned()))?;
+                let mut full_grid = vec![0_u8; pixels];
+                for (output, &index) in full_grid
+                    .get_mut(start..end)
+                    .ok_or_else(|| Error::Invalid("local palette row range is invalid".to_owned()))?
+                    .iter_mut()
+                    .zip(&layer.indices)
+                {
+                    *output = index.checked_add(1).ok_or_else(|| {
+                        Error::Invalid(
+                            "local palette index exceeds reserved 8-bit range".to_owned(),
+                        )
+                    })?;
+                }
+                let encoded = encode_flate(&full_grid, flate_level)?;
+                let palette_bytes = layer.palette.len().saturating_add(3);
+                optimized_payload = optimized_payload
+                    .saturating_add(encoded.len())
+                    .saturating_add(palette_bytes.saturating_mul(2).saturating_add(2))
+                    .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES);
+                layers.push(LayeredIndexedLayerTransform {
+                    encoded,
+                    palette: layer.palette,
+                });
+            }
+            if !passes_savings(options, original, optimized_payload) {
+                continue;
+            }
+            let pixel_count = u64::from(width) * u64::from(height);
+            return Ok(Some(ImageTransform {
+                encoded: Vec::new(),
+                width,
+                height,
+                filter: Vec::new(),
+                color_space: None,
+                layered_indexed: Some(LayeredIndexedTransform { layers }),
+                original_encoded_bytes: original,
+                optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
+                original_pixels: pixel_count,
+                optimized_pixels: pixel_count,
+                resized: false,
+                paper_indexed: true,
+                encoding: ImageResizeEncoding::Flate,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn decoded_pixels(
@@ -599,6 +982,7 @@ fn transcode_image(
             height,
             filter: b"DCTDecode".to_vec(),
             color_space: None,
+            layered_indexed: None,
             original_encoded_bytes: original,
             optimized_encoded_bytes,
             original_pixels: pixels,
@@ -608,12 +992,19 @@ fn transcode_image(
             encoding: ImageResizeEncoding::Jpeg,
         }));
     }
-    if components != 3
-        || !paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?
-    {
+    if components != 3 {
         return Ok(None);
     }
-    paper_indexed_transform(&decoded, width, height, original, options, flate_level)
+    if paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?
+        && let Some(candidate) =
+            paper_indexed_transform(&decoded, width, height, original, options, flate_level)?
+    {
+        return Ok(Some(candidate));
+    }
+    if !paper_indexed_layered_source_safe(document, dictionary)? {
+        return Ok(None);
+    }
+    paper_indexed_layered_transform(&decoded, width, height, original, options, flate_level)
 }
 
 fn resize_source_safe(
@@ -720,6 +1111,7 @@ fn resize_image(
         height: target_height,
         filter,
         color_space: None,
+        layered_indexed: None,
         original_encoded_bytes: original,
         optimized_encoded_bytes,
         original_pixels: u64::from(width) * u64::from(height),
@@ -730,12 +1122,18 @@ fn resize_image(
     }))
 }
 
+struct LayeredTransformSafety<'a> {
+    binding_count: usize,
+    non_xobject_references: &'a mut Option<HashSet<ObjectHandle>>,
+}
+
 fn transform_one(
     document: &mut EditDocument,
     handle: ObjectHandle,
     options: ImageOptimizationOptions,
     target: Option<ImageResizeTarget>,
     flate_level: crate::FlateLevel,
+    layered_safety: &mut LayeredTransformSafety<'_>,
     stats: &mut ImageOptimizationStats,
 ) -> Result<bool> {
     if !is_image(document, handle)? {
@@ -751,9 +1149,28 @@ fn transform_one(
     let Some(transform) = transform else {
         return Ok(false);
     };
+    if transform.layered_indexed.is_some() {
+        if layered_safety.binding_count == 0 {
+            return Ok(false);
+        }
+        if layered_safety.non_xobject_references.is_none() {
+            *layered_safety.non_xobject_references = Some(non_xobject_reference_targets(document)?);
+        }
+        if layered_safety
+            .non_xobject_references
+            .as_ref()
+            .is_some_and(|targets| targets.contains(&handle))
+        {
+            return Ok(false);
+        }
+    }
     stats.images_optimized = stats.images_optimized.saturating_add(1);
     if transform.paper_indexed {
         stats.paper_indexed_images = stats.paper_indexed_images.saturating_add(1);
+        if transform.layered_indexed.is_some() {
+            stats.paper_indexed_layered_images =
+                stats.paper_indexed_layered_images.saturating_add(1);
+        }
     }
     if transform.resized {
         stats.images_resized = stats.images_resized.saturating_add(1);
@@ -788,13 +1205,27 @@ pub fn optimize_images(
     flate_level: crate::FlateLevel,
 ) -> Result<ImageOptimizationStats> {
     let binding_counts = image_binding_counts(document)?;
+    let mut non_xobject_references = None;
     let mut stats = ImageOptimizationStats::default();
     let images = document
         .reachable_streams_with_subtype(b"Image")?
         .into_iter()
         .collect::<BTreeSet<_>>();
     for image in images {
-        if transform_one(document, image, options, None, flate_level, &mut stats)? {
+        let binding_count = binding_counts.get(&image).copied().unwrap_or(0);
+        let mut layered_safety = LayeredTransformSafety {
+            binding_count,
+            non_xobject_references: &mut non_xobject_references,
+        };
+        if transform_one(
+            document,
+            image,
+            options,
+            None,
+            flate_level,
+            &mut layered_safety,
+            &mut stats,
+        )? {
             stats.references_reused = stats.references_reused.saturating_add(
                 binding_counts
                     .get(&image)
@@ -835,13 +1266,19 @@ pub fn optimize_images_with_resize_targets(
         *binding_counts.entry(image).or_default() += 1;
     }
     let mut stats = ImageOptimizationStats::default();
+    let mut non_xobject_references = None;
     for (image, target) in by_image {
+        let mut layered_safety = LayeredTransformSafety {
+            binding_count: 0,
+            non_xobject_references: &mut non_xobject_references,
+        };
         if transform_one(
             document,
             image,
             options,
             Some(target),
             flate_level,
+            &mut layered_safety,
             &mut stats,
         )? {
             stats.references_reused = stats.references_reused.saturating_add(
@@ -909,6 +1346,73 @@ mod tests {
             dictionary.extend_from_slice(extra_image_dictionary);
         }
         pdf.stream(5, &dictionary, jpeg)?;
+        pdf.finish(1)
+    }
+
+    fn unrelated_xobject_key_pdf(jpeg: &[u8]) -> Result<Vec<u8>> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Private << /XObject << /Alias 5 0 R >> >> >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q 64 0 0 64 0 0 cm /Im0 Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+            jpeg,
+        )?;
+        pdf.finish(1)
+    }
+
+    fn indirect_xobject_map_pdf(jpeg: &[u8]) -> Result<Vec<u8>> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject 7 0 R >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q 64 0 0 64 0 0 cm /Im0 Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+            jpeg,
+        )?;
+        pdf.object(7, b"<< /Im0 5 0 R >>")?;
+        pdf.finish(1)
+    }
+
+    fn image_with_smask_pdf(jpeg: &[u8], mask_sample: u8) -> Result<Vec<u8>> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 64 64] /Resources << /XObject << /Im0 5 0 R /Sm0 6 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q 64 0 0 64 0 0 cm /Im0 Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /SMask 6 0 R",
+            jpeg,
+        )?;
+        let mask = encode_flate(&vec![mask_sample; 64 * 64], crate::FlateLevel::SIZE)?;
+        pdf.stream(
+            6,
+            b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+            &mask,
+        )?;
         pdf.finish(1)
     }
 
@@ -1017,6 +1521,208 @@ mod tests {
             3,
             85
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_install_uses_unit_square_form_and_full_grid_children() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let mut document = EditDocument::from_bytes(direct_jpeg_pdf(&jpeg, b"")?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let Some(&image) = images.first() else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let pixels = 64_usize * 64;
+        let first = encode_flate(&vec![1_u8; pixels], crate::FlateLevel::SIZE)?;
+        let second = encode_flate(&vec![0_u8; pixels], crate::FlateLevel::SIZE)?;
+        install_layered_indexed_transform(
+            &mut document,
+            image,
+            64,
+            64,
+            LayeredIndexedTransform {
+                layers: vec![
+                    LayeredIndexedLayerTransform {
+                        encoded: first,
+                        palette: vec![0_u8; 255 * 3],
+                    },
+                    LayeredIndexedLayerTransform {
+                        encoded: second,
+                        palette: vec![255_u8; 255 * 3],
+                    },
+                ],
+            },
+        )?;
+        let Some(object) = document.current_owned_object(image)? else {
+            return Err(Error::Invalid("installed Form is missing".to_owned()));
+        };
+        let OwnedObject::Stream { dictionary, data } = object else {
+            return Err(Error::Invalid(
+                "installed object is not a stream".to_owned(),
+            ));
+        };
+        assert_eq!(
+            resolved_name(&document, dictionary.get(b"Subtype".as_slice()))?.as_deref(),
+            Some(b"Form".as_slice())
+        );
+        let Some(OwnedObject::Array(bbox)) = dictionary.get(b"BBox".as_slice()) else {
+            return Err(Error::Invalid("installed Form has no BBox".to_owned()));
+        };
+        assert_eq!(
+            bbox.as_slice(),
+            &[
+                OwnedObject::Integer(0),
+                OwnedObject::Integer(0),
+                OwnedObject::Integer(1),
+                OwnedObject::Integer(1),
+            ]
+        );
+        let StreamData::Owned(content) = data else {
+            return Err(Error::Invalid(
+                "installed Form content is not owned".to_owned(),
+            ));
+        };
+        assert!(content.windows(3).any(|window| window == b" Do"));
+        let Some(OwnedObject::Dictionary(resources)) = dictionary.get(b"Resources".as_slice())
+        else {
+            return Err(Error::Invalid("installed Form has no Resources".to_owned()));
+        };
+        let Some(OwnedObject::Dictionary(xobjects)) = resources.get(b"XObject".as_slice()) else {
+            return Err(Error::Invalid(
+                "installed Form has no XObject resources".to_owned(),
+            ));
+        };
+        assert_eq!(xobjects.len(), 2);
+        for child in xobjects.values() {
+            let Some(OwnedObject::Stream { dictionary, .. }) =
+                document.resolve_owned_value(child)?
+            else {
+                return Err(Error::Invalid(
+                    "local palette child is not an image stream".to_owned(),
+                ));
+            };
+            assert_eq!(
+                resolved_name(&document, dictionary.get(b"Subtype".as_slice()))?.as_deref(),
+                Some(b"Image".as_slice())
+            );
+            assert_eq!(dimension(&document, &dictionary, b"Width")?, Some(64));
+            assert_eq!(dimension(&document, &dictionary, b"Height")?, Some(64));
+            let Some(OwnedObject::Array(mask)) = dictionary.get(b"Mask".as_slice()) else {
+                return Err(Error::Invalid(
+                    "local palette child has no color-key mask".to_owned(),
+                ));
+            };
+            assert_eq!(
+                mask.as_slice(),
+                &[OwnedObject::Integer(0), OwnedObject::Integer(0)]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_only_discards_proven_opaque_smask() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        for (sample, expected) in [(u8::MAX, true), (u8::MAX - 1, false)] {
+            let document = EditDocument::from_bytes(image_with_smask_pdf(&jpeg, sample)?)?;
+            let images = document.reachable_streams_with_subtype(b"Image")?;
+            let color = images.into_iter().find(|&handle| {
+                let Ok(Some(object)) = document.current_owned_object(handle) else {
+                    return false;
+                };
+                let Some(dictionary) = object.as_dictionary() else {
+                    return false;
+                };
+                matches!(
+                    resolved_name(&document, dictionary.get(b"ColorSpace".as_slice())),
+                    Ok(Some(name)) if name.as_slice() == b"DeviceRGB"
+                )
+            });
+            let Some(color) = color else {
+                return Err(Error::Invalid("test color image is unreachable".to_owned()));
+            };
+            let Some(object) = document.current_owned_object(color)? else {
+                return Err(Error::Invalid("test color image is missing".to_owned()));
+            };
+            let Some(dictionary) = object.as_dictionary() else {
+                return Err(Error::Invalid(
+                    "test color image has no dictionary".to_owned(),
+                ));
+            };
+            assert_eq!(redundant_opaque_smask(&document, dictionary)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_reference_guard_allows_plain_xobject_binding() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let document = EditDocument::from_bytes(direct_jpeg_pdf(&jpeg, b"")?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let Some(&image) = images.first() else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let bindings = image_binding_counts(&document)?;
+        let unsafe_targets = non_xobject_reference_targets(&document)?;
+        assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
+        assert!(!unsafe_targets.contains(&image));
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_reference_guard_rejects_unrelated_xobject_key() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let document = EditDocument::from_bytes(unrelated_xobject_key_pdf(&jpeg)?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let Some(&image) = images.first() else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let bindings = image_binding_counts(&document)?;
+        let unsafe_targets = non_xobject_reference_targets(&document)?;
+        assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
+        assert!(unsafe_targets.contains(&image));
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_reference_guard_fails_closed_on_indirect_xobject_map() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let document = EditDocument::from_bytes(indirect_xobject_map_pdf(&jpeg)?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let Some(&image) = images.first() else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let bindings = image_binding_counts(&document)?;
+        let unsafe_targets = non_xobject_reference_targets(&document)?;
+        assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
+        assert!(unsafe_targets.contains(&image));
+        Ok(())
+    }
+
+    #[test]
+    fn layered_indexed_reference_guard_rejects_smask_target() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let document = EditDocument::from_bytes(image_with_smask_pdf(&jpeg, u8::MAX)?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let mask = images.into_iter().find(|&handle| {
+            let Ok(Some(object)) = document.current_owned_object(handle) else {
+                return false;
+            };
+            let Some(dictionary) = object.as_dictionary() else {
+                return false;
+            };
+            matches!(
+                resolved_name(&document, dictionary.get(b"ColorSpace".as_slice())),
+                Ok(Some(name)) if name.as_slice() == b"DeviceGray"
+            )
+        });
+        let Some(mask) = mask else {
+            return Err(Error::Invalid("test SMask image is unreachable".to_owned()));
+        };
+        let bindings = image_binding_counts(&document)?;
+        let unsafe_targets = non_xobject_reference_targets(&document)?;
+        assert!(bindings.get(&mask).copied().unwrap_or(0) > 0);
+        assert!(unsafe_targets.contains(&mask));
         Ok(())
     }
 
