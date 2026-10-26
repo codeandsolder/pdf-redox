@@ -11,6 +11,8 @@ const MAX_CHANNEL_DELTA: u8 = 128;
 const WHOLE_MSE_LIMIT: u64 = 6;
 const FOREGROUND_MSE_LIMIT: u64 = 16;
 const THRESHOLDS: [u8; 5] = [44, 32, 20, 12, 0];
+const WEIGHTED_FOREGROUND_THRESHOLD: u8 = 32;
+const WEIGHTED_PAPER_STRIDE: usize = 4;
 
 #[derive(Debug)]
 pub struct IndexedPaperImage {
@@ -249,6 +251,86 @@ fn flatten_sse(rgb: &[u8], background: [u8; 3], threshold: u8) -> Option<u64> {
     Some(sse)
 }
 
+fn weighted_training_rgba(rgb: &[u8], background: [u8; 3]) -> Option<Vec<u8>> {
+    let mut training = Vec::new();
+    let mut paper_index = 0_usize;
+    for pixel in rgb.as_chunks::<3>().0 {
+        let foreground = channel_distance(pixel, background) > WEIGHTED_FOREGROUND_THRESHOLD;
+        if foreground || paper_index.is_multiple_of(WEIGHTED_PAPER_STRIDE) {
+            training.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        }
+        if !foreground {
+            paper_index = paper_index.checked_add(1)?;
+        }
+    }
+    Some(training)
+}
+
+pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage> {
+    let stats = paper_stats(rgb)?;
+    let training = weighted_training_rgba(rgb, stats.background)?;
+    if training.len() < PALETTE_COLORS.checked_mul(4)? {
+        return None;
+    }
+
+    let quantizer = NeuQuant::new(QUANTIZER_SAMPLE_FACTOR, PALETTE_COLORS, &training);
+    let mut palette = quantizer.color_map_rgb();
+    if palette.len() != PALETTE_COLORS * 3 {
+        return None;
+    }
+
+    let background_rgba = [
+        stats.background[0],
+        stats.background[1],
+        stats.background[2],
+        255,
+    ];
+    let background_index = quantizer.index_of(&background_rgba);
+    let background_start = background_index.checked_mul(3)?;
+    palette
+        .get_mut(background_start..background_start.checked_add(3)?)?
+        .copy_from_slice(&stats.background);
+
+    let mut indices = Vec::with_capacity(stats.pixels);
+    let mut whole_sse = 0_u64;
+    let mut foreground_sse = 0_u64;
+    let mut foreground_samples = 0_u64;
+    let mut max_delta = 0_u8;
+
+    for original in rgb.as_chunks::<3>().0 {
+        let index = if *original == stats.background {
+            background_index
+        } else {
+            quantizer.index_of(&[original[0], original[1], original[2], 255])
+        };
+        indices.push(u8::try_from(index).ok()?);
+        let palette_start = index.checked_mul(3)?;
+        let reconstructed = palette.get(palette_start..palette_start.checked_add(3)?)?;
+        let foreground = channel_distance(original, stats.background) > 0;
+        for (&source, &sample) in original.iter().zip(reconstructed) {
+            let delta = source.abs_diff(sample);
+            max_delta = max_delta.max(delta);
+            let square = u64::from(delta) * u64::from(delta);
+            whole_sse = whole_sse.checked_add(square)?;
+            if foreground {
+                foreground_sse = foreground_sse.checked_add(square)?;
+                foreground_samples = foreground_samples.checked_add(1)?;
+            }
+        }
+    }
+
+    let whole_samples = u64::try_from(stats.pixels).ok()?.checked_mul(3)?;
+    if whole_sse > whole_samples.checked_mul(WHOLE_MSE_LIMIT)?
+        || foreground_samples == 0
+        || foreground_sse > foreground_samples.checked_mul(FOREGROUND_MSE_LIMIT)?
+        || max_delta > MAX_CHANNEL_DELTA
+    {
+        return None;
+    }
+
+    Some(IndexedPaperImage { indices, palette })
+}
+
 fn quantize_at_threshold(
     rgb: &[u8],
     stats: PaperStats,
@@ -347,6 +429,28 @@ mod tests {
             }
         }
         rgb
+    }
+
+    #[test]
+    fn weighted_training_keeps_foreground_and_subsamples_paper() {
+        let background = [240_u8, 240, 240];
+        let rgb = [
+            240, 240, 240, // paper 0: kept
+            241, 240, 240, // paper 1
+            10, 100, 200, // foreground: always kept
+            242, 240, 240, // paper 2
+            243, 240, 240, // paper 3
+            244, 240, 240, // paper 4: kept
+            200, 20, 20, // foreground: always kept
+            245, 240, 240, // paper 5
+            246, 240, 240, // paper 6
+        ];
+        assert_eq!(
+            weighted_training_rgba(&rgb, background),
+            Some(vec![
+                240, 240, 240, 255, 10, 100, 200, 255, 244, 240, 240, 255, 200, 20, 20, 255,
+            ])
+        );
     }
 
     #[test]
