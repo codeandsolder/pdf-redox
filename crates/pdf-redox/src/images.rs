@@ -2,7 +2,7 @@ use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::resolved_number,
     paper_indexed,
-    stream_codec::{decode_image_stream, encode_flate, is_unfiltered_or_lone_flate},
+    stream_codec::{decode_image_stream, decode_stream, encode_flate, is_unfiltered_or_lone_flate},
 };
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
@@ -131,6 +131,7 @@ struct LayeredIndexedLayerTransform {
 #[derive(Debug)]
 struct LayeredIndexedTransform {
     layers: Vec<LayeredIndexedLayerTransform>,
+    base_color_space: OwnedObject,
 }
 
 #[derive(Debug)]
@@ -434,6 +435,59 @@ fn color_info(
     })
 }
 
+fn indexed_rgb_base_color_space(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<Option<OwnedObject>> {
+    let Some(source) = dictionary.get(b"ColorSpace".as_slice()) else {
+        return Ok(None);
+    };
+    let Some(resolved_source) = document.resolve_owned_value(source)? else {
+        return Ok(None);
+    };
+    if matches!(&resolved_source, OwnedObject::Name(name) if name.as_slice() == b"DeviceRGB") {
+        return Ok(Some(source.clone()));
+    }
+    let OwnedObject::Array(values) = resolved_source else {
+        return Ok(None);
+    };
+    if values.len() != 2 {
+        return Ok(None);
+    }
+    let Some(OwnedObject::Name(kind)) = document.resolve_owned_value(&values[0])? else {
+        return Ok(None);
+    };
+    if kind.as_slice() != b"ICCBased" {
+        return Ok(None);
+    }
+    let Some(profile_value) = values.get(1) else {
+        return Ok(None);
+    };
+    let Some(OwnedObject::Stream {
+        dictionary: profile_dictionary,
+        data,
+    }) = document.resolve_owned_value(profile_value)?
+    else {
+        return Ok(None);
+    };
+    if profile_dictionary.contains_key(b"Range".as_slice())
+        || resolved_number(document, profile_dictionary.get(b"N".as_slice()))? != Some(3.0)
+    {
+        return Ok(None);
+    }
+    let encoded = data.bytes(document.source())?;
+    let Ok(profile) = decode_stream(document, &profile_dictionary, encoded.as_ref()) else {
+        return Ok(None);
+    };
+    if profile.len() < 40
+        || profile.get(16..20) != Some(b"RGB ".as_slice())
+        || profile.get(36..40) != Some(b"acsp".as_slice())
+    {
+        return Ok(None);
+    }
+    Ok(Some(source.clone()))
+}
+
 fn is_non_null(document: &EditDocument, value: Option<&OwnedObject>) -> Result<bool> {
     let Some(value) = value else {
         return Ok(false);
@@ -448,7 +502,10 @@ fn source_filter(document: &EditDocument, dictionary: &OwnedDictionary) -> Resul
     resolved_name(document, dictionary.get(b"Filter".as_slice()))
 }
 
-fn indexed_color_space_with_transparent_zero(palette: &[u8]) -> Result<OwnedObject> {
+fn indexed_color_space_with_transparent_zero(
+    base_color_space: OwnedObject,
+    palette: &[u8],
+) -> Result<OwnedObject> {
     let mut lookup = vec![0_u8; 3];
     lookup.extend_from_slice(palette);
     let colors = lookup.len() / 3;
@@ -463,7 +520,7 @@ fn indexed_color_space_with_transparent_zero(palette: &[u8]) -> Result<OwnedObje
     }
     Ok(OwnedObject::Array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
-        OwnedObject::Name(b"DeviceRGB".to_vec()),
+        base_color_space,
         OwnedObject::Integer(hival),
         OwnedObject::String(lookup),
     ]))
@@ -480,7 +537,10 @@ fn install_layered_indexed_transform(
     let mut content = Vec::new();
     for (index, layer) in transform.layers.into_iter().enumerate() {
         let name = format!("PdfRedoxLocalPalette{index}").into_bytes();
-        let color_space = indexed_color_space_with_transparent_zero(&layer.palette)?;
+        let color_space = indexed_color_space_with_transparent_zero(
+            transform.base_color_space.clone(),
+            &layer.palette,
+        )?;
         let child = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: OwnedDictionary::from([
                 (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
@@ -597,6 +657,37 @@ fn finalize_jpeg_candidate(
     )
 }
 
+fn jpeg_transcode_candidate(
+    decoded: &[u8],
+    width: u32,
+    height: u32,
+    components: usize,
+    original: u64,
+    options: ImageOptimizationOptions,
+) -> Result<Option<ImageTransform>> {
+    let encoded = encode_jpeg_raster(width, height, components, decoded, options.jpeg_quality)?;
+    let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) else {
+        return Ok(None);
+    };
+    let optimized_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    let pixels = u64::from(width) * u64::from(height);
+    Ok(Some(ImageTransform {
+        encoded,
+        width,
+        height,
+        filter: b"DCTDecode".to_vec(),
+        color_space: None,
+        layered_indexed: None,
+        original_encoded_bytes: original,
+        optimized_encoded_bytes,
+        original_pixels: pixels,
+        optimized_pixels: pixels,
+        resized: false,
+        paper_indexed: false,
+        encoding: ImageResizeEncoding::Jpeg,
+    }))
+}
+
 fn paper_indexed_source_safe(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
@@ -709,6 +800,7 @@ fn paper_indexed_transform(
     original: u64,
     options: ImageOptimizationOptions,
     flate_level: crate::FlateLevel,
+    base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
     let Some(candidate) = paper_indexed::quantize_rgb(decoded) else {
         return Ok(None);
@@ -730,7 +822,7 @@ fn paper_indexed_transform(
     };
     let color_space = OwnedObject::Array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
-        OwnedObject::Name(b"DeviceRGB".to_vec()),
+        base_color_space,
         OwnedObject::Integer(hival),
         OwnedObject::String(candidate.palette),
     ]);
@@ -759,6 +851,7 @@ fn paper_indexed_layered_transform(
     original: u64,
     options: ImageOptimizationOptions,
     flate_level: crate::FlateLevel,
+    base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
     let width_usize = usize::try_from(width)
         .map_err(|_| Error::Invalid("local palette width exceeds usize".to_owned()))?;
@@ -831,7 +924,10 @@ fn paper_indexed_layered_transform(
                 height,
                 filter: Vec::new(),
                 color_space: None,
-                layered_indexed: Some(LayeredIndexedTransform { layers }),
+                layered_indexed: Some(LayeredIndexedTransform {
+                    layers,
+                    base_color_space,
+                }),
                 original_encoded_bytes: original,
                 optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
                 original_pixels: pixel_count,
@@ -938,8 +1034,12 @@ fn transcode_image(
     if !bpc_is_8(document, dictionary)? {
         return Ok(None);
     }
-    let Some((components, _, _)) = color_info(document, dictionary)? else {
-        return Ok(None);
+    let device_color_info = color_info(document, dictionary)?;
+    let indexed_base_color_space = indexed_rgb_base_color_space(document, dictionary)?;
+    let components = match device_color_info.as_ref() {
+        Some((components, _, _)) => *components,
+        None if indexed_base_color_space.is_some() => 3,
+        None => return Ok(None),
     };
     let area = width.wrapping_mul(height);
     if (options.min_width > 0 && width <= options.min_width)
@@ -951,6 +1051,9 @@ fn transcode_image(
     let source_filter = source_filter(document, dictionary)?;
     let source_bytes = data.bytes(document.source())?;
     if matches!(source_filter.as_deref(), Some(b"DCTDecode" | b"DCT")) {
+        if device_color_info.is_none() {
+            return Ok(None);
+        }
         for key in [
             b"DecodeParms".as_slice(),
             b"Decode".as_slice(),
@@ -971,40 +1074,44 @@ fn transcode_image(
     let Some(decoded) = decoded_pixels(document, image, width, height, components)? else {
         return Ok(None);
     };
-    let encoded = encode_jpeg_raster(width, height, components, &decoded, options.jpeg_quality)?;
     let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
-    if let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) {
-        let optimized_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
-        let pixels = u64::from(width) * u64::from(height);
-        return Ok(Some(ImageTransform {
-            encoded,
-            width,
-            height,
-            filter: b"DCTDecode".to_vec(),
-            color_space: None,
-            layered_indexed: None,
-            original_encoded_bytes: original,
-            optimized_encoded_bytes,
-            original_pixels: pixels,
-            optimized_pixels: pixels,
-            resized: false,
-            paper_indexed: false,
-            encoding: ImageResizeEncoding::Jpeg,
-        }));
+    if device_color_info.is_some()
+        && let Some(candidate) =
+            jpeg_transcode_candidate(&decoded, width, height, components, original, options)?
+    {
+        return Ok(Some(candidate));
     }
     if components != 3 {
         return Ok(None);
     }
+    let Some(indexed_base_color_space) = indexed_base_color_space else {
+        return Ok(None);
+    };
     if paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?
-        && let Some(candidate) =
-            paper_indexed_transform(&decoded, width, height, original, options, flate_level)?
+        && let Some(candidate) = paper_indexed_transform(
+            &decoded,
+            width,
+            height,
+            original,
+            options,
+            flate_level,
+            indexed_base_color_space.clone(),
+        )?
     {
         return Ok(Some(candidate));
     }
     if !paper_indexed_layered_source_safe(document, dictionary)? {
         return Ok(None);
     }
-    paper_indexed_layered_transform(&decoded, width, height, original, options, flate_level)
+    paper_indexed_layered_transform(
+        &decoded,
+        width,
+        height,
+        original,
+        options,
+        flate_level,
+        indexed_base_color_space,
+    )
 }
 
 fn resize_source_safe(
@@ -1416,6 +1523,80 @@ mod tests {
         pdf.finish(1)
     }
 
+    fn icc_profile(data_space: [u8; 4]) -> Vec<u8> {
+        let mut profile = vec![0_u8; 128];
+        profile[0..4].copy_from_slice(&128_u32.to_be_bytes());
+        profile[16..20].copy_from_slice(&data_space);
+        profile[20..24].copy_from_slice(b"XYZ ");
+        profile[36..40].copy_from_slice(b"acsp");
+        profile
+    }
+
+    fn iccbased_flate_pdf(data_space: [u8; 4], indirect: bool) -> Result<Vec<u8>> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let width = 800_usize;
+        let height = 700_usize;
+        let rgb = paper_rgb(width, height);
+        let encoded = encode_flate(&rgb, crate::FlateLevel::SIZE)?;
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 800 700] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q 800 0 0 700 0 0 cm /Im0 Do Q")?;
+        let color_space = if indirect {
+            b"7 0 R".as_slice()
+        } else {
+            b"[/ICCBased 6 0 R]".as_slice()
+        };
+        let mut image_dictionary =
+            b"/Type /XObject /Subtype /Image /Width 800 /Height 700 /ColorSpace ".to_vec();
+        image_dictionary.extend_from_slice(color_space);
+        image_dictionary.extend_from_slice(b" /BitsPerComponent 8 /Filter /FlateDecode");
+        pdf.stream(5, &image_dictionary, &encoded)?;
+        pdf.stream(6, b"/N 3", &icc_profile(data_space))?;
+        if indirect {
+            pdf.object(7, b"[/ICCBased 6 0 R]")?;
+        }
+        pdf.finish(1)
+    }
+
+    fn iccbased_flate_transform(
+        data_space: [u8; 4],
+        indirect: bool,
+    ) -> Result<Option<ImageTransform>> {
+        let document = EditDocument::from_bytes(iccbased_flate_pdf(data_space, indirect)?)?;
+        let Some(handle) = document
+            .reachable_streams_with_subtype(b"Image")?
+            .into_iter()
+            .next()
+        else {
+            return Err(Error::Invalid("ICC test image is unreachable".to_owned()));
+        };
+        let Some(image) = document.current_owned_object(handle)? else {
+            return Err(Error::Invalid(
+                "ICC test image object is missing".to_owned(),
+            ));
+        };
+        transcode_image(
+            &document,
+            &image,
+            ImageOptimizationOptions {
+                min_width: 0,
+                min_height: 0,
+                min_area: 0,
+                jpeg_quality: 85,
+                min_savings_bytes: 1,
+                min_savings_percent: 20,
+                ..ImageOptimizationOptions::default()
+            },
+            crate::FlateLevel::SIZE,
+        )
+    }
+
     fn direct_jpeg_transform(
         jpeg: &[u8],
         extra_image_dictionary: &[u8],
@@ -1551,6 +1732,7 @@ mod tests {
                         palette: vec![255_u8; 255 * 3],
                     },
                 ],
+                base_color_space: OwnedObject::Name(b"DeviceRGB".to_vec()),
             },
         )?;
         let Some(object) = document.current_owned_object(image)? else {
@@ -1753,6 +1935,60 @@ mod tests {
     }
 
     #[test]
+    fn paper_indexed_transform_preserves_verified_iccbased_rgb_base() -> Result<()> {
+        let Some(transform) = iccbased_flate_transform(*b"RGB ", false)? else {
+            return Err(Error::Invalid(
+                "verified ICCBased RGB image did not produce an Indexed candidate".to_owned(),
+            ));
+        };
+        let Some(OwnedObject::Array(color_space)) = transform.color_space else {
+            return Err(Error::Invalid(
+                "ICCBased transform did not emit an Indexed color space".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            color_space.first(),
+            Some(OwnedObject::Name(name)) if name.as_slice() == b"Indexed"
+        ));
+        let Some(OwnedObject::Array(base)) = color_space.get(1) else {
+            return Err(Error::Invalid(
+                "Indexed transform did not preserve the ICCBased base".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            base.first(),
+            Some(OwnedObject::Name(name)) if name.as_slice() == b"ICCBased"
+        ));
+        assert!(matches!(base.get(1), Some(OwnedObject::Reference(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn paper_indexed_transform_preserves_indirect_iccbased_rgb_base() -> Result<()> {
+        let Some(transform) = iccbased_flate_transform(*b"RGB ", true)? else {
+            return Err(Error::Invalid(
+                "indirect ICCBased RGB image did not produce an Indexed candidate".to_owned(),
+            ));
+        };
+        let Some(OwnedObject::Array(color_space)) = transform.color_space else {
+            return Err(Error::Invalid(
+                "indirect ICCBased transform did not emit an Indexed color space".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            color_space.get(1),
+            Some(OwnedObject::Reference(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn paper_indexed_transform_rejects_non_rgb_icc_header() -> Result<()> {
+        assert!(iccbased_flate_transform(*b"LAB ", false)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn paper_indexed_transform_emits_complete_indexed_rgb_image() -> Result<()> {
         let width = 800_u32;
         let height = 700_u32;
@@ -1778,6 +2014,7 @@ mod tests {
                 ..ImageOptimizationOptions::default()
             },
             crate::FlateLevel::SIZE,
+            OwnedObject::Name(b"DeviceRGB".to_vec()),
         )?
         else {
             return Err(Error::Invalid(
