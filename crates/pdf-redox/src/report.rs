@@ -904,6 +904,9 @@ pub struct OptimizationReport {
     pub icc_alternate_encoded_bytes_elided: usize,
     /// Number of raster images transcoded.
     pub raster_images_transcoded: usize,
+    #[serde(default)]
+    /// Number of paper-like RGB raster images rewritten as Indexed color.
+    pub raster_paper_indexed_images: usize,
     /// Number of raster images resized.
     pub raster_images_resized: usize,
     /// Number of raster JPEG images resized.

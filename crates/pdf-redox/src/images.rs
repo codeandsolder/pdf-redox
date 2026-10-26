@@ -1,6 +1,7 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::resolved_number,
+    paper_indexed,
     stream_codec::{decode_image_stream, encode_flate},
 };
 use fast_image_resize::{
@@ -76,6 +77,7 @@ impl Default for ImageOptimizationOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImageOptimizationStats {
     pub images_optimized: usize,
+    pub paper_indexed_images: usize,
     pub images_resized: usize,
     pub jpeg_images_resized: usize,
     pub flate_images_resized: usize,
@@ -99,10 +101,13 @@ struct ImageTransform {
     width: u32,
     height: u32,
     filter: Vec<u8>,
+    color_space: Option<OwnedObject>,
     original_encoded_bytes: u64,
+    optimized_encoded_bytes: u64,
     original_pixels: u64,
     optimized_pixels: u64,
     resized: bool,
+    paper_indexed: bool,
     encoding: ImageResizeEncoding,
 }
 
@@ -351,6 +356,9 @@ fn install_transform(
         OwnedObject::Integer(i64::from(transform.height)),
     );
     dictionary.insert(b"Filter".to_vec(), OwnedObject::Name(transform.filter));
+    if let Some(color_space) = transform.color_space {
+        dictionary.insert(b"ColorSpace".to_vec(), color_space);
+    }
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
     *data = StreamData::Owned(transform.encoded);
@@ -382,6 +390,76 @@ fn finalize_jpeg_candidate(
             .filter(|optimized| optimized.len() < encoded.len())
             .unwrap_or(encoded),
     )
+}
+
+fn paper_indexed_source_safe(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    source_filter: Option<&[u8]>,
+) -> Result<bool> {
+    if !matches!(source_filter, Some(b"FlateDecode" | b"Fl")) {
+        return Ok(false);
+    }
+    for key in [
+        b"Decode".as_slice(),
+        b"Mask".as_slice(),
+        b"SMask".as_slice(),
+        b"SMaskInData".as_slice(),
+    ] {
+        if is_non_null(document, dictionary.get(key))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn paper_indexed_transform(
+    decoded: &[u8],
+    width: u32,
+    height: u32,
+    original: u64,
+    options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
+) -> Result<Option<ImageTransform>> {
+    let Some(candidate) = paper_indexed::quantize_rgb(decoded) else {
+        return Ok(None);
+    };
+    let encoded = encode_flate(&candidate.indices, flate_level)?;
+    // Binary lookup strings are serialized as hexadecimal by the compact writer.
+    // Account for that representation conservatively in both admission and stats.
+    let palette_cost = candidate.palette.len().saturating_mul(2).saturating_add(2);
+    let optimized_payload = encoded.len().saturating_add(palette_cost);
+    if !passes_savings(options, original, optimized_payload) {
+        return Ok(None);
+    }
+    let hival = candidate.palette.len() / 3;
+    let Some(hival) = hival
+        .checked_sub(1)
+        .and_then(|value| i64::try_from(value).ok())
+    else {
+        return Ok(None);
+    };
+    let color_space = OwnedObject::Array(vec![
+        OwnedObject::Name(b"Indexed".to_vec()),
+        OwnedObject::Name(b"DeviceRGB".to_vec()),
+        OwnedObject::Integer(hival),
+        OwnedObject::String(candidate.palette),
+    ]);
+    let pixels = u64::from(width) * u64::from(height);
+    Ok(Some(ImageTransform {
+        encoded,
+        width,
+        height,
+        filter: b"FlateDecode".to_vec(),
+        color_space: Some(color_space),
+        original_encoded_bytes: original,
+        optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
+        original_pixels: pixels,
+        optimized_pixels: pixels,
+        resized: false,
+        paper_indexed: true,
+        encoding: ImageResizeEncoding::Flate,
+    }))
 }
 
 fn decoded_pixels(
@@ -463,6 +541,7 @@ fn transcode_image(
     document: &EditDocument,
     image: &OwnedObject,
     options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
 ) -> Result<Option<ImageTransform>> {
     let OwnedObject::Stream { dictionary, data } = image else {
         return Ok(None);
@@ -511,21 +590,30 @@ fn transcode_image(
     };
     let encoded = encode_jpeg_raster(width, height, components, &decoded, options.jpeg_quality)?;
     let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
-    let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) else {
+    if let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) {
+        let optimized_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        let pixels = u64::from(width) * u64::from(height);
+        return Ok(Some(ImageTransform {
+            encoded,
+            width,
+            height,
+            filter: b"DCTDecode".to_vec(),
+            color_space: None,
+            original_encoded_bytes: original,
+            optimized_encoded_bytes,
+            original_pixels: pixels,
+            optimized_pixels: pixels,
+            resized: false,
+            paper_indexed: false,
+            encoding: ImageResizeEncoding::Jpeg,
+        }));
+    }
+    if components != 3
+        || !paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?
+    {
         return Ok(None);
-    };
-    let pixels = u64::from(width) * u64::from(height);
-    Ok(Some(ImageTransform {
-        encoded,
-        width,
-        height,
-        filter: b"DCTDecode".to_vec(),
-        original_encoded_bytes: original,
-        original_pixels: pixels,
-        optimized_pixels: pixels,
-        resized: false,
-        encoding: ImageResizeEncoding::Jpeg,
-    }))
+    }
+    paper_indexed_transform(&decoded, width, height, original, options, flate_level)
 }
 
 fn resize_source_safe(
@@ -625,15 +713,19 @@ fn resize_image(
     if !passes_savings(options, original, encoded.len()) {
         return Ok(None);
     }
+    let optimized_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     Ok(Some(ImageTransform {
         encoded,
         width: target_width,
         height: target_height,
         filter,
+        color_space: None,
         original_encoded_bytes: original,
+        optimized_encoded_bytes,
         original_pixels: u64::from(width) * u64::from(height),
         optimized_pixels: u64::from(target_width) * u64::from(target_height),
         resized: true,
+        paper_indexed: false,
         encoding: target.encoding,
     }))
 }
@@ -654,12 +746,15 @@ fn transform_one(
     };
     let transform = match target {
         Some(target) => resize_image(document, &image, options, target, flate_level)?,
-        None => transcode_image(document, &image, options)?,
+        None => transcode_image(document, &image, options, flate_level)?,
     };
     let Some(transform) = transform else {
         return Ok(false);
     };
     stats.images_optimized = stats.images_optimized.saturating_add(1);
+    if transform.paper_indexed {
+        stats.paper_indexed_images = stats.paper_indexed_images.saturating_add(1);
+    }
     if transform.resized {
         stats.images_resized = stats.images_resized.saturating_add(1);
         match transform.encoding {
@@ -676,7 +771,7 @@ fn transform_one(
         .saturating_add(transform.original_encoded_bytes);
     stats.optimized_encoded_bytes = stats
         .optimized_encoded_bytes
-        .saturating_add(u64::try_from(transform.encoded.len()).unwrap_or(u64::MAX));
+        .saturating_add(transform.optimized_encoded_bytes);
     stats.original_pixels = stats
         .original_pixels
         .saturating_add(transform.original_pixels);
@@ -845,7 +940,28 @@ mod tests {
                 min_savings_percent: 0,
                 ..ImageOptimizationOptions::default()
             },
+            crate::FlateLevel::SIZE,
         )
+    }
+
+    fn paper_rgb(width: usize, height: usize) -> Vec<u8> {
+        let mut rgb = vec![248_u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 3;
+                if x % 97 < 4 || y % 113 < 3 {
+                    let shade = u8::try_from((x + y) % 80).unwrap_or_default();
+                    rgb[offset] = shade;
+                    rgb[offset + 1] = shade;
+                    rgb[offset + 2] = shade;
+                } else if x % 211 < 8 && y % 173 < 12 {
+                    rgb[offset] = 30;
+                    rgb[offset + 1] = 80;
+                    rgb[offset + 2] = 170;
+                }
+            }
+        }
+        rgb
     }
 
     #[test]
@@ -927,6 +1043,77 @@ mod tests {
         assert!(direct_jpeg_transform(&q100, b"/Mask [0 0 0 0 0 0]")?.is_none());
         assert!(direct_jpeg_transform(&q100, b"/Decode [0 1 0 1 0 1]")?.is_none());
         assert!(direct_jpeg_transform(&q100, b"/DecodeParms << /ColorTransform 1 >>")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn paper_indexed_transform_emits_complete_indexed_rgb_image() -> Result<()> {
+        let width = 800_u32;
+        let height = 700_u32;
+        let rgb = paper_rgb(
+            usize::try_from(width)
+                .map_err(|_| Error::Invalid("test width exceeds usize".to_owned()))?,
+            usize::try_from(height)
+                .map_err(|_| Error::Invalid("test height exceeds usize".to_owned()))?,
+        );
+        let original = u64::try_from(rgb.len())
+            .map_err(|_| Error::Invalid("test RGB payload exceeds u64".to_owned()))?;
+        let Some(transform) = paper_indexed_transform(
+            &rgb,
+            width,
+            height,
+            original,
+            ImageOptimizationOptions {
+                min_width: 0,
+                min_height: 0,
+                min_area: 0,
+                min_savings_bytes: 1,
+                min_savings_percent: 0,
+                ..ImageOptimizationOptions::default()
+            },
+            crate::FlateLevel::SIZE,
+        )?
+        else {
+            return Err(Error::Invalid(
+                "paper-like test image did not produce an Indexed candidate".to_owned(),
+            ));
+        };
+
+        assert!(transform.paper_indexed);
+        assert!(!transform.resized);
+        assert_eq!(transform.width, width);
+        assert_eq!(transform.height, height);
+        assert_eq!(transform.filter, b"FlateDecode");
+        assert_eq!(
+            transform.original_pixels,
+            u64::from(width) * u64::from(height)
+        );
+        assert_eq!(transform.optimized_pixels, transform.original_pixels);
+        let Some(OwnedObject::Array(color_space)) = transform.color_space.as_ref() else {
+            return Err(Error::Invalid(
+                "paper Indexed candidate has no Indexed color space".to_owned(),
+            ));
+        };
+        assert_eq!(color_space.len(), 4);
+        assert_eq!(color_space[0], OwnedObject::Name(b"Indexed".to_vec()));
+        assert_eq!(color_space[1], OwnedObject::Name(b"DeviceRGB".to_vec()));
+        assert_eq!(color_space[2], OwnedObject::Integer(255));
+        let OwnedObject::String(palette) = &color_space[3] else {
+            return Err(Error::Invalid(
+                "paper Indexed candidate palette is not a lookup string".to_owned(),
+            ));
+        };
+        assert_eq!(palette.len(), 256 * 3);
+        let expected_accounted = transform
+            .encoded
+            .len()
+            .saturating_add(palette.len().saturating_mul(2).saturating_add(2));
+        assert_eq!(
+            transform.optimized_encoded_bytes,
+            u64::try_from(expected_accounted)
+                .map_err(|_| Error::Invalid("test optimized payload exceeds u64".to_owned()))?
+        );
+        assert!(transform.optimized_encoded_bytes < transform.original_encoded_bytes);
         Ok(())
     }
 }

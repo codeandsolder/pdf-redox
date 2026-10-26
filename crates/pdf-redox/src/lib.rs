@@ -23,6 +23,7 @@ mod microstroke;
 mod optimize;
 mod page_representation;
 mod paint_batch;
+mod paper_indexed;
 mod polyline_simplify;
 mod preservation;
 mod print;

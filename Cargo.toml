@@ -34,6 +34,7 @@ clap = { version = "4", features = ["derive"] }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
+color_quant = "2.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
