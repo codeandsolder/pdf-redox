@@ -910,6 +910,9 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of those Indexed rewrites emitted as several source-grid local-palette layers.
     pub raster_paper_indexed_layered_images: usize,
+    #[serde(default)]
+    /// Number of those Indexed rewrites emitted as a weighted base plus sparse correction layer.
+    pub raster_paper_indexed_residual_images: usize,
     /// Number of raster images resized.
     pub raster_images_resized: usize,
     /// Number of raster JPEG images resized.
