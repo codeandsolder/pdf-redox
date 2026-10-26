@@ -793,8 +793,8 @@ fn paper_indexed_layered_source_safe(
         .all(|key| LOCAL_PALETTE_ALLOWED_SOURCE_KEYS.contains(&key.as_slice())))
 }
 
-fn paper_indexed_transform(
-    decoded: &[u8],
+fn paper_indexed_candidate_transform(
+    candidate: paper_indexed::IndexedPaperImage,
     width: u32,
     height: u32,
     original: u64,
@@ -802,9 +802,6 @@ fn paper_indexed_transform(
     flate_level: crate::FlateLevel,
     base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
-    let Some(candidate) = paper_indexed::quantize_rgb(decoded) else {
-        return Ok(None);
-    };
     let encoded = encode_flate(&candidate.indices, flate_level)?;
     // Binary lookup strings are serialized as hexadecimal by the compact writer.
     // Account for that representation conservatively in both admission and stats.
@@ -842,6 +839,52 @@ fn paper_indexed_transform(
         paper_indexed: true,
         encoding: ImageResizeEncoding::Flate,
     }))
+}
+
+fn paper_indexed_transform(
+    decoded: &[u8],
+    width: u32,
+    height: u32,
+    original: u64,
+    options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
+    base_color_space: OwnedObject,
+) -> Result<Option<ImageTransform>> {
+    let Some(candidate) = paper_indexed::quantize_rgb(decoded) else {
+        return Ok(None);
+    };
+    paper_indexed_candidate_transform(
+        candidate,
+        width,
+        height,
+        original,
+        options,
+        flate_level,
+        base_color_space,
+    )
+}
+
+fn paper_indexed_weighted_transform(
+    decoded: &[u8],
+    width: u32,
+    height: u32,
+    original: u64,
+    options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
+    base_color_space: OwnedObject,
+) -> Result<Option<ImageTransform>> {
+    let Some(candidate) = paper_indexed::quantize_rgb_foreground_weighted(decoded) else {
+        return Ok(None);
+    };
+    paper_indexed_candidate_transform(
+        candidate,
+        width,
+        height,
+        original,
+        options,
+        flate_level,
+        base_color_space,
+    )
 }
 
 fn paper_indexed_layered_transform(
@@ -1016,6 +1059,17 @@ fn direct_jpeg_is_strictly_finer_than_target(
     strictly_finer
 }
 
+const fn meets_image_optimization_size(
+    width: u32,
+    height: u32,
+    options: ImageOptimizationOptions,
+) -> bool {
+    let area = width.wrapping_mul(height);
+    (options.min_width == 0 || width > options.min_width)
+        && (options.min_height == 0 || height > options.min_height)
+        && (options.min_area == 0 || area > options.min_area)
+}
+
 fn transcode_image(
     document: &EditDocument,
     image: &OwnedObject,
@@ -1041,11 +1095,7 @@ fn transcode_image(
         None if indexed_base_color_space.is_some() => 3,
         None => return Ok(None),
     };
-    let area = width.wrapping_mul(height);
-    if (options.min_width > 0 && width <= options.min_width)
-        || (options.min_height > 0 && height <= options.min_height)
-        || (options.min_area > 0 && area <= options.min_area)
-    {
+    if !meets_image_optimization_size(width, height, options) {
         return Ok(None);
     }
     let source_filter = source_filter(document, dictionary)?;
@@ -1103,7 +1153,18 @@ fn transcode_image(
     if !paper_indexed_layered_source_safe(document, dictionary)? {
         return Ok(None);
     }
-    paper_indexed_layered_transform(
+    if let Some(candidate) = paper_indexed_layered_transform(
+        &decoded,
+        width,
+        height,
+        original,
+        options,
+        flate_level,
+        indexed_base_color_space.clone(),
+    )? {
+        return Ok(Some(candidate));
+    }
+    paper_indexed_weighted_transform(
         &decoded,
         width,
         height,
@@ -1833,6 +1894,80 @@ mod tests {
             };
             assert_eq!(redundant_opaque_smask(&document, dictionary)?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn single_indexed_install_preserves_existing_opaque_smask() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let mut document = EditDocument::from_bytes(image_with_smask_pdf(&jpeg, u8::MAX)?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let color = images.into_iter().find(|&handle| {
+            let Ok(Some(object)) = document.current_owned_object(handle) else {
+                return false;
+            };
+            let Some(dictionary) = object.as_dictionary() else {
+                return false;
+            };
+            matches!(
+                resolved_name(&document, dictionary.get(b"ColorSpace".as_slice())),
+                Ok(Some(name)) if name.as_slice() == b"DeviceRGB"
+            )
+        });
+        let Some(color) = color else {
+            return Err(Error::Invalid("test color image is unreachable".to_owned()));
+        };
+        let Some(before) = document.current_owned_object(color)? else {
+            return Err(Error::Invalid("test color image is missing".to_owned()));
+        };
+        let Some(before_dictionary) = before.as_dictionary() else {
+            return Err(Error::Invalid(
+                "test color image has no dictionary".to_owned(),
+            ));
+        };
+        let Some(smask) = before_dictionary.get(b"SMask".as_slice()).cloned() else {
+            return Err(Error::Invalid("test color image has no SMask".to_owned()));
+        };
+        assert!(redundant_opaque_smask(&document, before_dictionary)?);
+
+        let indices = vec![0_u8; 64 * 64];
+        let encoded = encode_flate(&indices, crate::FlateLevel::SIZE)?;
+        install_transform(
+            &mut document,
+            color,
+            ImageTransform {
+                encoded,
+                width: 64,
+                height: 64,
+                filter: b"FlateDecode".to_vec(),
+                color_space: Some(OwnedObject::Array(vec![
+                    OwnedObject::Name(b"Indexed".to_vec()),
+                    OwnedObject::Name(b"DeviceRGB".to_vec()),
+                    OwnedObject::Integer(0),
+                    OwnedObject::String(vec![0, 0, 0]),
+                ])),
+                layered_indexed: None,
+                original_encoded_bytes: u64::try_from(jpeg.len()).unwrap_or(u64::MAX),
+                optimized_encoded_bytes: 0,
+                original_pixels: 64 * 64,
+                optimized_pixels: 64 * 64,
+                resized: false,
+                paper_indexed: true,
+                encoding: ImageResizeEncoding::Flate,
+            },
+        )?;
+        let Some(after) = document.current_owned_object(color)? else {
+            return Err(Error::Invalid(
+                "rewritten color image is missing".to_owned(),
+            ));
+        };
+        let Some(after_dictionary) = after.as_dictionary() else {
+            return Err(Error::Invalid(
+                "rewritten color image has no dictionary".to_owned(),
+            ));
+        };
+        assert_eq!(after_dictionary.get(b"SMask".as_slice()), Some(&smask));
+        assert!(redundant_opaque_smask(&document, after_dictionary)?);
         Ok(())
     }
 
