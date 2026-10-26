@@ -1,4 +1,5 @@
 use color_quant::NeuQuant;
+use std::collections::BTreeMap;
 
 const PALETTE_COLORS: usize = 256;
 const LOCAL_PALETTE_COLORS: usize = 255;
@@ -13,11 +14,27 @@ const FOREGROUND_MSE_LIMIT: u64 = 16;
 const THRESHOLDS: [u8; 5] = [44, 32, 20, 12, 0];
 const WEIGHTED_FOREGROUND_THRESHOLD: u8 = 32;
 const WEIGHTED_PAPER_STRIDE: usize = 4;
+const RESIDUAL_ERROR_THRESHOLD: u8 = 16;
+const RESIDUAL_PALETTE_COLORS: usize = 255;
 
 #[derive(Debug)]
 pub struct IndexedPaperImage {
     pub indices: Vec<u8>,
     pub palette: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct ResidualIndexedPaperImage {
+    pub base_indices: Vec<u8>,
+    pub base_palette: Vec<u8>,
+    pub residual_indices: Vec<u8>,
+    pub residual_palette: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ForegroundIndexedPaperImage {
+    Weighted(IndexedPaperImage),
+    Residual(ResidualIndexedPaperImage),
 }
 
 #[derive(Debug)]
@@ -266,8 +283,10 @@ fn weighted_training_rgba(rgb: &[u8], background: [u8; 3]) -> Option<Vec<u8>> {
     Some(training)
 }
 
-pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage> {
-    let stats = paper_stats(rgb)?;
+fn quantize_foreground_weighted_candidate(
+    rgb: &[u8],
+    stats: PaperStats,
+) -> Option<IndexedPaperImage> {
     let training = weighted_training_rgba(rgb, stats.background)?;
     if training.len() < PALETTE_COLORS.checked_mul(4)? {
         return None;
@@ -292,11 +311,6 @@ pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage>
         .copy_from_slice(&stats.background);
 
     let mut indices = Vec::with_capacity(stats.pixels);
-    let mut whole_sse = 0_u64;
-    let mut foreground_sse = 0_u64;
-    let mut foreground_samples = 0_u64;
-    let mut max_delta = 0_u8;
-
     for original in rgb.as_chunks::<3>().0 {
         let index = if *original == stats.background {
             background_index
@@ -304,8 +318,137 @@ pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage>
             quantizer.index_of(&[original[0], original[1], original[2], 255])
         };
         indices.push(u8::try_from(index).ok()?);
-        let palette_start = index.checked_mul(3)?;
-        let reconstructed = palette.get(palette_start..palette_start.checked_add(3)?)?;
+    }
+    Some(IndexedPaperImage { indices, palette })
+}
+
+fn indexed_quality_ok(
+    rgb: &[u8],
+    stats: PaperStats,
+    candidate: &IndexedPaperImage,
+    foreground_threshold: u8,
+) -> Option<bool> {
+    if candidate.indices.len() != stats.pixels || candidate.palette.len() != PALETTE_COLORS * 3 {
+        return None;
+    }
+    let mut whole_sse = 0_u64;
+    let mut foreground_sse = 0_u64;
+    let mut foreground_samples = 0_u64;
+    let mut max_delta = 0_u8;
+    for (original, &index) in rgb.as_chunks::<3>().0.iter().zip(&candidate.indices) {
+        let palette_start = usize::from(index).checked_mul(3)?;
+        let reconstructed = candidate
+            .palette
+            .get(palette_start..palette_start.checked_add(3)?)?;
+        let foreground = channel_distance(original, stats.background) > foreground_threshold;
+        for (&source, &sample) in original.iter().zip(reconstructed) {
+            let delta = source.abs_diff(sample);
+            max_delta = max_delta.max(delta);
+            let square = u64::from(delta) * u64::from(delta);
+            whole_sse = whole_sse.checked_add(square)?;
+            if foreground {
+                foreground_sse = foreground_sse.checked_add(square)?;
+                foreground_samples = foreground_samples.checked_add(1)?;
+            }
+        }
+    }
+    let whole_samples = u64::try_from(stats.pixels).ok()?.checked_mul(3)?;
+    Some(
+        whole_sse <= whole_samples.checked_mul(WHOLE_MSE_LIMIT)?
+            && foreground_samples > 0
+            && foreground_sse <= foreground_samples.checked_mul(FOREGROUND_MSE_LIMIT)?
+            && max_delta <= MAX_CHANNEL_DELTA,
+    )
+}
+
+fn residual_palette(colors: &[[u8; 3]]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut exact = BTreeMap::<[u8; 3], u8>::new();
+    let mut exact_possible = true;
+    for &color in colors {
+        if exact.contains_key(&color) {
+            continue;
+        }
+        if exact.len() >= RESIDUAL_PALETTE_COLORS {
+            exact_possible = false;
+            break;
+        }
+        exact.insert(color, u8::try_from(exact.len()).ok()?);
+    }
+    if exact_possible {
+        let mut palette = vec![0_u8; exact.len().checked_mul(3)?];
+        let mut indices = Vec::with_capacity(colors.len());
+        for &color in colors {
+            let index = *exact.get(&color)?;
+            let start = usize::from(index).checked_mul(3)?;
+            palette
+                .get_mut(start..start.checked_add(3)?)?
+                .copy_from_slice(&color);
+            indices.push(index);
+        }
+        return Some((indices, palette));
+    }
+
+    let mut rgba = Vec::with_capacity(colors.len().checked_mul(4)?);
+    for &color in colors {
+        rgba.extend_from_slice(&[color[0], color[1], color[2], 255]);
+    }
+    let quantizer = NeuQuant::new(QUANTIZER_SAMPLE_FACTOR, RESIDUAL_PALETTE_COLORS, &rgba);
+    let palette = quantizer.color_map_rgb();
+    if palette.len() != RESIDUAL_PALETTE_COLORS * 3 {
+        return None;
+    }
+    let indices = colors
+        .iter()
+        .map(|color| u8::try_from(quantizer.index_of(&[color[0], color[1], color[2], 255])).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some((indices, palette))
+}
+
+fn quantize_residual_from_base(
+    rgb: &[u8],
+    stats: PaperStats,
+    base: IndexedPaperImage,
+) -> Option<ResidualIndexedPaperImage> {
+    let mut selected_positions = Vec::new();
+    let mut selected_colors = Vec::new();
+    for (position, (original, &index)) in
+        rgb.as_chunks::<3>().0.iter().zip(&base.indices).enumerate()
+    {
+        let start = usize::from(index).checked_mul(3)?;
+        let reconstructed = base.palette.get(start..start.checked_add(3)?)?;
+        if channel_distance(
+            original,
+            [reconstructed[0], reconstructed[1], reconstructed[2]],
+        ) > RESIDUAL_ERROR_THRESHOLD
+        {
+            selected_positions.push(position);
+            selected_colors.push([original[0], original[1], original[2]]);
+        }
+    }
+    if selected_colors.is_empty() {
+        return None;
+    }
+    let (selected_indices, residual_palette) = residual_palette(&selected_colors)?;
+    let mut residual_indices = vec![0_u8; stats.pixels];
+    for (&position, &index) in selected_positions.iter().zip(&selected_indices) {
+        *residual_indices.get_mut(position)? = index.checked_add(1)?;
+    }
+
+    let mut whole_sse = 0_u64;
+    let mut foreground_sse = 0_u64;
+    let mut foreground_samples = 0_u64;
+    let mut max_delta = 0_u8;
+    for (position, original) in rgb.as_chunks::<3>().0.iter().enumerate() {
+        let residual = *residual_indices.get(position)?;
+        let reconstructed = if residual == 0 {
+            let index = usize::from(*base.indices.get(position)?);
+            let start = index.checked_mul(3)?;
+            base.palette.get(start..start.checked_add(3)?)?
+        } else {
+            let index = usize::from(residual.checked_sub(1)?);
+            let start = index.checked_mul(3)?;
+            residual_palette.get(start..start.checked_add(3)?)?
+        };
         let foreground = channel_distance(original, stats.background) > 0;
         for (&source, &sample) in original.iter().zip(reconstructed) {
             let delta = source.abs_diff(sample);
@@ -318,7 +461,6 @@ pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage>
             }
         }
     }
-
     let whole_samples = u64::try_from(stats.pixels).ok()?.checked_mul(3)?;
     if whole_sse > whole_samples.checked_mul(WHOLE_MSE_LIMIT)?
         || foreground_samples == 0
@@ -328,7 +470,23 @@ pub fn quantize_rgb_foreground_weighted(rgb: &[u8]) -> Option<IndexedPaperImage>
         return None;
     }
 
-    Some(IndexedPaperImage { indices, palette })
+    Some(ResidualIndexedPaperImage {
+        base_indices: base.indices,
+        base_palette: base.palette,
+        residual_indices,
+        residual_palette,
+    })
+}
+
+pub fn quantize_rgb_foreground_weighted_or_residual(
+    rgb: &[u8],
+) -> Option<ForegroundIndexedPaperImage> {
+    let stats = paper_stats(rgb)?;
+    let base = quantize_foreground_weighted_candidate(rgb, stats)?;
+    if indexed_quality_ok(rgb, stats, &base, 0)? {
+        return Some(ForegroundIndexedPaperImage::Weighted(base));
+    }
+    quantize_residual_from_base(rgb, stats, base).map(ForegroundIndexedPaperImage::Residual)
 }
 
 fn quantize_at_threshold(
@@ -429,6 +587,21 @@ mod tests {
             }
         }
         rgb
+    }
+
+    #[test]
+    fn residual_palette_preserves_small_color_set_exactly() {
+        let colors = [[10, 20, 30], [200, 80, 40], [10, 20, 30], [0, 255, 120]];
+        let candidate = residual_palette(&colors);
+        assert!(candidate.is_some());
+        let Some((indices, palette)) = candidate else {
+            return;
+        };
+        assert_eq!(indices.len(), colors.len());
+        for (&index, expected) in indices.iter().zip(colors) {
+            let start = usize::from(index) * 3;
+            assert_eq!(&palette[start..start + 3], expected.as_slice());
+        }
     }
 
     #[test]

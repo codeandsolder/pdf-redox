@@ -105,6 +105,7 @@ pub struct ImageOptimizationStats {
     pub images_optimized: usize,
     pub paper_indexed_images: usize,
     pub paper_indexed_layered_images: usize,
+    pub paper_indexed_residual_images: usize,
     pub images_resized: usize,
     pub jpeg_images_resized: usize,
     pub flate_images_resized: usize,
@@ -129,9 +130,21 @@ struct LayeredIndexedLayerTransform {
 }
 
 #[derive(Debug)]
-struct LayeredIndexedTransform {
-    layers: Vec<LayeredIndexedLayerTransform>,
+struct ResidualIndexedTransform {
+    base_encoded: Vec<u8>,
+    base_palette: Vec<u8>,
+    residual_encoded: Vec<u8>,
+    residual_palette: Vec<u8>,
     base_color_space: OwnedObject,
+}
+
+#[derive(Debug)]
+enum LayeredIndexedTransform {
+    Local {
+        layers: Vec<LayeredIndexedLayerTransform>,
+        base_color_space: OwnedObject,
+    },
+    Residual(ResidualIndexedTransform),
 }
 
 #[derive(Debug)]
@@ -502,6 +515,28 @@ fn source_filter(document: &EditDocument, dictionary: &OwnedDictionary) -> Resul
     resolved_name(document, dictionary.get(b"Filter".as_slice()))
 }
 
+fn indexed_color_space(base_color_space: OwnedObject, palette: &[u8]) -> Result<OwnedObject> {
+    if palette.is_empty() || !palette.len().is_multiple_of(3) {
+        return Err(Error::Invalid(
+            "Indexed palette is empty or not RGB-aligned".to_owned(),
+        ));
+    }
+    let colors = palette.len() / 3;
+    if colors > 256 {
+        return Err(Error::Invalid(
+            "Indexed palette exceeds 256 colors".to_owned(),
+        ));
+    }
+    let hival = i64::try_from(colors - 1)
+        .map_err(|_| Error::Invalid("Indexed palette size exceeds i64".to_owned()))?;
+    Ok(OwnedObject::Array(vec![
+        OwnedObject::Name(b"Indexed".to_vec()),
+        base_color_space,
+        OwnedObject::Integer(hival),
+        OwnedObject::String(palette.to_vec()),
+    ]))
+}
+
 fn indexed_color_space_with_transparent_zero(
     base_color_space: OwnedObject,
     palette: &[u8],
@@ -526,21 +561,20 @@ fn indexed_color_space_with_transparent_zero(
     ]))
 }
 
-fn install_layered_indexed_transform(
+fn install_local_layered_indexed_transform(
     document: &mut EditDocument,
     handle: ObjectHandle,
     width: u32,
     height: u32,
-    transform: LayeredIndexedTransform,
+    layers: Vec<LayeredIndexedLayerTransform>,
+    base_color_space: &OwnedObject,
 ) -> Result<()> {
     let mut resources = OwnedDictionary::new();
     let mut content = Vec::new();
-    for (index, layer) in transform.layers.into_iter().enumerate() {
+    for (index, layer) in layers.into_iter().enumerate() {
         let name = format!("PdfRedoxLocalPalette{index}").into_bytes();
-        let color_space = indexed_color_space_with_transparent_zero(
-            transform.base_color_space.clone(),
-            &layer.palette,
-        )?;
+        let color_space =
+            indexed_color_space_with_transparent_zero(base_color_space.clone(), &layer.palette)?;
         let child = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: OwnedDictionary::from([
                 (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
@@ -592,6 +626,117 @@ fn install_layered_indexed_transform(
         data: StreamData::Owned(content),
     };
     Ok(())
+}
+
+fn install_residual_indexed_transform(
+    document: &mut EditDocument,
+    handle: ObjectHandle,
+    width: u32,
+    height: u32,
+    transform: ResidualIndexedTransform,
+) -> Result<()> {
+    let base_name = b"PdfRedoxResidualBase".to_vec();
+    let residual_name = b"PdfRedoxResidualCorrection".to_vec();
+    let base_color_space =
+        indexed_color_space(transform.base_color_space.clone(), &transform.base_palette)?;
+    let residual_color_space = indexed_color_space_with_transparent_zero(
+        transform.base_color_space,
+        &transform.residual_palette,
+    )?;
+    let base = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+        dictionary: OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+            (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+            (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+            (b"ColorSpace".to_vec(), base_color_space),
+            (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
+            (
+                b"Filter".to_vec(),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            ),
+        ]),
+        data: StreamData::Owned(transform.base_encoded),
+    }));
+    let residual = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+        dictionary: OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+            (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+            (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+            (b"ColorSpace".to_vec(), residual_color_space),
+            (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
+            (
+                b"Filter".to_vec(),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"Mask".to_vec(),
+                OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
+            ),
+        ]),
+        data: StreamData::Owned(transform.residual_encoded),
+    }));
+    let resources = OwnedDictionary::from([
+        (base_name.clone(), OwnedObject::Reference(base)),
+        (residual_name.clone(), OwnedObject::Reference(residual)),
+    ]);
+    let mut content = Vec::new();
+    for name in [&base_name, &residual_name] {
+        content.push(b'/');
+        content.extend_from_slice(name);
+        content.extend_from_slice(b" Do\n");
+    }
+    *document.edit_handle(handle)? = OwnedObject::Stream {
+        dictionary: OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
+            (b"FormType".to_vec(), OwnedObject::Integer(1)),
+            (
+                b"BBox".to_vec(),
+                OwnedObject::Array(vec![
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(1),
+                    OwnedObject::Integer(1),
+                ]),
+            ),
+            (
+                b"Resources".to_vec(),
+                OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"XObject".to_vec(),
+                    OwnedObject::Dictionary(resources),
+                )])),
+            ),
+        ]),
+        data: StreamData::Owned(content),
+    };
+    Ok(())
+}
+
+fn install_layered_indexed_transform(
+    document: &mut EditDocument,
+    handle: ObjectHandle,
+    width: u32,
+    height: u32,
+    transform: LayeredIndexedTransform,
+) -> Result<()> {
+    match transform {
+        LayeredIndexedTransform::Local {
+            layers,
+            base_color_space,
+        } => install_local_layered_indexed_transform(
+            document,
+            handle,
+            width,
+            height,
+            layers,
+            &base_color_space,
+        ),
+        LayeredIndexedTransform::Residual(transform) => {
+            install_residual_indexed_transform(document, handle, width, height, transform)
+        }
+    }
 }
 
 fn install_transform(
@@ -864,7 +1009,7 @@ fn paper_indexed_transform(
     )
 }
 
-fn paper_indexed_weighted_transform(
+fn paper_indexed_foreground_transform(
     decoded: &[u8],
     width: u32,
     height: u32,
@@ -873,18 +1018,85 @@ fn paper_indexed_weighted_transform(
     flate_level: crate::FlateLevel,
     base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
-    let Some(candidate) = paper_indexed::quantize_rgb_foreground_weighted(decoded) else {
+    let Some(candidate) = paper_indexed::quantize_rgb_foreground_weighted_or_residual(decoded)
+    else {
         return Ok(None);
     };
-    paper_indexed_candidate_transform(
-        candidate,
-        width,
-        height,
-        original,
-        options,
-        flate_level,
-        base_color_space,
-    )
+    match candidate {
+        paper_indexed::ForegroundIndexedPaperImage::Weighted(candidate) => {
+            paper_indexed_candidate_transform(
+                candidate,
+                width,
+                height,
+                original,
+                options,
+                flate_level,
+                base_color_space,
+            )
+        }
+        paper_indexed::ForegroundIndexedPaperImage::Residual(candidate) => {
+            let pixel_count = usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .ok_or_else(|| Error::Invalid("residual palette dimensions overflow".to_owned()))?;
+            if candidate.base_indices.len() != pixel_count
+                || candidate.residual_indices.len() != pixel_count
+                || candidate.base_palette.len() != 256 * 3
+                || candidate.residual_palette.is_empty()
+                || !candidate.residual_palette.len().is_multiple_of(3)
+                || candidate.residual_palette.len() > 255 * 3
+            {
+                return Ok(None);
+            }
+            let base_encoded = encode_flate(&candidate.base_indices, flate_level)?;
+            let residual_encoded = encode_flate(&candidate.residual_indices, flate_level)?;
+            let base_palette_cost = candidate
+                .base_palette
+                .len()
+                .saturating_mul(2)
+                .saturating_add(2);
+            let residual_palette_bytes = candidate.residual_palette.len().saturating_add(3);
+            let residual_palette_cost = residual_palette_bytes.saturating_mul(2).saturating_add(2);
+            let optimized_payload = LOCAL_PALETTE_FORM_OVERHEAD_BYTES
+                .saturating_add(base_encoded.len())
+                .saturating_add(base_palette_cost)
+                .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES)
+                .saturating_add(residual_encoded.len())
+                .saturating_add(residual_palette_cost)
+                .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES);
+            if !passes_savings(options, original, optimized_payload) {
+                return Ok(None);
+            }
+            let pixels = u64::from(width) * u64::from(height);
+            Ok(Some(ImageTransform {
+                encoded: Vec::new(),
+                width,
+                height,
+                filter: Vec::new(),
+                color_space: None,
+                layered_indexed: Some(LayeredIndexedTransform::Residual(
+                    ResidualIndexedTransform {
+                        base_encoded,
+                        base_palette: candidate.base_palette,
+                        residual_encoded,
+                        residual_palette: candidate.residual_palette,
+                        base_color_space,
+                    },
+                )),
+                original_encoded_bytes: original,
+                optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
+                original_pixels: pixels,
+                optimized_pixels: pixels,
+                resized: false,
+                paper_indexed: true,
+                encoding: ImageResizeEncoding::Flate,
+            }))
+        }
+    }
 }
 
 fn paper_indexed_layered_transform(
@@ -967,7 +1179,7 @@ fn paper_indexed_layered_transform(
                 height,
                 filter: Vec::new(),
                 color_space: None,
-                layered_indexed: Some(LayeredIndexedTransform {
+                layered_indexed: Some(LayeredIndexedTransform::Local {
                     layers,
                     base_color_space,
                 }),
@@ -1164,7 +1376,7 @@ fn transcode_image(
     )? {
         return Ok(Some(candidate));
     }
-    paper_indexed_weighted_transform(
+    paper_indexed_foreground_transform(
         &decoded,
         width,
         height,
@@ -1335,9 +1547,16 @@ fn transform_one(
     stats.images_optimized = stats.images_optimized.saturating_add(1);
     if transform.paper_indexed {
         stats.paper_indexed_images = stats.paper_indexed_images.saturating_add(1);
-        if transform.layered_indexed.is_some() {
-            stats.paper_indexed_layered_images =
-                stats.paper_indexed_layered_images.saturating_add(1);
+        match transform.layered_indexed.as_ref() {
+            Some(LayeredIndexedTransform::Local { .. }) => {
+                stats.paper_indexed_layered_images =
+                    stats.paper_indexed_layered_images.saturating_add(1);
+            }
+            Some(LayeredIndexedTransform::Residual(_)) => {
+                stats.paper_indexed_residual_images =
+                    stats.paper_indexed_residual_images.saturating_add(1);
+            }
+            None => {}
         }
     }
     if transform.resized {
@@ -1782,7 +2001,7 @@ mod tests {
             image,
             64,
             64,
-            LayeredIndexedTransform {
+            LayeredIndexedTransform::Local {
                 layers: vec![
                     LayeredIndexedLayerTransform {
                         encoded: first,
@@ -1860,6 +2079,90 @@ mod tests {
                 &[OwnedObject::Integer(0), OwnedObject::Integer(0)]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn residual_indexed_install_paints_opaque_base_then_transparent_correction() -> Result<()> {
+        let jpeg = rgb_jpeg(85)?;
+        let mut document = EditDocument::from_bytes(direct_jpeg_pdf(&jpeg, b"")?)?;
+        let images = document.reachable_streams_with_subtype(b"Image")?;
+        let Some(&image) = images.first() else {
+            return Err(Error::Invalid("test image is unreachable".to_owned()));
+        };
+        let pixels = 64_usize * 64;
+        let base_encoded = encode_flate(&vec![0_u8; pixels], crate::FlateLevel::SIZE)?;
+        let mut residual_indices = vec![0_u8; pixels];
+        residual_indices[pixels / 2] = 1;
+        let residual_encoded = encode_flate(&residual_indices, crate::FlateLevel::SIZE)?;
+        install_layered_indexed_transform(
+            &mut document,
+            image,
+            64,
+            64,
+            LayeredIndexedTransform::Residual(ResidualIndexedTransform {
+                base_encoded,
+                base_palette: vec![248_u8; 256 * 3],
+                residual_encoded,
+                residual_palette: vec![10, 80, 200],
+                base_color_space: OwnedObject::Name(b"DeviceRGB".to_vec()),
+            }),
+        )?;
+        let Some(OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(image)?
+        else {
+            return Err(Error::Invalid("residual Form is missing".to_owned()));
+        };
+        let StreamData::Owned(content) = data else {
+            return Err(Error::Invalid(
+                "residual Form content is not owned".to_owned(),
+            ));
+        };
+        assert_eq!(
+            content,
+            b"/PdfRedoxResidualBase Do\n/PdfRedoxResidualCorrection Do\n"
+        );
+        let Some(OwnedObject::Dictionary(resources)) = dictionary.get(b"Resources".as_slice())
+        else {
+            return Err(Error::Invalid("residual Form has no Resources".to_owned()));
+        };
+        let Some(OwnedObject::Dictionary(xobjects)) = resources.get(b"XObject".as_slice()) else {
+            return Err(Error::Invalid("residual Form has no XObjects".to_owned()));
+        };
+        let Some(base) = xobjects.get(b"PdfRedoxResidualBase".as_slice()) else {
+            return Err(Error::Invalid("residual Form has no base child".to_owned()));
+        };
+        let Some(OwnedObject::Stream {
+            dictionary: base_dictionary,
+            ..
+        }) = document.resolve_owned_value(base)?
+        else {
+            return Err(Error::Invalid("residual base is not an image".to_owned()));
+        };
+        assert!(!base_dictionary.contains_key(b"Mask".as_slice()));
+        let Some(correction) = xobjects.get(b"PdfRedoxResidualCorrection".as_slice()) else {
+            return Err(Error::Invalid(
+                "residual Form has no correction child".to_owned(),
+            ));
+        };
+        let Some(OwnedObject::Stream {
+            dictionary: correction_dictionary,
+            ..
+        }) = document.resolve_owned_value(correction)?
+        else {
+            return Err(Error::Invalid(
+                "residual correction is not an image".to_owned(),
+            ));
+        };
+        let Some(OwnedObject::Array(mask)) = correction_dictionary.get(b"Mask".as_slice()) else {
+            return Err(Error::Invalid(
+                "residual correction has no color-key mask".to_owned(),
+            ));
+        };
+        assert_eq!(
+            mask.as_slice(),
+            &[OwnedObject::Integer(0), OwnedObject::Integer(0)]
+        );
         Ok(())
     }
 
