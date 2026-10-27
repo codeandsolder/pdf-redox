@@ -39,6 +39,16 @@ impl FlateReuseCache {
         decoded: &[u8],
         encoded: Vec<u8>,
     ) {
+        self.insert_with_digest(handle, level, Sha256::digest(decoded).into(), encoded);
+    }
+
+    pub(crate) fn insert_with_digest(
+        &mut self,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+        decoded_sha256: [u8; 32],
+        encoded: Vec<u8>,
+    ) {
         if encoded.len() > MAX_REUSED_FLATE_BYTES.saturating_sub(self.retained_bytes)
             || self.entries.contains_key(&handle)
         {
@@ -49,7 +59,7 @@ impl FlateReuseCache {
             handle,
             FlateReuseEntry {
                 level,
-                decoded_sha256: Sha256::digest(decoded).into(),
+                decoded_sha256,
                 encoded,
             },
         );
@@ -207,6 +217,7 @@ pub fn optimize_flate_streams_with_cache(
 pub fn compress_unfiltered_streams(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
 ) -> Result<FlateOptimizationStats> {
     let handles = document.reachable_streams()?;
     let mut stats = FlateOptimizationStats::default();
@@ -240,7 +251,20 @@ pub fn compress_unfiltered_streams(
         }
         // The writer's historical StreamDataMode::Compress behavior always
         // applies Flate to non-empty unfiltered streams, even when a tiny stream grows.
-        let encoded = adaptive_flate_encode(&raw, level, true)?;
+        // Size-mode transforms may already have produced these exact level-9
+        // bytes for their admission gate; reuse them instead of recompressing.
+        let encoded = if level == crate::FlateLevel::SIZE
+            && let Some(encoded) = reuse_cache.take_matching(handle, level, &raw)
+        {
+            AdaptiveFlateEncoding {
+                bytes: encoded,
+                high_effort_tested: false,
+                high_effort_selected: false,
+                high_effort_extra_savings_bytes: 0,
+            }
+        } else {
+            adaptive_flate_encode(&raw, level, true)?
+        };
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }
@@ -301,6 +325,13 @@ mod tests {
                 b"BT /F1 12 Tf (changed) Tj ET"
             ),
             None
+        );
+
+        let digest = Sha256::digest(decoded).into();
+        cache.insert_with_digest(handle, crate::FlateLevel::PROCESSING, digest, vec![9, 10]);
+        assert_eq!(
+            cache.take_matching(handle, crate::FlateLevel::PROCESSING, decoded),
+            Some(vec![9, 10])
         );
     }
 

@@ -168,11 +168,11 @@ pub fn install_page_resource(
     Ok(())
 }
 
-pub fn replace_page_content(
+pub fn replace_page_content_with_handle(
     document: &mut EditDocument,
     page: ObjectHandle,
     bytes: Vec<u8>,
-) -> Result<()> {
+) -> Result<ObjectHandle> {
     let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
         data: StreamData::Owned(bytes),
@@ -181,7 +181,15 @@ pub fn replace_page_content(
     if let Some(dictionary) = object.as_dictionary_mut() {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
     }
-    Ok(())
+    Ok(stream)
+}
+
+pub fn replace_page_content(
+    document: &mut EditDocument,
+    page: ObjectHandle,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    replace_page_content_with_handle(document, page, bytes).map(|_| ())
 }
 
 pub fn normalize_page_contents(document: &mut EditDocument) -> Result<()> {

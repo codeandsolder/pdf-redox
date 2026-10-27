@@ -3,7 +3,8 @@ use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
         decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
-        replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
+        replace_page_content, replace_page_content_with_handle, resolved_bool_value,
+        resolved_dictionary, resolved_number_value,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
     flate::FlateReuseCache,
@@ -3211,11 +3212,30 @@ pub fn compact_vector_paths_with_flate_cache(
             continue;
         }
         let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&compacted, flate_level)?;
+        let after_encoded = if goal == OptimizationGoal::Size {
+            Some(crate::stream_codec::encode_flate(&compacted, flate_level)?)
+        } else {
+            None
+        };
+        let after_flate = match &after_encoded {
+            Some(encoded) => encoded.len(),
+            None => compressed_len(&compacted, flate_level)?,
+        };
         if goal == OptimizationGoal::Size && after_flate >= before_flate {
             continue;
         }
-        replace_page_content(document, page, compacted)?;
+        if let Some(after_encoded) = after_encoded {
+            let decoded_sha256 = Sha256::digest(&compacted).into();
+            let replacement = replace_page_content_with_handle(document, page, compacted)?;
+            flate_reuse_cache.insert_with_digest(
+                replacement,
+                flate_level,
+                decoded_sha256,
+                after_encoded,
+            );
+        } else {
+            replace_page_content(document, page, compacted)?;
+        }
         vector_rewritten_pages.insert(page);
         total.pages_compacted += 1;
         total.fill_groups_batched += stats.fill_groups_batched;
