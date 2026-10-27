@@ -1864,6 +1864,32 @@ fn inspect_owned_redirect_reference_holders(
     }
 }
 
+fn reachable_sampled_function_streams(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
+    let mut handles = Vec::new();
+    document.walk_output_objects(|handle, object| {
+        let sampled = match object {
+            CurrentObject::Source(HayroObject::Stream(stream)) => {
+                stream.dict().get::<i32>(b"FunctionType") == Some(0)
+            }
+            CurrentObject::Owned(OwnedObject::Stream { dictionary, .. }) => {
+                let Some(value) = dictionary.get(b"FunctionType".as_slice()) else {
+                    return Ok(());
+                };
+                matches!(
+                    document.resolve_owned_value(value)?,
+                    Some(OwnedObject::Integer(0))
+                )
+            }
+            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
+        };
+        if sampled {
+            handles.push(handle);
+        }
+        Ok(())
+    })?;
+    Ok(handles)
+}
+
 fn rewrite_all_references(
     document: &mut EditDocument,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
@@ -1913,6 +1939,33 @@ fn rewrite_all_references(
         rewritten = rewritten.saturating_add(1);
     }
     Ok(rewritten)
+}
+
+pub fn canonicalize_sampled_function_streams(
+    document: &mut EditDocument,
+) -> Result<TargetedDedupStats> {
+    let streams = reachable_sampled_function_streams(document)?;
+    if streams.len() < 2 {
+        return Ok(TargetedDedupStats::default());
+    }
+    let dependency_redirects = HashMap::new();
+    let mut duplicate_refs = HashSet::new();
+    let mut duplicate_raw_bytes = 0usize;
+    let redirects = exact_stream_redirects(
+        document,
+        &streams,
+        b"exact-sampled-function-stream",
+        &[],
+        &dependency_redirects,
+        &mut duplicate_refs,
+        &mut duplicate_raw_bytes,
+    )?;
+    let references_canonicalized = rewrite_all_references(document, &redirects)?;
+    Ok(TargetedDedupStats {
+        duplicate_streams_detected: duplicate_refs.len(),
+        duplicate_raw_bytes,
+        references_canonicalized,
+    })
 }
 
 pub fn exact_dictionary_fingerprint(
@@ -3278,6 +3331,67 @@ mod tests {
         assert_eq!(
             factor_form_payloads_across_metadata(&mut document)?,
             FormMetadataPayloadFactorStats::default()
+        );
+        Ok(())
+    }
+
+    fn sampled_function_fixture(distinct_dictionary: bool) -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S1 7 0 R /S2 8 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"/S1 sh /S2 sh")?;
+        let first =
+            b"/FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 8";
+        let second = if distinct_dictionary {
+            b"/FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [2] /BitsPerSample 8 /Decode [0 0.5 0 1 0 1]".as_slice()
+        } else {
+            first.as_slice()
+        };
+        let samples = [0_u8, 0, 0, 255, 255, 255];
+        pdf.stream(5, first, &samples)?;
+        pdf.stream(6, second, &samples)?;
+        pdf.object(7, b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 5 0 R /Extend [true true] >>")?;
+        pdf.object(8, b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 6 0 R /Extend [true true] >>")?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn sampled_function_dedup_rewrites_references_globally_and_is_idempotent() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sampled_function_fixture(false)?)?;
+        let stats = canonicalize_sampled_function_streams(&mut document)?;
+        assert_eq!(stats.duplicate_streams_detected, 1);
+        assert_eq!(stats.duplicate_raw_bytes, 6);
+        assert_eq!(stats.references_canonicalized, 1);
+
+        let first = document
+            .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(7, 0)))?
+            .ok_or_else(|| crate::Error::Invalid("first shading missing".to_owned()))?;
+        let second = document
+            .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(8, 0)))?
+            .ok_or_else(|| crate::Error::Invalid("second shading missing".to_owned()))?;
+        let first_function = first
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get(b"Function".as_slice()));
+        let second_function = second
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get(b"Function".as_slice()));
+        assert_eq!(first_function, second_function);
+        assert_eq!(
+            canonicalize_sampled_function_streams(&mut document)?,
+            TargetedDedupStats::default()
+        );
+        let output = document.write_compact()?;
+        assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sampled_function_dedup_keeps_semantically_distinct_dictionaries() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sampled_function_fixture(true)?)?;
+        assert_eq!(
+            canonicalize_sampled_function_streams(&mut document)?,
+            TargetedDedupStats::default()
         );
         Ok(())
     }

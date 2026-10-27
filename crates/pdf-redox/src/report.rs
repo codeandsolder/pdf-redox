@@ -826,6 +826,15 @@ pub struct OptimizationReport {
     /// Optimized encoded bytes for dense-remapped font programs plus maps.
     #[serde(default)]
     pub font_dense_optimized_encoded_bytes: usize,
+    /// Number of exact duplicate sampled Function streams detected.
+    #[serde(default)]
+    pub sampled_function_duplicate_streams_detected: usize,
+    /// Duplicate encoded bytes attributable to sampled Function streams.
+    #[serde(default)]
+    pub sampled_function_duplicate_raw_bytes: usize,
+    /// Number of references redirected to canonical sampled Function streams.
+    #[serde(default)]
+    pub sampled_function_references_canonicalized: usize,
     /// Number of to unicode duplicate streams detected.
     pub to_unicode_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to to unicode duplicate.
