@@ -860,6 +860,15 @@ pub struct OptimizationReport {
     /// Duplicate encoded Pattern cell payload bytes moved behind shared Forms, before wrapper overhead.
     #[serde(default)]
     pub pattern_payload_duplicate_raw_bytes_factored: usize,
+    /// Number of metadata-variant Form payload groups factored behind shared canonical Forms.
+    #[serde(default)]
+    pub form_metadata_payload_groups_factored: usize,
+    /// Number of metadata-preserving Form wrappers emitted.
+    #[serde(default)]
+    pub form_metadata_payload_wrappers_rewritten: usize,
+    /// Duplicate encoded Form payload bytes moved behind wrappers, before wrapper overhead.
+    #[serde(default)]
+    pub form_metadata_payload_duplicate_raw_bytes_factored: usize,
     /// Number of form duplicate streams detected.
     pub form_duplicate_streams_detected: usize,
     /// Total raw encoded bytes attributed to form duplicate.

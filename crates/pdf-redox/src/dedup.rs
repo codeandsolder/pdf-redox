@@ -1350,6 +1350,13 @@ pub struct PatternPayloadFactorStats {
     pub duplicate_raw_bytes_factored: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FormMetadataPayloadFactorStats {
+    pub groups_factored: usize,
+    pub wrappers_rewritten: usize,
+    pub duplicate_raw_bytes_factored: usize,
+}
+
 fn pattern_integer(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
@@ -2553,6 +2560,146 @@ fn form_dependency_redirects(
     })
 }
 
+const FACTORED_FORM_BODY_NAME: &[u8] = b"PdfRedoxSharedForm";
+const FACTORED_FORM_BODY_CONTENT: &[u8] = b"/PdfRedoxSharedForm Do\n";
+const MIN_FORM_METADATA_DUPLICATE_RAW_BYTES: usize = 4096;
+const MIN_FORM_METADATA_BODY_RAW_BYTES: usize = 256;
+
+fn metadata_wrapper_safe_form(
+    document: &EditDocument,
+    form: CowObjectHandle,
+) -> Result<Option<usize>> {
+    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(form)?
+    else {
+        return Ok(None);
+    };
+    let allowed = [
+        b"Type".as_slice(),
+        b"Subtype".as_slice(),
+        b"FormType".as_slice(),
+        b"BBox".as_slice(),
+        b"Resources".as_slice(),
+        b"Filter".as_slice(),
+        b"DecodeParms".as_slice(),
+        b"Length".as_slice(),
+        b"LastModified".as_slice(),
+        b"Name".as_slice(),
+    ];
+    if dictionary
+        .keys()
+        .any(|key| !allowed.contains(&key.as_slice()))
+    {
+        return Ok(None);
+    }
+    if !dictionary.contains_key(b"LastModified".as_slice()) {
+        return Ok(None);
+    }
+    // Require an explicit empty resource dictionary. An absent `/Resources`
+    // can inherit the caller's resources in PDF interpreters, while a present
+    // empty dictionary intentionally does not. Wrapping only the latter keeps
+    // resource lookup unchanged even for malformed bodies that name resources.
+    let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
+        return Ok(None);
+    };
+    let Some(resources) = resolved_dictionary_clone(document, resources)? else {
+        return Ok(None);
+    };
+    if !resources.is_empty() {
+        return Ok(None);
+    }
+    let raw_bytes = data.bytes(document.source())?.len();
+    Ok((raw_bytes >= MIN_FORM_METADATA_BODY_RAW_BYTES).then_some(raw_bytes))
+}
+
+fn form_last_modified(
+    document: &EditDocument,
+    form: CowObjectHandle,
+) -> Result<Option<OwnedObject>> {
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(form)? else {
+        return Ok(None);
+    };
+    Ok(dictionary.get(b"LastModified".as_slice()).cloned())
+}
+
+fn rewrite_form_as_metadata_wrapper(
+    document: &mut EditDocument,
+    form: CowObjectHandle,
+    canonical: CowObjectHandle,
+) -> Result<bool> {
+    let object = document.edit_handle(form)?;
+    let OwnedObject::Stream { dictionary, data } = object else {
+        return Ok(false);
+    };
+    dictionary.insert(
+        b"Resources".to_vec(),
+        OwnedObject::Dictionary(OwnedDictionary::from([(
+            b"XObject".to_vec(),
+            OwnedObject::Dictionary(OwnedDictionary::from([(
+                FACTORED_FORM_BODY_NAME.to_vec(),
+                OwnedObject::Reference(canonical),
+            )])),
+        )])),
+    );
+    dictionary.remove(b"Filter".as_slice());
+    dictionary.remove(b"DecodeParms".as_slice());
+    dictionary.remove(b"Length".as_slice());
+    *data = StreamData::Owned(FACTORED_FORM_BODY_CONTENT.to_vec());
+    Ok(true)
+}
+
+pub fn factor_form_payloads_across_metadata(
+    document: &mut EditDocument,
+) -> Result<FormMetadataPayloadFactorStats> {
+    let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
+        &[b"Name", b"LastModified"]
+    } else {
+        &[b"LastModified"]
+    };
+    let dependencies = form_dependency_redirects(document, ignored)?;
+    if dependencies.forms.is_empty() {
+        return Ok(FormMetadataPayloadFactorStats::default());
+    }
+
+    let mut groups = BTreeMap::<CowObjectHandle, Vec<(CowObjectHandle, usize)>>::new();
+    for (&form, &canonical) in &dependencies.forms {
+        let Some(raw_bytes) = metadata_wrapper_safe_form(document, form)? else {
+            continue;
+        };
+        if metadata_wrapper_safe_form(document, canonical)?.is_none()
+            || form_last_modified(document, form)? == form_last_modified(document, canonical)?
+        {
+            continue;
+        }
+        groups.entry(canonical).or_default().push((form, raw_bytes));
+    }
+
+    let mut stats = FormMetadataPayloadFactorStats::default();
+    for (canonical, members) in groups {
+        let duplicate_raw_bytes = members
+            .iter()
+            .map(|(_, raw_bytes)| *raw_bytes)
+            .sum::<usize>();
+        if duplicate_raw_bytes < MIN_FORM_METADATA_DUPLICATE_RAW_BYTES {
+            continue;
+        }
+        let mut rewritten = 0usize;
+        for (form, _) in members {
+            rewritten = rewritten.saturating_add(usize::from(rewrite_form_as_metadata_wrapper(
+                document, form, canonical,
+            )?));
+        }
+        if rewritten == 0 {
+            continue;
+        }
+        stats.groups_factored = stats.groups_factored.saturating_add(1);
+        stats.wrappers_rewritten = stats.wrappers_rewritten.saturating_add(rewritten);
+        stats.duplicate_raw_bytes_factored = stats
+            .duplicate_raw_bytes_factored
+            .saturating_add(duplicate_raw_bytes);
+    }
+    Ok(stats)
+}
+
 pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<TargetedDedupStats> {
     let ignored: &[&[u8]] = if document.source().version() > PdfVersion::Pdf10 {
         &[b"Name"]
@@ -3042,6 +3189,96 @@ mod tests {
         );
         let output = document.write_compact()?;
         assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 1);
+        Ok(())
+    }
+
+    fn metadata_variant_form_fixture(matrix: bool) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /A 5 0 R /B 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q /A Do /B Do Q")?;
+        let mut body = Vec::new();
+        for _ in 0..400 {
+            body.extend_from_slice(b"0 0 m 10 10 l S\n");
+        }
+        let matrix_entry = if matrix {
+            b" /Matrix [1 0 0 1 0 0]".as_slice()
+        } else {
+            b"".as_slice()
+        };
+        let mut first = b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>> /LastModified (first)".to_vec();
+        first.extend_from_slice(matrix_entry);
+        let mut second = b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>> /LastModified (second)".to_vec();
+        second.extend_from_slice(matrix_entry);
+        pdf.stream(5, &first, &body)?;
+        pdf.stream(6, &second, &body)?;
+        Ok((pdf.finish(1)?, body))
+    }
+
+    #[test]
+    fn form_metadata_payload_factoring_preserves_last_modified_and_is_idempotent() -> Result<()> {
+        let (input, body) = metadata_variant_form_fixture(false)?;
+        let mut document = EditDocument::from_bytes(input)?;
+        let stats = factor_form_payloads_across_metadata(&mut document)?;
+        assert_eq!(stats.groups_factored, 1);
+        assert_eq!(stats.wrappers_rewritten, 1);
+        assert_eq!(stats.duplicate_raw_bytes_factored, body.len());
+
+        let mut original_bodies = 0usize;
+        let mut wrappers = 0usize;
+        let mut last_modified = Vec::new();
+        for id in [5_i32, 6] {
+            let object = document
+                .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(id, 0)))?
+                .ok_or_else(|| crate::Error::Invalid("form is missing".to_owned()))?;
+            let OwnedObject::Stream { dictionary, data } = object else {
+                return Err(crate::Error::Invalid("form is not a stream".to_owned()));
+            };
+            last_modified.push(dictionary.get(b"LastModified".as_slice()).cloned());
+            let bytes = data.bytes(document.source())?;
+            if bytes.as_ref() == body.as_slice() {
+                original_bodies += 1;
+            } else if bytes.as_ref() == FACTORED_FORM_BODY_CONTENT {
+                wrappers += 1;
+                assert!(!dictionary.contains_key(b"Filter".as_slice()));
+                let resources = dictionary
+                    .get(b"Resources".as_slice())
+                    .and_then(OwnedObject::as_dictionary)
+                    .ok_or_else(|| crate::Error::Invalid("wrapper Resources missing".to_owned()))?;
+                let xobjects = resources
+                    .get(b"XObject".as_slice())
+                    .and_then(OwnedObject::as_dictionary)
+                    .ok_or_else(|| {
+                        crate::Error::Invalid("wrapper XObject resources missing".to_owned())
+                    })?;
+                assert!(matches!(
+                    xobjects.get(FACTORED_FORM_BODY_NAME),
+                    Some(OwnedObject::Reference(_))
+                ));
+            }
+        }
+        assert_eq!(original_bodies, 1);
+        assert_eq!(wrappers, 1);
+        assert_eq!(last_modified.len(), 2);
+        assert_ne!(last_modified[0], last_modified[1]);
+        assert_eq!(
+            factor_form_payloads_across_metadata(&mut document)?,
+            FormMetadataPayloadFactorStats::default()
+        );
+        let output = document.write_compact()?;
+        assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn form_metadata_payload_factoring_rejects_matrix_semantics() -> Result<()> {
+        let (input, _) = metadata_variant_form_fixture(true)?;
+        let mut document = EditDocument::from_bytes(input)?;
+        assert_eq!(
+            factor_form_payloads_across_metadata(&mut document)?,
+            FormMetadataPayloadFactorStats::default()
+        );
         Ok(())
     }
 }

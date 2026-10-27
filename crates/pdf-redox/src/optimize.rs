@@ -8,7 +8,8 @@ use crate::{
         canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
         canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
-        factor_duplicate_pattern_payloads, has_exact_duplicate_extgstate_dictionaries,
+        factor_duplicate_pattern_payloads, factor_form_payloads_across_metadata,
+        has_exact_duplicate_extgstate_dictionaries,
     },
     flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
@@ -558,6 +559,13 @@ fn optimize_pdf_with_document(
     let form_dedup = timed(&mut timings, "form-dedup", || {
         canonicalize_form_xobjects(&mut document)
     })?;
+    let form_metadata_payload_factor = timed(&mut timings, "form-metadata-payload-factor", || {
+        if cfg.preservation.metadata && !cfg.preservation.private_authoring_data {
+            factor_form_payloads_across_metadata(&mut document)
+        } else {
+            Ok(crate::dedup::FormMetadataPayloadFactorStats::default())
+        }
+    })?;
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.appearance_key_count == 0 {
             Ok(crate::dedup::TargetedDedupStats::default())
@@ -995,6 +1003,14 @@ fn optimize_pdf_with_document(
             form_dedup.references_canonicalized, form_dedup.duplicate_streams_detected
         ));
     }
+    if form_metadata_payload_factor.wrappers_rewritten > 0 {
+        notes.push(format!(
+            "Factored {} metadata-variant Form payload group(s) behind {} metadata-preserving wrapper(s), sharing about {} encoded payload bytes before wrapper overhead.",
+            form_metadata_payload_factor.groups_factored,
+            form_metadata_payload_factor.wrappers_rewritten,
+            form_metadata_payload_factor.duplicate_raw_bytes_factored
+        ));
+    }
     if appearance_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate annotation appearance reference(s) across {} duplicate Form stream object(s).",
@@ -1380,6 +1396,10 @@ fn optimize_pdf_with_document(
         pattern_payload_forms_created: pattern_payload_factor.forms_created,
         pattern_payload_duplicate_raw_bytes_factored: pattern_payload_factor
             .duplicate_raw_bytes_factored,
+        form_metadata_payload_groups_factored: form_metadata_payload_factor.groups_factored,
+        form_metadata_payload_wrappers_rewritten: form_metadata_payload_factor.wrappers_rewritten,
+        form_metadata_payload_duplicate_raw_bytes_factored: form_metadata_payload_factor
+            .duplicate_raw_bytes_factored,
         form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
         form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
         form_references_canonicalized: form_dedup.references_canonicalized,
@@ -1536,6 +1556,52 @@ mod tests {
         pdf.object(7, b"<< /Private true >>")?;
         pdf.object(8, b"<< /Illustrator << /Private true >> >>")?;
         pdf.finish(1)
+    }
+
+    fn form_metadata_payload_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /A 5 0 R /B 6 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q /A Do /B Do Q")?;
+        let mut body = Vec::new();
+        for _ in 0..400 {
+            body.extend_from_slice(b"0 0 m 10 10 l S\n");
+        }
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>> /LastModified (first)",
+            &body,
+        )?;
+        pdf.stream(
+            6,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>> /LastModified (second)",
+            &body,
+        )?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn default_optimize_factors_form_payloads_without_dropping_last_modified() -> Result<()> {
+        let input = form_metadata_payload_fixture()?;
+        let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
+        assert_eq!(report.form_metadata_payload_groups_factored, 1);
+        assert_eq!(report.form_metadata_payload_wrappers_rewritten, 1);
+        assert!(report.form_metadata_payload_duplicate_raw_bytes_factored >= 4096);
+        let analysis = crate::analyze_pdf_preflight(&output)?;
+        assert_eq!(analysis.authoring_metadata_key_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn authoring_preservation_suppresses_form_metadata_payload_factoring() -> Result<()> {
+        let input = form_metadata_payload_fixture()?;
+        let mut config = Config::optimize_only();
+        config.preservation.private_authoring_data = true;
+        let (_, report) = optimize_pdf(&input, &config)?;
+        assert_eq!(report.form_metadata_payload_groups_factored, 0);
+        assert_eq!(report.form_metadata_payload_wrappers_rewritten, 0);
+        Ok(())
     }
 
     fn duplicate_font_dictionary_fixture() -> Result<Vec<u8>> {
