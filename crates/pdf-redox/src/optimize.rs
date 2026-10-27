@@ -793,7 +793,7 @@ fn optimize_pdf_with_document(
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(&mut document, flate_level)
+        compress_unfiltered_streams(&mut document, flate_level, &mut flate_reuse_cache)
     })?;
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
