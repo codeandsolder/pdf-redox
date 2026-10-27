@@ -7,9 +7,9 @@ use crate::{
         canonicalize_exact_font_dictionaries, canonicalize_exact_structure_attribute_dictionaries,
         canonicalize_font_program_streams, canonicalize_form_xobjects, canonicalize_icc_profiles,
         canonicalize_image_xobjects, canonicalize_metadata_streams, canonicalize_page_contents,
-        canonicalize_to_unicode_cmaps, canonicalize_type3_charprocs,
-        factor_duplicate_pattern_payloads, factor_form_payloads_across_metadata,
-        has_exact_duplicate_extgstate_dictionaries,
+        canonicalize_sampled_function_streams, canonicalize_to_unicode_cmaps,
+        canonicalize_type3_charprocs, factor_duplicate_pattern_payloads,
+        factor_form_payloads_across_metadata, has_exact_duplicate_extgstate_dictionaries,
     },
     flate::{FlateReuseCache, compress_unfiltered_streams, optimize_flate_streams_with_cache},
     font::{
@@ -428,6 +428,12 @@ fn optimize_pdf_with_document(
         } else {
             canonicalize_exact_font_dictionaries(&mut document)
         }
+    })?;
+    // Sampled Functions can be dependencies of ExtGState, tint transforms, and
+    // shadings. Intern them before higher-level exact dedup so containers that
+    // differed only by duplicate Function references can converge this pass.
+    let sampled_function_dedup = timed(&mut timings, "sampled-function-dedup", || {
+        canonicalize_sampled_function_streams(&mut document)
     })?;
     let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
         let source_candidates_still_prove_uniqueness = match ext_gstate_dictionary_handles {
@@ -985,6 +991,14 @@ fn optimize_pdf_with_document(
             structure_attribute_dedup.references_canonicalized
         ));
     }
+    if sampled_function_dedup.duplicate_streams_detected > 0 {
+        notes.push(format!(
+            "Interned {} exact duplicate sampled Function stream object(s), canonicalizing {} reference(s) and removing about {} duplicate encoded payload bytes.",
+            sampled_function_dedup.duplicate_streams_detected,
+            sampled_function_dedup.references_canonicalized,
+            sampled_function_dedup.duplicate_raw_bytes
+        ));
+    }
     if to_unicode_dedup.references_canonicalized > 0 {
         notes.push(format!(
             "Canonicalized {} duplicate ToUnicode reference(s) across {} duplicate CMap stream object(s).",
@@ -1364,6 +1378,10 @@ fn optimize_pdf_with_document(
             .duplicate_objects_detected,
         structure_attribute_references_canonicalized: structure_attribute_dedup
             .references_canonicalized,
+        sampled_function_duplicate_streams_detected: sampled_function_dedup
+            .duplicate_streams_detected,
+        sampled_function_duplicate_raw_bytes: sampled_function_dedup.duplicate_raw_bytes,
+        sampled_function_references_canonicalized: sampled_function_dedup.references_canonicalized,
         font_programs_rendering_optimized: font_rendering.programs_optimized,
         font_rendering_original_encoded_bytes: font_rendering.original_encoded_bytes,
         font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
