@@ -348,7 +348,7 @@ pub enum OptimizationGoal {
 pub struct FlateLevel(u32);
 
 impl FlateLevel {
-    pub const PROCESSING: Self = Self(6);
+    pub const PROCESSING: Self = Self(7);
     pub const SIZE: Self = Self(9);
 
     pub const fn value(self) -> u32 {
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn optimization_goal_selects_compression_policy() {
-        assert_eq!(OptimizationGoal::Processing.flate_level().value(), 6);
+        assert_eq!(OptimizationGoal::Processing.flate_level().value(), 7);
         assert_eq!(OptimizationGoal::Size.flate_level().value(), 9);
     }
 

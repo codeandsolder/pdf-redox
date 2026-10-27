@@ -16,9 +16,10 @@ version = "0.1.0"
 
 [workspace.dependencies]
 hayro-syntax = { git = "https://github.com/codeandsolder/hayro", branch = "pdf-redox/zero-flpdf-base", default-features = false, features = ["std", "images"] }
-# Keep flate2's default miniz_oxide backend. zlib-rs levels 3-6 can hit a severe
-# ratio cliff on large repetitive PDF content without an end-to-end speed win.
-flate2 = "1.1"
+# Use zlib-rs deliberately. Processing uses level 7 so it stays on the slow matcher;
+# levels 3-6 use the medium matcher, which has pathological ratios on some highly
+# repetitive PDF content. Size uses level 9.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 libjpeg-turbo-rs = "=0.8.0"
 fast_image_resize = "6.1"
 fax = "=0.3.0"
