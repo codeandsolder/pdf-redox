@@ -367,6 +367,28 @@ pub fn compacted_rect_fill_len(rect: [f64; 4], operator: &[u8]) -> usize {
     .len()
 }
 
+// Keep the inclusive 0.001 pt snap policy stable when decimal PDF operands land
+// microscopically above the boundary after binary floating-point subtraction.
+fn snap_gap_with_roundoff(gap: f64, scale: f64) -> bool {
+    let page_gap = gap * scale;
+    page_gap <= RECT_SNAP_PAGE_GAP_PT || close(page_gap, RECT_SNAP_PAGE_GAP_PT)
+}
+
+// A previous merge can leave an endpoint a few ulps beyond the next source edge.
+// Forgive only overlap that is effectively zero in *page space*: using the
+// coordinate-relative epsilon directly would become too permissive for very
+// large user-space coordinates or magnifying CTMs.
+fn edge_gap_or_roundoff_overlap(a0: f64, a1: f64, b0: f64, b1: f64, scale: f64) -> Option<f64> {
+    if a1 <= b0 {
+        Some(b0 - a1)
+    } else if b1 <= a0 {
+        Some(a0 - b1)
+    } else {
+        let overlap = if a0 <= b0 { a1 - b0 } else { b1 - a0 };
+        close(overlap * scale, 0.0).then_some(0.0)
+    }
+}
+
 fn merge_collinear_rects(a: Rect, b: Rect, ctm: Matrix) -> Option<Rect> {
     if close(a.y0, b.y0) && close(a.y1, b.y1) {
         let x_scale = ctm.a.hypot(ctm.b);
@@ -375,14 +397,8 @@ fn merge_collinear_rects(a: Rect, b: Rect, ctm: Matrix) -> Option<Rect> {
         if a_extent >= MIN_MERGE_MEMBER_PAGE_EXTENT_PT
             && b_extent >= MIN_MERGE_MEMBER_PAGE_EXTENT_PT
         {
-            let gap = if a.x1 <= b.x0 {
-                b.x0 - a.x1
-            } else if b.x1 <= a.x0 {
-                a.x0 - b.x1
-            } else {
-                return None;
-            };
-            if gap * x_scale <= RECT_SNAP_PAGE_GAP_PT {
+            let gap = edge_gap_or_roundoff_overlap(a.x0, a.x1, b.x0, b.x1, x_scale)?;
+            if snap_gap_with_roundoff(gap, x_scale) {
                 return Some(Rect {
                     x0: a.x0.min(b.x0),
                     y0: a.y0,
@@ -399,14 +415,8 @@ fn merge_collinear_rects(a: Rect, b: Rect, ctm: Matrix) -> Option<Rect> {
         if a_extent >= MIN_MERGE_MEMBER_PAGE_EXTENT_PT
             && b_extent >= MIN_MERGE_MEMBER_PAGE_EXTENT_PT
         {
-            let gap = if a.y1 <= b.y0 {
-                b.y0 - a.y1
-            } else if b.y1 <= a.y0 {
-                a.y0 - b.y1
-            } else {
-                return None;
-            };
-            if gap * y_scale <= RECT_SNAP_PAGE_GAP_PT {
+            let gap = edge_gap_or_roundoff_overlap(a.y0, a.y1, b.y0, b.y1, y_scale)?;
+            if snap_gap_with_roundoff(gap, y_scale) {
                 return Some(Rect {
                     x0: a.x0,
                     y0: a.y0.min(b.y0),
@@ -3564,6 +3574,74 @@ mod tests {
         assert_eq!(stats.fill_groups_batched, 1);
         assert_eq!(stats.fill_paints_eliminated, 1);
         assert!(String::from_utf8_lossy(&output).contains("0 0 180.005 100 re f"));
+    }
+
+    #[test]
+    fn merges_decimal_roundoff_overlap_at_shared_edge() -> Result<()> {
+        let first = merge_rect_fill_pair(
+            [377.816, 0.0, 438.898, 10.0],
+            [438.898, 0.0, 509.734_000_000_000_04, 10.0],
+            Matrix::default(),
+        )
+        .ok_or_else(|| crate::Error::Invalid("first pair should merge".to_owned()))?;
+        assert!(
+            merge_rect_fill_pair(first, [509.734, 0.0, 563.924, 10.0], Matrix::default(),)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merges_snap_limit_gap_despite_binary_roundoff() {
+        assert!(
+            merge_rect_fill_pair(
+                [336.473, 0.0, 410.143, 10.0],
+                [410.144, 0.0, 474.17, 10.0],
+                Matrix::default(),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn does_not_merge_non_roundoff_overlap() {
+        assert!(
+            merge_rect_fill_pair(
+                [0.0, 0.0, 500.0, 10.0],
+                [499.9999, 0.0, 1000.0, 10.0],
+                Matrix::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn does_not_treat_large_coordinate_overlap_as_roundoff_after_ctm() {
+        let ctm = Matrix {
+            a: 10_000.0,
+            d: 1.0,
+            ..Matrix::default()
+        };
+        assert!(
+            merge_rect_fill_pair(
+                [1_000_000.0, 0.0, 1_000_010.0, 10.0],
+                [1_000_009.999_999, 0.0, 1_000_020.0, 10.0],
+                ctm,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn does_not_merge_gap_beyond_snap_roundoff() {
+        assert!(
+            merge_rect_fill_pair(
+                [0.0, 0.0, 10.0, 10.0],
+                [10.00102, 0.0, 20.0, 10.0],
+                Matrix::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
