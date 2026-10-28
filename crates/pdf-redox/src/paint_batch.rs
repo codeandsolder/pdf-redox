@@ -1168,13 +1168,19 @@ pub fn compact_collinear_paths(
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
-        let Some((compacted, vertices_removed)) = compact_collinear_line_points(&decoded) else {
+        // Processing always normalizes page content later. Make the collinear
+        // admission decision against that inevitable representation now, so a
+        // marginal exact win cannot appear only on the next optimizer pass.
+        // Keep the candidate-size threshold on the original decoded stream so
+        // lexical normalization does not silently narrow the existing domain.
+        let normalized = crate::content_stream::normalize_content_stream(&decoded);
+        let Some((compacted, vertices_removed)) = compact_collinear_line_points(&normalized) else {
             continue;
         };
-        if vertices_removed == 0 || compacted == decoded {
+        if vertices_removed == 0 || compacted == normalized {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = compressed_len(&normalized, flate_level)?;
         let after_flate = compressed_len(&compacted, flate_level)?;
         if after_flate > before_flate {
             continue;
@@ -1185,7 +1191,7 @@ pub fn compact_collinear_paths(
         stats.vertices_removed = stats.vertices_removed.saturating_add(vertices_removed);
         stats.decoded_bytes_removed = stats
             .decoded_bytes_removed
-            .saturating_add(decoded.len().saturating_sub(compacted.len()));
+            .saturating_add(normalized.len().saturating_sub(compacted.len()));
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
@@ -2630,6 +2636,55 @@ mod tests {
         assert!(!form_collinear_material(1023, 4095));
         assert!(form_collinear_material(1024, 0));
         assert!(form_collinear_material(0, 4096));
+    }
+
+    #[test]
+    fn page_collinear_compaction_uses_processing_normalized_representation() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        use std::io::Write as _;
+
+        let mut content = Vec::new();
+        for y in 0..4000 {
+            writeln!(
+                &mut content,
+                "0 {y} m   1 {y} l % removable trivia {y}\n   2 {y} l S"
+            )?;
+        }
+        assert!(content.len() >= MIN_PAGE_CONTENT_BYTES);
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 4000] /Resources << >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", &content)?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        assert_eq!(stats.pages_rewritten, 1);
+        assert_eq!(stats.forms_rewritten, 0);
+        assert_eq!(stats.vertices_removed, 4000);
+
+        let pages = document.page_handles()?;
+        assert_eq!(pages.len(), 1);
+        let Some(object) = document.current_owned_object(pages[0])? else {
+            return Err(crate::Error::Invalid("test page disappeared".to_owned()));
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            return Err(crate::Error::Invalid(
+                "test page is not a dictionary".to_owned(),
+            ));
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            return Err(crate::Error::Invalid("test page lost Contents".to_owned()));
+        };
+        let mut decoded = Vec::new();
+        decoded_content_value(&document, contents, &mut decoded)?;
+        assert!(!decoded.contains(&b'%'));
+        assert_eq!(operator_count(&decoded, b"l"), 4000);
+        Ok(())
     }
 
     #[test]
