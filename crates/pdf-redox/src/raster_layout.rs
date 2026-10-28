@@ -949,8 +949,8 @@ impl RasterVectorScanner {
         Ok(incomplete)
     }
 
-    fn finish(self) -> (RasterScanner, ProcessingVectorAnalysis) {
-        (self.raster, self.vector.finish())
+    fn finish(self, content: &[u8]) -> (RasterScanner, ProcessingVectorAnalysis) {
+        (self.raster, self.vector.finish(content))
     }
 }
 
@@ -1211,7 +1211,7 @@ fn scan_target_shared(
             }
             None
         };
-        let (raster, vector_analysis) = scanner.finish();
+        let (raster, vector_analysis) = scanner.finish(content);
         if !raster.complete {
             return Ok(None);
         }
@@ -5606,7 +5606,7 @@ pub fn normalize_raster_layout(
         resource_inventory_complete: true,
         ..RasterLayoutStats::default()
     };
-    let mut staged_xobjects = HashSet::new();
+    let mut inline_staging = Vec::new();
     let mut image_cache = RasterImageDecodeCache::default();
     let mut alpha_crop_cache = HashMap::<ObjectHandle, AlphaCropCacheEntry>::new();
     let mut alpha_crop_bounds_cache = HashMap::<ObjectHandle, Option<PixelCrop>>::new();
@@ -5729,7 +5729,9 @@ pub fn normalize_raster_layout(
                 .inline
                 .xobject_references_reused
                 .saturating_add(inline.stats.xobject_references_reused);
-            staged_xobjects.extend(inline.staged_xobjects);
+            if let Some(staging) = inline.staging {
+                inline_staging.push(staging);
+            }
             if inline.stats.scopes_rewritten == 0 {
                 continue;
             }
@@ -6035,8 +6037,14 @@ pub fn normalize_raster_layout(
         }
     }
     let staging_cleanup_started = Instant::now();
-    stats.staging_xobject_entries_removed =
-        cleanup_fragmented_inline_staging(document, &staged_xobjects)?;
+    let (staging_entries_removed, staging_restored_pages) =
+        cleanup_fragmented_inline_staging(document, &inline_staging)?;
+    stats.staging_xobject_entries_removed = staging_entries_removed;
+    if let Some(cache) = vector_cache {
+        for page in staging_restored_pages {
+            cache.remove(&page);
+        }
+    }
     stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
     if *DEBUG_RASTER {
         eprintln!(

@@ -718,12 +718,28 @@ fn ext_gstate_patches(
     Ok(out)
 }
 
+type SemanticKey = [u8; 32];
+
+#[cfg(test)]
+fn semantic_fingerprint(bytes: &[u8]) -> SemanticKey {
+    Sha256::digest(bytes).into()
+}
+
+fn update_semantic_hasher(hasher: &mut Sha256, operator: &[u8], values: &[f64]) {
+    hasher.update([u8::try_from(operator.len()).unwrap_or(u8::MAX)]);
+    hasher.update(operator);
+    for value in values {
+        let normalized = if *value == 0.0 { 0.0 } else { *value };
+        hasher.update(normalized.to_bits().to_be_bytes());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PathBlock {
     start: usize,
     end: usize,
     bounds: Rect,
-    semantic_key: Vec<u8>,
+    semantic_key: SemanticKey,
     operator_count: usize,
 }
 
@@ -731,19 +747,19 @@ struct PathBlockScanner {
     path_start: Option<usize>,
     path_valid: bool,
     bounds: Option<Rect>,
-    semantic_key: Vec<u8>,
+    semantic_hasher: Sha256,
     operator_count: usize,
     blocks: Vec<PathBlock>,
     inside_text: bool,
 }
 
 impl PathBlockScanner {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             path_start: None,
             path_valid: true,
             bounds: None,
-            semantic_key: Vec::new(),
+            semantic_hasher: Sha256::new(),
             operator_count: 0,
             blocks: Vec::new(),
             inside_text: false,
@@ -754,7 +770,7 @@ impl PathBlockScanner {
         self.path_start = None;
         self.path_valid = true;
         self.bounds = None;
-        self.semantic_key.clear();
+        self.semantic_hasher = Sha256::new();
         self.operator_count = 0;
     }
 
@@ -808,15 +824,8 @@ impl PathBlockScanner {
             self.path_valid = false;
             return;
         };
-        self.semantic_key
-            .push(u8::try_from(operator.len()).unwrap_or(u8::MAX));
-        self.semantic_key.extend_from_slice(operator);
+        update_semantic_hasher(&mut self.semantic_hasher, operator, &values);
         self.operator_count = self.operator_count.saturating_add(1);
-        for value in &values {
-            let normalized = if *value == 0.0 { 0.0 } else { *value };
-            self.semantic_key
-                .extend_from_slice(&normalized.to_bits().to_be_bytes());
-        }
         if operator == b"re" {
             let x = values[0];
             let y = values[1];
@@ -840,9 +849,9 @@ impl PathBlockScanner {
             && (block_len >= MIN_PATH_FORM_BYTES
                 || self.operator_count >= MIN_PROCESSING_PATH_FORM_OPERATORS)
         {
-            let mut semantic_key = self.semantic_key.clone();
-            semantic_key.push(u8::try_from(operator.len()).unwrap_or(u8::MAX));
-            semantic_key.extend_from_slice(operator);
+            let mut hasher = self.semantic_hasher.clone();
+            update_semantic_hasher(&mut hasher, operator, &[]);
+            let semantic_key = hasher.finalize().into();
             self.blocks.push(PathBlock {
                 start,
                 end,
@@ -902,7 +911,7 @@ struct TransformedBlockFrame {
     stage: TransformedBlockStage,
     valid: bool,
     body_start: usize,
-    semantic_key: Vec<u8>,
+    semantic_hasher: Sha256,
     operator_count: usize,
     path_bounds: Option<Rect>,
     paint_bounds: Option<Rect>,
@@ -910,12 +919,12 @@ struct TransformedBlockFrame {
 }
 
 impl TransformedBlockFrame {
-    const fn new(path_empty: bool) -> Self {
+    fn new(path_empty: bool) -> Self {
         Self {
             stage: TransformedBlockStage::ExpectPlacement,
             valid: path_empty,
             body_start: 0,
-            semantic_key: Vec::new(),
+            semantic_hasher: Sha256::new(),
             operator_count: 0,
             path_bounds: None,
             paint_bounds: None,
@@ -957,14 +966,7 @@ impl TransformedBlockFrame {
     }
 
     fn append_semantic(&mut self, operator: &[u8], values: &[f64]) {
-        self.semantic_key
-            .push(u8::try_from(operator.len()).unwrap_or(u8::MAX));
-        self.semantic_key.extend_from_slice(operator);
-        for value in values {
-            let normalized = if *value == 0.0 { 0.0 } else { *value };
-            self.semantic_key
-                .extend_from_slice(&normalized.to_bits().to_be_bytes());
-        }
+        update_semantic_hasher(&mut self.semantic_hasher, operator, values);
         self.operator_count = self.operator_count.saturating_add(1);
     }
 }
@@ -974,7 +976,7 @@ struct TransformedBlock {
     body_start: usize,
     body_end: usize,
     bounds: Rect,
-    semantic_key: Vec<u8>,
+    semantic_key: SemanticKey,
     operator_count: usize,
 }
 
@@ -1149,7 +1151,7 @@ impl TransformedBlockScanner {
                 body_start: frame.body_start,
                 body_end: q_offset,
                 bounds,
-                semantic_key: frame.semantic_key,
+                semantic_key: frame.semantic_hasher.finalize().into(),
                 operator_count: frame.operator_count,
             });
         }
@@ -1219,7 +1221,7 @@ struct ProcessingFactorScanner {
 }
 
 impl ProcessingFactorScanner {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             operands: Vec::new(),
             path: PathBlockScanner::new(),
@@ -1296,18 +1298,16 @@ pub fn processing_factor_candidate(
 ) -> bool {
     let mut path_keys = HashSet::new();
     let mut repeated_path = false;
-    let mut transformed = HashMap::<&[u8], (usize, usize, usize)>::new();
+    let mut transformed = HashMap::<SemanticKey, (usize, usize, usize)>::new();
     for analysis in cache.values() {
         for block in &analysis.path_blocks {
-            if !path_keys.insert(block.semantic_key.as_slice()) {
+            if !path_keys.insert(block.semantic_key) {
                 repeated_path = true;
             }
         }
         for block in &analysis.transformed_blocks {
             let body_len = block.body_end.saturating_sub(block.body_start);
-            let entry = transformed
-                .entry(block.semantic_key.as_slice())
-                .or_insert((0, 0, 0));
+            let entry = transformed.entry(block.semantic_key).or_insert((0, 0, 0));
             entry.0 = entry.0.saturating_add(1);
             // Equivalent semantic bodies can still differ lexically. Maxima are
             // deliberately conservative: they can cause a false positive (run
@@ -1351,14 +1351,14 @@ impl ProcessingPageScanner {
         ))
     }
 
-    pub(crate) fn finish(self) -> ProcessingVectorAnalysis {
+    pub(crate) fn finish(self, input: &[u8]) -> ProcessingVectorAnalysis {
         ProcessingVectorAnalysis {
             fills: self.fill.fills,
             path_blocks: self.factor.path.blocks,
             transformed_blocks: self.factor.transformed.blocks,
             path_coordinate_plan: self
                 .path_coordinates
-                .and_then(PathCoordinateScanner::finish),
+                .and_then(|scanner| scanner.finish(input)),
         }
     }
 
@@ -1388,7 +1388,7 @@ fn scan_processing_page(
     user_unit: Option<f64>,
 ) -> Option<ProcessingVectorAnalysis> {
     let mut scanner = ProcessingPageScanner::new(ext_gstates, user_unit);
-    matches!(scanner.scan(input), Ok(false)).then(|| scanner.finish())
+    matches!(scanner.scan(input), Ok(false)).then(|| scanner.finish(input))
 }
 
 #[derive(Debug, Clone)]
@@ -1483,7 +1483,7 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
         return Ok(false);
     }
 
-    let mut transformed_counts = HashMap::<&[u8], (usize, usize, usize)>::new();
+    let mut transformed_counts = HashMap::<SemanticKey, (usize, usize, usize)>::new();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
@@ -1499,9 +1499,11 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
         };
         for block in transformed_blocks {
             let body_len = block.body_end.saturating_sub(block.body_start);
-            let entry = transformed_counts
-                .entry(block.semantic_key.as_slice())
-                .or_insert((0, block.operator_count, body_len));
+            let entry = transformed_counts.entry(block.semantic_key).or_insert((
+                0,
+                block.operator_count,
+                body_len,
+            ));
             entry.0 = entry.0.saturating_add(1);
         }
     }
@@ -1513,7 +1515,7 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
         .map(|(key, _)| *key)
         .collect::<HashSet<_>>();
 
-    let mut path_keys = HashSet::<&[u8]>::new();
+    let mut path_keys = HashSet::<SemanticKey>::new();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
@@ -1529,14 +1531,14 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
         };
         for block in path_blocks {
             let nested_in_preferred = transformed_blocks.iter().any(|outer| {
-                preferred_transformed.contains(outer.semantic_key.as_slice())
+                preferred_transformed.contains(&outer.semantic_key)
                     && outer.body_start <= block.start
                     && block.end <= outer.body_end
             });
             if nested_in_preferred {
                 continue;
             }
-            if !path_keys.insert(block.semantic_key.as_slice()) {
+            if !path_keys.insert(block.semantic_key) {
                 return Ok(false);
             }
         }
@@ -1576,7 +1578,7 @@ fn factor_repeated_path_forms(
     let mut page_data = Vec::with_capacity(pages.len());
     let mut page_blocks =
         Vec::<(Vec<PathBlock>, Vec<TransformedBlock>)>::with_capacity(pages.len());
-    let mut groups = BTreeMap::<Vec<u8>, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
+    let mut groups = BTreeMap::<SemanticKey, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
     let mut occupied_names = BTreeSet::new();
     let mut scanned_blocks = 0usize;
     let mut cached_transformed = BTreeMap::new();
@@ -1609,13 +1611,15 @@ fn factor_repeated_path_forms(
     // inside it. Rewriting an inner path to a Form call makes that outer body
     // resource-dependent and intentionally ineligible for transformed-form
     // factoring later.
-    let mut transformed_counts = HashMap::<&[u8], (usize, usize, usize)>::new();
+    let mut transformed_counts = HashMap::<SemanticKey, (usize, usize, usize)>::new();
     for (_, transformed_blocks) in &page_blocks {
         for block in transformed_blocks {
             let body_len = block.body_end.saturating_sub(block.body_start);
-            let entry = transformed_counts
-                .entry(block.semantic_key.as_slice())
-                .or_insert((0, block.operator_count, body_len));
+            let entry = transformed_counts.entry(block.semantic_key).or_insert((
+                0,
+                block.operator_count,
+                body_len,
+            ));
             entry.0 = entry.0.saturating_add(1);
         }
     }
@@ -1624,7 +1628,7 @@ fn factor_repeated_path_forms(
         .filter(|(_, (count, operators, body_len))| {
             processing_transformed_factor_candidate(*body_len, *operators, *count)
         })
-        .map(|(key, _)| key.to_vec())
+        .map(|(key, _)| key)
         .collect::<HashSet<_>>();
 
     for (page_index, (path_blocks, transformed_blocks)) in page_blocks.into_iter().enumerate() {
@@ -1632,7 +1636,7 @@ fn factor_repeated_path_forms(
         for block in path_blocks {
             scanned_blocks = scanned_blocks.saturating_add(1);
             let nested_in_preferred = transformed_blocks.iter().any(|outer| {
-                preferred_transformed.contains(outer.semantic_key.as_slice())
+                preferred_transformed.contains(&outer.semantic_key)
                     && outer.body_start <= block.start
                     && block.end <= outer.body_end
             });
@@ -1855,7 +1859,7 @@ fn factor_repeated_transformed_blocks(
     pages: &[ObjectHandle],
 ) -> Result<VectorCompactionStats> {
     let mut page_data = Vec::with_capacity(pages.len());
-    let mut groups = BTreeMap::<Vec<u8>, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
+    let mut groups = BTreeMap::<SemanticKey, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
     let mut occupied_names = BTreeSet::new();
     let mut scanned_blocks = 0usize;
 
@@ -2803,14 +2807,8 @@ struct PathCoordinateOperand {
 
 #[derive(Debug, Clone)]
 struct PathCoordinatePlan {
-    replacements: Vec<(usize, usize, Vec<u8>)>,
+    canonicalized: Vec<u8>,
     coordinates_canonicalized: usize,
-}
-
-impl PathCoordinatePlan {
-    fn apply(&self, input: &[u8]) -> Option<Vec<u8>> {
-        apply_span_replacements(input, &self.replacements)
-    }
 }
 
 struct PathCoordinateScanner {
@@ -2928,7 +2926,7 @@ impl PathCoordinateScanner {
             .operands
             .iter()
             .map(|operand| operand.value)
-            .collect::<Option<Vec<_>>>()
+            .collect::<Option<SmallVec<[f64; 6]>>>()
         else {
             return;
         };
@@ -2936,7 +2934,7 @@ impl PathCoordinateScanner {
             .iter()
             .copied()
             .map(Self::rounded_coordinate)
-            .collect::<Option<Vec<_>>>()
+            .collect::<Option<SmallVec<[f64; 6]>>>()
         else {
             return;
         };
@@ -2971,7 +2969,7 @@ impl PathCoordinateScanner {
             .operands
             .iter()
             .map(|operand| operand.value)
-            .collect::<Option<Vec<_>>>()
+            .collect::<Option<SmallVec<[f64; 6]>>>()
             .filter(|values| values.len() == 6)
             .map(|values| {
                 Matrix::new(
@@ -3008,18 +3006,18 @@ impl PathCoordinateScanner {
             self.operands.clear();
             return;
         }
-        self.operands = instruction
-            .operands()
-            .zip(instruction.operand_spans())
-            .map(|(object, span)| PathCoordinateOperand {
-                value: crate::content_stream::operand_number(
-                    object,
-                    input.get(span.clone()).unwrap_or_default(),
-                ),
-                offset: span.start,
-                length: span.len(),
-            })
-            .collect();
+        self.operands.clear();
+        self.operands
+            .extend(instruction.operands().zip(instruction.operand_spans()).map(
+                |(object, span)| PathCoordinateOperand {
+                    value: crate::content_stream::operand_number(
+                        object,
+                        input.get(span.clone()).unwrap_or_default(),
+                    ),
+                    offset: span.start,
+                    length: span.len(),
+                },
+            ));
         self.process_operator(input, &instruction.operator[..]);
     }
 
@@ -3030,12 +3028,12 @@ impl PathCoordinateScanner {
         })
     }
 
-    fn finish(self) -> Option<PathCoordinatePlan> {
+    fn finish(self, input: &[u8]) -> Option<PathCoordinatePlan> {
         if !self.state_stack.is_empty() || self.replacements.is_empty() {
             return None;
         }
         Some(PathCoordinatePlan {
-            replacements: self.replacements,
+            canonicalized: apply_span_replacements(input, &self.replacements)?,
             coordinates_canonicalized: self.coordinates_canonicalized,
         })
     }
@@ -3059,9 +3057,9 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
     if !matches!(parsed, Ok(false)) {
         return None;
     }
-    let plan = scanner.finish()?;
+    let plan = scanner.finish(input)?;
     let coordinates = plan.coordinates_canonicalized;
-    Some((plan.apply(input)?, coordinates))
+    Some((plan.canonicalized, coordinates))
 }
 
 #[derive(Debug, Default)]
@@ -3101,7 +3099,7 @@ fn canonicalize_page_path_coordinates(
         let candidate = match cached {
             Some(Some(plan)) => {
                 let coordinates = plan.coordinates_canonicalized;
-                plan.apply(&decoded).map(|output| (output, coordinates))
+                Some((plan.canonicalized, coordinates))
             }
             Some(None) => continue,
             None => canonicalize_path_coordinates(&decoded, user_unit),
@@ -3316,6 +3314,9 @@ pub fn compact_vector_paths_with_flate_cache(
         total.estimated_flate_bytes_saved += before_flate.saturating_sub(after_flate);
     }
     if goal == OptimizationGoal::Processing {
+        for page in &vector_rewritten_pages {
+            path_coordinate_plans.remove(page);
+        }
         let mut late_rewritten_pages = BTreeSet::<ObjectHandle>::new();
         let factored =
             factor_repeated_path_forms(document, flate_level, pre_scanned_processing, &pages)?;
@@ -3335,6 +3336,9 @@ pub fn compact_vector_paths_with_flate_cache(
                 .extend(names.iter().cloned());
         }
 
+        for page in &factored.rewritten_pages {
+            path_coordinate_plans.remove(page);
+        }
         vector_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
         late_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
         let transformed = factor_repeated_transformed_blocks(
@@ -3354,6 +3358,9 @@ pub fn compact_vector_paths_with_flate_cache(
         total.transformed_form_estimated_flate_bytes_saved +=
             transformed.transformed_form_estimated_flate_bytes_saved;
         total.estimated_flate_bytes_saved += transformed.estimated_flate_bytes_saved;
+        for page in transformed.generated_page_xobjects.keys() {
+            path_coordinate_plans.remove(page);
+        }
         vector_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
         late_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
         for (page, names) in &transformed.generated_page_xobjects {
@@ -3374,6 +3381,9 @@ pub fn compact_vector_paths_with_flate_cache(
         total.shared_run_decoded_bytes_factored += shared_runs.shared_run_decoded_bytes_factored;
         total.shared_run_estimated_flate_bytes_saved +=
             shared_runs.shared_run_estimated_flate_bytes_saved;
+        for page in shared_runs.generated_page_xobjects.keys() {
+            path_coordinate_plans.remove(page);
+        }
         vector_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
         late_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
         for (page, names) in &shared_runs.generated_page_xobjects {
@@ -3444,7 +3454,7 @@ mod tests {
                     start: 0,
                     end: 1,
                     bounds,
-                    semantic_key: (*key).to_vec(),
+                    semantic_key: semantic_fingerprint(key),
                     operator_count: 1,
                 })
                 .collect(),
@@ -3454,7 +3464,7 @@ mod tests {
                     body_start: 0,
                     body_end: MIN_PROCESSING_PATH_FORM_BYTES,
                     bounds,
-                    semantic_key: (*key).to_vec(),
+                    semantic_key: semantic_fingerprint(key),
                     operator_count: 8,
                 })
                 .collect(),
@@ -3496,7 +3506,7 @@ mod tests {
                 path_blocks: Vec::new(),
                 transformed_blocks: Vec::new(),
                 path_coordinate_plan: Some(PathCoordinatePlan {
-                    replacements: vec![(0, 1, b"0".to_vec())],
+                    canonicalized: b"0".to_vec(),
                     coordinates_canonicalized: 1,
                 }),
             },
@@ -3521,7 +3531,7 @@ mod tests {
                 body_start: 0,
                 body_end: 39,
                 bounds,
-                semantic_key: key.to_vec(),
+                semantic_key: semantic_fingerprint(key),
                 operator_count: 32,
             }],
             path_coordinate_plan: None,
@@ -3989,14 +3999,12 @@ mod tests {
 
         let mut scanner = ProcessingPageScanner::new(BTreeMap::new(), Some(1.0));
         assert!(matches!(scanner.scan(input), Ok(false)));
-        let analysis = scanner.finish();
+        let analysis = scanner.finish(input);
         assert!(analysis.path_coordinate_plan.is_some());
         let Some(plan) = analysis.path_coordinate_plan else {
             return;
         };
-        let cached = plan
-            .apply(input)
-            .map(|output| (output, plan.coordinates_canonicalized));
+        let cached = Some((plan.canonicalized, plan.coordinates_canonicalized));
 
         assert_eq!(cached, standalone);
     }

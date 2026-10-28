@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::{form_content, form_resources, page_content, page_resources},
+    content::{form_content, form_resources, page_content, page_resources, replace_page_content},
 };
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
 use sha2::{Digest as _, Sha256};
@@ -31,6 +31,7 @@ struct DetachedInlineImage {
     dictionary: OwnedDictionary,
     data: Vec<u8>,
     fingerprint: InlineImageFingerprint,
+    original_inline: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,6 +347,12 @@ fn rewrite_inline_images(
         if span.start < cursor || span.end > content.len() {
             continue;
         }
+        let span_end = span.end;
+        let original_inline = if selected.is_none() {
+            content[span.clone()].to_vec()
+        } else {
+            Vec::new()
+        };
         output.extend_from_slice(&content[cursor..span.start]);
         let name = if let Some(name) = local_names.get(&fingerprint) {
             name.clone()
@@ -357,13 +364,14 @@ fn rewrite_inline_images(
                 dictionary,
                 data: data.into_owned(),
                 fingerprint,
+                original_inline,
             });
             name
         };
         output.push(b'/');
         output.extend_from_slice(&name);
         output.extend_from_slice(b" Do\n");
-        cursor = span.end;
+        cursor = span_end;
         externalized_occurrences = externalized_occurrences.saturating_add(1);
     }
     output.extend_from_slice(&content[cursor..]);
@@ -398,11 +406,22 @@ fn summary_for_target(
     }))
 }
 
-fn image_stream(document: &mut EditDocument, image: DetachedInlineImage) -> ObjectHandle {
+fn image_stream(
+    document: &mut EditDocument,
+    dictionary: OwnedDictionary,
+    data: Vec<u8>,
+) -> ObjectHandle {
     ObjectHandle::New(document.add_object(OwnedObject::Stream {
-        dictionary: image.dictionary,
-        data: StreamData::Owned(image.data),
+        dictionary,
+        data: StreamData::Owned(data),
     }))
+}
+
+#[derive(Debug)]
+pub struct InstalledInlineImage {
+    name: Vec<u8>,
+    handle: ObjectHandle,
+    original_inline: Vec<u8>,
 }
 
 fn install_rewrite(
@@ -412,10 +431,11 @@ fn install_rewrite(
     rewrite: DetachedInlineImageRewrite,
     xobjects_by_fingerprint: &mut HashMap<InlineImageFingerprint, ObjectHandle>,
     stats: &mut DuplicateInlineImageStats,
-) -> Result<()> {
+) -> Result<Vec<InstalledInlineImage>> {
     if rewrite.externalized_occurrences == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut installed = Vec::with_capacity(rewrite.images.len());
     let mut xobjects = match resources.get(b"XObject".as_slice()) {
         Some(value) => match document.resolve_owned_value(value)? {
             Some(OwnedObject::Dictionary(dictionary)) => dictionary,
@@ -424,18 +444,28 @@ fn install_rewrite(
         None => OwnedDictionary::new(),
     };
     for image in rewrite.images {
-        let fingerprint = image.fingerprint;
-        let name = image.name.clone();
+        let DetachedInlineImage {
+            name,
+            dictionary,
+            data,
+            fingerprint,
+            original_inline,
+        } = image;
         let handle = if let Some(handle) = xobjects_by_fingerprint.get(&fingerprint).copied() {
             stats.xobject_references_reused = stats.xobject_references_reused.saturating_add(1);
             handle
         } else {
-            let handle = image_stream(document, image);
+            let handle = image_stream(document, dictionary, data);
             xobjects_by_fingerprint.insert(fingerprint, handle);
             stats.xobjects_created = stats.xobjects_created.saturating_add(1);
             handle
         };
-        xobjects.insert(name, OwnedObject::Reference(handle));
+        xobjects.insert(name.clone(), OwnedObject::Reference(handle));
+        installed.push(InstalledInlineImage {
+            name,
+            handle,
+            original_inline,
+        });
     }
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
     match target {
@@ -464,7 +494,7 @@ fn install_rewrite(
     stats.occurrences_externalized = stats
         .occurrences_externalized
         .saturating_add(rewrite.externalized_occurrences);
-    Ok(())
+    Ok(installed)
 }
 
 pub fn externalize_duplicate_inline_images(
@@ -521,7 +551,7 @@ pub fn externalize_duplicate_inline_images(
             names,
             Some(&selected),
         )?;
-        install_rewrite(
+        let _ = install_rewrite(
             document,
             summary.target,
             summary.resources,
@@ -541,10 +571,16 @@ pub struct FragmentedInlineExternalizationStats {
     pub xobject_references_reused: usize,
 }
 
+#[derive(Debug)]
+pub struct FragmentedInlineStaging {
+    target: ContentTarget,
+    images: Vec<InstalledInlineImage>,
+}
+
 #[derive(Debug, Default)]
 pub struct FragmentedInlineExternalization {
     pub stats: FragmentedInlineExternalizationStats,
-    pub staged_xobjects: HashSet<ObjectHandle>,
+    pub(crate) staging: Option<FragmentedInlineStaging>,
 }
 
 pub fn externalize_fragmented_inline_target(
@@ -580,7 +616,7 @@ pub fn externalize_fragmented_inline_target(
     }
     let mut local_xobjects = HashMap::new();
     let mut stats = DuplicateInlineImageStats::default();
-    install_rewrite(
+    let installed = install_rewrite(
         document,
         target,
         resources,
@@ -588,9 +624,10 @@ pub fn externalize_fragmented_inline_target(
         &mut local_xobjects,
         &mut stats,
     )?;
-    result
-        .staged_xobjects
-        .extend(local_xobjects.values().copied());
+    result.staging = Some(FragmentedInlineStaging {
+        target,
+        images: installed,
+    });
     result.stats.scopes_rewritten = 1;
     result.stats.occurrences_externalized = stats.occurrences_externalized;
     result.stats.xobjects_created = stats.xobjects_created;
@@ -615,30 +652,67 @@ fn used_xobject_names(content: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
     (!incomplete).then_some(used)
 }
 
-/// Remove only temporary `XObject` resource entries created by fragmented-inline
-/// staging that no longer have a `Do` reference after raster reconstruction.
-/// Other pre-existing resource entries are left untouched.
+fn restore_staged_inline_references(
+    content: &[u8],
+    replacements: &HashMap<Vec<u8>, Vec<u8>>,
+) -> Option<(Vec<u8>, usize)> {
+    if replacements.is_empty() {
+        return Some((content.to_vec(), 0));
+    }
+    let mut spans = Vec::<(usize, usize, Vec<u8>)>::new();
+    let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+        if &instruction.operator[..] == b"Do"
+            && let Some(name) = instruction
+                .operands()
+                .next()
+                .and_then(crate::content_stream::operand_name)
+            && let Some(original) = replacements.get(name)
+        {
+            let span = instruction.span();
+            spans.push((span.start, span.end, original.clone()));
+        }
+        Ok(())
+    })
+    .ok()?;
+    if incomplete {
+        return None;
+    }
+    if spans.is_empty() {
+        return Some((content.to_vec(), 0));
+    }
+    spans.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut output = Vec::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for (start, end, original) in &spans {
+        if *start < cursor || *end > content.len() || *start > *end {
+            return None;
+        }
+        output.extend_from_slice(&content[cursor..*start]);
+        output.extend_from_slice(original);
+        cursor = *end;
+    }
+    output.extend_from_slice(&content[cursor..]);
+    Some((output, spans.len()))
+}
+
+/// Roll back fragmented-inline staging that raster reconstruction did not
+/// consume, then remove the temporary `XObject` bindings. A staged `Do` that is
+/// still present after all plans have run is a failed speculation; restoring
+/// its original `BI ... EI` bytes keeps raster normalization from bloating the
+/// output merely to discover that no safe merge exists.
 pub fn cleanup_fragmented_inline_staging(
     document: &mut EditDocument,
-    staged_xobjects: &HashSet<ObjectHandle>,
-) -> Result<usize> {
-    if staged_xobjects.is_empty() {
-        return Ok(0);
-    }
+    staging: &[FragmentedInlineStaging],
+) -> Result<(usize, BTreeSet<ObjectHandle>)> {
     let mut removed = 0usize;
-    for target in collect_targets(document)? {
+    let mut restored_pages = BTreeSet::new();
+    for staged in staging {
+        let target = staged.target;
         let mut resources = match target {
             ContentTarget::Page(page) => page_resources(document, page)?,
             ContentTarget::Form(form) => form_resources(document, form)?,
         }
         .unwrap_or_default();
-        let content = match target {
-            ContentTarget::Page(page) => page_content(document, page)?,
-            ContentTarget::Form(form) => form_content(document, form)?,
-        };
-        let Some(used_xobjects) = used_xobject_names(&content) else {
-            continue;
-        };
         let Some(value) = resources.get(b"XObject".as_slice()).cloned() else {
             continue;
         };
@@ -646,20 +720,45 @@ pub fn cleanup_fragmented_inline_staging(
         else {
             continue;
         };
+        let mut replacements = HashMap::<Vec<u8>, Vec<u8>>::new();
+        for image in &staged.images {
+            let still_bound = matches!(
+                xobjects.get(image.name.as_slice()),
+                Some(OwnedObject::Reference(handle)) if *handle == image.handle
+            );
+            if still_bound {
+                replacements.insert(image.name.clone(), image.original_inline.clone());
+            }
+        }
+        let content = match target {
+            ContentTarget::Page(page) => page_content(document, page)?,
+            ContentTarget::Form(form) => form_content(document, form)?,
+        };
+        let Some((rewritten, restored)) = restore_staged_inline_references(&content, &replacements)
+        else {
+            continue;
+        };
+        let Some(used_xobjects) = used_xobject_names(&rewritten) else {
+            continue;
+        };
         let before = xobjects.len();
         xobjects.retain(|name, value| {
-            let staged =
-                matches!(value, OwnedObject::Reference(handle) if staged_xobjects.contains(handle));
-            !staged || used_xobjects.contains(name)
+            let staged_binding = staged.images.iter().any(|image| {
+                image.name.as_slice() == name.as_slice()
+                    && matches!(value, OwnedObject::Reference(handle) if *handle == image.handle)
+            });
+            !staged_binding || used_xobjects.contains(name)
         });
         let removed_here = before.saturating_sub(xobjects.len());
-        if removed_here == 0 {
-            continue;
-        }
-        removed += removed_here;
+        removed = removed.saturating_add(removed_here);
         resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
+
         match target {
             ContentTarget::Page(page) => {
+                if restored != 0 {
+                    replace_page_content(document, page, rewritten)?;
+                    restored_pages.insert(page);
+                }
                 let object = document.edit_handle(page)?;
                 if let Some(dictionary) = object.as_dictionary_mut() {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
@@ -667,11 +766,107 @@ pub fn cleanup_fragmented_inline_staging(
             }
             ContentTarget::Form(form) => {
                 let object = document.edit_handle(form)?;
-                if let Some(dictionary) = object.as_dictionary_mut() {
+                if let OwnedObject::Stream { dictionary, data } = object {
                     dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+                    if restored != 0 {
+                        dictionary.remove(b"Filter".as_slice());
+                        dictionary.remove(b"DecodeParms".as_slice());
+                        dictionary.remove(b"Length".as_slice());
+                        *data = StreamData::Owned(rewritten);
+                    }
                 }
             }
         }
+        if *DEBUG_RASTER && restored != 0 {
+            eprintln!("raster-inline rollback {target:?}: restored={restored}");
+        }
     }
-    Ok(removed)
+    Ok((removed, restored_pages))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restores_only_matching_staged_do_references() {
+        let original = b"BI /W 1 /H 1 /CS /G /BPC 8 ID \x7f EI".to_vec();
+        let replacements = HashMap::from([(b"IIm1".to_vec(), original.clone())]);
+        let input = b"q /IIm1 Do /Other Do Q";
+        let Some((rewritten, restored)) = restore_staged_inline_references(input, &replacements)
+        else {
+            panic!("expected a complete content rewrite");
+        };
+        assert_eq!(restored, 1);
+        assert!(
+            rewritten
+                .windows(original.len())
+                .any(|window| window == original)
+        );
+        assert!(
+            rewritten
+                .windows(b"/Other Do".len())
+                .any(|window| window == b"/Other Do")
+        );
+        assert!(
+            !rewritten
+                .windows(b"/IIm1 Do".len())
+                .any(|window| window == b"/IIm1 Do")
+        );
+    }
+
+    #[test]
+    fn cleanup_reports_page_whose_staging_was_restored() -> Result<()> {
+        use crate::{ObjectId, test_support::ClassicPdfBuilder};
+
+        let original_inline = b"BI /W 1 /H 1 /CS /G /BPC 8 ID \x7f EI".to_vec();
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /IIm1 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"/IIm1 Do\n")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0x7f],
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let image = ObjectHandle::Existing(ObjectId::new(5, 0));
+        let staging = [FragmentedInlineStaging {
+            target: ContentTarget::Page(page),
+            images: vec![InstalledInlineImage {
+                name: b"IIm1".to_vec(),
+                handle: image,
+                original_inline: original_inline.clone(),
+            }],
+        }];
+
+        let (removed, restored_pages) = cleanup_fragmented_inline_staging(&mut document, &staging)?;
+        assert_eq!(removed, 1);
+        assert_eq!(restored_pages, BTreeSet::from([page]));
+        let content = page_content(&document, page)?;
+        assert!(content.starts_with(&original_inline));
+        assert!(
+            !content
+                .windows(b"IIm1".len())
+                .any(|window| window == b"IIm1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_is_noop_without_matching_reference() {
+        let replacements = HashMap::from([(b"IIm1".to_vec(), b"BI ID x EI".to_vec())]);
+        let input = b"q /Other Do Q";
+        let Some((rewritten, restored)) = restore_staged_inline_references(input, &replacements)
+        else {
+            panic!("expected a complete content rewrite");
+        };
+        assert_eq!(restored, 0);
+        assert_eq!(rewritten, input);
+    }
 }
