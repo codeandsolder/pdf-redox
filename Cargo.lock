@@ -273,12 +273,12 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hayro-ccitt"
 version = "0.4.0"
-source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#c073f251c0a5b8c889a610a72cee6e79e3d4b941"
+source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#18cb5787e90f604fdf13035e0dd9d4db70c1eac2"
 
 [[package]]
 name = "hayro-jbig2"
 version = "0.3.1"
-source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#c073f251c0a5b8c889a610a72cee6e79e3d4b941"
+source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#18cb5787e90f604fdf13035e0dd9d4db70c1eac2"
 dependencies = [
  "hayro-ccitt",
 ]
@@ -286,12 +286,12 @@ dependencies = [
 [[package]]
 name = "hayro-jpeg2000"
 version = "0.4.1"
-source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#c073f251c0a5b8c889a610a72cee6e79e3d4b941"
+source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#18cb5787e90f604fdf13035e0dd9d4db70c1eac2"
 
 [[package]]
 name = "hayro-syntax"
 version = "0.8.0"
-source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#c073f251c0a5b8c889a610a72cee6e79e3d4b941"
+source = "git+https://github.com/codeandsolder/hayro?branch=pdf-redox%2Fzero-flpdf-base#18cb5787e90f604fdf13035e0dd9d4db70c1eac2"
 dependencies = [
  "hayro-ccitt",
  "hayro-jbig2",
