@@ -98,7 +98,12 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
                 output.push(b' ');
             }
             first = false;
-            output.extend_from_slice(input.get(span).unwrap_or_default());
+            let raw = input.get(span).unwrap_or_default();
+            let end = raw
+                .iter()
+                .rposition(|byte| !matches!(byte, 0x00 | 0x09 | 0x0a | 0x0c | 0x0d | 0x20))
+                .map_or(0, |index| index + 1);
+            output.extend_from_slice(&raw[..end]);
         }
         if !first {
             output.push(b' ');
@@ -109,5 +114,21 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
         output
     } else {
         input.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_normalization_is_idempotent_for_composite_operand_spacing() {
+        let input = b"/Span <</ActualText<FEFF2008>>>  BDC\n( ) Tj\nEMC";
+        let normalized = normalize_content_stream(input);
+        assert_eq!(
+            normalized,
+            b"/Span <</ActualText<FEFF2008>>> BDC\n( ) Tj\nEMC"
+        );
+        assert_eq!(normalize_content_stream(&normalized), normalized);
     }
 }
