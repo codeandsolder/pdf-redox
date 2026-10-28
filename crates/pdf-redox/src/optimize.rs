@@ -1220,15 +1220,17 @@ fn optimize_pdf_with_document(
         || structure_compaction.name_tree_nodes_removed > 0
         || structure_compaction.named_destination_wrappers_inlined > 0
         || structure_compaction.named_destination_arrays_inlined > 0
+        || structure_compaction.stale_page_destination_references_rewritten > 0
     {
         notes.push(format!(
-            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), and inlined {} indirect destination array(s).",
+            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), inlined {} indirect destination array(s), and retargeted {} stale page destination reference(s).",
             structure_compaction.page_tree_nodes_before,
             structure_compaction.page_tree_nodes_after,
             structure_compaction.name_tree_nodes_before,
             structure_compaction.name_tree_nodes_after,
             structure_compaction.named_destination_wrappers_inlined,
-            structure_compaction.named_destination_arrays_inlined
+            structure_compaction.named_destination_arrays_inlined,
+            structure_compaction.stale_page_destination_references_rewritten
         ));
     }
     if pattern_payload_factor.groups_factored > 0 {
@@ -1496,6 +1498,8 @@ fn optimize_pdf_with_document(
         name_tree_nodes_removed: structure_compaction.name_tree_nodes_removed,
         named_destination_wrappers_inlined: structure_compaction.named_destination_wrappers_inlined,
         named_destination_arrays_inlined: structure_compaction.named_destination_arrays_inlined,
+        stale_page_destination_references_rewritten: structure_compaction
+            .stale_page_destination_references_rewritten,
         microstroke_pages_rasterized: microstroke_raster.pages_rewritten,
         microstroke_runs_rasterized: microstroke_raster.runs_rasterized,
         microstroke_strokes_rasterized: microstroke_raster.strokes_rasterized,
