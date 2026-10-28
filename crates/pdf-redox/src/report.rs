@@ -1026,6 +1026,10 @@ pub struct OptimizationReport {
     /// Number of raster staging `XObject` entries removed.
     pub raster_staging_xobject_entries_removed: usize,
     #[serde(default)]
+    /// Number of staged inline reconstruction batches rejected because their encoded payload
+    /// would not beat restoring the original inline representation.
+    pub raster_inline_reconstruction_payload_rejections: usize,
+    #[serde(default)]
     /// Number of raster rewritten `XObject` entries removed.
     pub raster_rewritten_xobject_entries_removed: usize,
     #[serde(default)]

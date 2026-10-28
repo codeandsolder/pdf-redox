@@ -493,7 +493,13 @@ fn optimize_pdf_with_document(
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
             && !repeated_page_objects_may_rewrite)
             .then_some(&mut raster_vector_cache);
-        normalize_raster_layout(&mut document, &cfg.raster_layout, flate_level, vector_cache)
+        normalize_raster_layout(
+            &mut document,
+            &cfg.raster_layout,
+            flate_level,
+            cfg.optimization_goal == crate::OptimizationGoal::Processing,
+            vector_cache,
+        )
     })?;
     for (name, micros) in [
         ("inline-externalize", raster_layout.inline_externalize_us),
@@ -1480,6 +1486,8 @@ fn optimize_pdf_with_document(
         raster_deferred_tile_candidates: raster_layout.deferred_tile_candidates,
         raster_deferred_tile_paints_consumed: raster_layout.deferred_tile_paints_consumed,
         raster_staging_xobject_entries_removed: raster_layout.staging_xobject_entries_removed,
+        raster_inline_reconstruction_payload_rejections: raster_layout
+            .inline_reconstruction_payload_rejections,
         raster_rewritten_xobject_entries_removed: raster_layout.rewritten_xobject_entries_removed,
         resource_entries_pruned: resource_prune.entries_removed,
         resource_font_entries_pruned: resource_prune.font_entries_removed,
