@@ -523,10 +523,105 @@ fn write_objstm(
     Ok(())
 }
 
-fn push_xref_stream_entry(output: &mut Vec<u8>, kind: u8, field2: u64, field3: u16) {
-    output.push(kind);
-    output.extend_from_slice(&field2.to_be_bytes());
-    output.extend_from_slice(&field3.to_be_bytes());
+const fn xref_field_width(value: u64) -> usize {
+    if value <= 0xff {
+        1
+    } else if value <= 0xffff {
+        2
+    } else if value <= 0xff_ffff {
+        3
+    } else if value <= 0xffff_ffff {
+        4
+    } else if value <= 0xff_ffff_ffff {
+        5
+    } else if value <= 0xffff_ffff_ffff {
+        6
+    } else if value <= 0xff_ffff_ffff_ffff {
+        7
+    } else {
+        8
+    }
+}
+
+fn push_be_field(output: &mut Vec<u8>, value: u64, width: usize) {
+    let bytes = value.to_be_bytes();
+    output.extend_from_slice(&bytes[bytes.len() - width..]);
+}
+
+fn push_xref_stream_entry(
+    output: &mut Vec<u8>,
+    widths: [usize; 3],
+    kind: u8,
+    field2: u64,
+    field3: u16,
+) {
+    push_be_field(output, u64::from(kind), widths[0]);
+    push_be_field(output, field2, widths[1]);
+    push_be_field(output, u64::from(field3), widths[2]);
+}
+
+fn png_up_predict_rows(data: &[u8], columns: usize) -> Vec<u8> {
+    debug_assert_ne!(columns, 0);
+    debug_assert_eq!(data.len() % columns, 0);
+    let rows = data.len() / columns;
+    let mut predicted = Vec::with_capacity(data.len().saturating_add(rows));
+    for (row_index, row) in data.chunks_exact(columns).enumerate() {
+        predicted.push(2);
+        let previous = row_index
+            .checked_sub(1)
+            .map(|previous| &data[previous * columns..row_index * columns]);
+        for (column, &byte) in row.iter().enumerate() {
+            let above = previous.map_or(0, |row| row[column]);
+            predicted.push(byte.wrapping_sub(above));
+        }
+    }
+    predicted
+}
+
+fn encode_xref_stream(
+    data: &[u8],
+    row_width: usize,
+    level: crate::FlateLevel,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let plain = crate::stream_codec::encode_flate(data, level)?;
+    let predicted = png_up_predict_rows(data, row_width);
+    let predicted = crate::stream_codec::encode_flate(&predicted, level)?;
+    let decode_parms = format!(" /DecodeParms << /Predictor 12 /Columns {row_width} >>");
+    let plain_cost = plain.len().saturating_add(plain.len().to_string().len());
+    let predicted_cost = predicted
+        .len()
+        .saturating_add(predicted.len().to_string().len())
+        .saturating_add(decode_parms.len());
+    if predicted_cost < plain_cost {
+        Ok((predicted, Some(decode_parms)))
+    } else {
+        Ok((plain, None))
+    }
+}
+
+fn encode_xref_entries(
+    entries: &[(u8, u64, u16)],
+    widths: [usize; 3],
+    level: crate::FlateLevel,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let row_width = widths.iter().sum::<usize>();
+    let mut data = Vec::with_capacity(entries.len().saturating_mul(row_width));
+    for &(kind, field2, field3) in entries {
+        push_xref_stream_entry(&mut data, widths, kind, field2, field3);
+    }
+    encode_xref_stream(&data, row_width, level)
+}
+
+fn xref_representation_cost(
+    widths: [usize; 3],
+    encoded_len: usize,
+    decode_parms: Option<&str>,
+) -> usize {
+    format!(" /W [{} {} {}]", widths[0], widths[1], widths[2])
+        .len()
+        .saturating_add(encoded_len)
+        .saturating_add(encoded_len.to_string().len())
+        .saturating_add(decode_parms.map_or(0, str::len))
 }
 
 #[expect(
@@ -630,28 +725,67 @@ pub fn write_pdf_with_object_streams(
 
     let xref_offset = output.len();
     normal_offsets.insert(xref_id, xref_offset);
-    let mut xref_data = Vec::with_capacity(size as usize * 11);
-    push_xref_stream_entry(&mut xref_data, 0, 0, 65535);
     let mut compressed_by_id = BTreeMap::<u32, (u32, u16)>::new();
     for (handle, entry) in &compressed {
         compressed_by_id.insert(plan.id(*handle)?.0, *entry);
     }
+
+    let mut entries = Vec::with_capacity(size as usize);
+    entries.push((0, 0, u16::MAX));
     for id in 1..size {
         if let Some(&(objstm, index)) = compressed_by_id.get(&id) {
-            push_xref_stream_entry(&mut xref_data, 2, u64::from(objstm), index);
+            entries.push((2, u64::from(objstm), index));
         } else {
             let offset = normal_offsets.get(&id).copied().ok_or_else(|| {
                 Error::Invalid(format!("missing xref-stream offset for output object {id}"))
             })?;
-            push_xref_stream_entry(&mut xref_data, 1, offset as u64, 0);
+            let offset = u64::try_from(offset)
+                .map_err(|_| Error::Invalid("xref-stream offset exceeds u64".to_owned()))?;
+            entries.push((1, offset, 0));
         }
     }
-    let encoded_xref = crate::stream_codec::encode_flate(&xref_data, level)?;
 
+    let max_field2 = entries
+        .iter()
+        .map(|(_, field2, _)| *field2)
+        .max()
+        .unwrap_or(0);
+    let compact_widths = [
+        1,
+        xref_field_width(max_field2),
+        xref_field_width(u64::from(u16::MAX)),
+    ];
+    let legacy_widths = [1, 8, 2];
+    let (compact_xref, compact_decode_parms) =
+        encode_xref_entries(&entries, compact_widths, level)?;
+    let compact_cost = xref_representation_cost(
+        compact_widths,
+        compact_xref.len(),
+        compact_decode_parms.as_deref(),
+    );
+    let (legacy_xref, legacy_decode_parms) = if compact_widths == legacy_widths {
+        (compact_xref.clone(), compact_decode_parms.clone())
+    } else {
+        encode_xref_entries(&entries, legacy_widths, level)?
+    };
+    let legacy_cost = xref_representation_cost(
+        legacy_widths,
+        legacy_xref.len(),
+        legacy_decode_parms.as_deref(),
+    );
+    let (widths, encoded_xref, xref_decode_parms) = if compact_cost < legacy_cost {
+        (compact_widths, compact_xref, compact_decode_parms)
+    } else {
+        (legacy_widths, legacy_xref, legacy_decode_parms)
+    };
     writeln!(&mut output, "{xref_id} 0 obj")?;
     output.extend_from_slice(b"<< /Type /XRef /Size ");
     write!(&mut output, "{size}")?;
-    output.extend_from_slice(b" /W [1 8 2] /Root ");
+    write!(
+        &mut output,
+        " /W [{} {} {}] /Root ",
+        widths[0], widths[1], widths[2]
+    )?;
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
     for (name, value) in document.trailer() {
         output.push(b' ');
@@ -659,7 +793,11 @@ pub fn write_pdf_with_object_streams(
         output.push(b' ');
         write_owned_object(&mut output, value, document, &plan)?;
     }
-    output.extend_from_slice(b" /Filter /FlateDecode /Length ");
+    output.extend_from_slice(b" /Filter /FlateDecode");
+    if let Some(decode_parms) = xref_decode_parms {
+        output.extend_from_slice(decode_parms.as_bytes());
+    }
+    output.extend_from_slice(b" /Length ");
     write!(&mut output, "{}", encoded_xref.len())?;
     output.extend_from_slice(b" >>\nstream\n");
     output.extend_from_slice(&encoded_xref);
@@ -673,6 +811,86 @@ pub fn write_pdf_with_object_streams(
 mod tests {
     use super::*;
     use crate::{ObjectId, OwnedDictionary, SourcePdf};
+
+    #[test]
+    fn xref_field_width_is_minimal() {
+        assert_eq!(xref_field_width(0), 1);
+        assert_eq!(xref_field_width(0xff), 1);
+        assert_eq!(xref_field_width(0x100), 2);
+        assert_eq!(xref_field_width(0xff_ffff), 3);
+        assert_eq!(xref_field_width(0x100_0000), 4);
+        assert_eq!(xref_field_width(u64::MAX), 8);
+    }
+
+    #[test]
+    fn png_up_predictor_emits_filter_byte_and_row_deltas() {
+        let predicted = png_up_predict_rows(&[0, 1, 2, 0, 2, 4], 3);
+        assert_eq!(predicted, [2, 0, 1, 2, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn xref_predictor_is_admitted_only_for_total_encoded_savings() -> crate::Result<()> {
+        let mut evolving = Vec::with_capacity(4096 * 6);
+        for index in 0_u32..4096 {
+            let bytes = index.to_be_bytes();
+            evolving.extend_from_slice(&[1, bytes[1], bytes[2], bytes[3], 0, 0]);
+        }
+        let (_, decode_parms) = encode_xref_stream(&evolving, 6, crate::FlateLevel::PROCESSING)?;
+        assert!(decode_parms.is_some());
+
+        let tiny = [0_u8, 0, 0, 0];
+        let (_, decode_parms) =
+            encode_xref_stream(&tiny, tiny.len(), crate::FlateLevel::PROCESSING)?;
+        assert!(decode_parms.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compact_xref_widths_fall_back_when_flate_is_larger() -> crate::Result<()> {
+        let entries = [
+            (0, 0, u16::MAX),
+            (1, 15, 0),
+            (2, 6, 0),
+            (2, 6, 1),
+            (2, 6, 2),
+            (1, 64, 0),
+            (1, 2_674_847, 0),
+            (1, 2_675_307, 0),
+        ];
+        let compact_widths = [1, 3, 2];
+        let legacy_widths = [1, 8, 2];
+        let (compact, compact_decode_parms) =
+            encode_xref_entries(&entries, compact_widths, crate::FlateLevel::PROCESSING)?;
+        let (legacy, legacy_decode_parms) =
+            encode_xref_entries(&entries, legacy_widths, crate::FlateLevel::PROCESSING)?;
+        assert!(
+            xref_representation_cost(
+                compact_widths,
+                compact.len(),
+                compact_decode_parms.as_deref(),
+            ) >= xref_representation_cost(
+                legacy_widths,
+                legacy.len(),
+                legacy_decode_parms.as_deref(),
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn object_stream_writer_round_trips_predicted_xref_stream() -> crate::Result<()> {
+        let document = EditDocument::from_bytes(sample_pdf(false))?;
+        let output = write_pdf_with_object_streams(&document, crate::FlateLevel::PROCESSING)?;
+        assert!(
+            !output
+                .windows(b"/W [1 8 2]".len())
+                .any(|window| window == b"/W [1 8 2]")
+        );
+        let rewritten = SourcePdf::from_bytes(output)?;
+        assert_eq!(rewritten.page_count(), 1);
+        assert_eq!(rewritten.object_count(), 6);
+        Ok(())
+    }
 
     #[test]
     fn compact_writer_round_trips_and_drops_unreachable_objects() -> crate::Result<()> {
