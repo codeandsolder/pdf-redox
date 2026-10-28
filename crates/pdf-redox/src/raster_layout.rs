@@ -7,7 +7,9 @@ use crate::{
         form_content, form_resources, page_content, page_resources, page_user_unit, resolved_bool,
         resolved_dictionary, resolved_number,
     },
-    content_stream::{InstructionOperand, instruction_operands, operand_numbers},
+    content_stream::{
+        InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
+    },
     hidden_text::{HiddenTextSharedContext, PhysicalHiddenTextScanner, hidden_text_shared_context},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
@@ -72,6 +74,7 @@ pub struct RasterLayoutStats {
     pub deferred_tile_candidates: usize,
     pub deferred_tile_paints_consumed: usize,
     pub staging_xobject_entries_removed: usize,
+    pub inline_reconstruction_payload_rejections: usize,
     pub rewritten_xobject_entries_removed: usize,
     pub inline_occurrences_remaining: usize,
     pub inline_inventory_complete: bool,
@@ -4910,6 +4913,33 @@ struct ApplyPlansResult {
     consumed_draws: HashSet<usize>,
     added_resource_names: BTreeSet<Vec<u8>>,
     obsolete_resource_names: BTreeSet<Vec<u8>>,
+    added_image_payload_bytes: usize,
+    has_non_fragment_plan: bool,
+}
+
+fn encoded_content_payload_len(
+    content: &[u8],
+    flate_level: crate::FlateLevel,
+    normalize_before_flate: bool,
+) -> Result<usize> {
+    let normalized = normalize_before_flate.then(|| normalize_content_stream(content));
+    let bytes = normalized.as_deref().unwrap_or(content);
+    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
+}
+
+fn inline_reconstruction_fits_budget(
+    fallback_content: &[u8],
+    candidate_content: &[u8],
+    added_image_payload_bytes: usize,
+    flate_level: crate::FlateLevel,
+    normalize_before_flate: bool,
+) -> Result<bool> {
+    let fallback_payload =
+        encoded_content_payload_len(fallback_content, flate_level, normalize_before_flate)?;
+    let candidate_payload =
+        encoded_content_payload_len(candidate_content, flate_level, normalize_before_flate)?
+            .saturating_add(added_image_payload_bytes);
+    Ok(candidate_payload < fallback_payload)
 }
 
 fn candidate_payload_fits_budget(
@@ -5116,6 +5146,25 @@ fn apply_plans(
                 }
                 continue;
             }
+        }
+
+        let plan_payload_bytes = prepared_main
+            .as_ref()
+            .map_or(0, PreparedImage::payload_bytes)
+            .saturating_add(
+                prepared_background
+                    .as_ref()
+                    .map_or(0, |(_, prepared)| prepared.payload_bytes()),
+            );
+        if matches!(
+            plan.kind,
+            MergeKind::PixelCluster | MergeKind::NativeFragment | MergeKind::Stripe
+        ) {
+            result.added_image_payload_bytes = result
+                .added_image_payload_bytes
+                .saturating_add(plan_payload_bytes);
+        } else {
+            result.has_non_fragment_plan = true;
         }
 
         stats.transparent_margins_cropped += usize::from(transparent_cropped);
@@ -5599,6 +5648,7 @@ pub fn normalize_raster_layout(
     document: &mut EditDocument,
     config: &RasterLayoutConfig,
     flate_level: crate::FlateLevel,
+    normalize_content_for_budget: bool,
     mut vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
 ) -> Result<RasterLayoutStats> {
     if *DEBUG_RASTER {
@@ -6007,8 +6057,18 @@ pub fn normalize_raster_layout(
             )?;
         }
 
+        let inline_target = match target {
+            ContentTarget::Page(page) => InlineContentTarget::Page(page),
+            ContentTarget::Form(form) => InlineContentTarget::Form(form),
+        };
+        let target_staging = inline_staging
+            .iter()
+            .find(|staging| staging.target() == inline_target);
+        let resources_before_apply = target_staging.map(|_| resources.clone());
+        let stats_before_apply = target_staging.map(|_| stats.clone());
+
         let apply_plans_started = Instant::now();
-        let applied = apply_plans(
+        let mut applied = apply_plans(
             document,
             ApplyPlansContext {
                 target,
@@ -6024,9 +6084,66 @@ pub fn normalize_raster_layout(
             plans,
             &mut stats,
         )?;
-        stats.apply_plans_us = stats
-            .apply_plans_us
-            .saturating_add(elapsed_micros_u64(apply_plans_started));
+        let apply_plans_us = elapsed_micros_u64(apply_plans_started);
+        stats.apply_plans_us = stats.apply_plans_us.saturating_add(apply_plans_us);
+
+        if applied.changed
+            && !applied.has_non_fragment_plan
+            && !applied.consumed_draws.is_empty()
+            && let Some(staging) = target_staging
+            && applied.consumed_draws.iter().all(|index| {
+                scanner
+                    .draws
+                    .get(*index)
+                    .is_some_and(|draw| staging.contains_resource_name(&draw.resource_name))
+            })
+            && let (Some(fallback_content), Some(candidate_content)) = (
+                staging.restore_all_references(&content),
+                staging.restore_all_references(&target_content(document, target)?),
+            )
+            && !inline_reconstruction_fits_budget(
+                &fallback_content,
+                &candidate_content,
+                applied.added_image_payload_bytes,
+                flate_level,
+                normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
+            )?
+        {
+            if *DEBUG_RASTER {
+                let fallback_payload = encoded_content_payload_len(
+                    &fallback_content,
+                    flate_level,
+                    normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
+                )?;
+                let candidate_payload = encoded_content_payload_len(
+                    &candidate_content,
+                    flate_level,
+                    normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
+                )?
+                .saturating_add(applied.added_image_payload_bytes);
+                eprintln!(
+                    "raster-inline payload rollback {target:?}: candidate={candidate_payload} fallback={fallback_payload} image_payload={}",
+                    applied.added_image_payload_bytes
+                );
+            }
+            let Some(resources) = resources_before_apply else {
+                return Err(Error::Invalid(
+                    "missing pre-apply resources for staged inline rollback".to_owned(),
+                ));
+            };
+            install_target(document, target, resources, content.clone())?;
+            let Some(mut snapshot) = stats_before_apply else {
+                return Err(Error::Invalid(
+                    "missing pre-apply stats for staged inline rollback".to_owned(),
+                ));
+            };
+            snapshot.apply_plans_us = snapshot.apply_plans_us.saturating_add(apply_plans_us);
+            snapshot.inline_reconstruction_payload_rejections = snapshot
+                .inline_reconstruction_payload_rejections
+                .saturating_add(1);
+            stats = snapshot;
+            applied = ApplyPlansResult::default();
+        }
         if applied.changed
             && let ContentTarget::Page(page) = target
             && let Some(cache) = vector_cache.as_deref_mut()
@@ -6678,6 +6795,35 @@ mod tests {
         assert!(candidate_payload_fits_budget(Some(1_000), 999));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_000));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_001));
+    }
+
+    #[test]
+    fn inline_reconstruction_budget_compares_final_encoded_representation() -> Result<()> {
+        let compact_fallback = vec![b'A'; 8 * 1024];
+        assert!(!inline_reconstruction_fits_budget(
+            &compact_fallback,
+            b"q /RL1 Do Q",
+            8 * 1024,
+            crate::FlateLevel::PROCESSING,
+            false,
+        )?);
+
+        let mut noisy_fallback = Vec::with_capacity(8 * 1024);
+        let mut state = 0x1234_5678_u32;
+        for _ in 0..8 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            noisy_fallback.push(state.to_le_bytes()[0]);
+        }
+        assert!(inline_reconstruction_fits_budget(
+            &noisy_fallback,
+            b"q /RL1 Do Q",
+            64,
+            crate::FlateLevel::PROCESSING,
+            false,
+        )?);
+        Ok(())
     }
 
     #[test]

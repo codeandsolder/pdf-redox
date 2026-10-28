@@ -577,6 +577,27 @@ pub struct FragmentedInlineStaging {
     images: Vec<InstalledInlineImage>,
 }
 
+impl FragmentedInlineStaging {
+    pub(crate) const fn target(&self) -> ContentTarget {
+        self.target
+    }
+
+    pub(crate) fn contains_resource_name(&self, name: &[u8]) -> bool {
+        self.images
+            .iter()
+            .any(|image| image.name.as_slice() == name)
+    }
+
+    pub(crate) fn restore_all_references(&self, content: &[u8]) -> Option<Vec<u8>> {
+        let replacements = self
+            .images
+            .iter()
+            .map(|image| (image.name.clone(), image.original_inline.clone()))
+            .collect::<HashMap<_, _>>();
+        restore_staged_inline_references(content, &replacements).map(|(content, _)| content)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FragmentedInlineExternalization {
     pub stats: FragmentedInlineExternalizationStats,
