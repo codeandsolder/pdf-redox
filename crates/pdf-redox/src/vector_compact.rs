@@ -3064,6 +3064,12 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
     Some((plan.apply(input)?, coordinates))
 }
 
+#[derive(Debug, Default)]
+struct PathCoordinateOutcome {
+    stats: VectorCompactionStats,
+    rewritten_pages: BTreeSet<ObjectHandle>,
+}
+
 fn canonicalize_page_path_coordinates(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -3071,8 +3077,9 @@ fn canonicalize_page_path_coordinates(
     mut pre_scanned: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
     rewritten_pages: &BTreeSet<ObjectHandle>,
     reuse_cache: &mut FlateReuseCache,
-) -> Result<VectorCompactionStats> {
+) -> Result<PathCoordinateOutcome> {
     let mut stats = VectorCompactionStats::default();
+    let mut coordinate_rewritten_pages = BTreeSet::new();
     for &page in pages {
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;
@@ -3122,6 +3129,7 @@ fn canonicalize_page_path_coordinates(
             continue;
         }
         replace_page_content(document, page, canonicalized.clone())?;
+        coordinate_rewritten_pages.insert(page);
         stats.pages_compacted = stats.pages_compacted.saturating_add(1);
         stats.path_coordinate_pages_rewritten =
             stats.path_coordinate_pages_rewritten.saturating_add(1);
@@ -3137,7 +3145,60 @@ fn canonicalize_page_path_coordinates(
         stats.estimated_flate_bytes_saved =
             stats.estimated_flate_bytes_saved.saturating_add(savings);
     }
-    Ok(stats)
+    Ok(PathCoordinateOutcome {
+        stats,
+        rewritten_pages: coordinate_rewritten_pages,
+    })
+}
+
+fn compact_processing_fill_tail(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    pages: &BTreeSet<ObjectHandle>,
+) -> Result<VectorCompactionStats> {
+    let mut total = VectorCompactionStats::default();
+    for &page in pages {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
+        let resources = match document.inherited_page_value(page, b"Resources")? {
+            Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
+            None => OwnedDictionary::default(),
+        };
+        let ext_gstates = ext_gstate_patches(document, &resources)?;
+        let (compacted, stats) = compact_content_with_ext_gstates(&decoded, &ext_gstates);
+        if compacted == decoded {
+            continue;
+        }
+        let before_flate = compressed_len(&decoded, flate_level)?;
+        let after_flate = compressed_len(&compacted, flate_level)?;
+        replace_page_content(document, page, compacted)?;
+        total.pages_compacted = total.pages_compacted.saturating_add(1);
+        total.fill_groups_batched = total
+            .fill_groups_batched
+            .saturating_add(stats.fill_groups_batched);
+        total.covered_fills_pruned = total
+            .covered_fills_pruned
+            .saturating_add(stats.covered_fills_pruned);
+        total.fill_paints_eliminated = total
+            .fill_paints_eliminated
+            .saturating_add(stats.fill_paints_eliminated);
+        total.decoded_bytes_removed = total
+            .decoded_bytes_removed
+            .saturating_add(stats.decoded_bytes_removed);
+        total.estimated_flate_bytes_saved = total
+            .estimated_flate_bytes_saved
+            .saturating_add(before_flate.saturating_sub(after_flate));
+    }
+    Ok(total)
 }
 
 fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
@@ -3255,6 +3316,7 @@ pub fn compact_vector_paths_with_flate_cache(
         total.estimated_flate_bytes_saved += before_flate.saturating_sub(after_flate);
     }
     if goal == OptimizationGoal::Processing {
+        let mut late_rewritten_pages = BTreeSet::<ObjectHandle>::new();
         let factored =
             factor_repeated_path_forms(document, flate_level, pre_scanned_processing, &pages)?;
         total.path_forms_created += factored.stats.path_forms_created;
@@ -3274,6 +3336,7 @@ pub fn compact_vector_paths_with_flate_cache(
         }
 
         vector_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
+        late_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
         let transformed = factor_repeated_transformed_blocks(
             document,
             flate_level,
@@ -3292,6 +3355,7 @@ pub fn compact_vector_paths_with_flate_cache(
             transformed.transformed_form_estimated_flate_bytes_saved;
         total.estimated_flate_bytes_saved += transformed.estimated_flate_bytes_saved;
         vector_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
+        late_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
         for (page, names) in &transformed.generated_page_xobjects {
             total
                 .generated_page_xobjects
@@ -3311,6 +3375,7 @@ pub fn compact_vector_paths_with_flate_cache(
         total.shared_run_estimated_flate_bytes_saved +=
             shared_runs.shared_run_estimated_flate_bytes_saved;
         vector_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
+        late_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
         for (page, names) in &shared_runs.generated_page_xobjects {
             total
                 .generated_page_xobjects
@@ -3327,15 +3392,31 @@ pub fn compact_vector_paths_with_flate_cache(
             &vector_rewritten_pages,
             flate_reuse_cache,
         )?;
-        total.pages_compacted += path_coordinates.pages_compacted;
-        total.decoded_bytes_removed += path_coordinates.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += path_coordinates.estimated_flate_bytes_saved;
-        total.path_coordinates_canonicalized += path_coordinates.path_coordinates_canonicalized;
-        total.path_coordinate_pages_rewritten += path_coordinates.path_coordinate_pages_rewritten;
+        vector_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
+        late_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
+        let path_coordinate_stats = path_coordinates.stats;
+        total.pages_compacted += path_coordinate_stats.pages_compacted;
+        total.decoded_bytes_removed += path_coordinate_stats.decoded_bytes_removed;
+        total.estimated_flate_bytes_saved += path_coordinate_stats.estimated_flate_bytes_saved;
+        total.path_coordinates_canonicalized +=
+            path_coordinate_stats.path_coordinates_canonicalized;
+        total.path_coordinate_pages_rewritten +=
+            path_coordinate_stats.path_coordinate_pages_rewritten;
         total.path_coordinate_decoded_bytes_removed +=
-            path_coordinates.path_coordinate_decoded_bytes_removed;
+            path_coordinate_stats.path_coordinate_decoded_bytes_removed;
         total.path_coordinate_estimated_flate_bytes_saved +=
-            path_coordinates.path_coordinate_estimated_flate_bytes_saved;
+            path_coordinate_stats.path_coordinate_estimated_flate_bytes_saved;
+
+        // Processing-only coordinate/factoring rewrites can make exact rectangle
+        // adjacency visible only after the initial fill scan. Close that local
+        // dependency here instead of requiring another whole optimizer pass.
+        let fill_tail = compact_processing_fill_tail(document, flate_level, &late_rewritten_pages)?;
+        total.pages_compacted += fill_tail.pages_compacted;
+        total.fill_groups_batched += fill_tail.fill_groups_batched;
+        total.covered_fills_pruned += fill_tail.covered_fills_pruned;
+        total.fill_paints_eliminated += fill_tail.fill_paints_eliminated;
+        total.decoded_bytes_removed += fill_tail.decoded_bytes_removed;
+        total.estimated_flate_bytes_saved += fill_tail.estimated_flate_bytes_saved;
     }
     Ok(total)
 }
@@ -3863,6 +3944,24 @@ mod tests {
     fn shared_q_block_gap_accepts_only_pdf_trivia() {
         assert!(shared_gap_is_trivia(b" \n% comment\r\n\t"));
         assert!(!shared_gap_is_trivia(b" 0 0 m "));
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_can_expose_exact_fill_adjacency() {
+        let input = b"0 0 10.004 10 re f 10.003 0 9.997 10 re f";
+        let (before, before_stats) = compact_content(input);
+        assert_eq!(before, input);
+        assert_eq!(before_stats.fill_groups_batched, 0);
+
+        let Some((canonicalized, coordinates)) = canonicalize_path_coordinates(input, 1.0) else {
+            panic!("expected path-coordinate canonicalization");
+        };
+        assert!(coordinates > 0);
+
+        let (after, after_stats) = compact_content(&canonicalized);
+        assert_eq!(after_stats.fill_groups_batched, 1);
+        assert_eq!(after_stats.fill_paints_eliminated, 1);
+        assert!(String::from_utf8_lossy(&after).contains("0 0 20 10 re f"));
     }
 
     #[test]
