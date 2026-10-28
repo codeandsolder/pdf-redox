@@ -1051,10 +1051,10 @@ mod tests {
     #[test]
     fn owned_reals_use_source_number_canonicalization() -> crate::Result<()> {
         for (value, expected) in [
-            (-2.3609999999999998, b"-2.361".as_slice()),
-            (-1.5110000000000001, b"-1.511".as_slice()),
-            (-1.7109999999999999, b"-1.711".as_slice()),
-            (1.6840000000000002, b"1.6840000000000002".as_slice()),
+            (-2.360_999_999_999_999_8, b"-2.361".as_slice()),
+            (-1.511_000_000_000_000_1, b"-1.511".as_slice()),
+            (-1.710_999_999_999_999_9, b"-1.711".as_slice()),
+            (1.684_000_000_000_000_2, b"1.6840000000000002".as_slice()),
             (-0.0, b"0".as_slice()),
         ] {
             let mut output = Vec::new();
