@@ -1066,6 +1066,10 @@ pub struct OptimizationReport {
     /// Number of page tree pages reparented.
     pub page_tree_pages_reparented: usize,
     #[serde(default)]
+    /// Number of redundant inherited page-tree entries removed because every descendant
+    /// path supplies the same key below that node.
+    pub shadowed_page_tree_inherited_entries_removed: usize,
+    #[serde(default)]
     /// Number of name trees repacked.
     pub name_trees_repacked: usize,
     #[serde(default)]
