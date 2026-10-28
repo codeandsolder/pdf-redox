@@ -1,8 +1,23 @@
-use crate::{EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result};
+use crate::{
+    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, source::CurrentObject,
+};
+use hayro_syntax::object::{Name as HayroName, Object as HayroObject};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_TREE_FANOUT: usize = 256;
 const NAME_TREE_FANOUT: usize = 64;
+const PAGE_IDENTITY_KEYS: [&[u8]; 10] = [
+    b"Contents",
+    b"Resources",
+    b"MediaBox",
+    b"CropBox",
+    b"Rotate",
+    b"UserUnit",
+    b"Group",
+    b"BleedBox",
+    b"TrimBox",
+    b"ArtBox",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StructureCompactionStats {
@@ -16,6 +31,148 @@ pub struct StructureCompactionStats {
     pub name_tree_nodes_removed: usize,
     pub named_destination_wrappers_inlined: usize,
     pub named_destination_arrays_inlined: usize,
+    pub stale_page_destination_references_rewritten: usize,
+}
+
+fn source_page_identity(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<Option<Vec<Option<OwnedObject>>>> {
+    let ObjectHandle::Existing(id) = page else {
+        return Ok(None);
+    };
+    let object = document.source().materialize(id)?;
+    let Some(dictionary) = object.as_dictionary() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        PAGE_IDENTITY_KEYS
+            .into_iter()
+            .map(|key| dictionary.get(key).cloned())
+            .collect(),
+    ))
+}
+
+fn reachable_page_dictionaries(document: &EditDocument) -> Result<Vec<ObjectHandle>> {
+    let mut pages = Vec::new();
+    document.walk_output_objects(|handle, object| {
+        let is_page = match object {
+            CurrentObject::Source(HayroObject::Dict(dictionary)) => dictionary
+                .get::<HayroName<'_>>(b"Type")
+                .is_some_and(|name| name.as_ref() == b"Page"),
+            CurrentObject::Owned(OwnedObject::Dictionary(dictionary)) => {
+                let Some(kind) = dictionary.get(b"Type".as_slice()) else {
+                    return Ok(());
+                };
+                matches!(
+                    document.resolve_owned_value(kind)?,
+                    Some(OwnedObject::Name(name)) if name == b"Page"
+                )
+            }
+            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
+        };
+        if is_page {
+            pages.push(handle);
+        }
+        Ok(())
+    })?;
+    Ok(pages)
+}
+
+fn stale_page_destination_map(
+    document: &EditDocument,
+) -> Result<BTreeMap<ObjectHandle, ObjectHandle>> {
+    let live_pages = document
+        .page_handles()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut live_identities = Vec::new();
+    for &page in &live_pages {
+        if let Some(identity) = source_page_identity(document, page)? {
+            live_identities.push((page, identity));
+        }
+    }
+
+    let mut redirects = BTreeMap::new();
+    for handle in reachable_page_dictionaries(document)? {
+        if live_pages.contains(&handle) {
+            continue;
+        }
+        let Some(identity) = source_page_identity(document, handle)? else {
+            continue;
+        };
+        let mut matches = live_identities
+            .iter()
+            .filter(|(_, live_identity)| *live_identity == identity)
+            .map(|(page, _)| *page);
+        let Some(canonical) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_none() {
+            redirects.insert(handle, canonical);
+        }
+    }
+    Ok(redirects)
+}
+
+const fn is_destination_mode(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"XYZ" | b"Fit" | b"FitH" | b"FitV" | b"FitR" | b"FitB" | b"FitBH" | b"FitBV"
+    )
+}
+
+fn rewrite_stale_page_destinations(
+    value: &mut OwnedObject,
+    redirects: &BTreeMap<ObjectHandle, ObjectHandle>,
+) -> usize {
+    let mut rewritten = 0usize;
+    match value {
+        OwnedObject::Array(values) => {
+            if values.len() >= 2
+                && let OwnedObject::Reference(target) = values[0]
+                && let OwnedObject::Name(mode) = &values[1]
+                && is_destination_mode(mode)
+                && let Some(canonical) = redirects.get(&target).copied()
+            {
+                values[0] = OwnedObject::Reference(canonical);
+                rewritten = rewritten.saturating_add(1);
+            }
+            for item in values {
+                rewritten =
+                    rewritten.saturating_add(rewrite_stale_page_destinations(item, redirects));
+            }
+        }
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for item in dictionary.values_mut() {
+                rewritten =
+                    rewritten.saturating_add(rewrite_stale_page_destinations(item, redirects));
+            }
+        }
+        _ => {}
+    }
+    rewritten
+}
+
+fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<usize> {
+    let redirects = stale_page_destination_map(document)?;
+    if redirects.is_empty() {
+        return Ok(0);
+    }
+    let handles = document.reachable_objects()?;
+    let mut rewritten = 0usize;
+    for handle in handles {
+        let Some(mut object) = document.current_owned_object(handle)? else {
+            continue;
+        };
+        let count = rewrite_stale_page_destinations(&mut object, &redirects);
+        if count == 0 {
+            continue;
+        }
+        *document.edit_handle(handle)? = object;
+        rewritten = rewritten.saturating_add(count);
+    }
+    Ok(rewritten)
 }
 
 fn dictionary_reference(dictionary: &OwnedDictionary, key: &[u8]) -> Option<ObjectHandle> {
@@ -564,7 +721,12 @@ fn compact_catalog_name_trees(
 }
 
 pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompactionStats> {
-    let mut stats = StructureCompactionStats::default();
+    let mut stats = StructureCompactionStats {
+        stale_page_destination_references_rewritten: canonicalize_stale_page_destinations(
+            document,
+        )?,
+        ..StructureCompactionStats::default()
+    };
     compact_catalog_name_trees(document, &mut stats)?;
     compact_page_tree(document, &mut stats)?;
     Ok(stats)
@@ -573,7 +735,113 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ClassicPdfBuilder;
+    use crate::{content::replace_page_content, test_support::ClassicPdfBuilder};
+
+    fn stale_destination_fixture(ambiguous: bool, destination_mode: &[u8]) -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        let open_action = format!("[9 0 R /{}]", String::from_utf8_lossy(destination_mode));
+        pdf.object(
+            1,
+            format!("<< /Type /Catalog /Pages 2 0 R /OpenAction {open_action} >>").as_bytes(),
+        )?;
+        if ambiguous {
+            pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>")?;
+        } else {
+            pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        }
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources <<>> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"0 0 m 1 1 l S")?;
+        if ambiguous {
+            pdf.object(
+                6,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources <<>> /Contents 4 0 R >>",
+            )?;
+        }
+        pdf.object(8, b"<< /Type /Pages /Kids [9 0 R] /Count 1 >>")?;
+        pdf.object(
+            9,
+            b"<< /Type /Page /Parent 8 0 R /MediaBox [0 0 10 10] /Resources <<>> /Contents 4 0 R >>",
+        )?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn canonicalizes_stale_page_destination_after_live_content_rewrite() -> Result<()> {
+        let mut document = stale_destination_fixture(false, b"Fit")?;
+        let live_page = ObjectHandle::Existing(crate::ObjectId::new(3, 0));
+        replace_page_content(&mut document, live_page, b"q Q".to_vec())?;
+
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.stale_page_destination_references_rewritten, 1);
+
+        let catalog = current_dictionary(
+            &document,
+            ObjectHandle::Existing(document.source().catalog_id()),
+        )?
+        .ok_or_else(|| crate::Error::Invalid("catalog is missing".to_owned()))?;
+        assert!(matches!(
+            catalog.get(b"OpenAction".as_slice()),
+            Some(OwnedObject::Array(destination))
+                if matches!(destination.first(), Some(OwnedObject::Reference(target)) if *target == live_page)
+        ));
+        let reachable = document.reachable_objects()?;
+        assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(8, 0))));
+        assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0))));
+        assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(4, 0))));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_page_destination_mapping_rejects_ambiguous_live_pages() -> Result<()> {
+        let mut document = stale_destination_fixture(true, b"Fit")?;
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.stale_page_destination_references_rewritten, 0);
+        assert!(
+            document
+                .reachable_objects()?
+                .contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_page_destination_mapping_requires_same_page_identity() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /OpenAction [9 0 R /Fit] >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources <<>> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"0 0 m 1 1 l S")?;
+        pdf.object(8, b"<< /Type /Pages /Kids [9 0 R] /Count 1 >>")?;
+        pdf.object(9, b"<< /Type /Page /Parent 8 0 R /MediaBox [0 0 20 10] /Resources <<>> /Contents 4 0 R >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.stale_page_destination_references_rewritten, 0);
+        assert!(
+            document
+                .reachable_objects()?
+                .contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_page_destination_rewrite_requires_standard_destination_mode() -> Result<()> {
+        let mut document = stale_destination_fixture(false, b"NotADest")?;
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.stale_page_destination_references_rewritten, 0);
+        assert!(
+            document
+                .reachable_objects()?
+                .contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0)))
+        );
+        Ok(())
+    }
 
     #[test]
     fn inlines_indirect_named_destination_arrays() -> Result<()> {

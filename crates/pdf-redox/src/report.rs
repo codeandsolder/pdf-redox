@@ -1080,6 +1080,9 @@ pub struct OptimizationReport {
     /// Number of indirect named-destination arrays inlined into name-tree leaves.
     pub named_destination_arrays_inlined: usize,
     #[serde(default)]
+    /// Number of destination arrays retargeted from stale page copies to live pages.
+    pub stale_page_destination_references_rewritten: usize,
+    #[serde(default)]
     /// Number of microstroke pages rasterized.
     pub microstroke_pages_rasterized: usize,
     #[serde(default)]
