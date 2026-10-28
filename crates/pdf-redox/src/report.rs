@@ -245,6 +245,11 @@ pub struct PdfAnalysis {
     pub page_representation_unknown_reasons: BTreeMap<String, usize>,
     /// Number of object entries.
     pub object_count: usize,
+    /// Per-page count of unique indirect objects reachable from the page dictionary,
+    /// including the page object itself but excluding the page-tree `/Parent` back-link.
+    /// Entries follow document page order.
+    #[serde(default)]
+    pub page_reachable_object_counts: Vec<usize>,
     /// Reachable indirect COS objects grouped by intrinsic structural role.
     #[serde(default)]
     pub object_role_counts: BTreeMap<String, usize>,

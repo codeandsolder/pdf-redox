@@ -581,6 +581,36 @@ struct ContentAnalysisStats {
     form_paint_count: usize,
     form_max_paints: usize,
     form_incomplete_parse_count: usize,
+    page_reachable_object_counts: Vec<usize>,
+}
+
+fn page_reachable_object_count(document: &EditDocument, page: CowObjectHandle) -> Result<usize> {
+    let Some(page_object) = document.current_owned_object(page)? else {
+        return Ok(0);
+    };
+
+    let mut seen = BTreeSet::new();
+    seen.insert(page);
+    let mut pending = Vec::new();
+    if let Some(dictionary) = page_object.as_dictionary() {
+        for (key, value) in dictionary {
+            if key.as_slice() != b"Parent" {
+                pending.extend(value.references());
+            }
+        }
+    } else {
+        pending.extend(page_object.references());
+    }
+
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        if let Some(object) = document.current_owned_object(handle)? {
+            pending.extend(object.references());
+        }
+    }
+    Ok(seen.len())
 }
 
 #[derive(Debug, Default)]
@@ -655,6 +685,8 @@ fn scan_content(
 fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
     let mut out = ContentAnalysisStats::default();
     for page in document.page_handles()? {
+        out.page_reachable_object_counts
+            .push(page_reachable_object_count(document, page)?);
         let content = page_content(document, page)?;
         let resources = page_resources(document, page)?.unwrap_or_default();
         let mut classifier = crate::page_representation::begin_page_classifier(document, page)?;
@@ -1508,6 +1540,7 @@ fn analyze_document_impl(
                 out.inline_image_bytes = content.inline_bytes;
                 out.duplicate_inline_image_payload_groups = duplicate_groups;
                 out.duplicate_inline_image_payload_wasted_bytes = duplicate_wasted_bytes;
+                out.page_reachable_object_counts = content.page_reachable_object_counts;
                 out.page_content_instruction_count = content.page_instruction_count;
                 out.page_content_max_instructions_per_page = content.page_max_instructions;
                 out.page_content_path_construction_operator_count =
@@ -1991,6 +2024,33 @@ mod tests {
         let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
         assert_eq!(analysis.font_opportunity_inventory_version, 1);
         assert_eq!(analysis.font_explicit_cid_to_gid_ref_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_page_reachable_object_counts_exclude_page_tree_parent() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /X 7 0 R >> >> /Contents 5 0 R >>",
+        )?;
+        pdf.object(
+            4,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 6 0 R >>",
+        )?;
+        pdf.stream(5, b"", b"q /X Do Q")?;
+        pdf.stream(6, b"", b"q Q")?;
+        pdf.stream(
+            7,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /Private 8 0 R >>",
+            b"q Q",
+        )?;
+        pdf.object(8, b"<< /Marker true >>")?;
+
+        let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
+        assert_eq!(analysis.page_reachable_object_counts, vec![4, 2]);
         Ok(())
     }
 
