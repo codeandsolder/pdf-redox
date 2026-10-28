@@ -789,14 +789,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restores_only_matching_staged_do_references() {
+    fn restores_only_matching_staged_do_references() -> Result<()> {
         let original = b"BI /W 1 /H 1 /CS /G /BPC 8 ID \x7f EI".to_vec();
         let replacements = HashMap::from([(b"IIm1".to_vec(), original.clone())]);
         let input = b"q /IIm1 Do /Other Do Q";
-        let Some((rewritten, restored)) = restore_staged_inline_references(input, &replacements)
-        else {
-            panic!("expected a complete content rewrite");
-        };
+        let (rewritten, restored) = restore_staged_inline_references(input, &replacements)
+            .ok_or_else(|| {
+                crate::Error::Invalid("expected a complete content rewrite".to_owned())
+            })?;
         assert_eq!(restored, 1);
         assert!(
             rewritten
@@ -813,6 +813,7 @@ mod tests {
                 .windows(b"/IIm1 Do".len())
                 .any(|window| window == b"/IIm1 Do")
         );
+        Ok(())
     }
 
     #[test]
@@ -859,14 +860,15 @@ mod tests {
     }
 
     #[test]
-    fn rollback_is_noop_without_matching_reference() {
+    fn rollback_is_noop_without_matching_reference() -> Result<()> {
         let replacements = HashMap::from([(b"IIm1".to_vec(), b"BI ID x EI".to_vec())]);
         let input = b"q /Other Do Q";
-        let Some((rewritten, restored)) = restore_staged_inline_references(input, &replacements)
-        else {
-            panic!("expected a complete content rewrite");
-        };
+        let (rewritten, restored) = restore_staged_inline_references(input, &replacements)
+            .ok_or_else(|| {
+                crate::Error::Invalid("expected a complete content rewrite".to_owned())
+            })?;
         assert_eq!(restored, 0);
         assert_eq!(rewritten, input);
+        Ok(())
     }
 }
