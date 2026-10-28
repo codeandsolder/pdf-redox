@@ -3448,6 +3448,7 @@ struct MergePlan {
     data: Vec<u8>,
     alpha: Option<Vec<u8>>,
     source_color_budget: Option<usize>,
+    source_payload_budget: Option<usize>,
     desired_ctm: Matrix,
     background: Option<BackgroundPaint>,
     alpha_crop_hint: Option<PixelCrop>,
@@ -3883,14 +3884,21 @@ fn build_stripe_plan(
     );
     let first_member = *members.iter().min()?;
     let mut source_images = HashSet::new();
-    let source_color_budget = members.iter().try_fold(0usize, |total, index| {
-        let target = draws[*index].target;
-        if !source_images.insert(target) {
-            return Some(total);
-        }
-        let info = infos.get(&target)?;
-        total.checked_add(info.encoded_color_bytes)
-    })?;
+    let (source_color_budget, source_payload_budget) =
+        members.iter().try_fold((0usize, 0usize), |totals, index| {
+            let target = draws[*index].target;
+            if !source_images.insert(target) {
+                return Some(totals);
+            }
+            let info = infos.get(&target)?;
+            Some((
+                totals.0.checked_add(info.encoded_color_bytes)?,
+                totals
+                    .1
+                    .checked_add(info.encoded_color_bytes)?
+                    .checked_add(info.encoded_mask_bytes)?,
+            ))
+        })?;
     Some(MergePlan {
         members: members.to_vec(),
         first_member,
@@ -3902,6 +3910,7 @@ fn build_stripe_plan(
         source_color_budget: first_info
             .preserve_encoded_color
             .then_some(source_color_budget),
+        source_payload_budget: Some(source_payload_budget),
         desired_ctm,
         background: None,
         alpha_crop_hint: None,
@@ -4262,6 +4271,7 @@ fn build_pixel_cluster_plan(
         data,
         alpha,
         source_color_budget: None,
+        source_payload_budget: None,
         desired_ctm,
         background: None,
         alpha_crop_hint: None,
@@ -4902,6 +4912,14 @@ struct ApplyPlansResult {
     obsolete_resource_names: BTreeSet<Vec<u8>>,
 }
 
+fn candidate_payload_fits_budget(
+    source_payload_budget: Option<usize>,
+    candidate_payload: usize,
+) -> bool {
+    source_payload_budget
+        .is_none_or(|source_payload| source_payload == 0 || candidate_payload < source_payload)
+}
+
 fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEncodingStats) {
     stats.binary_images_packed += usize::from(encoding.binary_packed);
     stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
@@ -5075,6 +5093,24 @@ fn apply_plans(
                     .map_or(0, |(_, background)| background.payload_bytes()),
             );
             if source_payload > 0 && candidate_payload >= source_payload {
+                for member in &plan.members {
+                    claimed.remove(member);
+                }
+                continue;
+            }
+        }
+
+        if plan.kind == MergeKind::Stripe
+            && cached_crop.is_none()
+            && let (Some(prepared), Some(source_payload)) =
+                (prepared_main.as_ref(), plan.source_payload_budget)
+        {
+            let candidate_payload = prepared.payload_bytes().saturating_add(
+                prepared_background
+                    .as_ref()
+                    .map_or(0, |(_, background)| background.payload_bytes()),
+            );
+            if !candidate_payload_fits_budget(Some(source_payload), candidate_payload) {
                 for member in &plan.members {
                     claimed.remove(member);
                 }
@@ -5265,6 +5301,7 @@ fn append_alpha_crop_plans(
             data: Vec::new(),
             alpha: None,
             source_color_budget: None,
+            source_payload_budget: None,
             desired_ctm: draw.ctm,
             background: None,
             alpha_crop_hint: Some(crop),
@@ -5315,6 +5352,7 @@ fn find_constant_color_mask_stencil_plans(
             data: Vec::new(),
             alpha: Some(alpha.data.to_vec()),
             source_color_budget: None,
+            source_payload_budget: None,
             desired_ctm: draw.ctm,
             background: None,
             alpha_crop_hint: None,
@@ -6611,6 +6649,38 @@ mod tests {
     }
 
     #[test]
+    fn stripe_plan_counts_each_source_payload_once() -> Result<()> {
+        let mut top = test_draw(1, 0.0);
+        top.ctm = Matrix::new(6.0, 0.0, 0.0, 2.0, 10.0, 22.0);
+        top.replace_ctm = top.ctm;
+        let mut bottom = test_draw(1, 0.0);
+        bottom.ctm = Matrix::new(6.0, 0.0, 0.0, 2.0, 10.0, 20.0);
+        bottom.replace_ctm = bottom.ctm;
+        let draws = vec![top, bottom];
+        let mut image = stripe_test_image(6, 2, vec![10; 12]);
+        image.encoded_color_bytes = 123;
+        image.encoded_mask_bytes = 17;
+        let infos = HashMap::from([(draws[0].target, image)]);
+        let Some(plan) = build_stripe_plan(&draws, &infos, &[0, 1], StripeAxis::Vertical, 1024)
+        else {
+            return Err(Error::Invalid(
+                "expected repeated-source stripe plan".to_owned(),
+            ));
+        };
+        assert_eq!(plan.source_payload_budget, Some(140));
+        Ok(())
+    }
+
+    #[test]
+    fn stripe_payload_budget_rejects_nonwinning_reencode() {
+        assert!(candidate_payload_fits_budget(None, 1_000));
+        assert!(candidate_payload_fits_budget(Some(0), 1_000));
+        assert!(candidate_payload_fits_budget(Some(1_000), 999));
+        assert!(!candidate_payload_fits_budget(Some(1_000), 1_000));
+        assert!(!candidate_payload_fits_budget(Some(1_000), 1_001));
+    }
+
+    #[test]
     fn transparent_crop_finds_nonzero_alpha_bounds() {
         let alpha = vec![
             0, 0, 0, 0, //
@@ -6802,6 +6872,7 @@ mod tests {
             data: (0..16).collect(),
             alpha: None,
             source_color_budget: None,
+            source_payload_budget: None,
             desired_ctm: Matrix::new(40.0, 0.0, 0.0, 20.0, 10.0, 30.0),
             background: None,
             alpha_crop_hint: None,
