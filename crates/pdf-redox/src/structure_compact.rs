@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_TREE_FANOUT: usize = 256;
 const NAME_TREE_FANOUT: usize = 64;
+const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 const PAGE_IDENTITY_KEYS: [&[u8]; 10] = [
     b"Contents",
     b"Resources",
@@ -25,6 +26,7 @@ pub struct StructureCompactionStats {
     pub page_tree_nodes_after: usize,
     pub page_tree_nodes_removed: usize,
     pub page_tree_pages_reparented: usize,
+    pub shadowed_page_tree_inherited_entries_removed: usize,
     pub name_trees_repacked: usize,
     pub name_tree_nodes_before: usize,
     pub name_tree_nodes_after: usize,
@@ -191,6 +193,105 @@ fn current_dictionary(
         .and_then(|object| object.as_dictionary().cloned()))
 }
 
+fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
+    fn visit(
+        document: &EditDocument,
+        node: ObjectHandle,
+        seen: &mut BTreeSet<ObjectHandle>,
+        removals: &mut Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+    ) -> Result<Option<[bool; PAGE_INHERITABLE_KEYS.len()]>> {
+        if !seen.insert(node) {
+            return Ok(None);
+        }
+        let Some(dictionary) = current_dictionary(document, node)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            dictionary.get(b"Type".as_slice()),
+            Some(OwnedObject::Name(name)) if name == b"Pages"
+        ) {
+            return Ok(None);
+        }
+        let Some(OwnedObject::Array(kids)) = dictionary.get(b"Kids".as_slice()) else {
+            return Ok(None);
+        };
+        if kids.is_empty() {
+            return Ok(Some(std::array::from_fn(|index| {
+                dictionary.contains_key(PAGE_INHERITABLE_KEYS[index])
+            })));
+        }
+
+        let mut child_coverage = vec![[false; PAGE_INHERITABLE_KEYS.len()]; kids.len()];
+        for (kid_index, kid) in kids.iter().enumerate() {
+            let OwnedObject::Reference(kid) = kid else {
+                return Ok(None);
+            };
+            let Some(child) = current_dictionary(document, *kid)? else {
+                return Ok(None);
+            };
+            if matches!(
+                child.get(b"Type".as_slice()),
+                Some(OwnedObject::Name(name)) if name == b"Pages"
+            ) {
+                let Some(coverage) = visit(document, *kid, seen, removals)? else {
+                    return Ok(None);
+                };
+                child_coverage[kid_index] = coverage;
+            } else if matches!(
+                child.get(b"Type".as_slice()),
+                Some(OwnedObject::Name(name)) if name == b"Page"
+            ) {
+                child_coverage[kid_index] =
+                    std::array::from_fn(|index| child.contains_key(PAGE_INHERITABLE_KEYS[index]));
+            } else {
+                return Ok(None);
+            }
+        }
+
+        let covered_below: [bool; PAGE_INHERITABLE_KEYS.len()] =
+            std::array::from_fn(|index| child_coverage.iter().all(|coverage| coverage[index]));
+        let remove = PAGE_INHERITABLE_KEYS
+            .into_iter()
+            .enumerate()
+            .filter(|(index, key)| dictionary.contains_key(*key) && covered_below[*index])
+            .map(|(_, key)| key.to_vec())
+            .collect::<Vec<_>>();
+        if !remove.is_empty() {
+            removals.push((node, remove));
+        }
+
+        Ok(Some(std::array::from_fn(|index| {
+            dictionary.contains_key(PAGE_INHERITABLE_KEYS[index]) || covered_below[index]
+        })))
+    }
+
+    let catalog = ObjectHandle::Existing(document.source().catalog_id());
+    let Some(catalog) = current_dictionary(document, catalog)? else {
+        return Ok(0);
+    };
+    let Some(root) = dictionary_reference(&catalog, b"Pages") else {
+        return Ok(0);
+    };
+    let mut seen = BTreeSet::new();
+    let mut removals = Vec::new();
+    if visit(document, root, &mut seen, &mut removals)?.is_none() {
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for (node, keys) in removals {
+        let Some(dictionary) = document.edit_handle(node)?.as_dictionary_mut() else {
+            return Err(Error::Invalid(
+                "validated page-tree node stopped being a dictionary".to_owned(),
+            ));
+        };
+        for key in keys {
+            removed = removed.saturating_add(usize::from(dictionary.remove(&key).is_some()));
+        }
+    }
+    Ok(removed)
+}
+
 fn page_tree_node_count(document: &EditDocument, root: ObjectHandle) -> Result<Option<usize>> {
     let mut seen = BTreeSet::new();
     let mut pending = vec![root];
@@ -289,19 +390,13 @@ fn compact_page_tree(
         return Ok(());
     }
 
-    let inheritable_keys = [
-        b"Resources".as_slice(),
-        b"MediaBox".as_slice(),
-        b"CropBox".as_slice(),
-        b"Rotate".as_slice(),
-    ];
     let mut inherited = Vec::with_capacity(pages.len());
     for &page in &pages {
         let Some(page_dictionary) = current_dictionary(document, page)? else {
             return Ok(());
         };
         let mut materialized = Vec::new();
-        for key in inheritable_keys {
+        for key in PAGE_INHERITABLE_KEYS {
             if !page_dictionary.contains_key(key)
                 && let Some(value) = document.inherited_page_value(page, key)?
             {
@@ -381,7 +476,7 @@ fn compact_page_tree(
         OwnedObject::Integer(i64::try_from(pages.len()).unwrap_or(i64::MAX)),
     );
     root_dictionary.remove(b"Parent".as_slice());
-    for key in inheritable_keys {
+    for key in PAGE_INHERITABLE_KEYS {
         root_dictionary.remove(key);
     }
 
@@ -728,6 +823,8 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
         ..StructureCompactionStats::default()
     };
     compact_catalog_name_trees(document, &mut stats)?;
+    stats.shadowed_page_tree_inherited_entries_removed =
+        prune_shadowed_page_tree_inheritance(document)?;
     compact_page_tree(document, &mut stats)?;
     Ok(stats)
 }
@@ -766,6 +863,151 @@ mod tests {
             b"<< /Type /Page /Parent 8 0 R /MediaBox [0 0 10 10] /Resources <<>> /Contents 4 0 R >>",
         )?;
         EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn drops_shadowed_root_resources_without_rebuilding_page_tree() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Old 5 0 R >> >> >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /New 6 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Marker /Old >>")?;
+        pdf.object(6, b"<< /Marker /New >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.page_tree_nodes_before, 1);
+        assert_eq!(stats.page_tree_nodes_after, 1);
+        assert_eq!(stats.shadowed_page_tree_inherited_entries_removed, 1);
+
+        let root = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(2, 0)),
+        )?
+        .ok_or_else(|| Error::Invalid("page-tree root is missing".to_owned()))?;
+        assert!(!root.contains_key(b"Resources".as_slice()));
+        let reachable = document.reachable_objects()?;
+        assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(5, 0))));
+        assert!(reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(6, 0))));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_inherited_resources_when_any_descendant_relies_on_them() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 /Resources << /XObject << /Old 5 0 R >> >> >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /New 6 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Marker /Old >>")?;
+        pdf.object(6, b"<< /Marker /New >>")?;
+        pdf.object(
+            7,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 8 0 R >>",
+        )?;
+        pdf.stream(8, b"", b"q Q")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.shadowed_page_tree_inherited_entries_removed, 0);
+        let root = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(2, 0)),
+        )?
+        .ok_or_else(|| Error::Invalid("page-tree root is missing".to_owned()))?;
+        assert!(root.contains_key(b"Resources".as_slice()));
+        assert!(
+            document
+                .reachable_objects()?
+                .contains(&ObjectHandle::Existing(crate::ObjectId::new(5, 0)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drops_shadowed_inheritance_across_nested_page_tree() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Old 5 0 R >> >> >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Resources << /XObject << /New 6 0 R >> >> >>",
+        )?;
+        pdf.object(
+            4,
+            b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 10 10] /Contents 7 0 R >>",
+        )?;
+        pdf.object(5, b"<< /Marker /Old >>")?;
+        pdf.object(6, b"<< /Marker /New >>")?;
+        pdf.stream(7, b"", b"q Q")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 1);
+        let root = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(2, 0)),
+        )?
+        .ok_or_else(|| Error::Invalid("page-tree root is missing".to_owned()))?;
+        let child = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(3, 0)),
+        )?
+        .ok_or_else(|| Error::Invalid("page-tree child is missing".to_owned()))?;
+        assert!(!root.contains_key(b"Resources".as_slice()));
+        assert!(child.contains_key(b"Resources".as_slice()));
+        let reachable = document.reachable_objects()?;
+        assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(5, 0))));
+        assert!(reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(6, 0))));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_page_tree_aborts_shadow_pruning_transaction() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 9 0 R] /Count 2 /Resources << /XObject << /Root 5 0 R >> >> >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Resources << /XObject << /Middle 6 0 R >> >> >>",
+        )?;
+        pdf.object(
+            4,
+            b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Leaf 7 0 R >> >> /Contents 8 0 R >>",
+        )?;
+        pdf.object(5, b"<< /Marker /Root >>")?;
+        pdf.object(6, b"<< /Marker /Middle >>")?;
+        pdf.object(7, b"<< /Marker /Leaf >>")?;
+        pdf.stream(8, b"", b"q Q")?;
+        pdf.object(9, b"<< /Type /NotAPageTreeNode >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 0);
+        let child = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(3, 0)),
+        )?
+        .ok_or_else(|| Error::Invalid("page-tree child is missing".to_owned()))?;
+        assert!(child.contains_key(b"Resources".as_slice()));
+        Ok(())
     }
 
     #[test]

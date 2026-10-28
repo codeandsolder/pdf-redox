@@ -1223,15 +1223,17 @@ fn optimize_pdf_with_document(
         ));
     }
     if structure_compaction.page_tree_nodes_removed > 0
+        || structure_compaction.shadowed_page_tree_inherited_entries_removed > 0
         || structure_compaction.name_tree_nodes_removed > 0
         || structure_compaction.named_destination_wrappers_inlined > 0
         || structure_compaction.named_destination_arrays_inlined > 0
         || structure_compaction.stale_page_destination_references_rewritten > 0
     {
         notes.push(format!(
-            "Canonicalized document trees: page-tree nodes {} -> {}, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), inlined {} indirect destination array(s), and retargeted {} stale page destination reference(s).",
+            "Canonicalized document trees: page-tree nodes {} -> {}, removed {} shadowed inherited page-tree entry/entries, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), inlined {} indirect destination array(s), and retargeted {} stale page destination reference(s).",
             structure_compaction.page_tree_nodes_before,
             structure_compaction.page_tree_nodes_after,
+            structure_compaction.shadowed_page_tree_inherited_entries_removed,
             structure_compaction.name_tree_nodes_before,
             structure_compaction.name_tree_nodes_after,
             structure_compaction.named_destination_wrappers_inlined,
@@ -1500,6 +1502,8 @@ fn optimize_pdf_with_document(
         page_tree_nodes_after: structure_compaction.page_tree_nodes_after,
         page_tree_nodes_removed: structure_compaction.page_tree_nodes_removed,
         page_tree_pages_reparented: structure_compaction.page_tree_pages_reparented,
+        shadowed_page_tree_inherited_entries_removed: structure_compaction
+            .shadowed_page_tree_inherited_entries_removed,
         name_trees_repacked: structure_compaction.name_trees_repacked,
         name_tree_nodes_before: structure_compaction.name_tree_nodes_before,
         name_tree_nodes_after: structure_compaction.name_tree_nodes_after,
