@@ -130,5 +130,19 @@ mod tests {
             b"/Span <</ActualText<FEFF2008>>> BDC\n( ) Tj\nEMC"
         );
         assert_eq!(normalize_content_stream(&normalized), normalized);
+
+        let all_pdf_whitespace = b"/Span <</ActualText<FEFF2008>>>\0\t\n\x0c\r   BDC";
+        assert_eq!(
+            normalize_content_stream(all_pdf_whitespace),
+            b"/Span <</ActualText<FEFF2008>>> BDC"
+        );
+
+        let with_comment = b"1 % discarded lexical comment\n 2 m";
+        let comment_normalized = normalize_content_stream(with_comment);
+        assert_eq!(comment_normalized, b"1 2 m");
+        assert_eq!(
+            normalize_content_stream(&comment_normalized),
+            comment_normalized
+        );
     }
 }
