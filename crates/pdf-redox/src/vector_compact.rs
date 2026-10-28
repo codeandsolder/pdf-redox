@@ -3947,21 +3947,23 @@ mod tests {
     }
 
     #[test]
-    fn path_coordinate_canonicalization_can_expose_exact_fill_adjacency() {
+    fn path_coordinate_canonicalization_can_expose_exact_fill_adjacency() -> crate::Result<()> {
         let input = b"0 0 10.004 10 re f 10.003 0 9.997 10 re f";
         let (before, before_stats) = compact_content(input);
         assert_eq!(before, input);
         assert_eq!(before_stats.fill_groups_batched, 0);
 
-        let Some((canonicalized, coordinates)) = canonicalize_path_coordinates(input, 1.0) else {
-            panic!("expected path-coordinate canonicalization");
-        };
+        let (canonicalized, coordinates) =
+            canonicalize_path_coordinates(input, 1.0).ok_or_else(|| {
+                crate::Error::Invalid("expected path-coordinate canonicalization".to_owned())
+            })?;
         assert!(coordinates > 0);
 
         let (after, after_stats) = compact_content(&canonicalized);
         assert_eq!(after_stats.fill_groups_batched, 1);
         assert_eq!(after_stats.fill_paints_eliminated, 1);
         assert!(String::from_utf8_lossy(&after).contains("0 0 20 10 re f"));
+        Ok(())
     }
 
     #[test]
