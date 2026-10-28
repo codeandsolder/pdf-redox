@@ -6,7 +6,7 @@
 use crate::{EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result};
 use hayro_syntax::{
     PdfVersion,
-    object::{Dict, MaybeRef, Object, Stream},
+    object::{Dict, FromBytes as _, MaybeRef, Number, Object, Stream},
 };
 use std::{collections::BTreeMap, io::Write as _};
 
@@ -326,13 +326,21 @@ pub fn write_pdf_real(output: &mut Vec<u8>, value: f64) -> Result<()> {
     if !value.is_finite() {
         return Err(Error::InvalidReal);
     }
+
+    // Project generated/owned binary64 values through the same decimal parser
+    // used for source PDF numbers. Otherwise arithmetic such as -2.361 can
+    // serialize as -2.3609999999999998 on the first write, then shorten only
+    // after Hayro reparses it, making an otherwise-stable rewrite non-idempotent.
+    // Expand Rust's scientific notation first because PDF real syntax has no
+    // exponent form; then reuse the source-number writer for the canonical form.
     let representation = value.to_string();
-    if representation.contains('e') || representation.contains('E') {
-        output.extend_from_slice(expand_scientific(&representation)?.as_bytes());
+    let decimal = if representation.contains('e') || representation.contains('E') {
+        expand_scientific(&representation)?
     } else {
-        output.extend_from_slice(representation.as_bytes());
-    }
-    Ok(())
+        representation
+    };
+    let number = Number::from_bytes(decimal.as_bytes()).ok_or(Error::InvalidReal)?;
+    write_source_number(output, &number)
 }
 
 fn expand_scientific(value: &str) -> Result<String> {
@@ -1037,6 +1045,28 @@ mod tests {
             dictionary.get(b"Missing".as_slice()),
             Some(&OwnedObject::Null)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_reals_use_source_number_canonicalization() -> crate::Result<()> {
+        for (value, expected) in [
+            (-2.360_999_999_999_999_8, b"-2.361".as_slice()),
+            (-1.511_000_000_000_000_1, b"-1.511".as_slice()),
+            (-1.710_999_999_999_999_9, b"-1.711".as_slice()),
+            (1.684_000_000_000_000_2, b"1.6840000000000002".as_slice()),
+            (-0.0, b"0".as_slice()),
+        ] {
+            let mut output = Vec::new();
+            write_pdf_real(&mut output, value)?;
+            assert_eq!(output, expected);
+
+            let number = Number::from_bytes(&output)
+                .ok_or_else(|| crate::Error::Invalid("written real should parse".to_owned()))?;
+            let mut rewritten = Vec::new();
+            write_source_number(&mut rewritten, &number)?;
+            assert_eq!(rewritten, output);
+        }
         Ok(())
     }
 

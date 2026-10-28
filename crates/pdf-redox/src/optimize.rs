@@ -1563,6 +1563,49 @@ mod tests {
         assert!(!search_font_outline_subset(&config));
     }
 
+    fn processing_coordinate_fill_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 37000] /Resources <<>> /Contents 4 0 R >>")?;
+        let mut content = Vec::new();
+        for row in 0..3000_u32 {
+            use std::io::Write as _;
+            let y = row * 12;
+            // Keep both boundaries in the same 0.01-grid cell while varying the
+            // discarded decimal tail enough that the Flate admission gate sees
+            // the same material win as real CAD/datasheet content.
+            let outer_micros = 3000 + (row * 7919 % 1900);
+            let inner_micros = 100 + (row * 3571 % 1800);
+            let outer = 10.0 + f64::from(outer_micros) / 1_000_000.0;
+            let inner = 10.0 + f64::from(inner_micros) / 1_000_000.0;
+            let remaining = 20.0 - inner;
+            writeln!(
+                &mut content,
+                "0 {y} {outer:.6} 10 re f {inner:.6} {y} {remaining:.6} 10 re f"
+            )?;
+        }
+        pdf.stream(4, b"", &content)?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn processing_closes_fill_adjacency_exposed_by_coordinate_canonicalization() -> Result<()> {
+        let input = processing_coordinate_fill_fixture()?;
+        let mut config = Config::optimize_only();
+        config.optimization_goal = crate::OptimizationGoal::Processing;
+
+        let (first, first_report) = optimize_pdf(&input, &config)?;
+        assert!(first_report.vector_path_coordinate_pages_rewritten > 0);
+        assert!(first_report.vector_fill_groups_batched >= 3000);
+
+        let (second, second_report) = optimize_pdf(&first, &config)?;
+        assert_eq!(second_report.vector_fill_groups_batched, 0);
+        assert_eq!(second_report.vector_path_coordinate_pages_rewritten, 0);
+        assert_eq!(second, first);
+        Ok(())
+    }
+
     fn practical_cleanup_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>")?;
