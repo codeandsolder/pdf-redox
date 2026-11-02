@@ -221,9 +221,12 @@ fn collect_preflight_refs(objects: &[(CowObjectHandle, OwnedObject)]) -> Preflig
     refs
 }
 
-fn collect_page_content_refs(document: &EditDocument) -> Result<HashSet<CowObjectHandle>> {
+fn collect_page_content_refs(
+    document: &EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<HashSet<CowObjectHandle>> {
     let mut refs = HashSet::new();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -652,9 +655,12 @@ fn scan_content(
     })
 }
 
-fn analyze_content(document: &EditDocument) -> Result<ContentAnalysisStats> {
+fn analyze_content(
+    document: &EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<ContentAnalysisStats> {
     let mut out = ContentAnalysisStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let content = page_content(document, page)?;
         let resources = page_resources(document, page)?.unwrap_or_default();
         let mut classifier = crate::page_representation::begin_page_classifier(document, page)?;
@@ -998,6 +1004,46 @@ fn count_direct_preflight_keys(
     }
 }
 
+fn record_content_analysis(out: &mut PdfAnalysis, content: ContentAnalysisStats) {
+    out.page_representation_inventory_version = 1;
+    out.document_representation = content.representation.document;
+    out.raster_page_count = content.representation.raster_pages;
+    out.native_page_count = content.representation.native_pages;
+    out.mixed_page_count = content.representation.mixed_pages;
+    out.blank_page_count = content.representation.blank_pages;
+    out.unknown_page_count = content.representation.unknown_pages;
+    out.page_representation_unknown_reasons = content
+        .representation
+        .unknown_reasons
+        .iter()
+        .map(|(&reason, &count)| (reason.to_owned(), count))
+        .collect();
+    let (duplicate_groups, duplicate_wasted_bytes) =
+        duplicate_payload_stats(content.inline_payloads);
+    out.inline_image_count = content.inline_count;
+    out.inline_image_bytes = content.inline_bytes;
+    out.duplicate_inline_image_payload_groups = duplicate_groups;
+    out.duplicate_inline_image_payload_wasted_bytes = duplicate_wasted_bytes;
+    out.page_content_instruction_count = content.page_instruction_count;
+    out.page_content_max_instructions_per_page = content.page_max_instructions;
+    out.page_content_path_construction_operator_count = content.page_path_construction_count;
+    out.page_content_max_path_construction_operators_per_page = content.page_max_path_construction;
+    out.page_content_paint_operator_count = content.page_paint_count;
+    out.page_content_max_paint_operators_per_page = content.page_max_paints;
+    out.page_content_xobject_paint_operator_count = content.page_xobject_paint_count;
+    out.page_content_max_xobject_paints_per_page = content.page_max_xobject_paints;
+    out.page_content_text_show_operator_count = content.page_text_show_count;
+    out.page_content_max_text_show_operators_per_page = content.page_max_text_shows;
+    out.page_content_incomplete_parse_pages = content.page_incomplete_parse_count;
+    out.form_content_instruction_count = content.form_instruction_count;
+    out.form_content_max_instructions_per_form = content.form_max_instructions;
+    out.form_content_path_construction_operator_count = content.form_path_construction_count;
+    out.form_content_max_path_construction_operators_per_form = content.form_max_path_construction;
+    out.form_content_paint_operator_count = content.form_paint_count;
+    out.form_content_max_paint_operators_per_form = content.form_max_paints;
+    out.form_content_incomplete_parse_forms = content.form_incomplete_parse_count;
+}
+
 fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
     Ok(analyze_document_impl(input, &document, deep, content_density)?.report)
@@ -1026,6 +1072,10 @@ fn analyze_document_impl(
         object_count: document.source().object_count(),
         ..PdfAnalysis::default()
     };
+    // Deep role analysis and content-density analysis are read-only and share
+    // the same ordered page identity. Recover the page tree once when either
+    // analysis needs it, while preserving each analysis' warning-on-failure behavior.
+    let analysis_pages = (deep || content_density).then(|| document.page_handles());
 
     match document_info_text(document, b"Producer") {
         Ok(value) => out.producer = value,
@@ -1041,13 +1091,21 @@ fn analyze_document_impl(
     }
 
     let page_content_refs = if deep {
-        match collect_page_content_refs(document) {
-            Ok(refs) => refs,
-            Err(error) => {
+        match analysis_pages.as_ref() {
+            Some(Ok(pages)) => match collect_page_content_refs(document, pages) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    out.warnings
+                        .push(format!("page-content role analysis skipped: {error}"));
+                    HashSet::new()
+                }
+            },
+            Some(Err(error)) => {
                 out.warnings
                     .push(format!("page-content role analysis skipped: {error}"));
                 HashSet::new()
             }
+            None => HashSet::new(),
         }
     } else {
         HashSet::new()
@@ -1487,53 +1545,17 @@ fn analyze_document_impl(
     }
 
     if content_density {
-        match analyze_content(document) {
-            Ok(content) => {
-                out.page_representation_inventory_version = 1;
-                out.document_representation = content.representation.document;
-                out.raster_page_count = content.representation.raster_pages;
-                out.native_page_count = content.representation.native_pages;
-                out.mixed_page_count = content.representation.mixed_pages;
-                out.blank_page_count = content.representation.blank_pages;
-                out.unknown_page_count = content.representation.unknown_pages;
-                out.page_representation_unknown_reasons = content
-                    .representation
-                    .unknown_reasons
-                    .iter()
-                    .map(|(&reason, &count)| (reason.to_owned(), count))
-                    .collect();
-                let (duplicate_groups, duplicate_wasted_bytes) =
-                    duplicate_payload_stats(content.inline_payloads);
-                out.inline_image_count = content.inline_count;
-                out.inline_image_bytes = content.inline_bytes;
-                out.duplicate_inline_image_payload_groups = duplicate_groups;
-                out.duplicate_inline_image_payload_wasted_bytes = duplicate_wasted_bytes;
-                out.page_content_instruction_count = content.page_instruction_count;
-                out.page_content_max_instructions_per_page = content.page_max_instructions;
-                out.page_content_path_construction_operator_count =
-                    content.page_path_construction_count;
-                out.page_content_max_path_construction_operators_per_page =
-                    content.page_max_path_construction;
-                out.page_content_paint_operator_count = content.page_paint_count;
-                out.page_content_max_paint_operators_per_page = content.page_max_paints;
-                out.page_content_xobject_paint_operator_count = content.page_xobject_paint_count;
-                out.page_content_max_xobject_paints_per_page = content.page_max_xobject_paints;
-                out.page_content_text_show_operator_count = content.page_text_show_count;
-                out.page_content_max_text_show_operators_per_page = content.page_max_text_shows;
-                out.page_content_incomplete_parse_pages = content.page_incomplete_parse_count;
-                out.form_content_instruction_count = content.form_instruction_count;
-                out.form_content_max_instructions_per_form = content.form_max_instructions;
-                out.form_content_path_construction_operator_count =
-                    content.form_path_construction_count;
-                out.form_content_max_path_construction_operators_per_form =
-                    content.form_max_path_construction;
-                out.form_content_paint_operator_count = content.form_paint_count;
-                out.form_content_max_paint_operators_per_form = content.form_max_paints;
-                out.form_content_incomplete_parse_forms = content.form_incomplete_parse_count;
-            }
-            Err(error) => out
+        match analysis_pages.as_ref() {
+            Some(Ok(pages)) => match analyze_content(document, pages) {
+                Ok(content) => record_content_analysis(&mut out, content),
+                Err(error) => out
+                    .warnings
+                    .push(format!("content-stream analysis skipped: {error}")),
+            },
+            Some(Err(error)) => out
                 .warnings
                 .push(format!("content-stream analysis skipped: {error}")),
+            None => {}
         }
     }
 
