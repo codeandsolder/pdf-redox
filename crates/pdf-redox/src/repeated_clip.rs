@@ -340,10 +340,11 @@ fn hoisted_run(input: &[u8], blocks: &[ClipBlock], run: ClipRun) -> Option<(Repl
 
 pub fn hoist_repeated_clip_prefixes(
     document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<RepeatedClipStats> {
     let mut stats = RepeatedClipStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };

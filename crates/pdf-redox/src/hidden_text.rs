@@ -1069,6 +1069,12 @@ struct PageScan {
     findings: Vec<InternalFinding>,
 }
 
+#[derive(Debug, Clone)]
+struct ScannedPage {
+    content: Vec<u8>,
+    scan: PageScan,
+}
+
 #[derive(Debug, Default)]
 pub struct HiddenTextApplyStats {
     pub removed: usize,
@@ -1358,39 +1364,41 @@ pub fn analyze_hidden_text(document: &EditDocument) -> Result<Vec<HiddenTextFind
     let pages = document.page_handles()?;
     let mut findings = Vec::new();
     for (index, page) in pages.into_iter().enumerate() {
-        let scan = scan_page(document, page, index + 1, &ocg)?;
-        findings.extend(scan.findings.into_iter().map(|finding| finding.public));
+        let scanned = scan_page(document, page, index + 1, &ocg)?;
+        findings.extend(
+            scanned
+                .scan
+                .findings
+                .into_iter()
+                .map(|finding| finding.public),
+        );
     }
     Ok(findings)
 }
 
 pub fn apply_hidden_text_policy(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
     if policy.remove_categories.is_empty() && policy.overrides.is_empty() {
         return Ok(HiddenTextApplyStats::default());
     }
     let ocg = optional_content_state(document)?;
-    let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
-    for (index, page) in pages.into_iter().enumerate() {
-        let mut scan = scan_page(document, page, index + 1, &ocg)?;
+    for (index, &page) in pages.iter().enumerate() {
+        let ScannedPage {
+            content: decoded,
+            mut scan,
+        } = scan_page(document, page, index + 1, &ocg)?;
         scan.findings
             .retain(|finding| policy.should_remove(&finding.public));
         if scan.findings.is_empty() {
             continue;
         }
-        let decoded = page_content(document, page)?;
-        let selected: BTreeSet<String> = scan
-            .findings
-            .iter()
-            .map(|finding| finding.public.id.clone())
-            .collect();
-        let mut ranges: Vec<(usize, usize)> = scan_page(document, page, index + 1, &ocg)?
+        let mut ranges: Vec<(usize, usize)> = scan
             .findings
             .into_iter()
-            .filter(|finding| selected.contains(&finding.public.id))
             .map(|finding| (finding.span_start, finding.span_end))
             .collect();
         if ranges.is_empty() {
@@ -1494,10 +1502,12 @@ fn may_contain_diagonal_text_transform(input: &[u8]) -> bool {
     false
 }
 
-pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenTextApplyStats> {
-    let pages = document.page_handles()?;
+pub fn remove_large_diagonal_text(
+    document: &mut EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<HiddenTextApplyStats> {
     let mut stats = HiddenTextApplyStats::default();
-    for page in pages {
+    for &page in pages {
         let decoded = page_content(document, page)?;
         if !may_contain_diagonal_text_transform(&decoded) {
             continue;
@@ -1523,21 +1533,23 @@ pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenT
 /// to remove, because approximate glyph bounds are not a proof of invisibility.
 pub fn prune_physically_hidden_text(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     candidate_pages: Option<&BTreeSet<CowObjectHandle>>,
 ) -> Result<HiddenTextApplyStats> {
     let ocg = optional_content_state(document)?;
-    let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
-    for (index, page) in pages.into_iter().enumerate() {
+    for (index, &page) in pages.iter().enumerate() {
         if candidate_pages.is_some_and(|pages| !pages.contains(&page)) {
             continue;
         }
-        let scan = scan_page(document, page, index + 1, &ocg)?;
+        let ScannedPage {
+            content: decoded,
+            scan,
+        } = scan_page(document, page, index + 1, &ocg)?;
         let ranges = physical_hidden_ranges(scan);
         if ranges.is_empty() {
             continue;
         }
-        let decoded = page_content(document, page)?;
         stats.removed += ranges.len();
         replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
@@ -1961,7 +1973,7 @@ fn scan_page(
     page: CowObjectHandle,
     page_number: usize,
     ocg: &OptionalContentState,
-) -> Result<PageScan> {
+) -> Result<ScannedPage> {
     let crop = page_crop(document, page)?;
     let resources = build_resources(
         document,
@@ -1978,7 +1990,10 @@ fn scan_page(
         &ocg.on,
     );
     let _incomplete = scanner.scan(&content)?;
-    Ok(scanner.finish())
+    Ok(ScannedPage {
+        content,
+        scan: scanner.finish(),
+    })
 }
 
 fn parse_to_unicode(data: &[u8]) -> HashMap<Vec<u8>, String> {

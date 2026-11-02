@@ -853,10 +853,11 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 pub fn coalesce_optional_content(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<MarkedContentCoalesceStats> {
     let mut stats = MarkedContentCoalesceStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -1134,10 +1135,11 @@ fn compact_collinear_form_paths(
 
 pub fn compact_collinear_paths(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<CollinearPathStats> {
     let mut stats = CollinearPathStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -1912,14 +1914,14 @@ struct StrokeFormPlan {
 )]
 pub fn factor_repeated_stroke_forms(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<StrokeFormFactorStats> {
-    let pages = document.page_handles()?;
     let mut page_data = Vec::<StrokeFormPageData>::new();
     let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
     let mut occupied_names = BTreeSet::<Vec<u8>>::new();
 
-    for page in pages {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2289,10 +2291,11 @@ fn outlined_glyph_font_dictionary(
 
 pub fn factor_outlined_glyphs(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = OutlinedGlyphFactorStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2354,9 +2357,12 @@ pub fn factor_outlined_glyphs(
     Ok(stats)
 }
 
-pub fn batch_page_paints(document: &mut EditDocument) -> Result<PaintBatchStats> {
+pub fn batch_page_paints(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2554,7 +2560,8 @@ mod tests {
         pdf.stream(4, b"", &content)?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = batch_page_paints(&mut document)?;
+        let pages = document.page_handles()?;
+        let stats = batch_page_paints(&mut document, &pages)?;
         assert_eq!(stats.pages_rewritten, 1);
         assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
         Ok(())
@@ -2657,7 +2664,8 @@ mod tests {
         pdf.stream(4, b"", &content)?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        let pages = document.page_handles()?;
+        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
         assert_eq!(stats.pages_rewritten, 1);
         assert_eq!(stats.forms_rewritten, 0);
         assert_eq!(stats.vertices_removed, 4000);
@@ -2708,7 +2716,8 @@ mod tests {
         )?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        let pages = document.page_handles()?;
+        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
         assert_eq!(stats.pages_rewritten, 0);
         assert_eq!(stats.forms_rewritten, 1);
         assert!(stats.vertices_removed > 10_000);

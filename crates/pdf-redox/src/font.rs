@@ -454,6 +454,7 @@ struct SparseCidUnionCandidate {
 )]
 fn union_sparse_cid_font_programs(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
     program_descriptors: &HashMap<CowObjectHandle, Vec<CowObjectHandle>>,
@@ -549,7 +550,8 @@ fn union_sparse_cid_font_programs(
 
     // Only pay the page-content glyph-usage scan after proving that at least
     // one 2+ program rendering-skeleton group exists.
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
+    let (identity_glyph_usage, _) =
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?;
     let incoming_references = incoming_reference_owners(document)?;
 
     let mut stats = FontOptimizationStats::default();
@@ -1708,11 +1710,12 @@ pub struct FontGlyphUsageHints {
 
 fn font_glyph_usage_with_hints(
     document: &EditDocument,
+    pages: &[CowObjectHandle],
     hints: FontGlyphUsageHints,
 ) -> Result<FontGlyphUsage> {
     let mut usage = FontUsageAccumulator::default();
 
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
             continue;
         };
@@ -1806,7 +1809,8 @@ fn font_glyph_usage_with_hints(
 
 #[cfg(test)]
 fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
-    font_glyph_usage_with_hints(document, FontGlyphUsageHints::default())
+    let pages = document.page_handles()?;
+    font_glyph_usage_with_hints(document, &pages, FontGlyphUsageHints::default())
 }
 
 fn merge_program_usage(
@@ -2532,6 +2536,7 @@ fn dense_compact_cidfont_type2_programs_with_usage(
 /// deduplication has already canonicalized byte-identical stripped subsets.
 pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
     glyph_usage_hints: FontGlyphUsageHints,
@@ -2565,6 +2570,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
 
     union_sparse_cid_font_programs(
         document,
+        pages,
         flate_level,
         &program_usage,
         &program_descriptors,
@@ -2870,54 +2876,68 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 /// the same final Flate size gate. If neither backend can produce a smaller
 /// stream for any live program, the authoritative ownership/subtype graph
 /// cannot make an outline rewrite possible and may be skipped entirely.
-pub fn has_profitable_font_outline_subset_candidate(
+#[derive(Debug)]
+pub struct FontOutlineSubsetProbe {
+    identity_glyph_usage: IdentityGlyphUsage,
+}
+
+pub fn probe_profitable_font_outline_subset(
     document: &EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     glyph_usage_hints: FontGlyphUsageHints,
-) -> Result<bool> {
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
-    for (program, gids) in identity_glyph_usage {
-        if gids.is_empty() {
-            continue;
-        }
-        let Some(OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(program)?
-        else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Filter".as_slice())
-            || !is_unfiltered_or_lone_flate(document, &dictionary)?
-        {
-            continue;
-        }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
-            continue;
-        };
-        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-        let subsets = [
-            crate::cff_cid::subset_cid_font(&candidate, &gids),
-            sfnt_blank_unused_glyph_outlines(&candidate, &gids),
-        ];
-        for (mut subset, _) in subsets.into_iter().flatten() {
-            if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
-                subset = trimmed;
+) -> Result<Option<FontOutlineSubsetProbe>> {
+    let (identity_glyph_usage, _) =
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?;
+    let profitable = 'programs: {
+        for (program, gids) in &identity_glyph_usage {
+            if gids.is_empty() {
+                continue;
             }
-            let Ok(encoded) = encode_flate(&subset, flate_level) else {
+            let Some(OwnedObject::Stream { dictionary, data }) =
+                document.current_owned_object(*program)?
+            else {
                 continue;
             };
-            if encoded.len() < raw.len() {
-                return Ok(true);
+            if !dictionary.contains_key(b"Filter".as_slice())
+                || !is_unfiltered_or_lone_flate(document, &dictionary)?
+            {
+                continue;
+            }
+            let raw = data.bytes(document.source())?;
+            let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+                continue;
+            };
+            let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+            let subsets = [
+                crate::cff_cid::subset_cid_font(&candidate, gids),
+                sfnt_blank_unused_glyph_outlines(&candidate, gids),
+            ];
+            for (mut subset, _) in subsets.into_iter().flatten() {
+                if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
+                    subset = trimmed;
+                }
+                let Ok(encoded) = encode_flate(&subset, flate_level) else {
+                    continue;
+                };
+                if encoded.len() < raw.len() {
+                    break 'programs true;
+                }
             }
         }
-    }
-    Ok(false)
+        false
+    };
+    Ok(profitable.then_some(FontOutlineSubsetProbe {
+        identity_glyph_usage,
+    }))
 }
 
 pub fn subset_font_outlines_after_dedup(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
+    pre_scanned: Option<FontOutlineSubsetProbe>,
     glyph_usage_hints: FontGlyphUsageHints,
 ) -> Result<FontOptimizationStats> {
     let program_usage = graph.indirect_program_usage();
@@ -2925,7 +2945,11 @@ pub fn subset_font_outlines_after_dedup(
         return Ok(FontOptimizationStats::default());
     }
 
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
+    let identity_glyph_usage = if let Some(pre_scanned) = pre_scanned {
+        pre_scanned.identity_glyph_usage
+    } else {
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?.0
+    };
     if identity_glyph_usage.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
@@ -3824,8 +3848,10 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_tiling_patterns() -> Result<()> {
         let document = EditDocument::from_bytes(pattern_font_usage_fixture())?;
+        let pages = document.page_handles()?;
         let (identity, winansi) = font_glyph_usage_with_hints(
             &document,
+            &pages,
             FontGlyphUsageHints {
                 no_type3_font_scopes: true,
                 ..FontGlyphUsageHints::default()
@@ -3840,8 +3866,10 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_type3_charprocs() -> Result<()> {
         let document = EditDocument::from_bytes(type3_font_usage_fixture(true))?;
+        let pages = document.page_handles()?;
         let (identity, winansi) = font_glyph_usage_with_hints(
             &document,
+            &pages,
             FontGlyphUsageHints {
                 no_tiling_pattern_scopes: true,
                 ..FontGlyphUsageHints::default()
@@ -4337,23 +4365,32 @@ mod tests {
         use write_fonts::read::{FontRef, TableProvider};
 
         let mut document = EditDocument::from_bytes(identity_cid_outline_fixture()?)?;
-        assert!(has_profitable_font_outline_subset_candidate(
-            &document,
-            crate::FlateLevel::SIZE,
-            FontGlyphUsageHints::default(),
-        )?);
+        let pages = document.page_handles()?;
+        assert!(
+            probe_profitable_font_outline_subset(
+                &document,
+                &pages,
+                crate::FlateLevel::SIZE,
+                FontGlyphUsageHints::default(),
+            )?
+            .is_some()
+        );
         let stripped = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(stripped.programs_glyph_subset, 0);
-        assert!(has_profitable_font_outline_subset_candidate(
+        let probe = probe_profitable_font_outline_subset(
             &document,
+            &pages,
             crate::FlateLevel::SIZE,
             FontGlyphUsageHints::default(),
-        )?);
+        )?
+        .ok_or_else(|| Error::Invalid("outline subset probe should find a candidate".to_owned()))?;
         let graph = collect_font_usage_graph(&document)?;
         let first = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            Some(probe),
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(first.programs_optimized, 1);
@@ -4380,16 +4417,23 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
+        let reparsed_pages = reparsed.page_handles()?;
         let graph = collect_font_usage_graph(&reparsed)?;
-        assert!(!has_profitable_font_outline_subset_candidate(
-            &reparsed,
-            crate::FlateLevel::SIZE,
-            FontGlyphUsageHints::default(),
-        )?);
+        assert!(
+            probe_profitable_font_outline_subset(
+                &reparsed,
+                &reparsed_pages,
+                crate::FlateLevel::SIZE,
+                FontGlyphUsageHints::default(),
+            )?
+            .is_none()
+        );
         let second = subset_font_outlines_after_dedup(
             &mut reparsed,
+            &reparsed_pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(second.programs_optimized, 0);
@@ -4523,10 +4567,13 @@ mod tests {
             .ok_or_else(|| Error::Invalid("deduplicated font program is missing".to_owned()))?;
 
         let graph = collect_font_usage_graph(&document)?;
+        let pages = document.page_handles()?;
         let subset = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(subset.programs_glyph_subset, 1);
@@ -4576,8 +4623,10 @@ mod tests {
         let dedup = crate::dedup::canonicalize_font_program_streams(&mut document)?;
         assert_eq!(dedup.duplicate_streams_detected, 0);
         let graph = collect_font_usage_graph(&document)?;
+        let pages = document.page_handles()?;
         let union = union_sparse_cid_font_programs_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
             FontGlyphUsageHints::default(),
@@ -4602,8 +4651,10 @@ mod tests {
 
         let _ = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         let decoded = document.decoded_stream_data(program)?;

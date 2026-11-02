@@ -274,8 +274,8 @@ pub fn replace_page_content(
     replace_page_content_with_handle(document, page, bytes).map(|_| ())
 }
 
-pub fn normalize_page_contents(document: &mut EditDocument) -> Result<()> {
-    for page in document.page_handles()? {
+pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandle]) -> Result<()> {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };

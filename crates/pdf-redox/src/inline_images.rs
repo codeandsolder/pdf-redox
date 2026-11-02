@@ -254,9 +254,9 @@ fn semantic_fingerprint(
     Ok(Some(hasher.finalize().into()))
 }
 
-fn collect_targets(document: &EditDocument) -> Result<Vec<ContentTarget>> {
+fn collect_targets(document: &EditDocument, pages: &[ObjectHandle]) -> Result<Vec<ContentTarget>> {
     let mut targets = BTreeSet::new();
-    for page in document.page_handles()? {
+    for &page in pages {
         targets.insert(ContentTarget::Page(page));
     }
     for handle in document.reachable_streams_with_subtype(b"Form")? {
@@ -499,10 +499,11 @@ fn install_rewrite(
 
 pub fn externalize_duplicate_inline_images(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
 ) -> Result<DuplicateInlineImageStats> {
     let mut summaries = Vec::new();
     let mut aggregate: HashMap<InlineImageFingerprint, (usize, usize, usize)> = HashMap::new();
-    for target in collect_targets(document)? {
+    for target in collect_targets(document, pages)? {
         let Some(summary) = summary_for_target(document, target)? else {
             continue;
         };

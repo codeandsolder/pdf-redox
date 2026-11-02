@@ -290,9 +290,12 @@ fn accumulate_xobject_bindings(
     Ok(())
 }
 
-fn image_binding_counts(document: &EditDocument) -> Result<BTreeMap<ObjectHandle, usize>> {
+fn image_binding_counts(
+    document: &EditDocument,
+    pages: &[ObjectHandle],
+) -> Result<BTreeMap<ObjectHandle, usize>> {
     let mut counts = BTreeMap::new();
-    for page in document.page_handles()? {
+    for &page in pages {
         let page_xobjects =
             xobject_bindings(document, document.inherited_page_value(page, b"Resources")?)?;
         let mut forms = VecDeque::new();
@@ -1568,10 +1571,11 @@ fn transform_one(
 
 pub fn optimize_images(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     options: ImageOptimizationOptions,
     flate_level: crate::FlateLevel,
 ) -> Result<ImageOptimizationStats> {
-    let binding_counts = image_binding_counts(document)?;
+    let binding_counts = image_binding_counts(document, pages)?;
     let mut non_xobject_references = None;
     let mut stats = ImageOptimizationStats::default();
     let images = document
@@ -2262,7 +2266,8 @@ mod tests {
         let Some(&image) = images.first() else {
             return Err(Error::Invalid("test image is unreachable".to_owned()));
         };
-        let bindings = image_binding_counts(&document)?;
+        let pages = document.page_handles()?;
+        let bindings = image_binding_counts(&document, &pages)?;
         let unsafe_targets = non_xobject_reference_targets(&document)?;
         assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
         assert!(!unsafe_targets.contains(&image));
@@ -2277,7 +2282,8 @@ mod tests {
         let Some(&image) = images.first() else {
             return Err(Error::Invalid("test image is unreachable".to_owned()));
         };
-        let bindings = image_binding_counts(&document)?;
+        let pages = document.page_handles()?;
+        let bindings = image_binding_counts(&document, &pages)?;
         let unsafe_targets = non_xobject_reference_targets(&document)?;
         assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
         assert!(unsafe_targets.contains(&image));
@@ -2292,7 +2298,8 @@ mod tests {
         let Some(&image) = images.first() else {
             return Err(Error::Invalid("test image is unreachable".to_owned()));
         };
-        let bindings = image_binding_counts(&document)?;
+        let pages = document.page_handles()?;
+        let bindings = image_binding_counts(&document, &pages)?;
         let unsafe_targets = non_xobject_reference_targets(&document)?;
         assert!(bindings.get(&image).copied().unwrap_or(0) > 0);
         assert!(unsafe_targets.contains(&image));
@@ -2319,7 +2326,8 @@ mod tests {
         let Some(mask) = mask else {
             return Err(Error::Invalid("test SMask image is unreachable".to_owned()));
         };
-        let bindings = image_binding_counts(&document)?;
+        let pages = document.page_handles()?;
+        let bindings = image_binding_counts(&document, &pages)?;
         let unsafe_targets = non_xobject_reference_targets(&document)?;
         assert!(bindings.get(&mask).copied().unwrap_or(0) > 0);
         assert!(unsafe_targets.contains(&mask));

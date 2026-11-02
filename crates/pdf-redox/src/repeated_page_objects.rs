@@ -534,8 +534,10 @@ fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     output
 }
 
-pub fn repeated_page_objects_prefix_possible(document: &EditDocument) -> Result<bool> {
-    let pages = document.page_handles()?;
+pub fn repeated_page_objects_prefix_possible(
+    document: &EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<bool> {
     if pages.len() < MIN_SUPPORT_PAGES {
         return Ok(false);
     }
@@ -556,8 +558,8 @@ pub fn repeated_page_objects_prefix_possible(document: &EditDocument) -> Result<
 
 pub fn remove_repeated_page_objects(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
 ) -> Result<RepeatedPageObjectStats> {
-    let pages = document.page_handles()?;
     if pages.len() < MIN_SUPPORT_PAGES {
         return Ok(RepeatedPageObjectStats::default());
     }

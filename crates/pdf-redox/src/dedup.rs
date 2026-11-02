@@ -2958,13 +2958,12 @@ impl PageContentHolder {
     }
 }
 
-fn page_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
-    document.page_handles()
-}
-
-fn page_content_holders(document: &EditDocument) -> Result<Vec<PageContentHolder>> {
+fn page_content_holders(
+    document: &EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<Vec<PageContentHolder>> {
     let mut holders = Vec::new();
-    for page in page_handles(document)? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -3028,8 +3027,11 @@ fn page_content_holders(document: &EditDocument) -> Result<Vec<PageContentHolder
     Ok(holders)
 }
 
-pub fn canonicalize_page_contents(document: &mut EditDocument) -> Result<TargetedDedupStats> {
-    let holders = page_content_holders(document)?;
+pub fn canonicalize_page_contents(
+    document: &mut EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<TargetedDedupStats> {
+    let holders = page_content_holders(document, pages)?;
     canonicalize_stream_holders(
         document,
         &holders,
@@ -3155,7 +3157,8 @@ mod tests {
     #[test]
     fn hayro_page_content_dedup_canonicalizes_exact_streams() -> Result<()> {
         let mut document = EditDocument::from_bytes(duplicate_page_content_fixture()?)?;
-        let stats = canonicalize_page_contents(&mut document)?;
+        let pages = document.page_handles()?;
+        let stats = canonicalize_page_contents(&mut document, &pages)?;
         assert_eq!(stats.duplicate_streams_detected, 1);
         assert_eq!(stats.references_canonicalized, 1);
         let output = document.write_compact()?;

@@ -971,10 +971,11 @@ struct Candidate {
 )]
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<MicrostrokeRasterStats> {
     let mut stats = MicrostrokeRasterStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };

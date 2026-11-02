@@ -3194,6 +3194,7 @@ fn compact_processing_fill_tail(
 )]
 pub fn compact_vector_paths_with_flate_cache(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
     mut raster_pre_scanned: BTreeMap<ObjectHandle, ProcessingVectorAnalysis>,
@@ -3204,8 +3205,7 @@ pub fn compact_vector_paths_with_flate_cache(
         BTreeMap::<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>::new();
     let mut path_coordinate_plans = BTreeMap::<ObjectHandle, Option<PathCoordinatePlan>>::new();
     let mut vector_rewritten_pages = BTreeSet::<ObjectHandle>::new();
-    let pages = document.page_handles()?;
-    for &page in &pages {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -3304,7 +3304,7 @@ pub fn compact_vector_paths_with_flate_cache(
         }
         let mut late_rewritten_pages = BTreeSet::<ObjectHandle>::new();
         let factored =
-            factor_repeated_path_forms(document, flate_level, pre_scanned_processing, &pages)?;
+            factor_repeated_path_forms(document, flate_level, pre_scanned_processing, pages)?;
         total.path_forms_created += factored.stats.path_forms_created;
         total.path_form_pages_rewritten += factored.stats.path_form_pages_rewritten;
         total.path_form_occurrences_replaced += factored.stats.path_form_occurrences_replaced;
@@ -3331,7 +3331,7 @@ pub fn compact_vector_paths_with_flate_cache(
             flate_level,
             factored.cached_transformed,
             &factored.rewritten_pages,
-            &pages,
+            pages,
         )?;
         total.pages_compacted += transformed.pages_compacted;
         total.transformed_forms_created += transformed.transformed_forms_created;
@@ -3356,7 +3356,7 @@ pub fn compact_vector_paths_with_flate_cache(
                 .extend(names.iter().cloned());
         }
 
-        let shared_runs = factor_shared_q_prefix_runs(document, flate_level, &pages)?;
+        let shared_runs = factor_shared_q_prefix_runs(document, flate_level, pages)?;
         total.pages_compacted += shared_runs.pages_compacted;
         total.decoded_bytes_removed += shared_runs.decoded_bytes_removed;
         total.estimated_flate_bytes_saved += shared_runs.estimated_flate_bytes_saved;
@@ -3382,7 +3382,7 @@ pub fn compact_vector_paths_with_flate_cache(
         let path_coordinates = canonicalize_page_path_coordinates(
             document,
             flate_level,
-            &pages,
+            pages,
             path_coordinate_plans,
             &vector_rewritten_pages,
             flate_reuse_cache,

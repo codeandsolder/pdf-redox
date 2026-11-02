@@ -15,7 +15,7 @@ use crate::{
     font::{
         FontGlyphUsageHints, FontOptimizationStats, FontUsageGraph, collect_font_usage_graph,
         dense_compact_cidfont_type2_programs, dense_compact_cidfont_type2_programs_with_graph,
-        has_profitable_font_outline_subset_candidate, strip_cidfont_type2_cmaps_after_dedup,
+        probe_profitable_font_outline_subset, strip_cidfont_type2_cmaps_after_dedup,
         strip_font_editing_tables, subset_font_outlines_after_dedup,
         union_sparse_cid_font_programs_after_dedup,
     },
@@ -116,6 +116,7 @@ fn add_font_rendering_stats(total: &mut FontOptimizationStats, delta: FontOptimi
 )]
 fn run_font_graph_phase(
     document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
     cfg: &Config,
     before: &PdfAnalysis,
     flate_level: crate::FlateLevel,
@@ -151,6 +152,7 @@ fn run_font_graph_phase(
         timed(timings, "font-sparse-union", || {
             union_sparse_cid_font_programs_after_dedup(
                 document,
+                pages,
                 flate_level,
                 graph,
                 font_glyph_usage_hints,
@@ -162,30 +164,39 @@ fn run_font_graph_phase(
     };
     add_font_rendering_stats(font_rendering, font_sparse_union);
 
+    let mut outline_probe = None;
     let outline_subset_possible = if cfg.preservation.font_editing_support {
         false
     } else if post_dedup_font_graph.is_some() {
-        // Another font stage already paid for the authoritative graph; running
-        // the negative-only subset probe first would only duplicate the same
-        // glyph/subsetter work before the full proof below.
+        // A prior font stage already mutated the document. The ownership graph
+        // can still be reused, but glyph usage must be scanned from current content.
         timings.insert("font-outline-opportunity".to_owned(), 0.0);
         true
     } else if !search_font_outline_subset(cfg) {
         timings.insert("font-outline-opportunity".to_owned(), 0.0);
         false
     } else {
-        timed(timings, "font-outline-opportunity", || {
-            has_profitable_font_outline_subset_candidate(
+        outline_probe = timed(timings, "font-outline-opportunity", || {
+            probe_profitable_font_outline_subset(
                 document,
+                pages,
                 flate_level,
                 font_glyph_usage_hints,
             )
-        })?
+        })?;
+        outline_probe.is_some()
     };
     let font_outline_subset = if outline_subset_possible {
         let graph = ensure_font_usage_graph(document, &mut post_dedup_font_graph, timings)?;
         timed(timings, "font-outline-subset", || {
-            subset_font_outlines_after_dedup(document, flate_level, graph, font_glyph_usage_hints)
+            subset_font_outlines_after_dedup(
+                document,
+                pages,
+                flate_level,
+                graph,
+                outline_probe,
+                font_glyph_usage_hints,
+            )
         })?
     } else {
         timings.insert("font-outline-subset".to_owned(), 0.0);
@@ -279,7 +290,8 @@ pub fn analyze_microstroke_rasterization(
     optimization_goal: crate::OptimizationGoal,
 ) -> Result<MicrostrokeRasterStats> {
     let mut document = EditDocument::from_bytes(input.to_vec())?;
-    rasterize_pathological_microstrokes(&mut document, optimization_goal.flate_level())
+    let pages = document.page_handles()?;
+    rasterize_pathological_microstrokes(&mut document, &pages, optimization_goal.flate_level())
 }
 
 /// Optimize a PDF according to the supplied configuration.
@@ -431,12 +443,19 @@ fn optimize_pdf_with_document(
             Ok(())
         }
     })?;
+    // Preservation is the last stage before structure compaction that can touch
+    // page-tree dictionaries. Page membership/order is stable across the remaining
+    // optimization passes even though page contents/resources continue to mutate.
+    // Snapshot ordered page identity once instead of repeatedly recovering /Pages.
+    let stable_pages = timed(&mut timings, "stable-page-index", || {
+        document.page_handles()
+    })?;
     let hidden_text = timed(&mut timings, "hidden-text", || {
-        apply_hidden_text_policy(&mut document, &cfg.hidden_text)
+        apply_hidden_text_policy(&mut document, &stable_pages, &cfg.hidden_text)
     })?;
     let large_diagonal_text = timed(&mut timings, "large-diagonal-text", || {
         if cfg.remove_large_diagonal_text {
-            remove_large_diagonal_text(&mut document)
+            remove_large_diagonal_text(&mut document, &stable_pages)
         } else {
             Ok(HiddenTextApplyStats::default())
         }
@@ -480,6 +499,7 @@ fn optimize_pdf_with_document(
         cid_cmap_source_inventory_still_valid,
     } = run_font_graph_phase(
         &mut document,
+        &stable_pages,
         cfg,
         &before,
         flate_level,
@@ -566,7 +586,7 @@ fn optimize_pdf_with_document(
     let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
     {
-        repeated_page_objects_prefix_possible(&document)?
+        repeated_page_objects_prefix_possible(&document, &stable_pages)?
     } else {
         false
     };
@@ -577,6 +597,7 @@ fn optimize_pdf_with_document(
             .then_some(&mut raster_vector_cache);
         normalize_raster_layout(
             &mut document,
+            &stable_pages,
             &cfg.raster_layout,
             flate_level,
             cfg.optimization_goal == crate::OptimizationGoal::Processing,
@@ -613,10 +634,10 @@ fn optimize_pdf_with_document(
             if fallback.is_empty() {
                 Ok(HiddenTextApplyStats::default())
             } else {
-                prune_physically_hidden_text(&mut document, Some(&fallback))
+                prune_physically_hidden_text(&mut document, &stable_pages, Some(&fallback))
             }
         } else {
-            prune_physically_hidden_text(&mut document, None)
+            prune_physically_hidden_text(&mut document, &stable_pages, None)
         }
     })?;
 
@@ -627,7 +648,7 @@ fn optimize_pdf_with_document(
         if raster_proved_no_inline {
             Ok(DuplicateInlineImageStats::default())
         } else {
-            externalize_duplicate_inline_images(&mut document)
+            externalize_duplicate_inline_images(&mut document, &stable_pages)
         }
     })?;
 
@@ -676,7 +697,7 @@ fn optimize_pdf_with_document(
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
-            remove_repeated_page_objects(&mut document)
+            remove_repeated_page_objects(&mut document, &stable_pages)
         } else {
             Ok(RepeatedPageObjectStats::default())
         }
@@ -686,7 +707,7 @@ fn optimize_pdf_with_document(
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
             let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
-            match plan_print_downsampling(&document, u32::from(target_ppi)) {
+            match plan_print_downsampling(&document, &stable_pages, u32::from(target_ppi)) {
                 Ok(plan) => (plan, None),
                 Err(error) => (PrintPlanHayro::default(), Some(error.to_string())),
             }
@@ -731,6 +752,7 @@ fn optimize_pdf_with_document(
             ..
         } => optimize_images(
             &mut document,
+            &stable_pages,
             ImageOptimizationOptions {
                 keep_inline_images: true,
                 jpeg_quality: *jpeg_quality,
@@ -748,7 +770,7 @@ fn optimize_pdf_with_document(
 
     let repeated_clips = timed(&mut timings, "repeated-clip-hoist", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            hoist_repeated_clip_prefixes(&mut document, flate_level)
+            hoist_repeated_clip_prefixes(&mut document, &stable_pages, flate_level)
         } else {
             Ok(RepeatedClipStats::default())
         }
@@ -789,6 +811,7 @@ fn optimize_pdf_with_document(
             };
             compact_vector_paths_with_flate_cache(
                 &mut document,
+                &stable_pages,
                 flate_level,
                 cfg.optimization_goal,
                 vector_cache,
@@ -801,7 +824,7 @@ fn optimize_pdf_with_document(
 
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            coalesce_optional_content(&mut document, flate_level)
+            coalesce_optional_content(&mut document, &stable_pages, flate_level)
         } else {
             Ok(MarkedContentCoalesceStats::default())
         }
@@ -809,7 +832,7 @@ fn optimize_pdf_with_document(
 
     let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            compact_collinear_paths(&mut document, flate_level)
+            compact_collinear_paths(&mut document, &stable_pages, flate_level)
         } else {
             Ok(CollinearPathStats::default())
         }
@@ -817,7 +840,7 @@ fn optimize_pdf_with_document(
 
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(&mut document, flate_level)
+            factor_outlined_glyphs(&mut document, &stable_pages, flate_level)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -825,7 +848,7 @@ fn optimize_pdf_with_document(
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            batch_page_paints(&mut document)
+            batch_page_paints(&mut document, &stable_pages)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -833,7 +856,7 @@ fn optimize_pdf_with_document(
 
     let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_repeated_stroke_forms(&mut document, flate_level)
+            factor_repeated_stroke_forms(&mut document, &stable_pages, flate_level)
         } else {
             Ok(StrokeFormFactorStats::default())
         }
@@ -841,7 +864,7 @@ fn optimize_pdf_with_document(
 
     let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            simplify_page_polylines(&mut document, flate_level)
+            simplify_page_polylines(&mut document, &stable_pages, flate_level)
         } else {
             Ok(PolylineSimplificationStats::default())
         }
@@ -864,12 +887,12 @@ fn optimize_pdf_with_document(
                 &vector_compaction.generated_page_xobjects,
             )
         } else {
-            prune_resources(&mut document)
+            prune_resources(&mut document, &stable_pages)
         }
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(&mut document, flate_level)
+            rasterize_pathological_microstrokes(&mut document, &stable_pages, flate_level)
         } else {
             Ok(MicrostrokeRasterStats::default())
         }
@@ -879,14 +902,14 @@ fn optimize_pdf_with_document(
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            normalize_page_contents(&mut document)?;
+            normalize_page_contents(&mut document, &stable_pages)?;
         }
         Ok(())
     })?;
     // Content streams are canonicalized only after every pass that can mutate
     // them, including lexical normalization.
     let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
-        canonicalize_page_contents(&mut document)
+        canonicalize_page_contents(&mut document, &stable_pages)
     })?;
     let structure_compaction = timed(&mut timings, "structure-compaction", || {
         compact_structure(&mut document)

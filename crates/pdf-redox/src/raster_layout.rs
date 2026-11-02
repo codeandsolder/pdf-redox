@@ -5615,6 +5615,7 @@ fn build_merge_plans_for_scanner(
 )]
 pub fn normalize_raster_layout(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     config: &RasterLayoutConfig,
     flate_level: crate::FlateLevel,
     normalize_content_for_budget: bool,
@@ -5672,7 +5673,6 @@ pub fn normalize_raster_layout(
     } else {
         None
     };
-    let pages = document.page_handles()?;
     stats.page_count = pages.len();
     let page_numbers = pages
         .iter()
@@ -5681,7 +5681,7 @@ pub fn normalize_raster_layout(
         .map(|(index, page)| (page, index + 1))
         .collect::<BTreeMap<_, _>>();
 
-    for target in collect_targets(document, &pages)? {
+    for target in collect_targets(document, pages)? {
         let scan_started = Instant::now();
         let Some(mut resources) = target_resources(document, target)? else {
             // A resource-less Form borrows its caller's resource scope. The

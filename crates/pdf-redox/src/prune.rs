@@ -324,7 +324,10 @@ pub fn prune_resources_with_usage(
     Ok(stats)
 }
 
-pub fn prune_resources(document: &mut EditDocument) -> Result<ResourcePruneStats> {
+pub fn prune_resources(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+) -> Result<ResourcePruneStats> {
     let mut stats = ResourcePruneStats::default();
     // Prune forms with local resource scopes first. Resource-less forms are
     // intentionally accounted against their caller's scope below.
@@ -351,7 +354,7 @@ pub fn prune_resources(document: &mut EditDocument) -> Result<ResourcePruneStats
         install_form_resources(document, form, resources)?;
     }
 
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(resources) = page_resources(document, page)? else {
             continue;
         };

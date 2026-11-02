@@ -264,10 +264,11 @@ impl<'a> Scanner<'a> {
 
 pub fn simplify_page_polylines(
     document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<PolylineSimplificationStats> {
     let mut stats = PolylineSimplificationStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;
         };
