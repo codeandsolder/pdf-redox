@@ -20,7 +20,7 @@ hayro-syntax = { git = "https://github.com/codeandsolder/hayro", branch = "pdf-r
 # levels 3-6 use the medium matcher, which has pathological ratios on some highly
 # repetitive PDF content. Size uses level 9.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-libjpeg-turbo-rs = "=0.8.0"
+libjpeg-turbo-rs = "=0.9.0"
 fast_image_resize = "6.1"
 fax = "=0.3.0"
 sha2 = "0.11"
