@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::resolved_number,
+    content::{resolved_name, resolved_non_null, resolved_number},
     paper_indexed,
     stream_codec::{decode_image_stream, decode_stream, encode_flate, is_unfiltered_or_lone_flate},
 };
@@ -412,16 +412,6 @@ fn non_xobject_reference_targets(document: &EditDocument) -> Result<HashSet<Obje
     Ok(unsafe_targets)
 }
 
-fn resolved_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
-}
-
 fn bpc_is_8(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
     Ok(matches!(
         document.resolve_owned_value(
@@ -499,16 +489,6 @@ fn indexed_rgb_base_color_space(
         return Ok(None);
     }
     Ok(Some(source.clone()))
-}
-
-fn is_non_null(document: &EditDocument, value: Option<&OwnedObject>) -> Result<bool> {
-    let Some(value) = value else {
-        return Ok(false);
-    };
-    Ok(!matches!(
-        document.resolve_owned_value(value)?,
-        Some(OwnedObject::Null) | None
-    ))
 }
 
 fn source_filter(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<Option<Vec<u8>>> {
@@ -847,7 +827,7 @@ fn paper_indexed_source_safe(
         b"SMask".as_slice(),
         b"SMaskInData".as_slice(),
     ] {
-        if is_non_null(document, dictionary.get(key))? {
+        if resolved_non_null(document, dictionary.get(key))? {
             return Ok(false);
         }
     }
@@ -926,7 +906,7 @@ fn paper_indexed_layered_source_safe(
         b"Mask".as_slice(),
         b"SMaskInData".as_slice(),
     ] {
-        if is_non_null(document, dictionary.get(key))? {
+        if resolved_non_null(document, dictionary.get(key))? {
             return Ok(false);
         }
     }
@@ -1321,7 +1301,7 @@ fn transcode_image(
             b"Decode".as_slice(),
             b"Mask".as_slice(),
         ] {
-            if is_non_null(document, dictionary.get(key))? {
+            if resolved_non_null(document, dictionary.get(key))? {
                 return Ok(None);
             }
         }
@@ -1400,12 +1380,12 @@ fn resize_source_safe(
         b"Mask".as_slice(),
         b"Decode".as_slice(),
     ] {
-        if is_non_null(document, dictionary.get(key))? {
+        if resolved_non_null(document, dictionary.get(key))? {
             return Ok(false);
         }
     }
     if encoding == ImageResizeEncoding::Jpeg
-        && is_non_null(document, dictionary.get(b"DecodeParms".as_slice()))?
+        && resolved_non_null(document, dictionary.get(b"DecodeParms".as_slice()))?
     {
         return Ok(false);
     }

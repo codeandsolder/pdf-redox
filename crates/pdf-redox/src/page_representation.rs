@@ -8,7 +8,10 @@
 
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
-    content::{form_content, form_resources, resolved_dictionary, resolved_number},
+    content::{
+        form_content, form_resources, page_box_numbers_matching, resolved_dictionary,
+        resolved_finite_number_array, resolved_number,
+    },
     content_stream::{instruction_operands, operand_numbers},
     geometry::{Matrix, Rect},
     report::{DocumentRepresentation, PageRepresentation},
@@ -680,38 +683,22 @@ fn resolved_rect(document: &EditDocument, value: Option<&OwnedObject>) -> Result
     let Some(value) = value else {
         return Ok(None);
     };
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+    let Some([x0, y0, x1, y1]) = resolved_finite_number_array::<4>(document, value)? else {
         return Ok(None);
     };
-    if values.len() != 4 {
-        return Ok(None);
-    }
-    let mut numbers = [0.0; 4];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number(document, Some(value))? else {
-            return Ok(None);
-        };
-        if !number.is_finite() {
-            return Ok(None);
-        }
-        numbers[index] = number;
-    }
-    let rect = Rect::new(numbers[0], numbers[1], numbers[2], numbers[3]);
-    (rect.area() > f64::EPSILON)
-        .then_some(rect)
-        .map_or(Ok(None), |r| Ok(Some(r)))
+    let rect = Rect::new(x0, y0, x1, y1);
+    Ok((rect.area() > f64::EPSILON).then_some(rect))
 }
 
 fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
-    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        let Some(value) = document.inherited_page_value(page, key)? else {
-            continue;
-        };
-        if let Some(rect) = resolved_rect(document, Some(&value))? {
-            return Ok(Some(rect));
-        }
-    }
-    Ok(None)
+    let Some([x0, y0, x1, y1]) = page_box_numbers_matching(document, page, |values| {
+        values.into_iter().all(f64::is_finite)
+            && Rect::new(values[0], values[1], values[2], values[3]).area() > f64::EPSILON
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Rect::new(x0, y0, x1, y1)))
 }
 
 fn axis_aligned_unit_rect(matrix: Matrix) -> Option<Rect> {

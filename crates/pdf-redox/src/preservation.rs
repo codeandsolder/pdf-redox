@@ -1,7 +1,7 @@
 use crate::geometry::{Matrix, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
-    OwnedObject, PreservationConfig, Result, StreamData, content::resolved_number_value,
+    OwnedObject, PreservationConfig, Result, StreamData, content::resolved_number_array,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -655,26 +655,6 @@ fn prune_dictionary_target(
         dictionary.entry(key).or_insert(value);
     }
     Ok(())
-}
-
-fn resolved_number_array<const N: usize>(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<[f64; N]>> {
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    if values.len() != N {
-        return Ok(None);
-    }
-    let mut out = [0.0; N];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number_value(document, value)? else {
-            return Ok(None);
-        };
-        out[index] = number;
-    }
-    Ok(Some(out))
 }
 
 fn inherited_page_value(

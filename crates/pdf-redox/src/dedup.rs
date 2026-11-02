@@ -4,7 +4,10 @@ use crate::{
 };
 use hayro_syntax::{
     PdfVersion,
-    object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject},
+    object::{
+        Array as HayroArray, Dict as HayroDict, MaybeRef as HayroMaybeRef, Name as HayroName,
+        Object as HayroObject,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -480,72 +483,212 @@ enum DirectPathStep {
     ArrayIndex(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DirectReferenceHolder {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
-    key: Vec<u8>,
-    target: CowObjectHandle,
+#[derive(Clone, Copy)]
+enum DirectDictionaryView<'a, 'pdf> {
+    Source(&'a HayroDict<'pdf>),
+    Owned(&'a OwnedDictionary),
 }
 
-fn inspect_source_direct_reference_holders(
+impl DirectDictionaryView<'_, '_> {
+    fn reference(self, key: &[u8]) -> Option<CowObjectHandle> {
+        match self {
+            Self::Source(dictionary) => dictionary
+                .get_ref(key)
+                .map(|reference| CowObjectHandle::Existing(reference.into())),
+            Self::Owned(dictionary) => match dictionary.get(key) {
+                Some(OwnedObject::Reference(reference)) => Some(*reference),
+                _ => None,
+            },
+        }
+    }
+
+    fn resolved_name_is(
+        self,
+        document: &EditDocument,
+        key: &[u8],
+        expected: &[u8],
+    ) -> Result<bool> {
+        match self {
+            Self::Source(dictionary) => Ok(dictionary
+                .get::<HayroName<'_>>(key)
+                .is_some_and(|name| name.as_ref() == expected)),
+            Self::Owned(dictionary) => {
+                let Some(value) = dictionary.get(key) else {
+                    return Ok(false);
+                };
+                Ok(matches!(
+                    document.resolve_owned_value(value)?,
+                    Some(OwnedObject::Name(name)) if name == expected
+                ))
+            }
+        }
+    }
+
+    fn has_direct_dictionary(self, key: &[u8]) -> bool {
+        match self {
+            Self::Source(dictionary) => matches!(
+                dictionary.get_raw::<HayroObject<'_>>(key),
+                Some(HayroMaybeRef::NotRef(HayroObject::Dict(_)))
+            ),
+            Self::Owned(dictionary) => {
+                matches!(dictionary.get(key), Some(OwnedObject::Dictionary(_)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DirectArrayView<'a, 'pdf> {
+    Source(&'a HayroArray<'pdf>),
+    Owned(&'a [OwnedObject]),
+}
+
+impl DirectArrayView<'_, '_> {
+    fn resolved_name_is(
+        self,
+        document: &EditDocument,
+        index: usize,
+        expected: &[u8],
+    ) -> Result<bool> {
+        match self {
+            Self::Source(array) => Ok(matches!(
+                array.iter::<HayroObject<'_>>().nth(index),
+                Some(HayroObject::Name(name)) if name.as_ref() == expected
+            )),
+            Self::Owned(values) => {
+                let Some(value) = values.get(index) else {
+                    return Ok(false);
+                };
+                Ok(matches!(
+                    document.resolve_owned_value(value)?,
+                    Some(OwnedObject::Name(name)) if name == expected
+                ))
+            }
+        }
+    }
+
+    fn reference(self, index: usize) -> Option<CowObjectHandle> {
+        match self {
+            Self::Source(array) => match array.raw_iter().nth(index) {
+                Some(HayroMaybeRef::Ref(reference)) => {
+                    Some(CowObjectHandle::Existing(reference.into()))
+                }
+                _ => None,
+            },
+            Self::Owned(values) => match values.get(index) {
+                Some(OwnedObject::Reference(reference)) => Some(*reference),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectWalkControl {
+    Descend,
+    SkipChildren,
+}
+
+trait DirectObjectVisitor {
+    fn visit_dictionary(
+        &mut self,
+        _document: &EditDocument,
+        _root: CowObjectHandle,
+        _path: &[DirectPathStep],
+        _dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        Ok(DirectWalkControl::Descend)
+    }
+
+    fn visit_array(
+        &mut self,
+        _document: &EditDocument,
+        _root: CowObjectHandle,
+        _path: &[DirectPathStep],
+        _array: DirectArrayView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        Ok(DirectWalkControl::Descend)
+    }
+
+    fn visit_reference(
+        &mut self,
+        _root: CowObjectHandle,
+        _path: &[DirectPathStep],
+        _target: CowObjectHandle,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn descend_dictionary_value(&self, _key: &[u8]) -> bool {
+        true
+    }
+}
+
+fn walk_source_direct_dictionary(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    dictionary: &HayroDict<'_>,
+    path: &mut Vec<DirectPathStep>,
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
+    if visitor.visit_dictionary(
+        document,
+        root,
+        path,
+        DirectDictionaryView::Source(dictionary),
+    )? == DirectWalkControl::SkipChildren
+    {
+        return Ok(());
+    }
+    for (name, value) in dictionary.entries() {
+        let key = name.as_ref();
+        path.push(DirectPathStep::DictKey(key.to_vec()));
+        match value {
+            HayroMaybeRef::Ref(target) => {
+                visitor.visit_reference(root, path, CowObjectHandle::Existing(target.into()))?
+            }
+            HayroMaybeRef::NotRef(value) if visitor.descend_dictionary_value(key) => {
+                walk_source_direct_object(document, root, &value, path, visitor)?;
+            }
+            HayroMaybeRef::NotRef(_) => {}
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
+fn walk_source_direct_object(
+    document: &EditDocument,
     root: CowObjectHandle,
     object: &HayroObject<'_>,
-    key: &[u8],
     path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<DirectReferenceHolder>,
-) {
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
     match object {
         HayroObject::Dict(dictionary) => {
-            if let Some(target) = dictionary.get_ref(key) {
-                holders.push(DirectReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    key: key.to_vec(),
-                    target: CowObjectHandle::Existing(target.into()),
-                });
-            }
-            for (name, value) in dictionary.entries() {
-                if name.as_ref() == key {
-                    continue;
-                }
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_direct_reference_holders(root, &value, key, path, holders);
-                path.pop();
-            }
+            walk_source_direct_dictionary(document, root, dictionary, path, visitor)?;
         }
         HayroObject::Stream(stream) => {
-            let dictionary = stream.dict();
-            if let Some(target) = dictionary.get_ref(key) {
-                holders.push(DirectReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    key: key.to_vec(),
-                    target: CowObjectHandle::Existing(target.into()),
-                });
-            }
-            for (name, value) in dictionary.entries() {
-                if name.as_ref() == key {
-                    continue;
-                }
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_direct_reference_holders(root, &value, key, path, holders);
-                path.pop();
-            }
+            walk_source_direct_dictionary(document, root, &stream.dict(), path, visitor)?;
         }
         HayroObject::Array(array) => {
+            if visitor.visit_array(document, root, path, DirectArrayView::Source(array))?
+                == DirectWalkControl::SkipChildren
+            {
+                return Ok(());
+            }
             for (index, value) in array.raw_iter().enumerate() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_source_direct_reference_holders(root, &value, key, path, holders);
+                match value {
+                    HayroMaybeRef::Ref(target) => visitor.visit_reference(
+                        root,
+                        path,
+                        CowObjectHandle::Existing(target.into()),
+                    )?,
+                    HayroMaybeRef::NotRef(value) => {
+                        walk_source_direct_object(document, root, &value, path, visitor)?;
+                    }
+                }
                 path.pop();
             }
         }
@@ -555,51 +698,114 @@ fn inspect_source_direct_reference_holders(
         | HayroObject::String(_)
         | HayroObject::Name(_) => {}
     }
+    Ok(())
 }
 
-fn inspect_owned_direct_reference_holders(
+fn walk_owned_direct_object(
+    document: &EditDocument,
     root: CowObjectHandle,
     object: &OwnedObject,
-    key: &[u8],
     path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<DirectReferenceHolder>,
-) {
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
     match object {
+        OwnedObject::Reference(target) => visitor.visit_reference(root, path, *target)?,
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if let Some(OwnedObject::Reference(target)) = dictionary.get(key) {
-                holders.push(DirectReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    key: key.to_vec(),
-                    target: *target,
-                });
+            if visitor.visit_dictionary(
+                document,
+                root,
+                path,
+                DirectDictionaryView::Owned(dictionary),
+            )? == DirectWalkControl::SkipChildren
+            {
+                return Ok(());
             }
             for (name, value) in dictionary {
-                if name.as_slice() == key || matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
                 path.push(DirectPathStep::DictKey(name.clone()));
-                inspect_owned_direct_reference_holders(root, value, key, path, holders);
+                if matches!(value, OwnedObject::Reference(_))
+                    || visitor.descend_dictionary_value(name)
+                {
+                    walk_owned_direct_object(document, root, value, path, visitor)?;
+                }
                 path.pop();
             }
         }
         OwnedObject::Array(values) => {
+            if visitor.visit_array(document, root, path, DirectArrayView::Owned(values))?
+                == DirectWalkControl::SkipChildren
+            {
+                return Ok(());
+            }
             for (index, value) in values.iter().enumerate() {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
                 path.push(DirectPathStep::ArrayIndex(index));
-                inspect_owned_direct_reference_holders(root, value, key, path, holders);
+                walk_owned_direct_object(document, root, value, path, visitor)?;
                 path.pop();
             }
         }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
+        OwnedObject::Null
         | OwnedObject::Boolean(_)
         | OwnedObject::Integer(_)
         | OwnedObject::Real(_)
         | OwnedObject::Name(_)
         | OwnedObject::String(_) => {}
+    }
+    Ok(())
+}
+
+fn walk_direct_output_objects(
+    document: &EditDocument,
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
+    document.walk_output_objects(|root, object| {
+        match object {
+            CurrentObject::Source(object) => {
+                walk_source_direct_object(document, root, &object, &mut Vec::new(), visitor)?;
+            }
+            CurrentObject::Owned(object) => {
+                walk_owned_direct_object(document, root, object, &mut Vec::new(), visitor)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectReferenceHolder {
+    root: CowObjectHandle,
+    path: Vec<DirectPathStep>,
+    key: Vec<u8>,
+    target: CowObjectHandle,
+}
+
+struct DirectReferenceVisitor<'a> {
+    key: &'a [u8],
+    holders: &'a mut Vec<DirectReferenceHolder>,
+}
+
+impl DirectObjectVisitor for DirectReferenceVisitor<'_> {
+    fn visit_reference(
+        &mut self,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        target: CowObjectHandle,
+    ) -> Result<()> {
+        let Some(DirectPathStep::DictKey(key)) = path.last() else {
+            return Ok(());
+        };
+        if key.as_slice() != self.key {
+            return Ok(());
+        }
+        self.holders.push(DirectReferenceHolder {
+            root,
+            path: path[..path.len() - 1].to_vec(),
+            key: self.key.to_vec(),
+            target,
+        });
+        Ok(())
+    }
+
+    fn descend_dictionary_value(&self, key: &[u8]) -> bool {
+        key != self.key
     }
 }
 
@@ -608,29 +814,13 @@ fn direct_reference_holders(
     key: &[u8],
 ) -> Result<Vec<DirectReferenceHolder>> {
     let mut holders = Vec::new();
-    document.walk_output_objects(|handle, object| {
-        match object {
-            CurrentObject::Source(object) => {
-                inspect_source_direct_reference_holders(
-                    handle,
-                    &object,
-                    key,
-                    &mut Vec::new(),
-                    &mut holders,
-                );
-            }
-            CurrentObject::Owned(object) => {
-                inspect_owned_direct_reference_holders(
-                    handle,
-                    object,
-                    key,
-                    &mut Vec::new(),
-                    &mut holders,
-                );
-            }
-        }
-        Ok(())
-    })?;
+    walk_direct_output_objects(
+        document,
+        &mut DirectReferenceVisitor {
+            key,
+            holders: &mut holders,
+        },
+    )?;
     Ok(holders)
 }
 
@@ -684,123 +874,42 @@ struct DirectArrayReferenceHolder {
     target: CowObjectHandle,
 }
 
-fn inspect_source_icc_arrays(
-    root: CowObjectHandle,
-    object: &HayroObject<'_>,
-    path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<DirectArrayReferenceHolder>,
-) {
-    match object {
-        HayroObject::Array(array) => {
-            let is_icc = matches!(array.iter::<HayroObject<'_>>().next(), Some(HayroObject::Name(name)) if name.as_ref() == b"ICCBased");
-            if is_icc && let Some(HayroMaybeRef::Ref(profile)) = array.raw_iter().nth(1) {
-                holders.push(DirectArrayReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    index: 1,
-                    target: CowObjectHandle::Existing(profile.into()),
-                });
-                return;
-            }
-            for (index, value) in array.raw_iter().enumerate() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_source_icc_arrays(root, &value, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Dict(dictionary) => {
-            for (name, value) in dictionary.entries() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_icc_arrays(root, &value, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Stream(stream) => {
-            for (name, value) in stream.dict().entries() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_icc_arrays(root, &value, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Null(_)
-        | HayroObject::Boolean(_)
-        | HayroObject::Number(_)
-        | HayroObject::String(_)
-        | HayroObject::Name(_) => {}
-    }
+struct IccArrayVisitor<'a> {
+    holders: &'a mut Vec<DirectArrayReferenceHolder>,
 }
 
-fn inspect_owned_icc_arrays(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: &OwnedObject,
-    path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<DirectArrayReferenceHolder>,
-) -> Result<()> {
-    match object {
-        OwnedObject::Array(values) => {
-            let is_icc = values.first().is_some_and(|first| {
-                matches!(document.resolve_owned_value(first), Ok(Some(OwnedObject::Name(name))) if name == b"ICCBased")
-            });
-            if is_icc && let Some(OwnedObject::Reference(profile)) = values.get(1) {
-                holders.push(DirectArrayReferenceHolder {
-                    root,
-                    path: path.clone(),
-                    index: 1,
-                    target: *profile,
-                });
-                return Ok(());
-            }
-            for (index, value) in values.iter().enumerate() {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_owned_icc_arrays(document, root, value, path, holders)?;
-                path.pop();
-            }
+impl DirectObjectVisitor for IccArrayVisitor<'_> {
+    fn visit_array(
+        &mut self,
+        document: &EditDocument,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        array: DirectArrayView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        if !array.resolved_name_is(document, 0, b"ICCBased")? {
+            return Ok(DirectWalkControl::Descend);
         }
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            for (name, value) in dictionary {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::DictKey(name.clone()));
-                inspect_owned_icc_arrays(document, root, value, path, holders)?;
-                path.pop();
-            }
-        }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
+        let Some(profile) = array.reference(1) else {
+            return Ok(DirectWalkControl::Descend);
+        };
+        self.holders.push(DirectArrayReferenceHolder {
+            root,
+            path: path.to_vec(),
+            index: 1,
+            target: profile,
+        });
+        Ok(DirectWalkControl::SkipChildren)
     }
-    Ok(())
 }
 
 fn icc_array_holders(document: &EditDocument) -> Result<Vec<DirectArrayReferenceHolder>> {
     let mut holders = Vec::new();
-    document.walk_output_objects(|handle, object| match object {
-        CurrentObject::Source(object) => {
-            inspect_source_icc_arrays(handle, &object, &mut Vec::new(), &mut holders);
-            Ok(())
-        }
-        CurrentObject::Owned(object) => {
-            inspect_owned_icc_arrays(document, handle, object, &mut Vec::new(), &mut holders)
-        }
-    })?;
+    walk_direct_output_objects(
+        document,
+        &mut IccArrayVisitor {
+            holders: &mut holders,
+        },
+    )?;
     Ok(holders)
 }
 
@@ -893,160 +1002,49 @@ fn object_at_direct_path<'a>(
     Some(object)
 }
 
-fn inspect_source_type3_dictionary(
-    root: CowObjectHandle,
-    dictionary: &hayro_syntax::object::Dict<'_>,
-    path: &mut Vec<DirectPathStep>,
-    targets: &mut BTreeSet<DirectDictionaryTarget>,
-) {
-    let is_type3 = dictionary
-        .get::<HayroName<'_>>(b"Subtype")
-        .is_some_and(|name| name.as_ref() == b"Type3");
-    if is_type3 {
-        if let Some(charprocs) = dictionary.get_ref(b"CharProcs") {
-            targets.insert(DirectDictionaryTarget {
-                root: CowObjectHandle::Existing(charprocs.into()),
-                path: Vec::new(),
-            });
-        } else if matches!(
-            dictionary.get_raw::<HayroObject<'_>>(b"CharProcs"),
-            Some(HayroMaybeRef::NotRef(HayroObject::Dict(_)))
-        ) {
-            let mut target_path = path.clone();
-            target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
-            targets.insert(DirectDictionaryTarget {
-                root,
-                path: target_path,
-            });
-        }
-    }
-
-    for (name, value) in dictionary.entries() {
-        if name.as_ref() == b"CharProcs" {
-            continue;
-        }
-        let HayroMaybeRef::NotRef(value) = value else {
-            continue;
-        };
-        path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-        inspect_source_type3_object(root, &value, path, targets);
-        path.pop();
-    }
+struct Type3TargetVisitor<'a> {
+    targets: &'a mut BTreeSet<DirectDictionaryTarget>,
 }
 
-fn inspect_source_type3_object(
-    root: CowObjectHandle,
-    object: &HayroObject<'_>,
-    path: &mut Vec<DirectPathStep>,
-    targets: &mut BTreeSet<DirectDictionaryTarget>,
-) {
-    match object {
-        HayroObject::Dict(dictionary) => {
-            inspect_source_type3_dictionary(root, dictionary, path, targets);
-        }
-        HayroObject::Stream(stream) => {
-            inspect_source_type3_dictionary(root, stream.dict(), path, targets);
-        }
-        HayroObject::Array(array) => {
-            for (index, value) in array.raw_iter().enumerate() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_source_type3_object(root, &value, path, targets);
-                path.pop();
+impl DirectObjectVisitor for Type3TargetVisitor<'_> {
+    fn visit_dictionary(
+        &mut self,
+        document: &EditDocument,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        if dictionary.resolved_name_is(document, b"Subtype", b"Type3")? {
+            if let Some(charprocs) = dictionary.reference(b"CharProcs") {
+                self.targets.insert(DirectDictionaryTarget {
+                    root: charprocs,
+                    path: Vec::new(),
+                });
+            } else if dictionary.has_direct_dictionary(b"CharProcs") {
+                let mut target_path = path.to_vec();
+                target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
+                self.targets.insert(DirectDictionaryTarget {
+                    root,
+                    path: target_path,
+                });
             }
         }
-        HayroObject::Null(_)
-        | HayroObject::Boolean(_)
-        | HayroObject::Number(_)
-        | HayroObject::String(_)
-        | HayroObject::Name(_) => {}
+        Ok(DirectWalkControl::Descend)
     }
-}
 
-fn owned_dictionary_is_type3(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
-) -> Result<bool> {
-    let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
-        return Ok(false);
-    };
-    Ok(matches!(
-        document.resolve_owned_value(subtype)?,
-        Some(OwnedObject::Name(name)) if name == b"Type3"
-    ))
-}
-
-fn inspect_owned_type3_object(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: &OwnedObject,
-    path: &mut Vec<DirectPathStep>,
-    targets: &mut BTreeSet<DirectDictionaryTarget>,
-) -> Result<()> {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if owned_dictionary_is_type3(document, dictionary)? {
-                match dictionary.get(b"CharProcs".as_slice()) {
-                    Some(OwnedObject::Reference(charprocs)) => {
-                        targets.insert(DirectDictionaryTarget {
-                            root: *charprocs,
-                            path: Vec::new(),
-                        });
-                    }
-                    Some(OwnedObject::Dictionary(_)) => {
-                        let mut target_path = path.clone();
-                        target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
-                        targets.insert(DirectDictionaryTarget {
-                            root,
-                            path: target_path,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            for (name, value) in dictionary {
-                if name.as_slice() == b"CharProcs" || matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::DictKey(name.clone()));
-                inspect_owned_type3_object(document, root, value, path, targets)?;
-                path.pop();
-            }
-        }
-        OwnedObject::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_owned_type3_object(document, root, value, path, targets)?;
-                path.pop();
-            }
-        }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
+    fn descend_dictionary_value(&self, key: &[u8]) -> bool {
+        key != b"CharProcs"
     }
-    Ok(())
 }
 
 fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
     let mut targets = BTreeSet::new();
-    document.walk_output_objects(|handle, object| match object {
-        CurrentObject::Source(object) => {
-            inspect_source_type3_object(handle, &object, &mut Vec::new(), &mut targets);
-            Ok(())
-        }
-        CurrentObject::Owned(object) => {
-            inspect_owned_type3_object(document, handle, object, &mut Vec::new(), &mut targets)
-        }
-    })?;
+    walk_direct_output_objects(
+        document,
+        &mut Type3TargetVisitor {
+            targets: &mut targets,
+        },
+    )?;
     Ok(targets)
 }
 
@@ -1920,95 +1918,20 @@ fn record_redirect_reference_holder(
     }
 }
 
-fn inspect_source_redirect_value(
-    root: CowObjectHandle,
-    value: HayroMaybeRef<HayroObject<'_>>,
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<RedirectReferenceHolder>,
-) {
-    match value {
-        HayroMaybeRef::Ref(target) => record_redirect_reference_holder(
-            root,
-            path,
-            CowObjectHandle::Existing(target.into()),
-            redirects,
-            holders,
-        ),
-        HayroMaybeRef::NotRef(value) => {
-            inspect_source_redirect_reference_holders(root, &value, redirects, path, holders);
-        }
-    }
+struct RedirectReferenceVisitor<'a> {
+    redirects: &'a HashMap<CowObjectHandle, CowObjectHandle>,
+    holders: &'a mut Vec<RedirectReferenceHolder>,
 }
 
-fn inspect_source_redirect_reference_holders(
-    root: CowObjectHandle,
-    object: &HayroObject<'_>,
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<RedirectReferenceHolder>,
-) {
-    match object {
-        HayroObject::Dict(dictionary) => {
-            for (name, value) in dictionary.entries() {
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_redirect_value(root, value, redirects, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Stream(stream) => {
-            for (name, value) in stream.dict().entries() {
-                path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
-                inspect_source_redirect_value(root, value, redirects, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Array(array) => {
-            for (index, value) in array.raw_iter().enumerate() {
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_source_redirect_value(root, value, redirects, path, holders);
-                path.pop();
-            }
-        }
-        HayroObject::Null(_)
-        | HayroObject::Boolean(_)
-        | HayroObject::Number(_)
-        | HayroObject::String(_)
-        | HayroObject::Name(_) => {}
-    }
-}
-
-fn inspect_owned_redirect_reference_holders(
-    root: CowObjectHandle,
-    object: &OwnedObject,
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    path: &mut Vec<DirectPathStep>,
-    holders: &mut Vec<RedirectReferenceHolder>,
-) {
-    match object {
-        OwnedObject::Reference(target) => {
-            record_redirect_reference_holder(root, path, *target, redirects, holders);
-        }
-        OwnedObject::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_owned_redirect_reference_holders(root, value, redirects, path, holders);
-                path.pop();
-            }
-        }
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            for (name, value) in dictionary {
-                path.push(DirectPathStep::DictKey(name.clone()));
-                inspect_owned_redirect_reference_holders(root, value, redirects, path, holders);
-                path.pop();
-            }
-        }
-        OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
+impl DirectObjectVisitor for RedirectReferenceVisitor<'_> {
+    fn visit_reference(
+        &mut self,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        target: CowObjectHandle,
+    ) -> Result<()> {
+        record_redirect_reference_holder(root, path, target, self.redirects, self.holders);
+        Ok(())
     }
 }
 
@@ -2047,25 +1970,13 @@ fn rewrite_all_references(
     }
 
     let mut holders = Vec::new();
-    document.walk_output_objects(|root, object| {
-        match object {
-            CurrentObject::Source(object) => inspect_source_redirect_reference_holders(
-                root,
-                &object,
-                redirects,
-                &mut Vec::new(),
-                &mut holders,
-            ),
-            CurrentObject::Owned(object) => inspect_owned_redirect_reference_holders(
-                root,
-                object,
-                redirects,
-                &mut Vec::new(),
-                &mut holders,
-            ),
-        }
-        Ok(())
-    })?;
+    walk_direct_output_objects(
+        document,
+        &mut RedirectReferenceVisitor {
+            redirects,
+            holders: &mut holders,
+        },
+    )?;
 
     let mut rewritten = 0usize;
     for holder in holders {

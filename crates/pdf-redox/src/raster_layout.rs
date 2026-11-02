@@ -4,8 +4,8 @@ use crate::{
     StreamData,
     bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
     content::{
-        form_content, form_resources, page_content, page_resources, page_user_unit, resolved_bool,
-        resolved_dictionary, resolved_number,
+        form_content, form_resources, page_box_numbers_matching, page_content, page_resources,
+        page_user_unit, resolved_bool, resolved_dictionary, resolved_non_null, resolved_number,
     },
     content_stream::{
         InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
@@ -1255,45 +1255,21 @@ fn scan_target_shared(
     }))
 }
 
-fn current_number_array4(document: &EditDocument, value: &OwnedObject) -> Result<Option<[f64; 4]>> {
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
+    let Some(values) = page_box_numbers_matching(document, page, |values| {
+        values.into_iter().all(f64::is_finite)
+            && values[0].min(values[2]) < values[0].max(values[2])
+            && values[1].min(values[3]) < values[1].max(values[3])
+    })?
+    else {
         return Ok(None);
     };
-    if values.len() != 4 {
-        return Ok(None);
-    }
-    let mut out = [0.0; 4];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number(document, Some(value))? else {
-            return Ok(None);
-        };
-        if !number.is_finite() {
-            return Ok(None);
-        }
-        out[index] = number;
-    }
-    Ok(Some(out))
-}
-
-fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
-    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        let Some(value) = document.inherited_page_value(page, key)? else {
-            continue;
-        };
-        let Some(values) = current_number_array4(document, &value)? else {
-            continue;
-        };
-        let rect = Rect {
-            x0: values[0].min(values[2]),
-            y0: values[1].min(values[3]),
-            x1: values[0].max(values[2]),
-            y1: values[1].max(values[3]),
-        };
-        if rect.x1 > rect.x0 && rect.y1 > rect.y0 {
-            return Ok(Some(rect));
-        }
-    }
-    Ok(None)
+    Ok(Some(Rect {
+        x0: values[0].min(values[2]),
+        y0: values[1].min(values[3]),
+        x1: values[0].max(values[2]),
+        y1: values[1].max(values[3]),
+    }))
 }
 
 #[expect(
@@ -1373,16 +1349,6 @@ fn dimensions(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<O
         return Ok(None);
     };
     Ok(Some((width, height)))
-}
-
-fn is_non_null(document: &EditDocument, value: Option<&OwnedObject>) -> Result<bool> {
-    let Some(value) = value else {
-        return Ok(false);
-    };
-    Ok(!matches!(
-        document.resolve_owned_value(value)?,
-        None | Some(OwnedObject::Null)
-    ))
 }
 
 fn color_components(document: &EditDocument, value: &OwnedObject) -> Result<Option<usize>> {
@@ -2174,8 +2140,8 @@ fn image_info(
     }
 
     let preserve_encoded_color = preserves_compact_color_encoding(document, dictionary)?;
-    let has_soft_mask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
-    let has_explicit_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+    let has_soft_mask = resolved_non_null(document, dictionary.get(b"SMask".as_slice()))?;
+    let has_explicit_mask = resolved_non_null(document, dictionary.get(b"Mask".as_slice()))?;
     let encoded_mask_bytes = if has_soft_mask {
         match dictionary.get(b"SMask".as_slice()) {
             Some(smask) => encoded_stream_payload_len(document, smask)?.unwrap_or(0),
@@ -2198,11 +2164,11 @@ fn image_info(
     let mut mask_height = height;
     if bake_masks {
         if let Some(smask) = dictionary.get(b"SMask".as_slice())
-            && is_non_null(document, Some(smask))?
+            && resolved_non_null(document, Some(smask))?
         {
             alpha = decode_mask_stream(document, smask, false)?;
         } else if let Some(mask) = dictionary.get(b"Mask".as_slice())
-            && is_non_null(document, Some(mask))?
+            && resolved_non_null(document, Some(mask))?
         {
             match document.resolve_owned_value(mask)? {
                 Some(OwnedObject::Array(_)) => {
@@ -2376,8 +2342,10 @@ fn image_may_have_pixel_transparency(
     {
         return Ok(true);
     }
-    Ok(is_non_null(document, dictionary.get(b"SMask".as_slice()))?
-        || is_non_null(document, dictionary.get(b"Mask".as_slice()))?)
+    Ok(
+        resolved_non_null(document, dictionary.get(b"SMask".as_slice()))?
+            || resolved_non_null(document, dictionary.get(b"Mask".as_slice()))?,
+    )
 }
 
 fn image_fully_transparent(image: &SampleImage) -> bool {
@@ -5471,8 +5439,9 @@ fn build_merge_plans_for_scanner(
             let Some(dictionary) = object.as_dictionary() else {
                 continue;
             };
-            let has_soft_mask = is_non_null(document, dictionary.get(b"SMask".as_slice()))?;
-            let has_explicit_mask = is_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+            let has_soft_mask = resolved_non_null(document, dictionary.get(b"SMask".as_slice()))?;
+            let has_explicit_mask =
+                resolved_non_null(document, dictionary.get(b"Mask".as_slice()))?;
             if !has_soft_mask && !has_explicit_mask {
                 continue;
             }

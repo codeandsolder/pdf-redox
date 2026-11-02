@@ -1,5 +1,8 @@
 use crate::config::HiddenTextPolicy;
-use crate::content::{replace_page_content, resolved_dictionary, resolved_number_value};
+use crate::content::{
+    page_box_numbers, page_content, replace_page_content, resolved_dictionary, resolved_name,
+    resolved_number_value,
+};
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
@@ -1378,7 +1381,7 @@ pub fn apply_hidden_text_policy(
         if scan.findings.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes(document, page)?;
+        let decoded = page_content(document, page)?;
         let selected: BTreeSet<String> = scan
             .findings
             .iter()
@@ -1495,7 +1498,7 @@ pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenT
     let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
     for page in pages {
-        let decoded = page_content_bytes(document, page)?;
+        let decoded = page_content(document, page)?;
         if !may_contain_diagonal_text_transform(&decoded) {
             continue;
         }
@@ -1534,7 +1537,7 @@ pub fn prune_physically_hidden_text(
         if ranges.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes(document, page)?;
+        let decoded = page_content(document, page)?;
         stats.removed += ranges.len();
         replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
@@ -1568,16 +1571,6 @@ fn resolved_array(
     })
 }
 
-fn resolved_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Vec<u8>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => name,
-        _ => Vec::new(),
-    })
-}
-
 fn resolved_u32(document: &EditDocument, value: &OwnedObject) -> Result<Option<u32>> {
     Ok(match document.resolve_owned_value(value)? {
         Some(OwnedObject::Integer(value)) => u32::try_from(value).ok(),
@@ -1604,8 +1597,8 @@ fn build_fonts(
 
 fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
     let mut info = FontInfo::default();
-    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?;
-    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?;
+    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?.unwrap_or_default();
+    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?.unwrap_or_default();
     info.identity_two_byte =
         subtype == b"Type0" && matches!(encoding.as_slice(), b"Identity-H" | b"Identity-V");
     if info.identity_two_byte {
@@ -1760,7 +1753,8 @@ fn build_images(
             out.insert(key.clone(), false);
             continue;
         };
-        let is_image = resolved_name(document, dictionary.get(b"Subtype".as_slice()))? == b"Image";
+        let is_image = resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            == Some(b"Image");
         let unmasked = is_image
             && !dictionary.contains_key(b"SMask".as_slice())
             && !dictionary.contains_key(b"Mask".as_slice());
@@ -1870,82 +1864,11 @@ fn optional_content_state(document: &EditDocument) -> Result<OptionalContentStat
     Ok(out)
 }
 
-fn decoded_content_value(
-    document: &EditDocument,
-    value: &OwnedObject,
-    output: &mut Vec<u8>,
-) -> Result<()> {
-    let value = match value {
-        OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            value
-        }
-        value => value.clone(),
-    };
-    match value {
-        OwnedObject::Stream { .. } => {
-            let bytes = document.decoded_owned_stream_data(&value)?;
-            if !output.is_empty() && output.last() != Some(&b'\n') {
-                output.push(b'\n');
-            }
-            output.extend_from_slice(&bytes);
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                decoded_content_value(document, &value, output)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn page_content_bytes(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
-    let Some(page) = document.current_owned_object(page)? else {
-        return Ok(Vec::new());
-    };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(Vec::new());
-    };
-    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-        return Ok(Vec::new());
-    };
-    let mut output = Vec::new();
-    decoded_content_value(document, contents, &mut output)?;
-    Ok(output)
-}
-
-fn owned_number_array<const N: usize>(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<[f64; N]>> {
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    if values.len() != N {
-        return Ok(None);
-    }
-    let mut out = [0.0; N];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number_value(document, value)? else {
-            return Ok(None);
-        };
-        out[index] = number;
-    }
-    Ok(Some(out))
-}
-
 fn page_crop(document: &EditDocument, page: CowObjectHandle) -> Result<Rect> {
-    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        if let Some(value) = document.inherited_page_value(page, key)?
-            && let Some(values) = owned_number_array::<4>(document, &value)?
-        {
-            return Ok(Rect::new(values[0], values[1], values[2], values[3]));
-        }
-    }
-    Ok(Rect::new(0.0, 0.0, 612.0, 792.0))
+    let Some([x0, y0, x1, y1]) = page_box_numbers(document, page)? else {
+        return Ok(Rect::new(0.0, 0.0, 612.0, 792.0));
+    };
+    Ok(Rect::new(x0, y0, x1, y1))
 }
 
 pub struct HiddenTextSharedContext {
@@ -2045,7 +1968,7 @@ fn scan_page(
         document.inherited_page_value(page, b"Resources")?,
         ocg,
     )?;
-    let content = page_content_bytes(document, page)?;
+    let content = page_content(document, page)?;
     let mut scanner = PageScanner::new(
         page_number,
         crop,

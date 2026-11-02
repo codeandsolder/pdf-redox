@@ -9,6 +9,7 @@ mod content;
 pub(crate) mod content_stream;
 mod dedup;
 mod error;
+mod ext_gstate;
 mod flate;
 mod font;
 mod font_subset;

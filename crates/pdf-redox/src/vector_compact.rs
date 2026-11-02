@@ -1,10 +1,11 @@
+use crate::ext_gstate::ext_gstate_semantics;
 use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
         decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
-        replace_page_content, replace_page_content_with_handle, resolved_bool_value,
-        resolved_dictionary, resolved_number_value,
+        replace_page_content, replace_page_content_with_handle, resolved_dictionary,
+        resolved_number_value,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
     flate::FlateReuseCache,
@@ -666,56 +667,24 @@ fn ext_gstate_patches(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStatePatch>> {
-    let Some(states) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let mut out = BTreeMap::new();
-    for (name, value) in states {
-        let Some(state) = resolved_dictionary(document, Some(&value))? else {
-            continue;
-        };
-        let fill_alpha_opaque = match state.get(b"ca".as_slice()) {
-            None => None,
-            Some(value) => Some(
-                resolved_number_value(document, value)?
-                    .is_some_and(|value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12),
-            ),
-        };
-        let normal_blend = match state.get(b"BM".as_slice()) {
-            None => None,
-            Some(value) => Some(matches!(
-                document.resolve_owned_value(value)?,
-                Some(OwnedObject::Name(name)) if name == b"Normal"
-            )),
-        };
-        let no_soft_mask = match state.get(b"SMask".as_slice()) {
-            None => None,
-            Some(value) => Some(matches!(
-                document.resolve_owned_value(value)?,
-                Some(OwnedObject::Name(name)) if name == b"None"
-            )),
-        };
-        // PDF `op` controls non-stroking overprint. When it is absent, `OP`
-        // supplies the value, so either key can make a fill non-idempotent.
-        let fill_overprint_disabled = if let Some(value) = state.get(b"op".as_slice()) {
-            Some(resolved_bool_value(document, value)? == Some(false))
-        } else if let Some(value) = state.get(b"OP".as_slice()) {
-            Some(resolved_bool_value(document, value)? == Some(false))
-        } else {
-            None
-        };
-        out.insert(
-            name,
-            ExtGStatePatch {
-                fill_alpha_opaque,
-                normal_blend,
-                no_soft_mask,
-                fill_overprint_disabled,
-            },
-        );
-    }
-    Ok(out)
+    Ok(ext_gstate_semantics(document, resources)?
+        .into_iter()
+        .map(|(name, state)| {
+            (
+                name,
+                ExtGStatePatch {
+                    fill_alpha_opaque: state.fill_alpha_opaque,
+                    normal_blend: state.normal_blend,
+                    no_soft_mask: state.no_soft_mask,
+                    // PDF `op` controls non-stroking overprint. When absent, `OP`
+                    // supplies the value, so preserve that fallback here.
+                    fill_overprint_disabled: state
+                        .fill_overprint_disabled
+                        .or(state.stroke_overprint_disabled),
+                },
+            )
+        })
+        .collect())
 }
 
 type SemanticKey = [u8; 32];
