@@ -692,7 +692,7 @@ fn batch_closed_fills(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
     if replacements.is_empty() {
         return Some((input.to_vec(), stats));
     }
-    let output = apply_replacements(input, replacements)?;
+    let output = crate::content_stream::apply_replacements(input, &replacements)?;
     Some((output, stats))
 }
 
@@ -763,27 +763,8 @@ fn batch_strokes(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
     if replacements.is_empty() {
         return Some((input.to_vec(), stats));
     }
-    let output = apply_replacements(input, replacements)?;
+    let output = crate::content_stream::apply_replacements(input, &replacements)?;
     Some((output, stats))
-}
-
-fn apply_replacements(
-    input: &[u8],
-    mut replacements: Vec<(usize, usize, Vec<u8>)>,
-) -> Option<Vec<u8>> {
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || start > end || end > input.len() {
-            return None;
-        }
-        output.extend_from_slice(input.get(cursor..start)?);
-        output.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    output.extend_from_slice(input.get(cursor..)?);
-    Some(output)
 }
 
 fn batch_content(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
@@ -865,7 +846,7 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Vec<u8>, usize)> {
         return Some((input.to_vec(), 0));
     }
     Some((
-        apply_replacements(input, replacements)?,
+        crate::content_stream::apply_replacements(input, &replacements)?,
         boundaries_coalesced,
     ))
 }
@@ -896,8 +877,8 @@ pub fn coalesce_optional_content(
         if boundaries == 0 || coalesced == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&coalesced, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&coalesced, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
@@ -1065,7 +1046,10 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     if replacements.is_empty() {
         return Some((input.to_vec(), 0));
     }
-    Some((apply_replacements(input, replacements)?, vertices_removed))
+    Some((
+        crate::content_stream::apply_replacements(input, &replacements)?,
+        vertices_removed,
+    ))
 }
 
 #[derive(Debug)]
@@ -1104,7 +1088,7 @@ fn compact_collinear_form_paths(
         if candidate_vertices_removed == 0 || compacted == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
         let encoded_len = encoded.len();
         if encoded_len > before_flate {
@@ -1180,8 +1164,8 @@ pub fn compact_collinear_paths(
         if vertices_removed == 0 || compacted == normalized {
             continue;
         }
-        let before_flate = compressed_len(&normalized, flate_level)?;
-        let after_flate = compressed_len(&compacted, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&normalized, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&compacted, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
@@ -2041,17 +2025,27 @@ pub fn factor_repeated_stroke_forms(
     let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
     for &page_index in &affected_pages {
         let page = &page_data[page_index];
-        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
-        let Some(rewritten) =
-            apply_replacements(&page.decoded, replacements_by_page[page_index].clone())
-        else {
+        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.decoded,
+            flate_level,
+        )?);
+        let Some(rewritten) = crate::content_stream::apply_replacements(
+            &page.decoded,
+            &replacements_by_page[page_index],
+        ) else {
             return Ok(StrokeFormFactorStats::default());
         };
-        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
         rewritten_pages.insert(page_index, rewritten);
     }
     for plan in &plans {
-        after_flate = after_flate.saturating_add(compressed_len(&plan.body, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &plan.body,
+            flate_level,
+        )?);
     }
     after_flate = after_flate
         .saturating_add(plans.len().saturating_mul(STROKE_FORM_OVERHEAD_BYTES))
@@ -2206,11 +2200,14 @@ fn outlined_glyph_estimated_after_flate(
     plans: &[GlyphFontPlan],
     flate_level: crate::FlateLevel,
 ) -> Result<usize> {
-    let mut total = compressed_len(rewritten, flate_level)?;
+    let mut total = crate::stream_codec::flate_encoded_len(rewritten, flate_level)?;
     let glyphs = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
     for plan in plans {
         for shape in &plan.shapes {
-            total = total.saturating_add(compressed_len(&shape.charproc, flate_level)?);
+            total = total.saturating_add(crate::stream_codec::flate_encoded_len(
+                &shape.charproc,
+                flate_level,
+            )?);
         }
     }
     Ok(total
@@ -2318,10 +2315,12 @@ pub fn factor_outlined_glyphs(
         let Some(replacement_plan) = outlined_glyph_replacements(&plans) else {
             continue;
         };
-        let Some(rewritten) = apply_replacements(&decoded, replacement_plan.replacements) else {
+        let Some(rewritten) =
+            crate::content_stream::apply_replacements(&decoded, &replacement_plan.replacements)
+        else {
             continue;
         };
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let after_flate = outlined_glyph_estimated_after_flate(&rewritten, &plans, flate_level)?;
         if before_flate <= after_flate
             || before_flate.saturating_sub(after_flate) < MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS
@@ -2353,10 +2352,6 @@ pub fn factor_outlined_glyphs(
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
     Ok(stats)
-}
-
-fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
 pub fn batch_page_paints(document: &mut EditDocument) -> Result<PaintBatchStats> {
@@ -2544,8 +2539,8 @@ mod tests {
         };
         assert!(candidate_stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
         assert!(
-            compressed_len(&batched, crate::FlateLevel::PROCESSING)?
-                > compressed_len(&content, crate::FlateLevel::PROCESSING)?,
+            crate::stream_codec::flate_encoded_len(&batched, crate::FlateLevel::PROCESSING)?
+                > crate::stream_codec::flate_encoded_len(&content, crate::FlateLevel::PROCESSING)?,
             "fixture must exercise the structural-over-size policy"
         );
 

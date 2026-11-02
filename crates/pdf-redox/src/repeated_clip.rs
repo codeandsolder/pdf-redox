@@ -338,27 +338,6 @@ fn hoisted_run(input: &[u8], blocks: &[ClipBlock], run: ClipRun) -> Option<(Repl
     Some(((first.start, last.end, output), decoded_savings))
 }
 
-fn apply_replacements(input: &[u8], replacements: &[Replacement]) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || start > end || end > input.len() {
-            return None;
-        }
-        output.extend_from_slice(input.get(cursor..start)?);
-        output.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    output.extend_from_slice(input.get(cursor..)?);
-    Some(output)
-}
-
-fn compressed_len(bytes: &[u8], level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(bytes, level)?.len())
-}
-
 pub fn hoist_repeated_clip_prefixes(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -401,11 +380,12 @@ pub fn hoist_repeated_clip_prefixes(
         if replacements.is_empty() {
             continue;
         }
-        let Some(rewritten) = apply_replacements(&decoded, &replacements) else {
+        let Some(rewritten) = crate::content_stream::apply_replacements(&decoded, &replacements)
+        else {
             continue;
         };
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&rewritten, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
@@ -450,8 +430,10 @@ mod tests {
             ));
         };
         assert!(savings >= MIN_DECODED_SAVINGS);
-        let Some(rewritten) = apply_replacements(input.as_bytes(), &[(start, end, replacement)])
-        else {
+        let Some(rewritten) = crate::content_stream::apply_replacements(
+            input.as_bytes(),
+            &[(start, end, replacement)],
+        ) else {
             return Err(crate::Error::Invalid(
                 "clip fixture rewrite failed".to_owned(),
             ));
@@ -506,7 +488,9 @@ mod tests {
                 "clip fixture was not hoisted".to_owned(),
             ));
         };
-        let Some(rewritten) = apply_replacements(input.as_bytes(), &[replacement]) else {
+        let Some(rewritten) =
+            crate::content_stream::apply_replacements(input.as_bytes(), &[replacement])
+        else {
             return Err(crate::Error::Invalid(
                 "clip fixture reparse failed".to_owned(),
             ));

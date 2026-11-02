@@ -132,30 +132,178 @@ where
 
 const HAYRO_FONT_FILE_KEYS: [&[u8]; 3] = [b"FontFile", b"FontFile2", b"FontFile3"];
 
+fn source_font_program_holders(
+    root: CowObjectHandle,
+    object: &HayroObject<'_>,
+    active_keys: u8,
+    path: &mut Vec<DirectPathStep>,
+    holders_by_key: &mut [Vec<DirectReferenceHolder>; HAYRO_FONT_FILE_KEYS.len()],
+) {
+    match object {
+        HayroObject::Dict(dictionary) => {
+            source_font_program_dictionary_holders(
+                root,
+                dictionary,
+                active_keys,
+                path,
+                holders_by_key,
+            );
+        }
+        HayroObject::Stream(stream) => {
+            source_font_program_dictionary_holders(
+                root,
+                stream.dict(),
+                active_keys,
+                path,
+                holders_by_key,
+            );
+        }
+        HayroObject::Array(array) => {
+            for (index, value) in array.raw_iter().enumerate() {
+                let HayroMaybeRef::NotRef(value) = value else {
+                    continue;
+                };
+                path.push(DirectPathStep::ArrayIndex(index));
+                source_font_program_holders(root, &value, active_keys, path, holders_by_key);
+                path.pop();
+            }
+        }
+        HayroObject::Null(_)
+        | HayroObject::Boolean(_)
+        | HayroObject::Number(_)
+        | HayroObject::String(_)
+        | HayroObject::Name(_) => {}
+    }
+}
+
+fn source_font_program_dictionary_holders(
+    root: CowObjectHandle,
+    dictionary: &hayro_syntax::object::Dict<'_>,
+    active_keys: u8,
+    path: &mut Vec<DirectPathStep>,
+    holders_by_key: &mut [Vec<DirectReferenceHolder>; HAYRO_FONT_FILE_KEYS.len()],
+) {
+    for (index, key) in HAYRO_FONT_FILE_KEYS.iter().copied().enumerate() {
+        if active_keys & (1 << index) == 0 {
+            continue;
+        }
+        if let Some(target) = dictionary.get_ref(key) {
+            holders_by_key[index].push(DirectReferenceHolder {
+                root,
+                path: path.clone(),
+                key: key.to_vec(),
+                target: CowObjectHandle::Existing(target.into()),
+            });
+        }
+    }
+
+    for (name, value) in dictionary.entries() {
+        let HayroMaybeRef::NotRef(value) = value else {
+            continue;
+        };
+        let mut child_active_keys = active_keys;
+        if let Some(index) = HAYRO_FONT_FILE_KEYS
+            .iter()
+            .position(|key| name.as_ref() == *key)
+        {
+            child_active_keys &= !(1 << index);
+        }
+        if child_active_keys == 0 {
+            continue;
+        }
+        path.push(DirectPathStep::DictKey(name.as_ref().to_vec()));
+        source_font_program_holders(root, &value, child_active_keys, path, holders_by_key);
+        path.pop();
+    }
+}
+
+fn owned_font_program_holders(
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    active_keys: u8,
+    path: &mut Vec<DirectPathStep>,
+    holders_by_key: &mut [Vec<DirectReferenceHolder>; HAYRO_FONT_FILE_KEYS.len()],
+) {
+    match object {
+        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            for (index, key) in HAYRO_FONT_FILE_KEYS.iter().copied().enumerate() {
+                if active_keys & (1 << index) == 0 {
+                    continue;
+                }
+                if let Some(OwnedObject::Reference(target)) = dictionary.get(key) {
+                    holders_by_key[index].push(DirectReferenceHolder {
+                        root,
+                        path: path.clone(),
+                        key: key.to_vec(),
+                        target: *target,
+                    });
+                }
+            }
+
+            for (name, value) in dictionary {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                let mut child_active_keys = active_keys;
+                if let Some(index) = HAYRO_FONT_FILE_KEYS
+                    .iter()
+                    .position(|key| name.as_slice() == *key)
+                {
+                    child_active_keys &= !(1 << index);
+                }
+                if child_active_keys == 0 {
+                    continue;
+                }
+                path.push(DirectPathStep::DictKey(name.clone()));
+                owned_font_program_holders(root, value, child_active_keys, path, holders_by_key);
+                path.pop();
+            }
+        }
+        OwnedObject::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if matches!(value, OwnedObject::Reference(_)) {
+                    continue;
+                }
+                path.push(DirectPathStep::ArrayIndex(index));
+                owned_font_program_holders(root, value, active_keys, path, holders_by_key);
+                path.pop();
+            }
+        }
+        OwnedObject::Reference(_)
+        | OwnedObject::Null
+        | OwnedObject::Boolean(_)
+        | OwnedObject::Integer(_)
+        | OwnedObject::Real(_)
+        | OwnedObject::Name(_)
+        | OwnedObject::String(_) => {}
+    }
+}
+
 fn font_program_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
-    // Preserve the previous key-major holder ordering while paying for only one
-    // reachable-object traversal. Each per-key recursive inspector is unchanged,
-    // so direct/nested reference semantics remain exactly the same.
+    // Preserve the historical key-major holder ordering while traversing each
+    // direct object subtree only once. `active_keys` reproduces the old
+    // key-specific recursion rule: a direct value under `/FontFileN` is opaque
+    // only to that same key's search, while the other font-file keys can still
+    // be discovered inside malformed/nonstandard direct values.
     let mut holders_by_key: [Vec<DirectReferenceHolder>; HAYRO_FONT_FILE_KEYS.len()] =
         std::array::from_fn(|_| Vec::new());
+    let all_keys = (1_u8 << HAYRO_FONT_FILE_KEYS.len()) - 1;
     document.walk_output_objects(|handle, object| {
-        for (index, key) in HAYRO_FONT_FILE_KEYS.iter().copied().enumerate() {
-            match &object {
-                CurrentObject::Source(object) => inspect_source_direct_reference_holders(
-                    handle,
-                    object,
-                    key,
-                    &mut Vec::new(),
-                    &mut holders_by_key[index],
-                ),
-                CurrentObject::Owned(object) => inspect_owned_direct_reference_holders(
-                    handle,
-                    object,
-                    key,
-                    &mut Vec::new(),
-                    &mut holders_by_key[index],
-                ),
-            }
+        match &object {
+            CurrentObject::Source(object) => source_font_program_holders(
+                handle,
+                object,
+                all_keys,
+                &mut Vec::new(),
+                &mut holders_by_key,
+            ),
+            CurrentObject::Owned(object) => owned_font_program_holders(
+                handle,
+                object,
+                all_keys,
+                &mut Vec::new(),
+                &mut holders_by_key,
+            ),
         }
         Ok(())
     })?;

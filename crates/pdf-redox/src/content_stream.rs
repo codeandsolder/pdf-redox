@@ -78,6 +78,29 @@ pub fn operand_number(object: &HayroObject<'_>, raw: &[u8]) -> Option<f64> {
     }
 }
 
+/// Apply sorted, non-overlapping byte-range replacements to a content stream.
+///
+/// Returns `None` when any range is invalid or overlaps an earlier replacement.
+pub fn apply_replacements(
+    input: &[u8],
+    replacements: &[(usize, usize, Vec<u8>)],
+) -> Option<Vec<u8>> {
+    let mut replacements = replacements.to_vec();
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in replacements {
+        if start < cursor || start > end || end > input.len() {
+            return None;
+        }
+        output.extend_from_slice(input.get(cursor..start)?);
+        output.extend_from_slice(&replacement);
+        cursor = end;
+    }
+    output.extend_from_slice(input.get(cursor..)?);
+    Some(output)
+}
+
 /// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
 ///
 /// Streams with inline images or malformed trailing input are left unchanged so

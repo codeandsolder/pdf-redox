@@ -920,27 +920,6 @@ fn replacement_bytes(name: &[u8], run: &MicroStrokeRun, raster: &RasterizedRun) 
     out
 }
 
-fn compressed_len(data: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(data, flate_level)?.len())
-}
-
-fn apply_replacements(input: &[u8], replacements: &[(usize, usize, Vec<u8>)]) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut out = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || end > input.len() || start > end {
-            return None;
-        }
-        out.extend_from_slice(&input[cursor..start]);
-        out.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    out.extend_from_slice(&input[cursor..]);
-    Some(out)
-}
-
 fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
     let Some(value) = value else {
         return Ok(None);
@@ -1090,7 +1069,8 @@ pub fn rasterize_pathological_microstrokes(
             let payload = image_payload(&raster, flate_level)?;
             let name = next_image_name(&mut name_index, &mut occupied);
             let replacement = replacement_bytes(&name, &run, &raster);
-            let local_before = compressed_len(&decoded[run.start..run.end], flate_level)?;
+            let local_before =
+                crate::stream_codec::flate_encoded_len(&decoded[run.start..run.end], flate_level)?;
             let local_after = payload
                 .data
                 .len()
@@ -1124,15 +1104,17 @@ pub fn rasterize_pathological_microstrokes(
                 )
             })
             .collect::<Vec<_>>();
-        let Some(rewritten) = apply_replacements(&decoded, &replacements) else {
+        let Some(rewritten) = crate::content_stream::apply_replacements(&decoded, &replacements)
+        else {
             continue;
         };
-        let before = compressed_len(&decoded, flate_level)?;
+        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let image_cost = candidates
             .iter()
             .map(|candidate| candidate.data.len().saturating_add(192))
             .sum::<usize>();
-        let after = compressed_len(&rewritten, flate_level)?.saturating_add(image_cost);
+        let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
+            .saturating_add(image_cost);
         if after >= before {
             continue;
         }

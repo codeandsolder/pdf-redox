@@ -1718,7 +1718,10 @@ fn factor_repeated_path_forms(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
+        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.decoded,
+            flate_level,
+        )?);
         let Some(rewritten) =
             apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
         else {
@@ -1728,7 +1731,10 @@ fn factor_repeated_path_forms(
                 rewritten_pages: BTreeSet::new(),
             });
         };
-        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -1757,7 +1763,8 @@ fn factor_repeated_path_forms(
         });
     }
     for (bytes, _, _, _) in &selected {
-        after_flate = after_flate.saturating_add(compressed_len(bytes, flate_level)?);
+        after_flate =
+            after_flate.saturating_add(crate::stream_codec::flate_encoded_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
         eprintln!("path-forms flate before={before_flate} after={after_flate}");
@@ -1967,13 +1974,19 @@ fn factor_repeated_transformed_blocks(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
+        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.decoded,
+            flate_level,
+        )?);
         let Some(rewritten) =
             apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
         else {
             return Ok(VectorCompactionStats::default());
         };
-        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -1998,7 +2011,8 @@ fn factor_repeated_transformed_blocks(
         return Ok(VectorCompactionStats::default());
     }
     for (bytes, _, _, _, _) in &selected {
-        after_flate = after_flate.saturating_add(compressed_len(bytes, flate_level)?);
+        after_flate =
+            after_flate.saturating_add(crate::stream_codec::flate_encoded_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
         eprintln!("transform-forms flate before={before_flate} after={after_flate}");
@@ -2657,7 +2671,7 @@ fn factor_shared_q_prefix_runs(
         else {
             continue;
         };
-        let compressed_body_bytes = compressed_len(&body, flate_level)?;
+        let compressed_body_bytes = crate::stream_codec::flate_encoded_len(&body, flate_level)?;
         let conservative_overhead = 384usize
             .saturating_add(resources.len().saturating_mul(96))
             .saturating_add(candidate.page_indices.len().saturating_mul(32));
@@ -2699,13 +2713,19 @@ fn factor_shared_q_prefix_runs(
     let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
     for &page_index in &affected_pages {
         let page = &page_data[page_index];
-        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
+        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.decoded,
+            flate_level,
+        )?);
         let Some(rewritten) =
             apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
         else {
             return Ok(VectorCompactionStats::default());
         };
-        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -3109,7 +3129,7 @@ fn canonicalize_page_path_coordinates(
         };
         let before_encoded = crate::stream_codec::encode_flate(&decoded, flate_level)?;
         let before_flate = before_encoded.len();
-        let after_flate = compressed_len(&canonicalized, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&canonicalized, flate_level)?;
         let savings = before_flate.saturating_sub(after_flate);
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
             .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
@@ -3176,8 +3196,8 @@ fn compact_processing_fill_tail(
         if compacted == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&compacted, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&compacted, flate_level)?;
         replace_page_content(document, page, compacted)?;
         total.pages_compacted = total.pages_compacted.saturating_add(1);
         total.fill_groups_batched = total
@@ -3197,10 +3217,6 @@ fn compact_processing_fill_tail(
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
     Ok(total)
-}
-
-fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
 #[expect(
@@ -3280,7 +3296,7 @@ pub fn compact_vector_paths_with_flate_cache(
             }
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let after_encoded = if goal == OptimizationGoal::Size {
             Some(crate::stream_codec::encode_flate(&compacted, flate_level)?)
         } else {
@@ -3288,7 +3304,7 @@ pub fn compact_vector_paths_with_flate_cache(
         };
         let after_flate = match &after_encoded {
             Some(encoded) => encoded.len(),
-            None => compressed_len(&compacted, flate_level)?,
+            None => crate::stream_codec::flate_encoded_len(&compacted, flate_level)?,
         };
         if goal == OptimizationGoal::Size && after_flate >= before_flate {
             continue;

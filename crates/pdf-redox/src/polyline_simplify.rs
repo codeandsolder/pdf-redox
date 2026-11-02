@@ -262,27 +262,6 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn apply_replacements(input: &[u8], replacements: &[Replacement]) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || end > input.len() || start > end {
-            return None;
-        }
-        output.extend_from_slice(&input[cursor..start]);
-        output.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    output.extend_from_slice(&input[cursor..]);
-    Some(output)
-}
-
-fn compressed_len(bytes: &[u8], level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(bytes, level)?.len())
-}
-
 pub fn simplify_page_polylines(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -310,11 +289,12 @@ pub fn simplify_page_polylines(
         if replacements.is_empty() || vertices_removed == 0 {
             continue;
         }
-        let Some(simplified) = apply_replacements(&decoded, &replacements) else {
+        let Some(simplified) = crate::content_stream::apply_replacements(&decoded, &replacements)
+        else {
             continue;
         };
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&simplified, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&simplified, flate_level)?;
         let savings = before_flate.saturating_sub(after_flate);
         if savings < MIN_FLATE_SAVINGS_BYTES {
             continue;
@@ -422,7 +402,7 @@ mod tests {
             ));
         };
         assert!(removed > 0);
-        let simplified = apply_replacements(input, &replacements)
+        let simplified = crate::content_stream::apply_replacements(input, &replacements)
             .ok_or_else(|| crate::Error::Invalid("scaled replacements overlap".to_owned()))?;
         assert!(
             simplified
@@ -453,7 +433,7 @@ mod tests {
             ));
         };
         assert!(removed > 0);
-        let simplified = apply_replacements(input, &replacements)
+        let simplified = crate::content_stream::apply_replacements(input, &replacements)
             .ok_or_else(|| crate::Error::Invalid("UserUnit replacements overlap".to_owned()))?;
         assert!(
             simplified
