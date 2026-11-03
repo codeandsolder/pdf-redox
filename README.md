@@ -37,7 +37,9 @@ Early but functional. The core currently provides:
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
 - a client-side WASM review UI that analyzes first and asks the user what invisible text to remove before rewriting; the WASM layer keeps that exact-byte analysis in memory and reuses it for the subsequent rewrite after a SHA-256 identity check, avoiding a second full structural scan.
 
-Native formatting, strict Clippy, workspace tests, and the `wasm32-unknown-unknown` build are CI gates.
+The workspace is pinned to `nightly-2026-08-01` (Rust 1.99.0-nightly) because the direct `zlib-rs-fast` compression engine uses portable SIMD. Stable Rust is not a supported build configuration for this repository.
+
+Native formatting, strict Clippy, workspace tests, Rustdoc, and the `wasm32-unknown-unknown` build are CI gates.
 
 Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB subset remains active optimization work. A corpus-wide scan found that almost all other oversampled non-JPEG images are bilevel, Indexed, masked, or otherwise semantically unsuitable for the current path, and found no safe Form-local-only Print candidates, so broad raster classification and Form-branch cloning are intentionally deferred. Resource pruning runs by invariant after namespace-qualified usage analysis; malformed or incompletely analyzed scopes are preserved conservatively rather than guessed at.
 

@@ -15,71 +15,25 @@ permissions:
   contents: read
 
 jobs:
-  msrv:
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.92.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: msrv
-      - name: Check declared MSRV
-        run: cargo check --locked --workspace --all-targets --all-features
-
   rust:
-    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Diff check
-        run: git diff --check
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --locked --workspace --all-features
-      - name: Rustdoc
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --all-features --no-deps
-
-
-  rust-shared-cache:
-    name: Rust 1.99.0 (shared sccache)
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9be344b41c4c7e53f451d7ab1f66d7d9e7a9a6f4 # main
+    name: Rust 1.99 nightly
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
     with:
       command: |
-        cargo +1.99.0 fmt --all -- --check
+        cargo +nightly-2026-08-01 fmt --all -- --check
         git diff --check
-        cargo +1.99.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +1.99.0 test --locked --workspace --all-features
-        RUSTDOCFLAGS=-Dwarnings cargo +1.99.0 doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "1.99.0"
+        cargo +nightly-2026-08-01 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +nightly-2026-08-01 test --locked --workspace --all-features
+        RUSTDOCFLAGS=-Dwarnings cargo +nightly-2026-08-01 doc --locked --workspace --all-features --no-deps
+      rust-toolchain: "nightly-2026-08-01"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
   wasm:
     name: WASM compatibility
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: wasm
-      - name: WASM check
-        run: cargo check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+    with:
+      command: cargo +nightly-2026-08-01 check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
+      rust-toolchain: "nightly-2026-08-01"
+      rust-targets: "wasm32-unknown-unknown"
+      rustflags: ""
