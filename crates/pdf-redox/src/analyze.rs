@@ -1041,7 +1041,107 @@ fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<P
     Ok(analyze_document_impl(input, &document, deep, content_density)?.report)
 }
 
+// Exact deep-analysis recompression estimates can run independently. Keep decoded
+// buffers bounded, and use the same whole-stream encoder as PDF optimization.
+struct FlateEstimate {
+    decoded: Vec<u8>,
+    raw_len: usize,
+    non_image: bool,
+}
+
+#[derive(Default)]
+struct DeepFlateEstimator {
+    pending: Vec<FlateEstimate>,
+    pending_bytes: usize,
+    encoder: Option<crate::stream_codec::FlateBatchEncoder>,
+    encoder_unavailable: bool,
+}
+
+impl DeepFlateEstimator {
+    const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_BATCH_STREAMS: usize = 64;
+
+    fn queue(&mut self, decoded: Vec<u8>, raw_len: usize, non_image: bool, out: &mut PdfAnalysis) {
+        if self.pending_bytes.saturating_add(decoded.len()) > Self::MAX_BATCH_BYTES {
+            self.flush(out);
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(decoded.len());
+        self.pending.push(FlateEstimate {
+            decoded,
+            raw_len,
+            non_image,
+        });
+        if self.pending_bytes >= Self::MAX_BATCH_BYTES
+            || self.pending.len() >= Self::MAX_BATCH_STREAMS
+        {
+            self.flush(out);
+        }
+    }
+
+    fn flush(&mut self, out: &mut PdfAnalysis) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if self.pending.len() > 1 && self.encoder.is_none() && !self.encoder_unavailable {
+            match crate::stream_codec::FlateBatchEncoder::new(
+                crate::Config::default().flate_workers,
+            ) {
+                Ok(encoder) => self.encoder = Some(encoder),
+                Err(_) => self.encoder_unavailable = true,
+            }
+        }
+
+        // The executor returns one error if any job fails. Scalar fallback
+        // retains the old independent, best-effort semantics for each stream.
+        let inputs = self
+            .pending
+            .iter()
+            .map(|job| job.decoded.as_slice())
+            .collect::<Vec<_>>();
+        let lengths = self
+            .encoder
+            .as_ref()
+            .and_then(|encoder| encoder.encode_many(&inputs, crate::FlateLevel::SIZE).ok())
+            .map_or_else(
+                || {
+                    inputs
+                        .iter()
+                        .map(|decoded| {
+                            crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
+                                .ok()
+                                .map(|encoded| encoded.len())
+                        })
+                        .collect()
+                },
+                |outputs| {
+                    outputs
+                        .iter()
+                        .map(|output| Some(output.len()))
+                        .collect::<Vec<_>>()
+                },
+            );
+        drop(inputs);
+
+        for (job, encoded_len) in self.pending.drain(..).zip(lengths) {
+            let Some(encoded_len) = encoded_len else {
+                continue;
+            };
+            let saving = job.raw_len.saturating_sub(encoded_len);
+            if saving >= 1024 && saving * 100 >= job.raw_len.saturating_mul(5) {
+                out.flate_recompress_candidate_count += 1;
+                out.flate_recompress_potential_saving_bytes += saving;
+                if job.non_image {
+                    out.non_image_flate_recompress_candidate_count += 1;
+                    out.non_image_flate_recompress_potential_saving_bytes += saving;
+                }
+            }
+        }
+        self.pending_bytes = 0;
+    }
+}
+
 struct ObjectAnalysisAccumulator {
+    flate_estimates: DeepFlateEstimator,
     deep: bool,
     content_density_reachable_handles: HashSet<CowObjectHandle>,
     content_analysis: Option<ContentAnalysisStats>,
@@ -1073,6 +1173,7 @@ impl ObjectAnalysisAccumulator {
     ) -> Self {
         Self {
             deep,
+            flate_estimates: DeepFlateEstimator::default(),
             content_density_reachable_handles,
             content_analysis: content_density.then(ContentAnalysisStats::default),
             form_content_analysis_error: None,
@@ -1324,20 +1425,14 @@ impl ObjectAnalysisAccumulator {
             if !is_image {
                 out.non_image_flate_stream_count += 1;
             }
+            // A source payload below 1,024 bytes cannot save 1,024 bytes,
+            // regardless of the result of recompression.
             if self.deep
-                && let Some(decoded) = decoded.as_deref()
-                && let Ok(repacked) =
-                    crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
+                && raw.len() >= 1024
+                && let Some(decoded) = decoded
             {
-                let saving = raw.len().saturating_sub(repacked.len());
-                if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
-                    out.flate_recompress_candidate_count += 1;
-                    out.flate_recompress_potential_saving_bytes += saving;
-                    if !is_image {
-                        out.non_image_flate_recompress_candidate_count += 1;
-                        out.non_image_flate_recompress_potential_saving_bytes += saving;
-                    }
-                }
+                self.flate_estimates
+                    .queue(decoded, raw.len(), !is_image, out);
             }
         }
         if self.deep {
@@ -1635,6 +1730,7 @@ fn analyze_document_impl(
             object_analysis.analyze_object(document, &mut out, handle, &object, &preflight_refs)?;
         }
     }
+    object_analysis.flate_estimates.flush(&mut out);
     let ext_gstate_dictionary_handles = object_analysis.finalize_object_inventory(
         document,
         &mut out,
@@ -1747,6 +1843,71 @@ fn analyze_document_impl(
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn deep_flate_estimate_batches_preserve_scalar_thresholds_and_classification() -> Result<()> {
+        let mut estimator = DeepFlateEstimator::default();
+        let mut actual = PdfAnalysis::default();
+        let mut expected = PdfAnalysis::default();
+
+        // More than two complete stream-count batches, with both eligible and
+        // ineligible savings and a mix of image/non-image Flate streams.
+        for index in 0..145_usize {
+            let size = 4_096 + index * 327;
+            let decoded = match index % 3 {
+                0 => vec![0_u8; size],
+                1 => (0_u8..=255).cycle().take(size).collect::<Vec<_>>(),
+                _ => b"q 1 0 0 1 0 0 cm Q"
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(size)
+                    .collect(),
+            };
+            let scalar_len =
+                crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::SIZE)?.len();
+            let raw_len = scalar_len
+                + match index % 5 {
+                    0 => 100,
+                    1 => 1_023,
+                    2 => 1_024,
+                    3 => 2_500,
+                    _ => 5_000,
+                };
+            let non_image = index % 2 == 0;
+            let saving = raw_len.saturating_sub(scalar_len);
+            if saving >= 1024 && saving * 100 >= raw_len.saturating_mul(5) {
+                expected.flate_recompress_candidate_count += 1;
+                expected.flate_recompress_potential_saving_bytes += saving;
+                if non_image {
+                    expected.non_image_flate_recompress_candidate_count += 1;
+                    expected.non_image_flate_recompress_potential_saving_bytes += saving;
+                }
+            }
+            estimator.queue(decoded, raw_len, non_image, &mut actual);
+        }
+        estimator.flush(&mut actual);
+
+        assert_eq!(
+            actual.flate_recompress_candidate_count,
+            expected.flate_recompress_candidate_count
+        );
+        assert_eq!(
+            actual.flate_recompress_potential_saving_bytes,
+            expected.flate_recompress_potential_saving_bytes
+        );
+        assert_eq!(
+            actual.non_image_flate_recompress_candidate_count,
+            expected.non_image_flate_recompress_candidate_count
+        );
+        assert_eq!(
+            actual.non_image_flate_recompress_potential_saving_bytes,
+            expected.non_image_flate_recompress_potential_saving_bytes
+        );
+        assert!(estimator.pending.is_empty());
+        assert_eq!(estimator.pending_bytes, 0);
+        Ok(())
+    }
 
     fn content_density_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
