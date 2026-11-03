@@ -282,8 +282,9 @@ mod tests {
         ];
         let inputs = buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let serial = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
-        let parallel =
-            FlateBatchEncoder::new(std::num::NonZeroUsize::new(4).expect("four is non-zero"))?;
+        let parallel = FlateBatchEncoder::new(
+            std::num::NonZeroUsize::new(4).unwrap_or(std::num::NonZeroUsize::MIN),
+        )?;
 
         for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
             assert_eq!(
