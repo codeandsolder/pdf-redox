@@ -1,6 +1,9 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::{form_content, form_resources, page_content, page_resources, replace_page_content},
+    content::{
+        PageRewriteResult, form_content, form_resources, page_content, page_resources,
+        replace_page_content,
+    },
 };
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
 use sha2::{Digest as _, Sha256};
@@ -500,7 +503,7 @@ fn install_rewrite(
 pub fn externalize_duplicate_inline_images(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
-) -> Result<DuplicateInlineImageStats> {
+) -> Result<PageRewriteResult<DuplicateInlineImageStats>> {
     let mut summaries = Vec::new();
     let mut aggregate: HashMap<InlineImageFingerprint, (usize, usize, usize)> = HashMap::new();
     for target in collect_targets(document, pages)? {
@@ -523,17 +526,20 @@ pub fn externalize_duplicate_inline_images(
                 .then_some(*fingerprint)
         })
         .collect();
-    let mut stats = DuplicateInlineImageStats {
-        fingerprints_selected: selected.len(),
-        duplicate_payload_bytes: selected
-            .iter()
-            .filter_map(|fingerprint| aggregate.get(fingerprint))
-            .map(|&(count, bytes, _)| count.saturating_sub(1).saturating_mul(bytes))
-            .sum(),
-        ..DuplicateInlineImageStats::default()
+    let mut result = PageRewriteResult {
+        stats: DuplicateInlineImageStats {
+            fingerprints_selected: selected.len(),
+            duplicate_payload_bytes: selected
+                .iter()
+                .filter_map(|fingerprint| aggregate.get(fingerprint))
+                .map(|&(count, bytes, _)| count.saturating_sub(1).saturating_mul(bytes))
+                .sum(),
+            ..DuplicateInlineImageStats::default()
+        },
+        ..PageRewriteResult::default()
     };
     if selected.is_empty() {
-        return Ok(stats);
+        return Ok(result);
     }
     let mut xobjects_by_fingerprint = HashMap::new();
     for summary in summaries {
@@ -552,16 +558,23 @@ pub fn externalize_duplicate_inline_images(
             names,
             Some(&selected),
         )?;
+        let target = summary.target;
+        let occurrences_before = result.stats.occurrences_externalized;
         let _ = install_rewrite(
             document,
-            summary.target,
+            target,
             summary.resources,
             rewrite,
             &mut xobjects_by_fingerprint,
-            &mut stats,
+            &mut result.stats,
         )?;
+        if result.stats.occurrences_externalized > occurrences_before
+            && let ContentTarget::Page(page) = target
+        {
+            result.rewritten_pages.insert(page);
+        }
     }
-    Ok(stats)
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -821,6 +834,41 @@ pub fn cleanup_fragmented_inline_staging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_externalization_reports_only_page_rewrites() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut inline = b"BI /W 40 /H 40 /CS /G /BPC 8 ID\n".to_vec();
+        inline.extend(std::iter::repeat_n(0x7f, 40 * 40));
+        inline.extend_from_slice(b"\nEI\n");
+        let mut page_content = inline.clone();
+        page_content.extend_from_slice(b"/Fm1 Do\n");
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", &page_content)?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources <<>>",
+            &inline,
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+
+        let result = externalize_duplicate_inline_images(&mut document, &pages)?;
+
+        assert_eq!(result.stats.fingerprints_selected, 1);
+        assert_eq!(result.stats.occurrences_externalized, 2);
+        assert_eq!(result.stats.xobjects_created, 1);
+        assert_eq!(result.rewritten_pages, BTreeSet::from([pages[0]]));
+        Ok(())
+    }
 
     #[test]
     fn restores_only_matching_staged_do_references() -> Result<()> {

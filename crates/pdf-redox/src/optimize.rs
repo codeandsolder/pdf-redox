@@ -1,7 +1,7 @@
 use crate::{
     Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::analyze_document_for_optimization,
-    content::normalize_page_contents,
+    content::{PageRewriteResult, normalize_page_contents},
     dedup::{
         canonicalize_appearance_streams, canonicalize_exact_extgstate_dictionaries,
         canonicalize_exact_font_dictionaries, canonicalize_exact_structure_attribute_dictionaries,
@@ -614,9 +614,14 @@ fn optimize_pdf_with_document(
     ] {
         timings.insert(format!("raster/{name}"), micros_to_millis(micros));
     }
-    let physically_hidden_text = timed(&mut timings, "physical-hidden-text", || {
+    let mut raster_resource_usage_exact =
+        cfg.raster_layout.enabled && raster_layout.resource_inventory_complete;
+    let PageRewriteResult {
+        stats: physically_hidden_text,
+        rewritten_pages: physically_hidden_text_rewritten_pages,
+    } = timed(&mut timings, "physical-hidden-text", || {
         if !cfg.raster_layout.enabled || !cfg.raster_layout.prune_hidden_paints {
-            return Ok(HiddenTextApplyStats::default());
+            return Ok(PageRewriteResult::default());
         }
         if raster_layout.page_hidden_text_inventory_complete {
             let fallback = raster_layout
@@ -625,7 +630,7 @@ fn optimize_pdf_with_document(
                 .copied()
                 .collect::<BTreeSet<_>>();
             if fallback.is_empty() {
-                Ok(HiddenTextApplyStats::default())
+                Ok(PageRewriteResult::default())
             } else {
                 prune_physically_hidden_text(&mut document, &stable_pages, Some(&fallback))
             }
@@ -633,17 +638,32 @@ fn optimize_pdf_with_document(
             prune_physically_hidden_text(&mut document, &stable_pages, None)
         }
     })?;
+    raster_vector_cache.retain(|page, _| !physically_hidden_text_rewritten_pages.contains(page));
+    if !physically_hidden_text_rewritten_pages.is_empty() {
+        raster_resource_usage_exact = false;
+    }
 
-    let inline_image_dedup = timed(&mut timings, "inline-image-dedup", || {
+    let PageRewriteResult {
+        stats: inline_image_dedup,
+        rewritten_pages: inline_image_rewritten_pages,
+    } = timed(&mut timings, "inline-image-dedup", || {
         let raster_proved_no_inline = cfg.raster_layout.enabled
             && raster_layout.inline_inventory_complete
             && raster_layout.inline_occurrences_remaining == 0;
         if raster_proved_no_inline {
-            Ok(DuplicateInlineImageStats::default())
+            Ok(PageRewriteResult::default())
         } else {
             externalize_duplicate_inline_images(&mut document, &stable_pages)
         }
     })?;
+    raster_vector_cache.retain(|page, _| !inline_image_rewritten_pages.contains(page));
+    if inline_image_dedup.occurrences_externalized != 0 {
+        // Processing-vector analysis is page-content-local: Form rewrites do not
+        // invalidate callers' cached path analysis, while rewritten pages do.
+        // Resource-usage inventories are document-wide and therefore still lose
+        // exactness for either target kind.
+        raster_resource_usage_exact = false;
+    }
 
     // Entropy-optimize surviving/reconstructed JPEGs before exact image
     // canonicalization. This preserves quantized DCT coefficients while allowing
@@ -688,13 +708,20 @@ fn optimize_pdf_with_document(
             canonicalize_type3_charprocs(&mut document)
         }
     })?;
-    let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
+    let PageRewriteResult {
+        stats: repeated_page_objects,
+        rewritten_pages: repeated_page_objects_rewritten_pages,
+    } = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
             remove_repeated_page_objects(&mut document, &stable_pages)
         } else {
-            Ok(RepeatedPageObjectStats::default())
+            Ok(PageRewriteResult::default())
         }
     })?;
+    raster_vector_cache.retain(|page, _| !repeated_page_objects_rewritten_pages.contains(page));
+    if repeated_page_objects.objects_removed != 0 {
+        raster_resource_usage_exact = false;
+    }
 
     let print_plan_started = Instant::now();
     let (print_plan, print_plan_error) = match &cfg.image_policy {
@@ -761,13 +788,17 @@ fn optimize_pdf_with_document(
         raster_transform_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    let repeated_clips = timed(&mut timings, "repeated-clip-hoist", || {
+    let PageRewriteResult {
+        stats: repeated_clips,
+        rewritten_pages: repeated_clip_rewritten_pages,
+    } = timed(&mut timings, "repeated-clip-hoist", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             hoist_repeated_clip_prefixes(&mut document, &stable_pages, flate_level)
         } else {
-            Ok(RepeatedClipStats::default())
+            Ok(PageRewriteResult::default())
         }
     })?;
+    raster_vector_cache.retain(|page, _| !repeated_clip_rewritten_pages.contains(page));
 
     let mut flate_reuse_cache = FlateReuseCache::default();
     let vector_compaction = timed(&mut timings, "vector-compaction", || {
@@ -776,28 +807,15 @@ fn optimize_pdf_with_document(
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
             && !raster_layout.page_vector_merge_candidate;
-        let raster_cache_is_exact = physically_hidden_text.removed == 0
-            && inline_image_dedup.occurrences_externalized == 0
-            && repeated_clips.pages_rewritten == 0;
-        if raster_cache_is_exact {
-            for page in &repeated_page_objects.rewritten_pages {
-                raster_vector_cache.remove(page);
-            }
-        }
         let processing_proved_no_vector_candidate = cfg.optimization_goal
             == crate::OptimizationGoal::Processing
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
-            && raster_cache_is_exact
             && !raster_layout.page_vector_merge_candidate
             && raster_vector_cache.len() == raster_layout.page_count
             && !processing_factor_candidate(&raster_vector_cache);
         if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
-            let vector_cache = if raster_cache_is_exact {
-                std::mem::take(&mut raster_vector_cache)
-            } else {
-                BTreeMap::new()
-            };
+            let vector_cache = std::mem::take(&mut raster_vector_cache);
             compact_vector_paths_with_flate_cache(
                 &mut document,
                 &stable_pages,
@@ -810,6 +828,9 @@ fn optimize_pdf_with_document(
             Ok(VectorCompactionStats::default())
         }
     })?;
+    if vector_compaction.shared_run_forms_created != 0 {
+        raster_resource_usage_exact = false;
+    }
 
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -834,6 +855,9 @@ fn optimize_pdf_with_document(
             Ok(OutlinedGlyphFactorStats::default())
         }
     })?;
+    if outlined_glyphs.fonts_created != 0 {
+        raster_resource_usage_exact = false;
+    }
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -850,6 +874,9 @@ fn optimize_pdf_with_document(
             Ok(StrokeFormFactorStats::default())
         }
     })?;
+    if stroke_forms.forms_created != 0 {
+        raster_resource_usage_exact = false;
+    }
 
     let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -860,15 +887,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
-        let shared_usage_is_exact = cfg.raster_layout.enabled
-            && raster_layout.resource_inventory_complete
-            && physically_hidden_text.removed == 0
-            && inline_image_dedup.occurrences_externalized == 0
-            && repeated_page_objects.objects_removed == 0
-            && vector_compaction.shared_run_forms_created == 0
-            && outlined_glyphs.fonts_created == 0
-            && stroke_forms.forms_created == 0;
-        if shared_usage_is_exact {
+        if raster_resource_usage_exact {
             prune_resources_with_usage(
                 &mut document,
                 &raster_layout.page_resource_names_by_type,
