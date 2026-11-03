@@ -190,10 +190,10 @@ pub fn compression_baseline_sizes(decoded: &[u8]) -> Result<(usize, usize)> {
 /// stream decode failures are counted and skipped because malformed filter payloads should not
 /// prevent extracting unrelated streams.
 pub fn visit_compression_sample_candidates(
-    input: &[u8],
+    input: Vec<u8>,
     mut visitor: impl FnMut(CompressionSampleCandidate),
 ) -> Result<CompressionSampleScanStats> {
-    let document = EditDocument::from_bytes(input.to_vec())?;
+    let document = EditDocument::from_bytes(input)?;
     let handles = document.reachable_streams()?;
     let mut stats = CompressionSampleScanStats {
         reachable_streams: handles.len(),
@@ -262,7 +262,7 @@ mod tests {
     fn extracts_decoded_lone_flate_stream() -> Result<()> {
         let input = fixture()?;
         let mut samples = Vec::new();
-        let stats = visit_compression_sample_candidates(&input, |sample| samples.push(sample))?;
+        let stats = visit_compression_sample_candidates(input, |sample| samples.push(sample))?;
         assert_eq!(stats.candidates, 1);
         assert_eq!(samples.len(), 1);
         let sample = &samples[0];

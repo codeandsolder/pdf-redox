@@ -429,7 +429,7 @@ impl CorpusRun {
             }
         };
         let mut per_file = PerFileCandidates::default();
-        let scan = visit_compression_sample_candidates(&input, |candidate| {
+        let scan = visit_compression_sample_candidates(input, |candidate| {
             per_file.consider(
                 candidate,
                 &self.args,
