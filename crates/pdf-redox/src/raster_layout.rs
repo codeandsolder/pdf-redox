@@ -1493,7 +1493,7 @@ struct SampleImage {
 
 #[derive(Default)]
 struct RasterImageDecodeCache {
-    entries: HashMap<ObjectHandle, Option<SampleImage>>,
+    entries: HashMap<(ObjectHandle, bool), Option<SampleImage>>,
     decoded_bytes: usize,
     hits: usize,
     misses: usize,
@@ -1518,14 +1518,16 @@ impl RasterImageDecodeCache {
         &mut self,
         document: &EditDocument,
         handle: ObjectHandle,
+        bake_masks: bool,
     ) -> Result<Option<SampleImage>> {
-        if let Some(cached) = self.entries.get(&handle) {
+        let key = (handle, bake_masks);
+        if let Some(cached) = self.entries.get(&key) {
             self.hits = self.hits.saturating_add(1);
             return Ok(cached.clone());
         }
 
         self.misses = self.misses.saturating_add(1);
-        let decoded = image_info(document, handle, true)?;
+        let decoded = image_info(document, handle, bake_masks)?;
         let bytes = decoded.as_ref().map_or(0, Self::image_bytes);
 
         // Keep this a bounded performance cache, not a second document model.
@@ -1539,7 +1541,7 @@ impl RasterImageDecodeCache {
                 self.clear();
             }
             self.decoded_bytes = self.decoded_bytes.saturating_add(bytes);
-            self.entries.insert(handle, decoded.clone());
+            self.entries.insert(key, decoded.clone());
         }
 
         Ok(decoded)
@@ -2746,7 +2748,7 @@ fn prune_hidden_raster_paints(
             if !prune_occluded && !image_may_have_pixel_transparency(document, draw.target)? {
                 None
             } else {
-                image_cache.get_or_decode(document, draw.target)?
+                image_cache.get_or_decode(document, draw.target, true)?
             };
         visibility.insert(draw.target, decoded);
     }
@@ -5464,6 +5466,7 @@ struct MergePlanContext<'a> {
 fn build_merge_plans_for_scanner(
     document: &EditDocument,
     context: MergePlanContext<'_>,
+    image_cache: &mut RasterImageDecodeCache,
     alpha_crop_bounds_cache: &mut HashMap<ObjectHandle, Option<PixelCrop>>,
     stats: &mut RasterLayoutStats,
 ) -> Result<Vec<MergePlan>> {
@@ -5523,9 +5526,11 @@ fn build_merge_plans_for_scanner(
             infos.insert(draw.target, info.clone());
             continue;
         }
-        if let Some(info) = image_info(document, draw.target, config.bake_masks)? {
+        if let Some(info) = image_cache.get_or_decode(document, draw.target, config.bake_masks)? {
             infos.insert(draw.target, info);
-        } else if structural_mask && let Some(info) = image_info(document, draw.target, true)? {
+        } else if structural_mask
+            && let Some(info) = image_cache.get_or_decode(document, draw.target, true)?
+        {
             infos.insert(draw.target, info);
         }
     }
@@ -5979,6 +5984,7 @@ pub fn normalize_raster_layout(
                 config,
                 user_unit,
             },
+            &mut image_cache,
             &mut alpha_crop_bounds_cache,
             &mut stats,
         )?;
@@ -6070,6 +6076,7 @@ pub fn normalize_raster_layout(
                     config,
                     user_unit,
                 },
+                &mut image_cache,
                 &mut alpha_crop_bounds_cache,
                 &mut stats,
             )?;
@@ -6454,6 +6461,39 @@ mod tests {
         assert!(image_may_have_pixel_transparency(&document, handle(10))?);
         assert!(!image_may_have_pixel_transparency(&document, handle(11))?);
         assert!(image_may_have_pixel_transparency(&document, handle(1))?);
+        Ok(())
+    }
+
+    #[test]
+    fn image_decode_cache_separates_mask_policy() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 4 0 R >>")?;
+        pdf.object(4, b"<< /Type /Pages /Kids [] /Count 0 >>")?;
+        pdf.stream(
+            2,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 3 0 R",
+            &[0],
+        )?;
+        pdf.stream(
+            3,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[255],
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let image = ObjectHandle::Existing(ObjectId::new(2, 0));
+        let mut cache = RasterImageDecodeCache::default();
+
+        assert!(cache.get_or_decode(&document, image, false)?.is_none());
+        let baked = cache
+            .get_or_decode(&document, image, true)?
+            .ok_or_else(|| Error::Invalid("expected baked soft-mask image".to_owned()))?;
+        assert!(baked.alpha.is_some());
+        assert!(cache.get_or_decode(&document, image, false)?.is_none());
+        assert_eq!(cache.misses, 2);
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.entries.len(), 2);
         Ok(())
     }
 
