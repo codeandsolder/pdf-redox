@@ -2383,8 +2383,8 @@ const fn shared_gap_is_trivia(bytes: &[u8]) -> bool {
 fn shared_page_visible_box(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
     let Some(numbers) = page_box_numbers_matching(document, page, |numbers| {
         numbers.into_iter().all(f64::is_finite)
-            && numbers[0] != numbers[2]
-            && numbers[1] != numbers[3]
+            && numbers[0].min(numbers[2]) < numbers[0].max(numbers[2])
+            && numbers[1].min(numbers[3]) < numbers[1].max(numbers[3])
     })?
     else {
         return Ok(None);
