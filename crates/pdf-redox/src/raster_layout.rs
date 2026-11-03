@@ -1178,6 +1178,73 @@ struct TargetScanResult {
     hidden_ranges: Option<Vec<(usize, usize)>>,
 }
 
+// Raster normalization mutates page content/resources but not page geometry. Keep
+// immutable page facts lazy so skipped/incomplete targets preserve their existing
+// error behavior, while rescans reuse the same geometry snapshot. This state also
+// owns processing-vector cache validity for every content rewrite in this pass.
+struct RasterPageState<'a> {
+    vector_cache: Option<&'a mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
+    user_units: HashMap<ObjectHandle, Option<f64>>,
+    visible_rects: HashMap<ObjectHandle, Option<Rect>>,
+}
+
+impl<'a> RasterPageState<'a> {
+    fn new(vector_cache: Option<&'a mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>) -> Self {
+        Self {
+            vector_cache,
+            user_units: HashMap::new(),
+            visible_rects: HashMap::new(),
+        }
+    }
+
+    fn collect_vector(&self, target: ContentTarget) -> bool {
+        self.vector_cache.is_some() && matches!(target, ContentTarget::Page(_))
+    }
+
+    fn user_unit(&mut self, document: &EditDocument, page: ObjectHandle) -> Result<Option<f64>> {
+        if let Some(&cached) = self.user_units.get(&page) {
+            return Ok(cached);
+        }
+        let value = page_user_unit(document, page)?;
+        self.user_units.insert(page, value);
+        Ok(value)
+    }
+
+    fn visible_rect(
+        &mut self,
+        document: &EditDocument,
+        page: ObjectHandle,
+    ) -> Result<Option<Rect>> {
+        if let Some(&cached) = self.visible_rects.get(&page) {
+            return Ok(cached);
+        }
+        let value = page_visible_rect(document, page)?;
+        self.visible_rects.insert(page, value);
+        Ok(value)
+    }
+
+    fn record_vector(&mut self, target: ContentTarget, analysis: Option<ProcessingVectorAnalysis>) {
+        let (ContentTarget::Page(page), Some(analysis), Some(cache)) =
+            (target, analysis, self.vector_cache.as_deref_mut())
+        else {
+            return;
+        };
+        cache.insert(page, analysis);
+    }
+
+    fn invalidate_vector(&mut self, target: ContentTarget) {
+        if let ContentTarget::Page(page) = target {
+            self.invalidate_page_vector(page);
+        }
+    }
+
+    fn invalidate_page_vector(&mut self, page: ObjectHandle) {
+        if let Some(cache) = self.vector_cache.as_deref_mut() {
+            cache.remove(&page);
+        }
+    }
+}
+
 fn scan_target_shared(
     document: &EditDocument,
     target: ContentTarget,
@@ -1185,6 +1252,7 @@ fn scan_target_shared(
     content: &[u8],
     hidden_context: Option<&HiddenTextSharedContext>,
     page_numbers: &BTreeMap<ObjectHandle, usize>,
+    page_state: &mut RasterPageState<'_>,
     collect_vector: bool,
 ) -> Result<Option<TargetScanResult>> {
     let ContentTarget::Page(page) = target else {
@@ -1199,8 +1267,8 @@ fn scan_target_shared(
 
     let page_number = page_numbers.get(&page).copied().unwrap_or(1);
     if collect_vector {
-        let mut scanner =
-            RasterVectorScanner::new(document, resources, page_user_unit(document, page)?)?;
+        let user_unit = page_state.user_unit(document, page)?;
+        let mut scanner = RasterVectorScanner::new(document, resources, user_unit)?;
         let hidden_ranges = if let Some(context) = hidden_context {
             let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
             if scanner.scan_with_hidden(content, &mut hidden)? {
@@ -5619,7 +5687,7 @@ pub fn normalize_raster_layout(
     config: &RasterLayoutConfig,
     flate_level: crate::FlateLevel,
     normalize_content_for_budget: bool,
-    mut vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
+    vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
 ) -> Result<RasterLayoutStats> {
     if *DEBUG_RASTER {
         eprintln!(
@@ -5668,6 +5736,7 @@ pub fn normalize_raster_layout(
     let mut image_cache = RasterImageDecodeCache::default();
     let mut alpha_crop_cache = HashMap::<ObjectHandle, AlphaCropCacheEntry>::new();
     let mut alpha_crop_bounds_cache = HashMap::<ObjectHandle, Option<PixelCrop>>::new();
+    let mut page_state = RasterPageState::new(vector_cache);
     let hidden_context: Option<HiddenTextSharedContext> = if config.prune_hidden_paints {
         Some(hidden_text_shared_context(document)?)
     } else {
@@ -5698,7 +5767,7 @@ pub fn normalize_raster_layout(
             continue;
         };
         let mut content = target_content(document, target)?;
-        let collect_vector = vector_cache.is_some() && matches!(target, ContentTarget::Page(_));
+        let collect_vector = page_state.collect_vector(target);
         let Some(scan) = scan_target_shared(
             document,
             target,
@@ -5706,6 +5775,7 @@ pub fn normalize_raster_layout(
             &content,
             hidden_context.as_ref(),
             &page_numbers,
+            &mut page_state,
             collect_vector,
         )?
         else {
@@ -5729,11 +5799,7 @@ pub fn normalize_raster_layout(
         };
         let mut scanner = scan.scanner;
         let mut shared_hidden_ranges = scan.hidden_ranges;
-        if let (ContentTarget::Page(page), Some(analysis), Some(cache)) =
-            (target, scan.vector_analysis, vector_cache.as_deref_mut())
-        {
-            cache.insert(page, analysis);
-        }
+        page_state.record_vector(target, scan.vector_analysis);
         stats.target_scan_us = stats
             .target_scan_us
             .saturating_add(elapsed_micros_u64(scan_started));
@@ -5793,11 +5859,7 @@ pub fn normalize_raster_layout(
                 continue;
             }
 
-            if let ContentTarget::Page(page) = target
-                && let Some(cache) = vector_cache.as_deref_mut()
-            {
-                cache.remove(&page);
-            }
+            page_state.invalidate_vector(target);
             let rescan_started = Instant::now();
             let Some(updated_resources) = target_resources(document, target)? else {
                 continue;
@@ -5811,6 +5873,7 @@ pub fn normalize_raster_layout(
                 &content,
                 hidden_context.as_ref(),
                 &page_numbers,
+                &mut page_state,
                 collect_vector,
             )?
             else {
@@ -5826,13 +5889,7 @@ pub fn normalize_raster_layout(
                 .saturating_add(elapsed_micros_u64(rescan_started));
             scanner = rescanned.scanner;
             shared_hidden_ranges = rescanned.hidden_ranges;
-            if let (ContentTarget::Page(page), Some(analysis), Some(cache)) = (
-                target,
-                rescanned.vector_analysis,
-                vector_cache.as_deref_mut(),
-            ) {
-                cache.insert(page, analysis);
-            }
+            page_state.record_vector(target, rescanned.vector_analysis);
             if scanner.inline_occurrences != 0 {
                 stats.inline_inventory_complete = false;
                 continue;
@@ -5868,7 +5925,7 @@ pub fn normalize_raster_layout(
         if config.prune_hidden_paints {
             let hidden_prune_started = Instant::now();
             let scope = match target {
-                ContentTarget::Page(page) => page_visible_rect(document, page)?,
+                ContentTarget::Page(page) => page_state.visible_rect(document, page)?,
                 ContentTarget::Form(_) => None,
             };
             let HiddenRasterPruneResult {
@@ -5909,7 +5966,7 @@ pub fn normalize_raster_layout(
         }
 
         let user_unit = match target {
-            ContentTarget::Page(page) => page_user_unit(document, page)?.unwrap_or(1.0),
+            ContentTarget::Page(page) => page_state.user_unit(document, page)?.unwrap_or(1.0),
             ContentTarget::Form(_) => 1.0,
         };
         let mut plans = build_merge_plans_for_scanner(
@@ -5978,11 +6035,7 @@ pub fn normalize_raster_layout(
                 }
             }
             if !removal_ranges.is_empty() {
-                if let ContentTarget::Page(page) = target
-                    && let Some(cache) = vector_cache.as_deref_mut()
-                {
-                    cache.remove(&page);
-                }
+                page_state.invalidate_vector(target);
                 let rewritten = remove_content_ranges(&content, removal_ranges)?;
                 install_target(document, target, resources, rewritten)?;
             }
@@ -5990,11 +6043,7 @@ pub fn normalize_raster_layout(
         }
 
         if let Some(rewritten) = pending_pruned_content {
-            if let ContentTarget::Page(page) = target
-                && let Some(cache) = vector_cache.as_deref_mut()
-            {
-                cache.remove(&page);
-            }
+            page_state.invalidate_vector(target);
             install_target(document, target, resources.clone(), rewritten)?;
 
             // Mixed prune+reconstruction scopes are uncommon. Preserve the previous
@@ -6113,11 +6162,8 @@ pub fn normalize_raster_layout(
             stats = snapshot;
             applied = ApplyPlansResult::default();
         }
-        if applied.changed
-            && let ContentTarget::Page(page) = target
-            && let Some(cache) = vector_cache.as_deref_mut()
-        {
-            cache.remove(&page);
+        if applied.changed {
+            page_state.invalidate_vector(target);
         }
         if applied.changed && !applied.obsolete_resource_names.is_empty() {
             let current_content = target_content(document, target)?;
@@ -6164,10 +6210,8 @@ pub fn normalize_raster_layout(
     let (staging_entries_removed, staging_restored_pages) =
         cleanup_fragmented_inline_staging(document, &inline_staging)?;
     stats.staging_xobject_entries_removed = staging_entries_removed;
-    if let Some(cache) = vector_cache {
-        for page in staging_restored_pages {
-            cache.remove(&page);
-        }
+    for page in staging_restored_pages {
+        page_state.invalidate_page_vector(page);
     }
     stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
     if *DEBUG_RASTER {
