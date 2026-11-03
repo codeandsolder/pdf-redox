@@ -878,8 +878,8 @@ impl DirectPreflightScanner<'_> {
         }
 
         for (key, value) in dictionary {
-            let child_collect_refs = if mode.collect_refs {
-                if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
+            let child_collect_refs = mode.collect_refs
+                && if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
                     if let OwnedObject::Reference(handle) = value {
                         self.refs.font.insert(*handle);
                         if key.as_slice() == b"FontFile2" {
@@ -902,10 +902,7 @@ impl DirectPreflightScanner<'_> {
                     false
                 } else {
                     !matches!(value, OwnedObject::Reference(_))
-                }
-            } else {
-                false
-            };
+                };
             if !matches!(value, OwnedObject::Reference(_)) {
                 self.scan(
                     value,

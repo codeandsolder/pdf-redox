@@ -579,13 +579,9 @@ fn optimize_pdf_with_document(
             Ok(IccAlternateElisionStats::default())
         }
     })?;
-    let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
+    let repeated_page_objects_may_rewrite = cfg.remove_repeated_page_objects
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
-    {
-        repeated_page_objects_prefix_possible(&document, &stable_pages)?
-    } else {
-        false
-    };
+        && repeated_page_objects_prefix_possible(&document, &stable_pages)?;
     let mut raster_vector_cache = BTreeMap::new();
     let raster_layout = timed(&mut timings, "raster-layout", || {
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
@@ -787,18 +783,14 @@ fn optimize_pdf_with_document(
                 raster_vector_cache.remove(page);
             }
         }
-        let processing_proved_no_vector_candidate = if cfg.optimization_goal
+        let processing_proved_no_vector_candidate = cfg.optimization_goal
             == crate::OptimizationGoal::Processing
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
             && raster_cache_is_exact
             && !raster_layout.page_vector_merge_candidate
-        {
-            raster_vector_cache.len() == raster_layout.page_count
-                && !processing_factor_candidate(&raster_vector_cache)
-        } else {
-            false
-        };
+            && raster_vector_cache.len() == raster_layout.page_count
+            && !processing_factor_candidate(&raster_vector_cache);
         if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
             let vector_cache = if raster_cache_is_exact {
                 std::mem::take(&mut raster_vector_cache)
