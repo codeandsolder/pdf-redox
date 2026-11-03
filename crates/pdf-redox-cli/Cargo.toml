@@ -20,3 +20,8 @@ pdf-redox = { path = "../pdf-redox" }
 clap.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+
+[[bin]]
+name = "pdf-redox-compression-corpus"
+path = "src/compression_corpus.rs"
+doc = false

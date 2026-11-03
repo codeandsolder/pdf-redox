@@ -4,6 +4,7 @@
 mod analyze;
 mod bilevel;
 mod cff_cid;
+mod compression_corpus;
 mod config;
 mod content;
 pub(crate) mod content_stream;
@@ -44,6 +45,10 @@ mod vector_compact;
 pub(crate) mod writer;
 
 pub use analyze::{analyze_pdf, analyze_pdf_preflight};
+pub use compression_corpus::{
+    CompressionSampleCandidate, CompressionSampleKind, CompressionSampleScanStats,
+    compression_baseline_sizes, visit_compression_sample_candidates,
+};
 pub(crate) use config::FlateLevel;
 pub use config::{
     AnnotationPolicy, Config, HiddenTextPolicy, ImagePolicy, OptimizationGoal, PreservationConfig,
