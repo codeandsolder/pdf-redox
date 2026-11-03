@@ -41,6 +41,9 @@ pub enum Error {
     /// The document violates a structural or transformation invariant.
     #[error("invalid pdf structure: {0}")]
     Invalid(String),
+    /// The direct Flate encoder or its worker pool failed.
+    #[error("flate compression failed: {0}")]
+    Compression(String),
     /// A supplied cached analysis belongs to different input bytes.
     #[error("cached analysis does not match input PDF")]
     AnalysisInputMismatch,

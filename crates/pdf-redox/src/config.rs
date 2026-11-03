@@ -1,6 +1,9 @@
 use crate::report::{HiddenTextAction, HiddenTextCategory, HiddenTextFinding};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -345,13 +348,13 @@ pub enum OptimizationGoal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlateLevel(u32);
+pub struct FlateLevel(i32);
 
 impl FlateLevel {
     pub const PROCESSING: Self = Self(7);
     pub const SIZE: Self = Self(9);
 
-    pub const fn value(self) -> u32 {
+    pub const fn value(self) -> i32 {
         self.0
     }
 }
@@ -368,6 +371,18 @@ impl OptimizationGoal {
             Self::Size => FlateLevel::SIZE,
             Self::Processing => FlateLevel::PROCESSING,
         }
+    }
+}
+
+fn default_flate_workers() -> NonZeroUsize {
+    #[cfg(target_family = "wasm")]
+    {
+        NonZeroUsize::MIN
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let available = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        NonZeroUsize::new(available.get().min(4)).unwrap_or(NonZeroUsize::MIN)
     }
 }
 
@@ -406,6 +421,10 @@ pub struct Config {
     /// Primary optimization objective used when size and display-list simplicity conflict.
     #[serde(default)]
     pub optimization_goal: OptimizationGoal,
+    /// Maximum number of persistent workers used for independent whole-stream Flate compression.
+    /// WASM always uses one worker; native defaults to the available parallelism capped at four.
+    #[serde(default = "default_flate_workers")]
+    pub flate_workers: NonZeroUsize,
     /// Rasterize only pathological fields of hundreds of tiny opaque vector strokes.
     /// This is intentionally lossy at the vector/semantic level, so it is off for the
     /// normal optimize/processing policies and enabled by default only for Print.
@@ -431,6 +450,7 @@ impl Config {
             remove_large_diagonal_text: false,
             remove_repeated_page_objects: false,
             optimization_goal: OptimizationGoal::Size,
+            flate_workers: default_flate_workers(),
             rasterize_excessive_small_vectors: false,
             elide_icc_profiles_to_alternate: false,
         }

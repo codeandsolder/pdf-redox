@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 hayro-syntax.workspace = true
-flate2.workspace = true
+zlib-rs.workspace = true
 libjpeg-turbo-rs.workspace = true
 fast_image_resize.workspace = true
 fax.workspace = true
@@ -24,6 +24,9 @@ write-fonts.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 color_quant.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zlib-rs = { workspace = true, features = ["parallel"] }
 
 [dev-dependencies]
 serde_json.workspace = true

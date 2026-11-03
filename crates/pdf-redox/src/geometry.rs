@@ -219,7 +219,7 @@ impl Matrix {
         }
     }
 
-    pub fn transform(self, x: f64, y: f64) -> (f64, f64) {
+    pub const fn transform(self, x: f64, y: f64) -> (f64, f64) {
         (
             self.a.mul_add(x, self.c.mul_add(y, self.e)),
             self.b.mul_add(x, self.d.mul_add(y, self.f)),
