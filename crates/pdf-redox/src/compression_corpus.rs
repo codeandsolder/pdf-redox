@@ -8,9 +8,9 @@ use sha2::{Digest as _, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompressionSampleKind {
-    /// Image XObject payload.
+    /// Image `XObject` payload.
     Image,
-    /// Form XObject payload.
+    /// Form `XObject` payload.
     Form,
     /// Tiling/shading pattern payload.
     Pattern,
@@ -26,7 +26,7 @@ pub enum CompressionSampleKind {
     ObjectStream,
     /// PDF cross-reference stream payload.
     Xref,
-    /// Stream without a stronger self-describing classification, commonly page content or CMaps.
+    /// Stream without a stronger self-describing classification, commonly page content or `CMaps`.
     Other,
 }
 
@@ -144,6 +144,20 @@ fn source_was_flate(document: &EditDocument, dictionary: &OwnedDictionary) -> bo
     }
 }
 
+// Convert all platform-sized counters without silently clamping values above 2^32.
+// Individual 16-bit limbs are exactly representable in f64.
+fn usize_as_f64(mut value: usize) -> f64 {
+    let mut result = 0.0;
+    let mut scale = 1.0;
+    while value != 0 {
+        let limb = u16::try_from(value & usize::from(u16::MAX)).unwrap_or_default();
+        result = f64::from(limb).mul_add(scale, result);
+        value >>= 16;
+        scale *= 65_536.0;
+    }
+    result
+}
+
 fn byte_statistics(bytes: &[u8]) -> (f64, u16, usize, usize) {
     let mut counts = [0_usize; 256];
     let mut zero_bytes = 0_usize;
@@ -154,13 +168,13 @@ fn byte_statistics(bytes: &[u8]) -> (f64, u16, usize, usize) {
         ascii_like_bytes += usize::from(matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e));
     }
 
-    let len = bytes.len() as f64;
+    let len = usize_as_f64(bytes.len());
     let mut entropy = 0.0;
     let mut unique = 0_u16;
     for count in counts.into_iter().filter(|count| *count != 0) {
         unique += 1;
-        let probability = count as f64 / len;
-        entropy -= probability * probability.log2();
+        let probability = usize_as_f64(count) / len;
+        entropy = probability.mul_add(-probability.log2(), entropy);
     }
     (entropy, unique, zero_bytes, ascii_like_bytes)
 }
