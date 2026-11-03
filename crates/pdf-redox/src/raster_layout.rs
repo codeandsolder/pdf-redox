@@ -111,6 +111,80 @@ enum ContentTarget {
     Form(ObjectHandle),
 }
 
+impl RasterLayoutStats {
+    fn invalidate_target_scan(&mut self, target: ContentTarget) {
+        self.inline_inventory_complete = false;
+        self.resource_inventory_complete = false;
+        if matches!(target, ContentTarget::Page(_)) {
+            self.page_vector_inventory_complete = false;
+            self.page_hidden_text_inventory_complete = false;
+        }
+    }
+
+    fn record_target_scan(&mut self, target: ContentTarget, scanner: &RasterScanner) {
+        self.inline_occurrences_remaining = self
+            .inline_occurrences_remaining
+            .saturating_add(scanner.inline_occurrences);
+        if scanner.inline_occurrences != 0 {
+            // Inline-image dictionaries can reference named resources that the
+            // instruction-level resource inventory intentionally does not parse.
+            self.resource_inventory_complete = false;
+            if let ContentTarget::Page(page) = target {
+                // The canonical physical-hidden-text scanner intentionally ignores
+                // inline `BI` bodies, so a surviving inline image must force this
+                // page through the fallback scanner rather than allowing the raster
+                // inventory to prove that no follow-up scan is needed.
+                self.page_physical_hidden_text_candidate = true;
+                self.page_hidden_text_candidates.insert(page);
+                self.page_hidden_text_shared_complete.remove(&page);
+            }
+        }
+        self.record_page_vector_candidate(target, scanner);
+        if let ContentTarget::Page(page) = target {
+            self.page_rect_fill_paints_seen = self
+                .page_rect_fill_paints_seen
+                .saturating_add(scanner.rect_fills.len());
+            let hidden_candidate =
+                scanner.text_with_ext_gstate || scanner.covering_paint_after_text;
+            self.page_physical_hidden_text_candidate |= hidden_candidate;
+            if hidden_candidate {
+                self.page_hidden_text_candidates.insert(page);
+            }
+        }
+    }
+
+    fn record_page_vector_candidate(&mut self, target: ContentTarget, scanner: &RasterScanner) {
+        if matches!(target, ContentTarget::Page(_)) {
+            self.page_vector_merge_candidate |= scanner.vector_merge_candidate;
+        }
+    }
+
+    fn invalidate_page_vector_scan(&mut self, target: ContentTarget) {
+        if matches!(target, ContentTarget::Page(_)) {
+            self.page_vector_inventory_complete = false;
+        }
+    }
+
+    fn record_resource_usage(&mut self, target: ContentTarget, usage: ResourceUsage) {
+        match target {
+            ContentTarget::Page(page) => {
+                self.page_resource_names_by_type.insert(page, usage.by_type);
+            }
+            ContentTarget::Form(form) => {
+                self.form_resource_names_by_type.insert(form, usage.by_type);
+            }
+        }
+    }
+
+    fn record_unmodified_target(&mut self, target: ContentTarget, scanner: &RasterScanner) {
+        self.record_target_scan(target, scanner);
+        self.record_resource_usage(
+            target,
+            scanner.resource_usage_after_removing(&HashSet::new()),
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RasterDraw {
     target: ObjectHandle,
@@ -5880,27 +5954,17 @@ pub fn normalize_raster_layout(
             hidden_ranges: mut shared_hidden_ranges,
         } = match scanned {
             TargetLoadResult::MissingResources => {
-                // A resource-less Form borrows its caller's resource scope. The
-                // per-target inventory cannot represent that dependency exactly,
-                // so force the canonical borrowing-aware resource-pruning path.
-                stats.resource_inventory_complete = false;
-                if matches!(target, ContentTarget::Page(_)) {
-                    stats.page_vector_inventory_complete = false;
-                    stats.page_hidden_text_inventory_complete = false;
-                }
+                // A resource-less Form borrows its caller's resource scope. More
+                // generally, without a target scan none of the scan-derived
+                // inventories can claim completeness for this target.
+                stats.invalidate_target_scan(target);
                 stats.target_scan_us = stats
                     .target_scan_us
                     .saturating_add(elapsed_micros_u64(scan_started));
                 continue;
             }
             TargetLoadResult::Incomplete { content_len } => {
-                stats.inline_inventory_complete = false;
-                stats.resource_inventory_complete = false;
-                if matches!(target, ContentTarget::Page(_)) {
-                    stats.page_vector_inventory_complete = false;
-                    stats.page_hidden_text_inventory_complete = false;
-                    stats.resource_inventory_complete = false;
-                }
+                stats.invalidate_target_scan(target);
                 stats.target_scan_us = stats
                     .target_scan_us
                     .saturating_add(elapsed_micros_u64(scan_started));
@@ -5917,21 +5981,7 @@ pub fn normalize_raster_layout(
 
         if scanner.inline_occurrences > 0 {
             if scanner.inline_occurrences < config.fragmented_paint_threshold {
-                stats.inline_occurrences_remaining = stats
-                    .inline_occurrences_remaining
-                    .saturating_add(scanner.inline_occurrences);
-                if matches!(target, ContentTarget::Page(_)) {
-                    stats.page_rect_fill_paints_seen = stats
-                        .page_rect_fill_paints_seen
-                        .saturating_add(scanner.rect_fills.len());
-                    stats.page_vector_merge_candidate |= scanner.vector_merge_candidate;
-                    let hidden_candidate =
-                        scanner.text_with_ext_gstate || scanner.covering_paint_after_text;
-                    stats.page_physical_hidden_text_candidate |= hidden_candidate;
-                    if hidden_candidate && let ContentTarget::Page(page) = target {
-                        stats.page_hidden_text_candidates.insert(page);
-                    }
-                }
+                stats.record_unmodified_target(target, &scanner);
                 continue;
             }
             let inline_started = Instant::now();
@@ -5967,6 +6017,7 @@ pub fn normalize_raster_layout(
                 inline_staging.push(staging);
             }
             if inline.stats.scopes_rewritten == 0 {
+                stats.record_unmodified_target(target, &scanner);
                 continue;
             }
 
@@ -5985,13 +6036,8 @@ pub fn normalize_raster_layout(
                 scanner: rescanned_scanner,
                 hidden_ranges: rescanned_hidden_ranges,
             } = match rescanned {
-                TargetLoadResult::MissingResources => continue,
-                TargetLoadResult::Incomplete { .. } => {
-                    stats.inline_inventory_complete = false;
-                    if matches!(target, ContentTarget::Page(_)) {
-                        stats.page_vector_inventory_complete = false;
-                        stats.page_hidden_text_inventory_complete = false;
-                    }
+                TargetLoadResult::MissingResources | TargetLoadResult::Incomplete { .. } => {
+                    stats.invalidate_target_scan(target);
                     continue;
                 }
                 TargetLoadResult::Complete(scanned) => scanned,
@@ -6004,32 +6050,18 @@ pub fn normalize_raster_layout(
             scanner = rescanned_scanner;
             shared_hidden_ranges = rescanned_hidden_ranges;
             if scanner.inline_occurrences != 0 {
-                stats.inline_inventory_complete = false;
+                stats.record_unmodified_target(target, &scanner);
                 continue;
             }
         }
 
-        stats.inline_occurrences_remaining = stats
-            .inline_occurrences_remaining
-            .saturating_add(scanner.inline_occurrences);
-        if matches!(target, ContentTarget::Page(_)) {
-            stats.page_rect_fill_paints_seen = stats
-                .page_rect_fill_paints_seen
-                .saturating_add(scanner.rect_fills.len());
-            stats.page_vector_merge_candidate |= scanner.vector_merge_candidate;
-            let hidden_candidate =
-                scanner.text_with_ext_gstate || scanner.covering_paint_after_text;
-            stats.page_physical_hidden_text_candidate |= hidden_candidate;
-            if hidden_candidate && let ContentTarget::Page(page) = target {
-                stats.page_hidden_text_candidates.insert(page);
-            }
-            if *DEBUG_VECTOR {
-                eprintln!(
-                    "vector-proof target={target:?} rect_fills={} candidate={}",
-                    scanner.rect_fills.len(),
-                    scanner.vector_merge_candidate
-                );
-            }
+        stats.record_target_scan(target, &scanner);
+        if matches!(target, ContentTarget::Page(_)) && *DEBUG_VECTOR {
+            eprintln!(
+                "vector-proof target={target:?} rect_fills={} candidate={}",
+                scanner.rect_fills.len(),
+                scanner.vector_merge_candidate
+            );
         }
 
         let mut pending_pruned_content = None;
@@ -6098,19 +6130,10 @@ pub fn normalize_raster_layout(
         )?;
 
         if plans.is_empty() {
-            let usage = scanner.resource_usage_after_removing(&pruned_draws);
-            match target {
-                ContentTarget::Page(page) => {
-                    stats
-                        .page_resource_names_by_type
-                        .insert(page, usage.by_type);
-                }
-                ContentTarget::Form(form) => {
-                    stats
-                        .form_resource_names_by_type
-                        .insert(form, usage.by_type);
-                }
-            }
+            stats.record_resource_usage(
+                target,
+                scanner.resource_usage_after_removing(&pruned_draws),
+            );
         }
 
         if !plans.is_empty()
@@ -6150,6 +6173,7 @@ pub fn normalize_raster_layout(
             }
             if !removal_ranges.is_empty() {
                 page_state.invalidate_vector(target);
+                stats.invalidate_page_vector_scan(target);
                 let rewritten = remove_content_ranges(&content, removal_ranges)?;
                 install_target(document, target, resources, rewritten)?;
             }
@@ -6169,14 +6193,17 @@ pub fn normalize_raster_layout(
             // explicit content/resources snapshot. Hidden-text results from the
             // original token offsets are deliberately discarded.
             let rescan_started = Instant::now();
-            let Some(rescanned) = scan_target(document, &resources, &content)? else {
-                install_target(document, target, resources, content)?;
-                continue;
-            };
+            let rescanned = scan_target(document, &resources, &content)?;
             stats.target_scan_us = stats
                 .target_scan_us
                 .saturating_add(elapsed_micros_u64(rescan_started));
+            let Some(rescanned) = rescanned else {
+                stats.invalidate_target_scan(target);
+                install_target(document, target, resources, content)?;
+                continue;
+            };
             scanner = rescanned;
+            stats.record_page_vector_candidate(target, &scanner);
             pruned_draws.clear();
             plans = build_merge_plans_for_scanner(
                 document,
@@ -6330,6 +6357,12 @@ pub fn normalize_raster_layout(
                 return Err(error);
             }
             page_state.invalidate_vector(target);
+            if !rejected_apply && applied_changed {
+                // Plan application can remove or relocate raster paint barriers.
+                // Without a final rescan, the pre-apply vector skip proof no
+                // longer describes the installed content snapshot.
+                stats.invalidate_page_vector_scan(target);
+            }
         }
 
         if !rejected_apply {
@@ -6353,18 +6386,7 @@ pub fn normalize_raster_layout(
                 .entry(b"XObject".to_vec())
                 .or_default()
                 .extend(applied.added_resource_names);
-            match target {
-                ContentTarget::Page(page) => {
-                    stats
-                        .page_resource_names_by_type
-                        .insert(page, usage.by_type);
-                }
-                ContentTarget::Form(form) => {
-                    stats
-                        .form_resource_names_by_type
-                        .insert(form, usage.by_type);
-                }
-            }
+            stats.record_resource_usage(target, usage);
         }
     }
     let staging_cleanup_started = Instant::now();
@@ -6383,6 +6405,7 @@ pub fn normalize_raster_layout(
     for target in staging_cleanup.restored_targets {
         if let InlineContentTarget::Page(page) = target {
             page_state.invalidate_page_vector(page);
+            stats.page_vector_inventory_complete = false;
             // The physical hidden-text scanner models Image XObject `Do` coverage
             // but intentionally ignores inline `BI` bodies. Force the final page
             // through the canonical scanner after restoring its original bytes.
@@ -6426,6 +6449,20 @@ mod tests {
             clip: None,
             clip_polygon: None,
             clip_complex: false,
+        }
+    }
+
+    fn inline_staging_test_config(fragmented_paint_threshold: usize) -> RasterLayoutConfig {
+        RasterLayoutConfig {
+            enabled: true,
+            crop_transparent: false,
+            crop_background: false,
+            prune_hidden_paints: true,
+            bake_masks: false,
+            reconstruct_pixel_clusters: false,
+            merge_stripes: false,
+            fragmented_paint_threshold,
+            ..RasterLayoutConfig::default()
         }
     }
 
@@ -7039,17 +7076,7 @@ mod tests {
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let page = ObjectHandle::Existing(ObjectId::new(3, 0));
-        let config = RasterLayoutConfig {
-            enabled: true,
-            crop_transparent: false,
-            crop_background: false,
-            prune_hidden_paints: true,
-            bake_masks: false,
-            reconstruct_pixel_clusters: false,
-            merge_stripes: false,
-            fragmented_paint_threshold: 1,
-            ..RasterLayoutConfig::default()
-        };
+        let config = inline_staging_test_config(1);
         let mut vector_cache = BTreeMap::new();
 
         let stats = normalize_raster_layout(
@@ -7064,6 +7091,7 @@ mod tests {
         assert!(stats.inline_inventory_complete);
         assert_eq!(stats.inline_occurrences_remaining, 1);
         assert!(!stats.resource_inventory_complete);
+        assert!(!stats.page_vector_inventory_complete);
         assert!(stats.page_hidden_text_candidates.contains(&page));
         assert!(!stats.page_hidden_text_shared_complete.contains(&page));
         assert!(!vector_cache.contains_key(&page));
@@ -7072,6 +7100,176 @@ mod tests {
             page_content(&document, page)?
                 .windows(2)
                 .any(|bytes| bytes == b"BI")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_raster_prune_invalidates_vector_skip_proof() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(
+            4,
+            b"",
+            b"0 0 1 1 re f q 1 0 0 1 0 0 cm /Im1 Do Q 1 0 1 1 re f",
+        )?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 6 0 R",
+            &[0x7f],
+        )?;
+        pdf.stream(
+            6,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0x00],
+        )?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let stats = normalize_raster_layout(
+            &mut document,
+            &[page],
+            &inline_staging_test_config(64),
+            FlateLevel::PROCESSING,
+            true,
+            None,
+        )?;
+
+        assert_eq!(stats.transparent_paints_pruned, 1);
+        assert!(!stats.page_vector_inventory_complete);
+        assert!(
+            !page_content(&document, page)?
+                .windows(b"/Im1 Do".len())
+                .any(|bytes| bytes == b"/Im1 Do")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surviving_inline_image_invalidates_typed_resource_inventory() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /CS0 /DeviceGray >> >> /Contents 4 0 R >>",
+        )?;
+        let mut content = b"BI /W 1 /H 1 /CS /CS0 /BPC 8 ID ".to_vec();
+        content.push(0x7f);
+        content.extend_from_slice(b" EI");
+        pdf.stream(4, b"", &content)?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let stats = normalize_raster_layout(
+            &mut document,
+            &[page],
+            &inline_staging_test_config(2),
+            FlateLevel::PROCESSING,
+            true,
+            None,
+        )?;
+
+        assert!(stats.inline_inventory_complete);
+        assert_eq!(stats.inline_occurrences_remaining, 1);
+        assert!(!stats.resource_inventory_complete);
+        assert!(stats.page_hidden_text_candidates.contains(&page));
+        assert!(!stats.page_hidden_text_shared_complete.contains(&page));
+        assert_eq!(stats.inline.scopes_rewritten, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_inline_externalization_threshold_keeps_scan_observations() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /Bad 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        let mut content = b"BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        content.push(0x11);
+        content.extend_from_slice(b" EI BI /W 1 /H 1 /CS /Bad /BPC 8 ID ");
+        content.push(0x22);
+        content.extend_from_slice(b" EI");
+        pdf.stream(4, b"", &content)?;
+        pdf.stream(5, b"", b"opaque decode parameters")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let stats = normalize_raster_layout(
+            &mut document,
+            &[page],
+            &inline_staging_test_config(2),
+            FlateLevel::PROCESSING,
+            true,
+            None,
+        )?;
+
+        assert!(stats.inline_inventory_complete);
+        assert_eq!(stats.inline_occurrences_remaining, 2);
+        assert_eq!(stats.inline.scopes_rewritten, 0);
+        assert!(!stats.resource_inventory_complete);
+        assert!(stats.page_hidden_text_candidates.contains(&page));
+        assert!(!stats.page_hidden_text_shared_complete.contains(&page));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_inline_externalization_counts_rescan_survivor_and_rollback() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ColorSpace << /Bad 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        let mut content = b"BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        content.push(0x11);
+        content.extend_from_slice(b" EI BI /W 1 /H 1 /CS /Bad /BPC 8 ID ");
+        content.push(0x22);
+        content.extend_from_slice(b" EI");
+        pdf.stream(4, b"", &content)?;
+        pdf.stream(5, b"", b"opaque decode parameters")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let stats = normalize_raster_layout(
+            &mut document,
+            &[page],
+            &inline_staging_test_config(1),
+            FlateLevel::PROCESSING,
+            true,
+            None,
+        )?;
+
+        assert!(stats.inline_inventory_complete);
+        assert_eq!(stats.inline_occurrences_remaining, 2);
+        assert_eq!(stats.inline.scopes_rewritten, 1);
+        assert_eq!(stats.staging_xobject_entries_removed, 1);
+        assert!(!stats.resource_inventory_complete);
+        assert!(stats.page_hidden_text_candidates.contains(&page));
+        assert!(!stats.page_hidden_text_shared_complete.contains(&page));
+        assert_eq!(
+            page_content(&document, page)?
+                .windows(2)
+                .filter(|bytes| *bytes == b"BI")
+                .count(),
+            2
         );
         Ok(())
     }
