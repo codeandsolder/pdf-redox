@@ -4884,22 +4884,6 @@ fn unique_xobject_name(xobjects: &OwnedDictionary, suffix: &mut usize) -> Vec<u8
     }
 }
 
-fn install_target_resources(
-    document: &mut EditDocument,
-    target: ContentTarget,
-    resources: OwnedDictionary,
-) -> Result<()> {
-    let handle = match target {
-        ContentTarget::Page(page) => page,
-        ContentTarget::Form(form) => form,
-    };
-    let object = document.edit_handle(handle)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-    }
-    Ok(())
-}
-
 fn install_target(
     document: &mut EditDocument,
     target: ContentTarget,
@@ -4937,7 +4921,6 @@ struct RewriteInput<'a> {
 }
 
 struct ApplyPlansContext<'a> {
-    target: ContentTarget,
     resources: OwnedDictionary,
     input: RewriteInput<'a>,
     config: &'a RasterLayoutConfig,
@@ -4947,7 +4930,7 @@ struct ApplyPlansContext<'a> {
 
 #[derive(Debug, Default)]
 struct ApplyPlansResult {
-    changed: bool,
+    rewritten_content: Option<Vec<u8>>,
     consumed_draws: HashSet<usize>,
     added_resource_names: BTreeSet<Vec<u8>>,
     obsolete_resource_names: BTreeSet<Vec<u8>>,
@@ -5013,15 +4996,14 @@ fn apply_plans(
     context: ApplyPlansContext<'_>,
     mut plans: Vec<MergePlan>,
     stats: &mut RasterLayoutStats,
-) -> Result<ApplyPlansResult> {
-    let target = context.target;
+) -> Result<(OwnedDictionary, ApplyPlansResult)> {
     let mut resources = context.resources;
     let input = context.input;
     let config = context.config;
     let flate_level = context.flate_level;
     let alpha_crop_cache = context.alpha_crop_cache;
     if plans.is_empty() {
-        return Ok(ApplyPlansResult::default());
+        return Ok((resources, ApplyPlansResult::default()));
     }
     plans.sort_by_key(|plan| plan.first_member);
     let mut xobjects =
@@ -5318,7 +5300,7 @@ fn apply_plans(
         }
     }
     if replacements.is_empty() {
-        return Ok(result);
+        return Ok((resources, result));
     }
     replacements.sort_by_key(|(start, _, _)| *start);
     let mut rewritten = Vec::with_capacity(input.content.len());
@@ -5335,9 +5317,8 @@ fn apply_plans(
     }
     rewritten.extend_from_slice(&input.content[cursor..]);
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
-    install_target(document, target, resources, rewritten)?;
-    result.changed = true;
-    Ok(result)
+    result.rewritten_content = Some(rewritten);
+    Ok((resources, result))
 }
 
 fn append_alpha_crop_plans(
@@ -6048,17 +6029,21 @@ pub fn normalize_raster_layout(
             continue;
         }
 
+        let mut target_changed = false;
         if let Some(rewritten) = pending_pruned_content {
             page_state.invalidate_vector(target);
-            install_target(document, target, resources.clone(), rewritten)?;
+            content = rewritten;
+            target_changed = true;
 
             // Mixed prune+reconstruction scopes are uncommon. Preserve the previous
-            // conservative behavior there: rescan the post-prune content and build
-            // plans against the exact new operator/range layout. Hidden-text results
-            // from the original token offsets are deliberately discarded.
+            // conservative behavior there: rescan the post-prune bytes and build
+            // plans against their exact new operator/range layout. The rewrite does
+            // not need to be installed first because raster scanning consumes the
+            // explicit content/resources snapshot. Hidden-text results from the
+            // original token offsets are deliberately discarded.
             let rescan_started = Instant::now();
-            content = target_content(document, target)?;
             let Some(rescanned) = scan_target(document, target, &resources, &content)? else {
+                install_target(document, target, resources, content)?;
                 continue;
             };
             stats.target_scan_us = stats
@@ -6093,10 +6078,9 @@ pub fn normalize_raster_layout(
         let stats_before_apply = target_staging.map(|_| stats.clone());
 
         let apply_plans_started = Instant::now();
-        let mut applied = apply_plans(
+        let (candidate_resources, mut applied) = apply_plans(
             document,
             ApplyPlansContext {
-                target,
                 resources,
                 input: RewriteInput {
                     content: &content,
@@ -6112,7 +6096,9 @@ pub fn normalize_raster_layout(
         let apply_plans_us = elapsed_micros_u64(apply_plans_started);
         stats.apply_plans_us = stats.apply_plans_us.saturating_add(apply_plans_us);
 
-        if applied.changed
+        let applied_changed = applied.rewritten_content.is_some();
+        let mut rejected_apply = false;
+        if applied_changed
             && !applied.has_non_fragment_plan
             && !applied.consumed_draws.is_empty()
             && let Some(staging) = target_staging
@@ -6122,9 +6108,10 @@ pub fn normalize_raster_layout(
                     .get(*index)
                     .is_some_and(|draw| staging.contains_resource_name(&draw.resource_name))
             })
+            && let Some(rewritten) = applied.rewritten_content.as_deref()
             && let (Some(fallback_content), Some(candidate_content)) = (
                 staging.restore_all_references(&content),
-                staging.restore_all_references(&target_content(document, target)?),
+                staging.restore_all_references(rewritten),
             )
             && !inline_reconstruction_fits_budget(
                 &fallback_content,
@@ -6151,12 +6138,11 @@ pub fn normalize_raster_layout(
                     applied.added_image_payload_bytes
                 );
             }
-            let Some(resources) = resources_before_apply else {
+            let Some(rollback_resources) = resources_before_apply else {
                 return Err(Error::Invalid(
                     "missing pre-apply resources for staged inline rollback".to_owned(),
                 ));
             };
-            install_target(document, target, resources, content.clone())?;
             let Some(mut snapshot) = stats_before_apply else {
                 return Err(Error::Invalid(
                     "missing pre-apply stats for staged inline rollback".to_owned(),
@@ -6167,27 +6153,35 @@ pub fn normalize_raster_layout(
                 .inline_reconstruction_payload_rejections
                 .saturating_add(1);
             stats = snapshot;
+            resources = rollback_resources;
             applied = ApplyPlansResult::default();
-        }
-        if applied.changed {
-            page_state.invalidate_vector(target);
-        }
-        if applied.changed && !applied.obsolete_resource_names.is_empty() {
-            let current_content = target_content(document, target)?;
-            if let Some(current_resources) = target_resources(document, target)? {
-                let (resources, removed) = prune_xobject_candidates_for_content(
-                    document,
-                    current_resources,
-                    &current_content,
-                    &applied.obsolete_resource_names,
-                )?;
-                if removed != 0 {
-                    install_target_resources(document, target, resources)?;
-                    stats.rewritten_xobject_entries_removed = stats
-                        .rewritten_xobject_entries_removed
-                        .saturating_add(removed);
-                }
+            rejected_apply = true;
+        } else {
+            resources = candidate_resources;
+            if let Some(rewritten) = applied.rewritten_content.take() {
+                content = rewritten;
+                target_changed = true;
+                page_state.invalidate_vector(target);
             }
+        }
+
+        if !rejected_apply && applied_changed && !applied.obsolete_resource_names.is_empty() {
+            let (updated_resources, removed) = prune_xobject_candidates_for_content(
+                document,
+                resources,
+                &content,
+                &applied.obsolete_resource_names,
+            )?;
+            resources = updated_resources;
+            if removed != 0 {
+                stats.rewritten_xobject_entries_removed = stats
+                    .rewritten_xobject_entries_removed
+                    .saturating_add(removed);
+            }
+        }
+
+        if target_changed {
+            install_target(document, target, resources, content)?;
         }
 
         {
