@@ -628,10 +628,6 @@ struct NameChild {
     last: Vec<u8>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "name-tree replacement keeps collection, rebuilding, and parent-object rewrite invariants together"
-)]
 fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -> Result<usize> {
     if snapshot.pairs.is_empty() {
         let Some(root) = document.edit_handle(snapshot.root)?.as_dictionary_mut() else {
