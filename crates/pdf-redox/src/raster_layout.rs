@@ -4972,7 +4972,80 @@ struct ApplyPlansContext<'a> {
     input: RewriteInput<'a>,
     config: &'a RasterLayoutConfig,
     flate_level: crate::FlateLevel,
-    alpha_crop_cache: &'a mut HashMap<ObjectHandle, AlphaCropCacheEntry>,
+    alpha_crop_cache: &'a HashMap<ObjectHandle, AlphaCropCacheEntry>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ApplyPlanStats {
+    pixel_clusters_reconstructed: usize,
+    pixel_paints_reconstructed: usize,
+    native_fragment_groups_reconstructed: usize,
+    native_fragment_paints_reconstructed: usize,
+    stripe_groups_merged: usize,
+    stripe_paints_merged: usize,
+    masks_baked: usize,
+    transparent_margins_cropped: usize,
+    background_margins_cropped: usize,
+    cropped_pixels_removed: u64,
+    binary_images_packed: usize,
+    binary_masks_packed: usize,
+    stencil_images_emitted: usize,
+    constant_color_mask_stencils_emitted: usize,
+    relaxed_stencil_images_emitted: usize,
+    bilevel_ccitt_images_emitted: usize,
+    bilevel_flate_images_emitted: usize,
+    binary_image_encoded_bytes_saved: u64,
+    deferred_tile_paints_consumed: usize,
+}
+
+impl ApplyPlanStats {
+    fn record_image_encoding(&mut self, encoding: ImageEncodingStats) {
+        self.binary_images_packed += usize::from(encoding.binary_packed);
+        self.binary_masks_packed += usize::from(encoding.binary_mask_packed);
+        self.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
+        self.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
+        self.bilevel_ccitt_images_emitted = self
+            .bilevel_ccitt_images_emitted
+            .saturating_add(usize::from(encoding.bilevel_ccitt_images));
+        self.bilevel_flate_images_emitted = self
+            .bilevel_flate_images_emitted
+            .saturating_add(usize::from(encoding.bilevel_flate_images));
+        self.binary_image_encoded_bytes_saved = self
+            .binary_image_encoded_bytes_saved
+            .saturating_add(encoding.encoded_bytes_saved);
+    }
+
+    fn commit_to(self, stats: &mut RasterLayoutStats) {
+        stats.pixel_clusters_reconstructed += self.pixel_clusters_reconstructed;
+        stats.pixel_paints_reconstructed += self.pixel_paints_reconstructed;
+        stats.native_fragment_groups_reconstructed += self.native_fragment_groups_reconstructed;
+        stats.native_fragment_paints_reconstructed += self.native_fragment_paints_reconstructed;
+        stats.stripe_groups_merged += self.stripe_groups_merged;
+        stats.stripe_paints_merged += self.stripe_paints_merged;
+        stats.masks_baked += self.masks_baked;
+        stats.transparent_margins_cropped += self.transparent_margins_cropped;
+        stats.background_margins_cropped += self.background_margins_cropped;
+        stats.cropped_pixels_removed = stats
+            .cropped_pixels_removed
+            .saturating_add(self.cropped_pixels_removed);
+        stats.binary_images_packed += self.binary_images_packed;
+        stats.binary_masks_packed += self.binary_masks_packed;
+        stats.stencil_images_emitted += self.stencil_images_emitted;
+        stats.constant_color_mask_stencils_emitted += self.constant_color_mask_stencils_emitted;
+        stats.relaxed_stencil_images_emitted += self.relaxed_stencil_images_emitted;
+        stats.bilevel_ccitt_images_emitted = stats
+            .bilevel_ccitt_images_emitted
+            .saturating_add(self.bilevel_ccitt_images_emitted);
+        stats.bilevel_flate_images_emitted = stats
+            .bilevel_flate_images_emitted
+            .saturating_add(self.bilevel_flate_images_emitted);
+        stats.binary_image_encoded_bytes_saved = stats
+            .binary_image_encoded_bytes_saved
+            .saturating_add(self.binary_image_encoded_bytes_saved);
+        stats.deferred_tile_paints_consumed = stats
+            .deferred_tile_paints_consumed
+            .saturating_add(self.deferred_tile_paints_consumed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4983,6 +5056,8 @@ struct ApplyPlansResult {
     obsolete_resource_names: BTreeSet<Vec<u8>>,
     added_image_payload_bytes: usize,
     has_non_fragment_plan: bool,
+    alpha_crop_cache_entries: HashMap<ObjectHandle, AlphaCropCacheEntry>,
+    stats: ApplyPlanStats,
 }
 
 fn encoded_content_payload_len(
@@ -4995,19 +5070,34 @@ fn encoded_content_payload_len(
     Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
 
-fn inline_reconstruction_fits_budget(
+#[derive(Debug, Clone, Copy)]
+struct InlineReconstructionBudget {
+    fallback_payload: usize,
+    candidate_payload: usize,
+}
+
+impl InlineReconstructionBudget {
+    const fn fits(self) -> bool {
+        self.candidate_payload < self.fallback_payload
+    }
+}
+
+fn inline_reconstruction_budget(
     fallback_content: &[u8],
     candidate_content: &[u8],
     added_image_payload_bytes: usize,
     flate_level: crate::FlateLevel,
     normalize_before_flate: bool,
-) -> Result<bool> {
+) -> Result<InlineReconstructionBudget> {
     let fallback_payload =
         encoded_content_payload_len(fallback_content, flate_level, normalize_before_flate)?;
     let candidate_payload =
         encoded_content_payload_len(candidate_content, flate_level, normalize_before_flate)?
             .saturating_add(added_image_payload_bytes);
-    Ok(candidate_payload < fallback_payload)
+    Ok(InlineReconstructionBudget {
+        fallback_payload,
+        candidate_payload,
+    })
 }
 
 fn candidate_payload_fits_budget(
@@ -5018,22 +5108,6 @@ fn candidate_payload_fits_budget(
         .is_none_or(|source_payload| source_payload == 0 || candidate_payload < source_payload)
 }
 
-fn record_image_encoding_stats(stats: &mut RasterLayoutStats, encoding: ImageEncodingStats) {
-    stats.binary_images_packed += usize::from(encoding.binary_packed);
-    stats.binary_masks_packed += usize::from(encoding.binary_mask_packed);
-    stats.stencil_images_emitted += usize::from(encoding.stencil_color.is_some());
-    stats.relaxed_stencil_images_emitted += usize::from(encoding.relaxed_stencil);
-    stats.bilevel_ccitt_images_emitted = stats
-        .bilevel_ccitt_images_emitted
-        .saturating_add(usize::from(encoding.bilevel_ccitt_images));
-    stats.bilevel_flate_images_emitted = stats
-        .bilevel_flate_images_emitted
-        .saturating_add(usize::from(encoding.bilevel_flate_images));
-    stats.binary_image_encoded_bytes_saved = stats
-        .binary_image_encoded_bytes_saved
-        .saturating_add(encoding.encoded_bytes_saved);
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "plan application must preserve rewrite ordering, resource edits, and accumulated statistics atomically"
@@ -5042,7 +5116,6 @@ fn apply_plans(
     document: &mut EditDocument,
     context: ApplyPlansContext<'_>,
     mut plans: Vec<MergePlan>,
-    stats: &mut RasterLayoutStats,
 ) -> Result<(OwnedDictionary, ApplyPlansResult)> {
     let mut resources = context.resources;
     let input = context.input;
@@ -5067,7 +5140,11 @@ fn apply_plans(
         let first_draw = &input.draws[plan.first_member];
         let source_crop_hint = plan.alpha_crop_hint;
         let cached_crop = if plan.kind == MergeKind::AlphaCrop {
-            alpha_crop_cache.get(&first_draw.target).copied()
+            result
+                .alpha_crop_cache_entries
+                .get(&first_draw.target)
+                .or_else(|| alpha_crop_cache.get(&first_draw.target))
+                .copied()
         } else {
             None
         };
@@ -5234,13 +5311,16 @@ fn apply_plans(
             result.has_non_fragment_plan = true;
         }
 
-        stats.transparent_margins_cropped += usize::from(transparent_cropped);
-        stats.background_margins_cropped += usize::from(background_cropped);
-        stats.cropped_pixels_removed = stats.cropped_pixels_removed.saturating_add(removed_pixels);
+        result.stats.transparent_margins_cropped += usize::from(transparent_cropped);
+        result.stats.background_margins_cropped += usize::from(background_cropped);
+        result.stats.cropped_pixels_removed = result
+            .stats
+            .cropped_pixels_removed
+            .saturating_add(removed_pixels);
 
         let background = if let Some((background_relative, prepared)) = prepared_background {
             let (image, encoding) = install_prepared_image(document, prepared, 1, 1);
-            record_image_encoding_stats(stats, encoding);
+            result.stats.record_image_encoding(encoding);
             let name = unique_xobject_name(&xobjects, &mut suffix);
             xobjects.insert(name.clone(), OwnedObject::Reference(image));
             result.added_resource_names.insert(name.clone());
@@ -5262,14 +5342,14 @@ fn apply_plans(
             };
             let (image, encoding) =
                 install_prepared_image(document, prepared, plan.width, plan.height);
-            record_image_encoding_stats(stats, encoding);
+            result.stats.record_image_encoding(encoding);
             let name = unique_xobject_name(&xobjects, &mut suffix);
             xobjects.insert(name.clone(), OwnedObject::Reference(image));
             result.added_resource_names.insert(name.clone());
             if plan.kind == MergeKind::AlphaCrop
                 && let Some(source_crop) = source_crop_hint
             {
-                alpha_crop_cache.insert(
+                result.alpha_crop_cache_entries.insert(
                     first_draw.target,
                     AlphaCropCacheEntry {
                         image,
@@ -5320,30 +5400,31 @@ fn apply_plans(
         }
         result.consumed_draws.extend(plan.members.iter().copied());
         if plan.kind == MergeKind::PixelCluster {
-            stats.deferred_tile_paints_consumed = stats
+            result.stats.deferred_tile_paints_consumed = result
+                .stats
                 .deferred_tile_paints_consumed
                 .saturating_add(plan.members.len());
         }
         match plan.kind {
             MergeKind::Stripe => {
-                stats.stripe_groups_merged += 1;
-                stats.stripe_paints_merged += plan.members.len();
+                result.stats.stripe_groups_merged += 1;
+                result.stats.stripe_paints_merged += plan.members.len();
             }
             MergeKind::PixelCluster => {
-                stats.pixel_clusters_reconstructed += 1;
-                stats.pixel_paints_reconstructed += plan.members.len();
+                result.stats.pixel_clusters_reconstructed += 1;
+                result.stats.pixel_paints_reconstructed += plan.members.len();
             }
             MergeKind::NativeFragment => {
-                stats.native_fragment_groups_reconstructed += 1;
-                stats.native_fragment_paints_reconstructed += plan.members.len();
+                result.stats.native_fragment_groups_reconstructed += 1;
+                result.stats.native_fragment_paints_reconstructed += plan.members.len();
             }
             MergeKind::ConstantColorMaskStencil => {
-                stats.constant_color_mask_stencils_emitted += 1;
+                result.stats.constant_color_mask_stencils_emitted += 1;
             }
             MergeKind::AlphaCrop => {}
         }
         if mask_baked && image_created {
-            stats.masks_baked += 1;
+            result.stats.masks_baked += 1;
         }
     }
     if replacements.is_empty() {
@@ -6121,10 +6202,10 @@ pub fn normalize_raster_layout(
             .iter()
             .find(|staging| staging.target() == inline_target);
         let resources_before_apply = target_staging.map(|_| resources.clone());
-        let stats_before_apply = target_staging.map(|_| stats.clone());
+        let new_object_checkpoint = document.new_object_checkpoint();
 
         let apply_plans_started = Instant::now();
-        let (candidate_resources, mut applied) = apply_plans(
+        let apply_result = apply_plans(
             document,
             ApplyPlansContext {
                 resources,
@@ -6134,71 +6215,85 @@ pub fn normalize_raster_layout(
                 },
                 config,
                 flate_level,
-                alpha_crop_cache: &mut alpha_crop_cache,
+                alpha_crop_cache: &alpha_crop_cache,
             },
             plans,
-            &mut stats,
-        )?;
+        );
         let apply_plans_us = elapsed_micros_u64(apply_plans_started);
         stats.apply_plans_us = stats.apply_plans_us.saturating_add(apply_plans_us);
+        let (candidate_resources, mut applied) = match apply_result {
+            Ok(result) => result,
+            Err(error) => {
+                document.rollback_new_objects(new_object_checkpoint)?;
+                return Err(error);
+            }
+        };
 
         let applied_changed = applied.rewritten_content.is_some();
-        let mut rejected_apply = false;
-        if applied_changed
-            && !applied.has_non_fragment_plan
-            && !applied.consumed_draws.is_empty()
-            && let Some(staging) = target_staging
-            && applied.consumed_draws.iter().all(|index| {
+        let inline_budget_rejection = (|| -> Result<Option<InlineReconstructionBudget>> {
+            if !applied_changed
+                || applied.has_non_fragment_plan
+                || applied.consumed_draws.is_empty()
+            {
+                return Ok(None);
+            }
+            let Some(staging) = target_staging else {
+                return Ok(None);
+            };
+            if !applied.consumed_draws.iter().all(|index| {
                 scanner
                     .draws
                     .get(*index)
                     .is_some_and(|draw| staging.contains_resource_name(&draw.resource_name))
-            })
-            && let Some(rewritten) = applied.rewritten_content.as_deref()
-            && let (Some(fallback_content), Some(candidate_content)) = (
+            }) {
+                return Ok(None);
+            }
+            let Some(rewritten) = applied.rewritten_content.as_deref() else {
+                return Ok(None);
+            };
+            let (Some(fallback_content), Some(candidate_content)) = (
                 staging.restore_all_references(&content),
                 staging.restore_all_references(rewritten),
-            )
-            && !inline_reconstruction_fits_budget(
+            ) else {
+                return Ok(None);
+            };
+            let budget = inline_reconstruction_budget(
                 &fallback_content,
                 &candidate_content,
                 applied.added_image_payload_bytes,
                 flate_level,
                 normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
-            )?
-        {
+            )?;
+            Ok((!budget.fits()).then_some(budget))
+        })();
+        let inline_budget_rejection = match inline_budget_rejection {
+            Ok(rejection) => rejection,
+            Err(error) => {
+                document.rollback_new_objects(new_object_checkpoint)?;
+                return Err(error);
+            }
+        };
+
+        let mut rejected_apply = false;
+        if let Some(budget) = inline_budget_rejection {
             if *DEBUG_RASTER {
-                let fallback_payload = encoded_content_payload_len(
-                    &fallback_content,
-                    flate_level,
-                    normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
-                )?;
-                let candidate_payload = encoded_content_payload_len(
-                    &candidate_content,
-                    flate_level,
-                    normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
-                )?
-                .saturating_add(applied.added_image_payload_bytes);
                 eprintln!(
-                    "raster-inline payload rollback {target:?}: candidate={candidate_payload} fallback={fallback_payload} image_payload={}",
+                    "raster-inline payload rollback {target:?}: candidate={} fallback={} image_payload={}",
+                    budget.candidate_payload,
+                    budget.fallback_payload,
                     applied.added_image_payload_bytes
                 );
             }
             let Some(rollback_resources) = resources_before_apply else {
+                document.rollback_new_objects(new_object_checkpoint)?;
                 return Err(Error::Invalid(
                     "missing pre-apply resources for staged inline rollback".to_owned(),
                 ));
             };
-            let Some(mut snapshot) = stats_before_apply else {
-                return Err(Error::Invalid(
-                    "missing pre-apply stats for staged inline rollback".to_owned(),
-                ));
-            };
-            snapshot.apply_plans_us = snapshot.apply_plans_us.saturating_add(apply_plans_us);
-            snapshot.inline_reconstruction_payload_rejections = snapshot
+            document.rollback_new_objects(new_object_checkpoint)?;
+            stats.inline_reconstruction_payload_rejections = stats
                 .inline_reconstruction_payload_rejections
                 .saturating_add(1);
-            stats = snapshot;
             resources = rollback_resources;
             applied = ApplyPlansResult::default();
             rejected_apply = true;
@@ -6207,27 +6302,46 @@ pub fn normalize_raster_layout(
             if let Some(rewritten) = applied.rewritten_content.take() {
                 content = rewritten;
                 target_changed = true;
-                page_state.invalidate_vector(target);
             }
         }
 
+        let mut rewritten_xobject_entries_removed = 0usize;
         if !rejected_apply && applied_changed && !applied.obsolete_resource_names.is_empty() {
-            let (updated_resources, removed) = prune_xobject_candidates_for_content(
+            let pruned = prune_xobject_candidates_for_content(
                 document,
                 resources,
                 &content,
                 &applied.obsolete_resource_names,
-            )?;
+            );
+            let (updated_resources, removed) = match pruned {
+                Ok(result) => result,
+                Err(error) => {
+                    document.rollback_new_objects(new_object_checkpoint)?;
+                    return Err(error);
+                }
+            };
             resources = updated_resources;
-            if removed != 0 {
-                stats.rewritten_xobject_entries_removed = stats
-                    .rewritten_xobject_entries_removed
-                    .saturating_add(removed);
-            }
+            rewritten_xobject_entries_removed = removed;
         }
 
         if target_changed {
-            install_target(document, target, resources, content)?;
+            if let Err(error) = install_target(document, target, resources, content) {
+                document.rollback_new_objects(new_object_checkpoint)?;
+                return Err(error);
+            }
+            page_state.invalidate_vector(target);
+        }
+
+        if !rejected_apply {
+            applied.stats.commit_to(&mut stats);
+            for (source, entry) in applied.alpha_crop_cache_entries.drain() {
+                alpha_crop_cache.insert(source, entry);
+            }
+            if rewritten_xobject_entries_removed != 0 {
+                stats.rewritten_xobject_entries_removed = stats
+                    .rewritten_xobject_entries_removed
+                    .saturating_add(rewritten_xobject_entries_removed);
+            }
         }
 
         {
@@ -6893,13 +7007,16 @@ mod tests {
     #[test]
     fn inline_reconstruction_budget_compares_final_encoded_representation() -> Result<()> {
         let compact_fallback = vec![b'A'; 8 * 1024];
-        assert!(!inline_reconstruction_fits_budget(
-            &compact_fallback,
-            b"q /RL1 Do Q",
-            8 * 1024,
-            crate::FlateLevel::PROCESSING,
-            false,
-        )?);
+        assert!(
+            !inline_reconstruction_budget(
+                &compact_fallback,
+                b"q /RL1 Do Q",
+                8 * 1024,
+                crate::FlateLevel::PROCESSING,
+                false,
+            )?
+            .fits()
+        );
 
         let mut noisy_fallback = Vec::with_capacity(8 * 1024);
         let mut state = 0x1234_5678_u32;
@@ -6909,13 +7026,16 @@ mod tests {
             state ^= state << 5;
             noisy_fallback.push(state.to_le_bytes()[0]);
         }
-        assert!(inline_reconstruction_fits_budget(
-            &noisy_fallback,
-            b"q /RL1 Do Q",
-            64,
-            crate::FlateLevel::PROCESSING,
-            false,
-        )?);
+        assert!(
+            inline_reconstruction_budget(
+                &noisy_fallback,
+                b"q /RL1 Do Q",
+                64,
+                crate::FlateLevel::PROCESSING,
+                false,
+            )?
+            .fits()
+        );
         Ok(())
     }
 

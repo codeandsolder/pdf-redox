@@ -453,6 +453,9 @@ impl OwnedObject {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewObjectCheckpoint(usize);
+
 /// Mutation applied to an object that already exists in the source PDF.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExistingObjectChange {
@@ -766,6 +769,31 @@ impl EditDocument {
     /// Adds a new object to the document overlay and returns its temporary identifier.
     pub fn add_object(&mut self, object: OwnedObject) -> NewObjectId {
         self.overlay.add(object)
+    }
+
+    /// Snapshot the tail of the unnumbered-object arena before speculative allocation.
+    ///
+    /// The checkpoint is only for transactions that have not linked any subsequently
+    /// allocated handles into the reachable object graph. Handles allocated after the
+    /// checkpoint must be discarded together with a rollback because their indices may
+    /// be reused by later allocations.
+    pub(crate) fn new_object_checkpoint(&self) -> NewObjectCheckpoint {
+        NewObjectCheckpoint(self.overlay.added.len())
+    }
+
+    /// Discard speculative tail allocations made after `new_object_checkpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint does not belong to the current overlay tail.
+    pub(crate) fn rollback_new_objects(&mut self, checkpoint: NewObjectCheckpoint) -> Result<()> {
+        if checkpoint.0 > self.overlay.added.len() {
+            return Err(Error::Invalid(
+                "new-object rollback checkpoint exceeds current overlay length".to_owned(),
+            ));
+        }
+        self.overlay.added.truncate(checkpoint.0);
+        Ok(())
     }
 
     /// Return a mutable overlay object previously allocated with `add_object`.
@@ -1685,6 +1713,23 @@ mod tests {
             ]
         );
         assert!(document.overlay().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_new_object_rollback_discards_only_tail_allocations() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let prefix = document.add_object(OwnedObject::Null);
+        let checkpoint = document.new_object_checkpoint();
+        let speculative = document.add_object(OwnedObject::Boolean(true));
+        assert!(document.overlay().added(speculative).is_some());
+
+        document.rollback_new_objects(checkpoint)?;
+        assert!(document.overlay().added(prefix).is_some());
+        assert!(document.overlay().added(speculative).is_none());
+
+        let replacement = document.add_object(OwnedObject::Integer(7));
+        assert_eq!(replacement.index(), speculative.index());
         Ok(())
     }
 
