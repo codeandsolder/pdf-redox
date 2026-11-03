@@ -246,8 +246,6 @@ pub fn visit_compression_sample_candidates(
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
-    use flate2::{Compression, write::ZlibEncoder};
-    use std::io::Write as _;
 
     fn fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
@@ -255,9 +253,7 @@ mod tests {
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
         pdf.object(3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>")?;
         let decoded = b"BT /F1 12 Tf (compression corpus) Tj ET\n".repeat(32);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(7));
-        encoder.write_all(&decoded)?;
-        let encoded = encoder.finish()?;
+        let encoded = crate::stream_codec::encode_flate(&decoded, FlateLevel::PROCESSING)?;
         pdf.stream(4, b"/Filter /FlateDecode", &encoded)?;
         pdf.finish(1)
     }
