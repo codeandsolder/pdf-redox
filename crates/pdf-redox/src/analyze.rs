@@ -93,42 +93,6 @@ fn all_source_objects(document: &EditDocument) -> Result<Vec<(CowObjectHandle, O
     Ok(objects)
 }
 
-fn collect_content_stream_refs(
-    document: &EditDocument,
-    value: &OwnedObject,
-    refs: &mut HashSet<CowObjectHandle>,
-    seen: &mut HashSet<CowObjectHandle>,
-) -> Result<()> {
-    match value {
-        OwnedObject::Reference(handle) => {
-            if !seen.insert(*handle) {
-                return Ok(());
-            }
-            let Some(target) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            match target {
-                OwnedObject::Stream { .. } => {
-                    refs.insert(*handle);
-                }
-                OwnedObject::Array(values) => {
-                    for value in &values {
-                        collect_content_stream_refs(document, value, refs, seen)?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                collect_content_stream_refs(document, value, refs, seen)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct PreflightRefs {
     font: HashSet<CowObjectHandle>,
@@ -174,26 +138,6 @@ fn resolve_ext_g_state_map_refs(document: &EditDocument, refs: &mut PreflightRef
     Ok(())
 }
 
-fn collect_page_content_refs(
-    document: &EditDocument,
-    pages: &[CowObjectHandle],
-) -> Result<HashSet<CowObjectHandle>> {
-    let mut refs = HashSet::new();
-    for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        collect_content_stream_refs(document, contents, &mut refs, &mut HashSet::new())?;
-    }
-    Ok(refs)
-}
-
 const fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
     match key {
         b"Metadata" => Some("metadata"),
@@ -213,8 +157,13 @@ const fn incoming_role_for_key(key: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn role_descends_into_dictionary(role: &str) -> bool {
+    role != "page-content"
+}
+
 fn collect_incoming_roles(
     objects: &[(CowObjectHandle, OwnedObject)],
+    page_handles: &HashSet<CowObjectHandle>,
 ) -> HashMap<CowObjectHandle, HashSet<&'static str>> {
     let objects_by_handle: HashMap<_, _> = objects
         .iter()
@@ -224,10 +173,15 @@ fn collect_incoming_roles(
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
 
-    for (_, object) in objects {
+    for (handle, object) in objects {
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
+        if page_handles.contains(handle)
+            && let Some(contents) = dictionary.get(b"Contents".as_slice())
+        {
+            queue.push_back((contents, "page-content"));
+        }
         for (key, value) in dictionary {
             if let Some(role) = incoming_role_for_key(key) {
                 queue.push_back((value, role));
@@ -253,7 +207,7 @@ fn collect_incoming_roles(
                             queue.push_back((value, role));
                         }
                     }
-                    OwnedObject::Dictionary(dictionary) => {
+                    OwnedObject::Dictionary(dictionary) if role_descends_into_dictionary(role) => {
                         for (key, child) in dictionary {
                             queue.push_back((child, incoming_role_for_key(key).unwrap_or(role)));
                         }
@@ -266,7 +220,9 @@ fn collect_incoming_roles(
                     queue.push_back((value, role));
                 }
             }
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. }
+                if role_descends_into_dictionary(role) =>
+            {
                 for (key, child) in dictionary {
                     queue.push_back((child, incoming_role_for_key(key).unwrap_or(role)));
                 }
@@ -292,96 +248,105 @@ fn dictionary_name(
     })
 }
 
+#[derive(Debug)]
+struct DeepObjectFacts {
+    kind: Option<Vec<u8>>,
+    subtype: Option<Vec<u8>>,
+    raw_stream_bytes: Option<usize>,
+}
+
 fn stream_role(
-    document: &EditDocument,
     object: &OwnedObject,
     handle: CowObjectHandle,
+    facts: &DeepObjectFacts,
     font_refs: &HashSet<CowObjectHandle>,
-    page_content_refs: &HashSet<CowObjectHandle>,
     icc_profile_refs: &HashSet<CowObjectHandle>,
     incoming_roles: &HashMap<CowObjectHandle, HashSet<&'static str>>,
-) -> Result<&'static str> {
+) -> &'static str {
     let OwnedObject::Stream { dictionary, .. } = object else {
-        return Ok("other");
+        return "other";
     };
-    let kind = dictionary_name(document, dictionary, b"Type")?;
-    if let Some(kind) = kind.as_deref() {
+    if let Some(kind) = facts.kind.as_deref() {
         match kind {
-            b"Metadata" => return Ok("metadata"),
-            b"EmbeddedFile" => return Ok("embedded-file"),
-            b"ObjStm" => return Ok("object-stream"),
-            b"XRef" => return Ok("xref-stream"),
+            b"Metadata" => return "metadata",
+            b"EmbeddedFile" => return "embedded-file",
+            b"ObjStm" => return "object-stream",
+            b"XRef" => return "xref-stream",
             _ => {}
         }
     }
-    if let Some(subtype) = dictionary_name(document, dictionary, b"Subtype")? {
-        match subtype.as_slice() {
-            b"Image" => return Ok("image"),
-            b"Form" => return Ok("form"),
+    if let Some(subtype) = facts.subtype.as_deref() {
+        match subtype {
+            b"Image" => return "image",
+            b"Form" => return "form",
             _ => {}
         }
     }
     if font_refs.contains(&handle) {
-        return Ok("font-program");
+        return "font-program";
     }
-    if page_content_refs.contains(&handle) {
-        return Ok("page-content");
+    let incoming = incoming_roles.get(&handle);
+    if incoming.is_some_and(|roles| roles.contains("page-content")) {
+        return "page-content";
     }
     if icc_profile_refs.contains(&handle) {
-        return Ok("icc-profile");
+        return "icc-profile";
     }
-    if let Some(roles) = incoming_roles.get(&handle) {
+    if let Some(roles) = incoming {
         if roles.len() == 1 {
-            return Ok(roles.iter().next().copied().unwrap_or("other"));
+            return roles.iter().next().copied().unwrap_or("other");
         }
         if roles.len() > 1 {
-            return Ok("multi-reference");
+            return "multi-reference";
         }
     }
-    if kind.as_deref() == Some(b"CMap") {
-        return Ok("cmap");
+    if facts.kind.as_deref() == Some(b"CMap") {
+        return "cmap";
     }
     // Several common stream classes are identified by their defining dictionary
     // keys rather than `/Type` or `/Subtype`. Keeping them out of the generic
     // `other` bucket makes corpus byte anatomy actionable.
     if dictionary.contains_key(b"PatternType".as_slice()) {
-        return Ok("pattern");
+        return "pattern";
     }
     if dictionary.contains_key(b"ShadingType".as_slice()) {
-        return Ok("shading");
+        return "shading";
     }
     if dictionary.contains_key(b"FunctionType".as_slice()) {
-        return Ok("function");
+        return "function";
     }
     if dictionary.contains_key(b"Width".as_slice())
         && dictionary.contains_key(b"Height".as_slice())
         && dictionary.contains_key(b"BitsPerComponent".as_slice())
     {
-        return Ok("image-like");
+        return "image-like";
     }
-    Ok("other")
+    "other"
 }
 
 fn structural_object_role(
-    document: &EditDocument,
     object: &OwnedObject,
     stream_role_name: Option<&str>,
+    facts: Option<&DeepObjectFacts>,
 ) -> Result<String> {
     if matches!(object, OwnedObject::Stream { .. }) {
         return Ok(format!("stream:{}", stream_role_name.unwrap_or("other")));
     }
-    if let Some(dictionary) = object.as_dictionary() {
-        let kind = dictionary_name(document, dictionary, b"Type")?;
-        let subtype = dictionary_name(document, dictionary, b"Subtype")?;
-        return Ok(match (kind, subtype) {
+    if object.as_dictionary().is_some() {
+        let Some(facts) = facts else {
+            return Err(crate::Error::Invalid(
+                "deep analysis dictionary facts are missing".to_owned(),
+            ));
+        };
+        return Ok(match (&facts.kind, &facts.subtype) {
             (Some(kind), Some(subtype)) => format!(
                 "dict:{}/{}",
-                String::from_utf8_lossy(&kind),
-                String::from_utf8_lossy(&subtype)
+                String::from_utf8_lossy(kind),
+                String::from_utf8_lossy(subtype)
             ),
-            (Some(kind), None) => format!("dict:{}", String::from_utf8_lossy(&kind)),
+            (Some(kind), None) => format!("dict:{}", String::from_utf8_lossy(kind)),
             (None, Some(subtype)) => {
-                format!("dict:subtype:{}", String::from_utf8_lossy(&subtype))
+                format!("dict:subtype:{}", String::from_utf8_lossy(subtype))
             }
             (None, None) => "dict:untyped".to_owned(),
         });
@@ -398,24 +363,61 @@ fn structural_object_role(
     })
 }
 
-fn record_object_graph_inventory(
-    document: &EditDocument,
+fn record_role_inventory(
     objects: &[(CowObjectHandle, OwnedObject)],
-    stream_roles: &HashMap<CowObjectHandle, &'static str>,
+    deep_object_facts: &HashMap<CowObjectHandle, DeepObjectFacts>,
+    font_refs: &HashSet<CowObjectHandle>,
+    icc_profile_refs: &HashSet<CowObjectHandle>,
+    incoming_roles: &HashMap<CowObjectHandle, HashSet<&'static str>>,
     out: &mut PdfAnalysis,
-) -> Result<()> {
-    let mut roles = HashMap::new();
+) -> Result<HashMap<CowObjectHandle, &'static str>> {
+    let mut stream_roles = HashMap::new();
+    let mut object_roles = HashMap::new();
     for (handle, object) in objects {
-        let role = structural_object_role(document, object, stream_roles.get(handle).copied())?;
-        *out.object_role_counts.entry(role.clone()).or_default() += 1;
-        roles.insert(*handle, role);
+        let stream_role_name = if matches!(object, OwnedObject::Stream { .. }) {
+            let Some(facts) = deep_object_facts.get(handle) else {
+                return Err(crate::Error::Invalid(
+                    "deep analysis stream facts are missing".to_owned(),
+                ));
+            };
+            let role = stream_role(
+                object,
+                *handle,
+                facts,
+                font_refs,
+                icc_profile_refs,
+                incoming_roles,
+            );
+            let Some(raw_stream_bytes) = facts.raw_stream_bytes else {
+                return Err(crate::Error::Invalid(
+                    "deep analysis stream byte count is missing".to_owned(),
+                ));
+            };
+            *out.stream_role_counts.entry(role.to_owned()).or_default() += 1;
+            *out.stream_role_raw_bytes
+                .entry(role.to_owned())
+                .or_default() += raw_stream_bytes;
+            stream_roles.insert(*handle, role);
+            Some(role)
+        } else {
+            None
+        };
+
+        let object_role =
+            structural_object_role(object, stream_role_name, deep_object_facts.get(handle))?;
+        *out.object_role_counts
+            .entry(object_role.clone())
+            .or_default() += 1;
+        object_roles.insert(*handle, object_role);
     }
 
+    // Target roles must be complete before reference edges can be labelled, so
+    // edge accounting remains a second pass over the immutable object snapshot.
     for (handle, object) in objects {
         let Some(dictionary) = object.as_dictionary() else {
             continue;
         };
-        let source_role = roles
+        let source_role = object_roles
             .get(handle)
             .cloned()
             .unwrap_or_else(|| "unknown".to_owned());
@@ -425,14 +427,14 @@ fn record_object_graph_inventory(
                 .entry(format!("{source_role}/{key_text}"))
                 .or_default() += 1;
             for target in value.references() {
-                let target_role = roles.get(&target).map_or("missing", String::as_str);
+                let target_role = object_roles.get(&target).map_or("missing", String::as_str);
                 *out.object_reference_edge_counts
                     .entry(format!("{source_role}/{key_text}->{target_role}"))
                     .or_default() += 1;
             }
         }
     }
-    Ok(())
+    Ok(stream_roles)
 }
 
 fn duplicate_payload_role_stats(
@@ -1071,16 +1073,9 @@ fn analyze_document_impl(
             .push(format!("Creator metadata analysis skipped: {error}")),
     }
 
-    let page_content_refs = if deep {
+    let page_content_role_pages = if deep {
         match analysis_pages.as_ref() {
-            Some(Ok(pages)) => match collect_page_content_refs(document, pages) {
-                Ok(refs) => refs,
-                Err(error) => {
-                    out.warnings
-                        .push(format!("page-content role analysis skipped: {error}"));
-                    HashSet::new()
-                }
-            },
+            Some(Ok(pages)) => pages.iter().copied().collect(),
             Some(Err(error)) => {
                 out.warnings
                     .push(format!("page-content role analysis skipped: {error}"));
@@ -1102,6 +1097,7 @@ fn analyze_document_impl(
     let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
     let mut font_dictionary_fingerprint_inventory_complete = true;
+    let mut deep_object_facts = HashMap::<CowObjectHandle, DeepObjectFacts>::new();
     let mut direct_key_inventory = DirectKeyInventory::new();
     let mut preflight_refs = PreflightRefs::default();
     if let Some(objects) = objects.as_deref() {
@@ -1208,6 +1204,16 @@ fn analyze_document_impl(
             );
         }
         if !is_stream {
+            if deep {
+                deep_object_facts.insert(
+                    handle,
+                    DeepObjectFacts {
+                        kind: type_name?,
+                        subtype: dictionary_name(document, dictionary, b"Subtype")?,
+                        raw_stream_bytes: None,
+                    },
+                );
+            }
             return Ok(());
         }
 
@@ -1328,6 +1334,16 @@ fn analyze_document_impl(
                     }
                 }
             }
+        }
+        if deep {
+            deep_object_facts.insert(
+                handle,
+                DeepObjectFacts {
+                    kind: type_name,
+                    subtype,
+                    raw_stream_bytes: Some(raw.len()),
+                },
+            );
         }
         Ok(())
     };
@@ -1480,32 +1496,19 @@ fn analyze_document_impl(
         let objects = objects.as_deref().ok_or_else(|| {
             crate::Error::Invalid("deep analysis object table is missing".to_owned())
         })?;
-        let incoming_roles = collect_incoming_roles(objects);
-        let mut stream_roles = HashMap::new();
-        for (handle, object) in objects {
-            if !matches!(object, OwnedObject::Stream { .. }) {
-                continue;
-            }
-            let role = stream_role(
-                document,
-                object,
-                *handle,
-                &preflight_refs.font,
-                &page_content_refs,
-                &preflight_refs.icc_profiles,
-                &incoming_roles,
-            )?;
-            *out.stream_role_counts.entry(role.to_owned()).or_default() += 1;
-            *out.stream_role_raw_bytes
-                .entry(role.to_owned())
-                .or_default() += raw_stream_bytes(document, object)?.len();
-            stream_roles.insert(*handle, role);
-        }
+        let incoming_roles = collect_incoming_roles(objects, &page_content_role_pages);
+        let stream_roles = record_role_inventory(
+            objects,
+            &deep_object_facts,
+            &preflight_refs.font,
+            &preflight_refs.icc_profiles,
+            &incoming_roles,
+            &mut out,
+        )?;
         (
             out.duplicate_stream_role_groups,
             out.duplicate_stream_role_wasted_bytes,
         ) = duplicate_payload_role_stats(&stream_payloads, &stream_payload_members, &stream_roles);
-        record_object_graph_inventory(document, objects, &stream_roles, &mut out)?;
 
         (
             out.duplicate_metadata_payload_groups,
@@ -1998,6 +2001,38 @@ mod tests {
         let analysis = analyze_pdf_preflight(&pdf.finish(1)?)?;
         assert_eq!(analysis.font_opportunity_inventory_version, 1);
         assert_eq!(analysis.font_explicit_cid_to_gid_ref_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_analysis_seeds_page_content_role_from_page_objects() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Private << /Contents 8 0 R /ColorSpace [/ICCBased 4 0 R] >> >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 7 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(6, b"", b"q Q")?;
+        pdf.object(7, b"[4 0 R 6 0 R]")?;
+        pdf.stream(8, b"", b"q Q")?;
+
+        let analysis = analyze_pdf(&pdf.finish(1)?)?;
+        assert_eq!(analysis.stream_role_counts.get("page-content"), Some(&2));
+        assert_eq!(analysis.stream_role_counts.get("icc-profile"), None);
+        assert_eq!(analysis.stream_role_counts.get("other"), Some(&1));
+        assert_eq!(analysis.stream_role_raw_bytes.get("page-content"), Some(&6));
+        assert_eq!(analysis.stream_role_raw_bytes.get("other"), Some(&3));
+        assert_eq!(
+            analysis.object_role_counts.get("stream:page-content"),
+            Some(&2)
+        );
+        assert_eq!(analysis.object_role_counts.get("stream:other"), Some(&1));
+        assert_eq!(analysis.object_role_counts.get("dict:Page"), Some(&1));
         Ok(())
     }
 
