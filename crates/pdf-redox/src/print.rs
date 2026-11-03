@@ -2,7 +2,9 @@ use crate::geometry::Matrix;
 use crate::images::ImageResizeTarget;
 use crate::{
     Result,
-    content::{page_user_unit, resolved_number},
+    content::{
+        page_content, page_user_unit, resolved_name, resolved_number, resolved_number_array,
+    },
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -213,82 +215,14 @@ fn cow_xobjects(
     Ok((out, complete))
 }
 
-fn cow_content_value(
-    document: &crate::EditDocument,
-    value: &crate::OwnedObject,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let value = match value {
-        crate::OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            value
-        }
-        value => value.clone(),
-    };
-    match value {
-        crate::OwnedObject::Stream { .. } => {
-            let bytes = document.decoded_owned_stream_data(&value)?;
-            if !out.is_empty() && out.last() != Some(&b'\n') {
-                out.push(b'\n');
-            }
-            out.extend_from_slice(&bytes);
-        }
-        crate::OwnedObject::Array(values) => {
-            for value in values {
-                cow_content_value(document, &value, out)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn cow_page_content(document: &crate::EditDocument, page: crate::ObjectHandle) -> Result<Vec<u8>> {
-    let Some(page) = document.current_owned_object(page)? else {
-        return Ok(Vec::new());
-    };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(Vec::new());
-    };
-    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    cow_content_value(document, contents, &mut out)?;
-    Ok(out)
-}
-
-fn cow_number_array<const N: usize>(
-    document: &crate::EditDocument,
-    value: Option<&crate::OwnedObject>,
-) -> Result<Option<[f64; N]>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(crate::OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    if values.len() != N {
-        return Ok(None);
-    }
-    let mut out = [0.0; N];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number(document, Some(value))? else {
-            return Ok(None);
-        };
-        out[index] = number;
-    }
-    Ok(Some(out))
-}
-
 fn cow_form_matrix(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
 ) -> Result<Matrix> {
-    let Some(values) = cow_number_array::<6>(document, dictionary.get(b"Matrix".as_slice()))?
-    else {
+    let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
+        return Ok(Matrix::default());
+    };
+    let Some(values) = resolved_number_array::<6>(document, value)? else {
         return Ok(Matrix::default());
     };
     Ok(Matrix::new(
@@ -336,13 +270,7 @@ fn cow_subtype(
     let Some(dictionary) = object.as_dictionary() else {
         return Ok(None);
     };
-    let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(crate::OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
+    resolved_name(document, dictionary.get(b"Subtype".as_slice()))
 }
 
 fn cow_record_image(
@@ -554,7 +482,7 @@ pub fn plan_print_downsampling(
         let mut base_ctm = Matrix::default();
         let user_unit = page_user_unit(document, page)?.unwrap_or(1.0);
         base_ctm.scale(user_unit, user_unit);
-        let content = cow_page_content(document, page)?;
+        let content = page_content(document, page)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
         if scanner.scan(&content).is_err() || !scanner.complete {
             complete = false;
