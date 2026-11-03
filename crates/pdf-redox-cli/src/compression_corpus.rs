@@ -51,11 +51,11 @@ struct Args {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct ShapeKey {
     kind: CompressionSampleKind,
-    size_log2: u8,
-    source_ratio_decile: u8,
+    size_log2: u32,
+    source_ratio_decile: usize,
     entropy_half_bits: u8,
-    zero_decile: u8,
-    ascii_decile: u8,
+    zero_decile: usize,
+    ascii_decile: usize,
 }
 
 impl ShapeKey {
@@ -65,7 +65,7 @@ impl ShapeKey {
             kind: candidate.kind,
             size_log2: usize::BITS
                 .saturating_sub(len.leading_zeros())
-                .saturating_sub(1) as u8,
+                .saturating_sub(1),
             source_ratio_decile: ratio_decile(
                 if candidate.source_was_flate {
                     candidate.encoded_bytes
@@ -74,9 +74,7 @@ impl ShapeKey {
                 },
                 len,
             ),
-            entropy_half_bits: (candidate.entropy_bits_per_byte * 2.0)
-                .round()
-                .clamp(0.0, 16.0) as u8,
+            entropy_half_bits: entropy_half_bits(candidate.entropy_bits_per_byte),
             zero_decile: ratio_decile(candidate.zero_bytes, len),
             ascii_decile: ratio_decile(candidate.ascii_like_bytes, len),
         }
@@ -175,12 +173,19 @@ impl PerFileCandidates {
     }
 }
 
-fn ratio_decile(numerator: usize, denominator: usize) -> u8 {
+fn entropy_half_bits(entropy: f64) -> u8 {
+    let rounded = (entropy * 2.0).round().clamp(0.0, 16.0);
+    (0_u8..=16)
+        .find(|bucket| f64::from(*bucket) >= rounded)
+        .unwrap_or(16)
+}
+
+fn ratio_decile(numerator: usize, denominator: usize) -> usize {
     if denominator == 0 {
         return 0;
     }
     let value = numerator.saturating_mul(10) / denominator;
-    value.min(10) as u8
+    value.min(10)
 }
 
 #[derive(Debug, Serialize)]
@@ -225,7 +230,7 @@ struct Summary {
     failure_examples: Vec<String>,
 }
 
-fn kind_name(kind: CompressionSampleKind) -> &'static str {
+const fn kind_name(kind: CompressionSampleKind) -> &'static str {
     match kind {
         CompressionSampleKind::Image => "image",
         CompressionSampleKind::Form => "form",
@@ -321,7 +326,10 @@ fn display_source(root: &Path, path: &Path) -> String {
     }
 }
 
-fn add_scan_stats(total: &mut CompressionSampleScanStats, current: CompressionSampleScanStats) {
+const fn add_scan_stats(
+    total: &mut CompressionSampleScanStats,
+    current: CompressionSampleScanStats,
+) {
     total.reachable_streams += current.reachable_streams;
     total.unsupported_filter_streams += current.unsupported_filter_streams;
     total.empty_streams += current.empty_streams;
@@ -440,7 +448,7 @@ impl CorpusRun {
         self.summary.pdfs_scanned += 1;
         add_scan_stats(&mut self.summary.scan, scan);
         for (shape, candidate) in per_file.into_sorted() {
-            self.write_candidate(&source, &processed_pdf, shape, candidate)?;
+            self.write_candidate(&source, &processed_pdf, shape, &candidate)?;
         }
         Ok(())
     }
@@ -450,7 +458,7 @@ impl CorpusRun {
         source: &str,
         processed_pdf: &str,
         shape: ShapeKey,
-        candidate: CompressionSampleCandidate,
+        candidate: &CompressionSampleCandidate,
     ) -> ToolResult<()> {
         if self.selected_hashes.contains(&candidate.decoded_sha256) {
             self.summary.exact_duplicates_pruned += 1;
