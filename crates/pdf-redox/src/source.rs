@@ -1461,7 +1461,7 @@ fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<Obje
 )]
 pub fn exact_i64_to_f64(value: i64) -> Option<f64> {
     let magnitude = value.unsigned_abs();
-    let significant_bits = u64::BITS - magnitude.leading_zeros();
+    let significant_bits = magnitude.bit_width();
     let discarded_bits = significant_bits.saturating_sub(f64::MANTISSA_DIGITS);
 
     (magnitude.trailing_zeros() >= discarded_bits).then_some(value as f64)

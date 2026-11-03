@@ -157,13 +157,13 @@ pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>>
 }
 
 /// Persistent whole-stream Flate executor used by document-level batch phases.
-pub(crate) struct FlateBatchEncoder {
+pub struct FlateBatchEncoder {
     #[cfg(not(target_family = "wasm"))]
     compressor: Option<zlib_rs::BatchCompressor>,
 }
 
 impl FlateBatchEncoder {
-    pub(crate) fn new(workers: std::num::NonZeroUsize) -> Result<Self> {
+    pub fn new(workers: std::num::NonZeroUsize) -> Result<Self> {
         #[cfg(target_family = "wasm")]
         {
             let _ = workers;
@@ -182,11 +182,7 @@ impl FlateBatchEncoder {
         }
     }
 
-    pub(crate) fn encode_many(
-        &self,
-        inputs: &[&[u8]],
-        level: crate::FlateLevel,
-    ) -> Result<Vec<Vec<u8>>> {
+    pub fn encode_many(&self, inputs: &[&[u8]], level: crate::FlateLevel) -> Result<Vec<Vec<u8>>> {
         #[cfg(not(target_family = "wasm"))]
         if inputs.len() > 1
             && let Some(compressor) = &self.compressor

@@ -1523,7 +1523,7 @@ fn rounded_u8(value: f64) -> Option<u8> {
     clippy::cast_sign_loss,
     reason = "the input is clamped to a nonnegative unit interval before conversion"
 )]
-fn unit_f64_to_u8(value: f64) -> u8 {
+const fn unit_f64_to_u8(value: f64) -> u8 {
     value.clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8
 }
 

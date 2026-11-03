@@ -86,7 +86,7 @@ struct AdaptiveFlateEncoding {
 }
 
 impl AdaptiveFlateEncoding {
-    fn baseline(bytes: Vec<u8>) -> Self {
+    const fn baseline(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
             high_effort_tested: false,
@@ -119,6 +119,115 @@ fn should_test_high_effort(
             <= decoded_len.saturating_mul(ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT)
 }
 
+struct UnfilteredFlateCandidate {
+    handle: ObjectHandle,
+    raw: Vec<u8>,
+    encoded: Option<AdaptiveFlateEncoding>,
+}
+
+fn collect_unfiltered_candidates(
+    document: &mut crate::EditDocument,
+    level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
+) -> Result<Vec<UnfilteredFlateCandidate>> {
+    let mut candidates = Vec::new();
+    for handle in document.reachable_streams()? {
+        let Some(crate::OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        let raw = data.bytes(document.source())?.into_owned();
+        let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
+            !matches!(
+                document.resolve_owned_value(value),
+                Ok(Some(crate::OwnedObject::Null) | None)
+            )
+        });
+        if raw.is_empty() {
+            if has_filter {
+                let object = document.edit_handle(handle)?;
+                if let crate::OwnedObject::Stream { dictionary, data } = object {
+                    dictionary.remove(b"Filter".as_slice());
+                    dictionary.remove(b"DecodeParms".as_slice());
+                    dictionary.remove(b"Length".as_slice());
+                    *data = crate::StreamData::Owned(Vec::new());
+                }
+            }
+            continue;
+        }
+        if has_filter {
+            continue;
+        }
+
+        let encoded = if level == crate::FlateLevel::SIZE {
+            reuse_cache
+                .take_matching(handle, level, &raw)
+                .map(AdaptiveFlateEncoding::baseline)
+        } else {
+            None
+        };
+        candidates.push(UnfilteredFlateCandidate {
+            handle,
+            raw,
+            encoded,
+        });
+    }
+    Ok(candidates)
+}
+
+fn batch_missing_baselines(
+    candidates: &mut [UnfilteredFlateCandidate],
+    level: crate::FlateLevel,
+    batcher: &FlateBatchEncoder,
+) -> Result<()> {
+    let indices = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    let outputs = {
+        let inputs = indices
+            .iter()
+            .map(|&index| candidates[index].raw.as_slice())
+            .collect::<Vec<_>>();
+        batcher.encode_many(&inputs, level)?
+    };
+    for (index, bytes) in indices.into_iter().zip(outputs) {
+        candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
+    }
+    Ok(())
+}
+
+fn batch_high_effort_candidates(
+    candidates: &mut [UnfilteredFlateCandidate],
+    level: crate::FlateLevel,
+    batcher: &FlateBatchEncoder,
+) -> Result<()> {
+    let indices = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let encoded = candidate.encoded.as_ref()?;
+            should_test_high_effort(candidate.raw.len(), level, encoded.bytes.len(), true)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let outputs = {
+        let inputs = indices
+            .iter()
+            .map(|&index| candidates[index].raw.as_slice())
+            .collect::<Vec<_>>();
+        batcher.encode_many(&inputs, crate::FlateLevel::SIZE)?
+    };
+    for (index, bytes) in indices.into_iter().zip(outputs) {
+        if let Some(encoded) = &mut candidates[index].encoded {
+            encoded.consider_high_effort(bytes);
+        }
+    }
+    Ok(())
+}
+
 fn is_safe_lone_flate(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
@@ -145,7 +254,7 @@ pub fn optimize_flate_streams_with_cache(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
-    encoder: &FlateBatchEncoder,
+    batcher: &FlateBatchEncoder,
 ) -> Result<FlateOptimizationStats> {
     struct Candidate {
         handle: ObjectHandle,
@@ -189,7 +298,7 @@ pub fn optimize_flate_streams_with_cache(
             .iter()
             .map(|&index| candidates[index].decoded.as_slice())
             .collect::<Vec<_>>();
-        encoder.encode_many(&inputs, level)?
+        batcher.encode_many(&inputs, level)?
     };
     for (index, bytes) in batch_indices.into_iter().zip(batch_outputs) {
         candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
@@ -232,99 +341,13 @@ pub fn compress_unfiltered_streams(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
-    encoder: &FlateBatchEncoder,
+    batcher: &FlateBatchEncoder,
 ) -> Result<FlateOptimizationStats> {
-    struct Candidate {
-        handle: ObjectHandle,
-        raw: Vec<u8>,
-        encoded: Option<AdaptiveFlateEncoding>,
-    }
-
-    let handles = document.reachable_streams()?;
-    let mut candidates = Vec::new();
-    for handle in handles {
-        let Some(crate::OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(handle)?
-        else {
-            continue;
-        };
-        let raw = data.bytes(document.source())?.into_owned();
-        let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
-            !matches!(
-                document.resolve_owned_value(value),
-                Ok(Some(crate::OwnedObject::Null) | None)
-            )
-        });
-        if raw.is_empty() {
-            if has_filter {
-                let object = document.edit_handle(handle)?;
-                if let crate::OwnedObject::Stream { dictionary, data } = object {
-                    dictionary.remove(b"Filter".as_slice());
-                    dictionary.remove(b"DecodeParms".as_slice());
-                    dictionary.remove(b"Length".as_slice());
-                    *data = crate::StreamData::Owned(Vec::new());
-                }
-            }
-            continue;
-        }
-        if has_filter {
-            continue;
-        }
-
-        // Size-mode transforms may already have produced these exact level-9 bytes for their
-        // admission gate; reuse them instead of recompressing. Processing mode always batches its
-        // baseline level-7 encode.
-        let encoded = if level == crate::FlateLevel::SIZE {
-            reuse_cache
-                .take_matching(handle, level, &raw)
-                .map(AdaptiveFlateEncoding::baseline)
-        } else {
-            None
-        };
-        candidates.push(Candidate {
-            handle,
-            raw,
-            encoded,
-        });
-    }
-
-    let baseline_indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
-        .collect::<Vec<_>>();
-    let baseline_outputs = {
-        let inputs = baseline_indices
-            .iter()
-            .map(|&index| candidates[index].raw.as_slice())
-            .collect::<Vec<_>>();
-        encoder.encode_many(&inputs, level)?
-    };
-    for (index, bytes) in baseline_indices.into_iter().zip(baseline_outputs) {
-        candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
-    }
-
-    let high_effort_indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            let encoded = candidate.encoded.as_ref()?;
-            should_test_high_effort(candidate.raw.len(), level, encoded.bytes.len(), true)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let high_effort_outputs = {
-        let inputs = high_effort_indices
-            .iter()
-            .map(|&index| candidates[index].raw.as_slice())
-            .collect::<Vec<_>>();
-        encoder.encode_many(&inputs, crate::FlateLevel::SIZE)?
-    };
-    for (index, bytes) in high_effort_indices.into_iter().zip(high_effort_outputs) {
-        if let Some(encoded) = &mut candidates[index].encoded {
-            encoded.consider_high_effort(bytes);
-        }
-    }
+    // Size-mode transforms may already have produced exact level-9 bytes for their admission gate;
+    // collection preserves those while Processing leaves the baseline work for the batch executor.
+    let mut candidates = collect_unfiltered_candidates(document, level, reuse_cache)?;
+    batch_missing_baselines(&mut candidates, level, batcher)?;
+    batch_high_effort_candidates(&mut candidates, level, batcher)?;
 
     let mut stats = FlateOptimizationStats::default();
     for candidate in candidates {
