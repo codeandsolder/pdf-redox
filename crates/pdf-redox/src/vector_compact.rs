@@ -3,9 +3,9 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
-        replace_page_content, replace_page_content_with_handle, resolved_dictionary,
-        resolved_number_value,
+        decoded_content_value, effective_page_resources, install_page_resource,
+        page_box_numbers_matching, page_user_unit, replace_page_content,
+        replace_page_content_with_handle, resolved_dictionary,
     },
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
     flate::FlateReuseCache,
@@ -2381,43 +2381,20 @@ const fn shared_gap_is_trivia(bytes: &[u8]) -> bool {
 }
 
 fn shared_page_visible_box(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
-    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        let Some(value) = document.inherited_page_value(page, key)? else {
-            continue;
-        };
-        let Some(OwnedObject::Array(values)) = document.resolve_owned_value(&value)? else {
-            continue;
-        };
-        if values.len() != 4 {
-            continue;
-        }
-        let mut numbers = [0.0; 4];
-        let mut valid = true;
-        for (index, value) in values.iter().enumerate() {
-            let Some(number) = resolved_number_value(document, value)? else {
-                valid = false;
-                break;
-            };
-            if !number.is_finite() {
-                valid = false;
-                break;
-            }
-            numbers[index] = number;
-        }
-        if !valid {
-            continue;
-        }
-        let bounds = Rect {
-            x0: numbers[0].min(numbers[2]),
-            y0: numbers[1].min(numbers[3]),
-            x1: numbers[0].max(numbers[2]),
-            y1: numbers[1].max(numbers[3]),
-        };
-        if bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0 {
-            return Ok(Some(bounds));
-        }
-    }
-    Ok(None)
+    let Some(numbers) = page_box_numbers_matching(document, page, |numbers| {
+        numbers.into_iter().all(f64::is_finite)
+            && numbers[0].min(numbers[2]) < numbers[0].max(numbers[2])
+            && numbers[1].min(numbers[3]) < numbers[1].max(numbers[3])
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Rect {
+        x0: numbers[0].min(numbers[2]),
+        y0: numbers[1].min(numbers[3]),
+        x1: numbers[0].max(numbers[2]),
+        y1: numbers[1].max(numbers[3]),
+    }))
 }
 
 const fn same_rect(left: Rect, right: Rect) -> bool {

@@ -10,7 +10,7 @@ use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{
         form_content, form_resources, page_box_numbers_matching, resolved_dictionary,
-        resolved_finite_number_array, resolved_number,
+        resolved_finite_number_array, resolved_name, resolved_number,
     },
     content_stream::{instruction_operands, operand_numbers},
     geometry::{Matrix, Rect},
@@ -643,40 +643,21 @@ fn one_name_operand(operands: &[crate::content_stream::InstructionOperand]) -> O
 }
 
 fn resolved_name_is_image(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
-    Ok(matches!(
-        document.resolve_owned_value(dictionary.get(b"Subtype".as_slice()).unwrap_or(&OwnedObject::Null))?,
-        Some(OwnedObject::Name(name)) if name.as_slice() == b"Image"
-    ))
+    Ok(
+        resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            == Some(b"Image"),
+    )
 }
 
 fn resolved_name_is_none(document: &EditDocument, value: &OwnedObject) -> Result<bool> {
-    Ok(matches!(
-       document.resolve_owned_value(value)?,
-       Some(OwnedObject::Name(name)) if name.as_slice() == b"None"
-    ))
+    Ok(resolved_name(document, Some(value))?.as_deref() == Some(b"None"))
 }
 
 fn resolved_matrix(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Matrix>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    if values.len() != 6 {
-        return Ok(None);
-    }
-    let mut numbers = [0.0; 6];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number(document, Some(value))? else {
-            return Ok(None);
-        };
-        if !number.is_finite() {
-            return Ok(None);
-        }
-        numbers[index] = number;
-    }
-    Ok(Some(Matrix::from(numbers)))
+    Ok(resolved_finite_number_array::<6>(document, value)?.map(Matrix::from))
 }
 
 fn resolved_rect(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Rect>> {
