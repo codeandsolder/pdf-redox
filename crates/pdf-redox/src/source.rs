@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-/// Cached classification of a source object as a non-stream or a stream with an optional subtype.
+/// Cached classification of a source object as a non-stream or a stream with an optional resolved subtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceStreamKind {
     NotStream,
@@ -453,6 +453,9 @@ impl OwnedObject {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NewObjectCheckpoint(usize);
+
 /// Mutation applied to an object that already exists in the source PDF.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExistingObjectChange {
@@ -766,6 +769,31 @@ impl EditDocument {
     /// Adds a new object to the document overlay and returns its temporary identifier.
     pub fn add_object(&mut self, object: OwnedObject) -> NewObjectId {
         self.overlay.add(object)
+    }
+
+    /// Snapshot the tail of the unnumbered-object arena before speculative allocation.
+    ///
+    /// The checkpoint is only for transactions that have not linked any subsequently
+    /// allocated handles into the reachable object graph. Handles allocated after the
+    /// checkpoint must be discarded together with a rollback because their indices may
+    /// be reused by later allocations.
+    pub(crate) const fn new_object_checkpoint(&self) -> NewObjectCheckpoint {
+        NewObjectCheckpoint(self.overlay.added.len())
+    }
+
+    /// Discard speculative tail allocations made after `new_object_checkpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint does not belong to the current overlay tail.
+    pub(crate) fn rollback_new_objects(&mut self, checkpoint: NewObjectCheckpoint) -> Result<()> {
+        if checkpoint.0 > self.overlay.added.len() {
+            return Err(Error::Invalid(
+                "new-object rollback checkpoint exceeds current overlay length".to_owned(),
+            ));
+        }
+        self.overlay.added.truncate(checkpoint.0);
+        Ok(())
     }
 
     /// Return a mutable overlay object previously allocated with `add_object`.
@@ -1506,6 +1534,7 @@ pub fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ClassicPdfBuilder;
 
     #[test]
     fn exact_i64_to_f64_rejects_only_lossy_conversions() {
@@ -1567,6 +1596,34 @@ mod tests {
         assert!(
             !document
                 .stream_subtype_is(ObjectHandle::Existing(ObjectId::new(999_999, 0)), b"Image",)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_stream_subtype_resolves_indirect_name() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /F 4 0 R >> >> /Contents 6 0 R >>",
+        )?;
+        pdf.stream(
+            4,
+            b"/Type /XObject /Subtype 5 0 R /BBox [0 0 1 1] /Resources <<>>",
+            b"q Q",
+        )?;
+        pdf.object(5, b"/Form")?;
+        pdf.stream(6, b"", b"q Q")?;
+
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let form = ObjectHandle::Existing(ObjectId::new(4, 0));
+        assert!(document.stream_subtype_is(form, b"Form")?);
+        assert!(
+            document
+                .reachable_streams_with_subtype(b"Form")?
+                .contains(&form)
         );
         Ok(())
     }
@@ -1656,6 +1713,23 @@ mod tests {
             ]
         );
         assert!(document.overlay().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_new_object_rollback_discards_only_tail_allocations() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let prefix = document.add_object(OwnedObject::Null);
+        let checkpoint = document.new_object_checkpoint();
+        let speculative = document.add_object(OwnedObject::Boolean(true));
+        assert!(document.overlay().added(speculative).is_some());
+
+        document.rollback_new_objects(checkpoint)?;
+        assert!(document.overlay().added(prefix).is_some());
+        assert!(document.overlay().added(speculative).is_none());
+
+        let replacement = document.add_object(OwnedObject::Integer(7));
+        assert_eq!(replacement.index(), speculative.index());
         Ok(())
     }
 

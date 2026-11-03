@@ -6,7 +6,10 @@ use crate::{
     },
 };
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 const MAX_SOURCE_PATHS_PER_BATCH: usize = 64;
 const MIN_PAGE_CONTENT_BYTES: usize = 64 * 1024;
@@ -605,7 +608,7 @@ fn stroke_transaction(
     ))
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContentBatchStats {
     groups_created: usize,
     source_paints_batched: usize,
@@ -652,24 +655,23 @@ fn record_closed_fill_group(
     Some(())
 }
 
-fn batch_closed_fills(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
-    let events = events_for(input, "closed fill/stroke paint batching")?;
-    if !page_paint_batching_is_safe(&events) {
-        return Some((input.to_vec(), ContentBatchStats::default()));
-    }
+fn batch_closed_fills<'a>(
+    input: &'a [u8],
+    events: &[Event],
+) -> Option<(Cow<'a, [u8]>, ContentBatchStats)> {
     let mut replacements = Vec::<(usize, usize, Vec<u8>)>::new();
     let mut stats = ContentBatchStats::default();
     let mut index = 0usize;
 
     while index < events.len() {
-        let Some((first, mut next_index)) = closed_fill_transaction(input, &events, index) else {
+        let Some((first, mut next_index)) = closed_fill_transaction(input, events, index) else {
             index += 1;
             continue;
         };
         let miter_bits = first.miter_bits;
         let mut group = vec![first];
 
-        while let Some((next, after_next)) = closed_fill_transaction(input, &events, next_index) {
+        while let Some((next, after_next)) = closed_fill_transaction(input, events, next_index) {
             let previous = group.last()?;
             if miter_bits != next.miter_bits
                 || !input.get(previous.end..next.start).is_some_and(trivia_only)
@@ -690,10 +692,10 @@ fn batch_closed_fills(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
     }
 
     if replacements.is_empty() {
-        return Some((input.to_vec(), stats));
+        return Some((Cow::Borrowed(input), stats));
     }
-    let output = apply_replacements(input, replacements)?;
-    Some((output, stats))
+    let output = crate::content_stream::apply_replacements(input, &replacements)?;
+    Some((Cow::Owned(output), stats))
 }
 
 fn stroke_replacement(input: &[u8], transactions: &[StrokeTransaction]) -> Option<Vec<u8>> {
@@ -714,23 +716,22 @@ fn stroke_replacement(input: &[u8], transactions: &[StrokeTransaction]) -> Optio
     Some(output)
 }
 
-fn batch_strokes(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
-    let events = events_for(input, "stroke paint batching")?;
-    if !page_paint_batching_is_safe(&events) {
-        return Some((input.to_vec(), ContentBatchStats::default()));
-    }
+fn batch_strokes<'a>(
+    input: &'a [u8],
+    events: &[Event],
+) -> Option<(Cow<'a, [u8]>, ContentBatchStats)> {
     let mut replacements = Vec::<(usize, usize, Vec<u8>)>::new();
     let mut stats = ContentBatchStats::default();
     let mut index = 0usize;
 
     while index < events.len() {
-        let Some((first, mut next_index)) = stroke_transaction(input, &events, index) else {
+        let Some((first, mut next_index)) = stroke_transaction(input, events, index) else {
             index += 1;
             continue;
         };
         let mut run = vec![first];
         while next_index < events.len() {
-            let Some((next, after_next)) = stroke_transaction(input, &events, next_index) else {
+            let Some((next, after_next)) = stroke_transaction(input, events, next_index) else {
                 break;
             };
             let previous = run.last()?;
@@ -761,34 +762,35 @@ fn batch_strokes(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
     }
 
     if replacements.is_empty() {
-        return Some((input.to_vec(), stats));
+        return Some((Cow::Borrowed(input), stats));
     }
-    let output = apply_replacements(input, replacements)?;
-    Some((output, stats))
+    let output = crate::content_stream::apply_replacements(input, &replacements)?;
+    Some((Cow::Owned(output), stats))
 }
 
-fn apply_replacements(
-    input: &[u8],
-    mut replacements: Vec<(usize, usize, Vec<u8>)>,
-) -> Option<Vec<u8>> {
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || start > end || end > input.len() {
-            return None;
+fn batch_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, ContentBatchStats)> {
+    let events = events_for(input, "paint batching")?;
+    if !page_paint_batching_is_safe(&events) {
+        return Some((Cow::Borrowed(input), ContentBatchStats::default()));
+    }
+
+    let (filled, fill_stats) = batch_closed_fills(input, &events)?;
+    let (stroked, stroke_stats) = match filled {
+        Cow::Borrowed(filled) => batch_strokes(filled, &events)?,
+        Cow::Owned(filled) => {
+            let stroke_events = events_for(&filled, "stroke paint batching after fill rewrite")?;
+            if page_paint_batching_is_safe(&stroke_events) {
+                let (stroked, stroke_stats) = batch_strokes(&filled, &stroke_events)?;
+                let stroked = match stroked {
+                    Cow::Borrowed(_) => Cow::Owned(filled),
+                    Cow::Owned(stroked) => Cow::Owned(stroked),
+                };
+                (stroked, stroke_stats)
+            } else {
+                (Cow::Owned(filled), ContentBatchStats::default())
+            }
         }
-        output.extend_from_slice(input.get(cursor..start)?);
-        output.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    output.extend_from_slice(input.get(cursor..)?);
-    Some(output)
-}
-
-fn batch_content(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
-    let (filled, fill_stats) = batch_closed_fills(input)?;
-    let (stroked, stroke_stats) = batch_strokes(&filled)?;
+    };
     Some((
         stroked,
         ContentBatchStats {
@@ -865,17 +867,18 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Vec<u8>, usize)> {
         return Some((input.to_vec(), 0));
     }
     Some((
-        apply_replacements(input, replacements)?,
+        crate::content_stream::apply_replacements(input, &replacements)?,
         boundaries_coalesced,
     ))
 }
 
 pub fn coalesce_optional_content(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<MarkedContentCoalesceStats> {
     let mut stats = MarkedContentCoalesceStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -896,8 +899,8 @@ pub fn coalesce_optional_content(
         if boundaries == 0 || coalesced == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
-        let after_flate = compressed_len(&coalesced, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&coalesced, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
@@ -1065,7 +1068,10 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     if replacements.is_empty() {
         return Some((input.to_vec(), 0));
     }
-    Some((apply_replacements(input, replacements)?, vertices_removed))
+    Some((
+        crate::content_stream::apply_replacements(input, &replacements)?,
+        vertices_removed,
+    ))
 }
 
 #[derive(Debug)]
@@ -1104,7 +1110,7 @@ fn compact_collinear_form_paths(
         if candidate_vertices_removed == 0 || compacted == decoded {
             continue;
         }
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
         let encoded_len = encoded.len();
         if encoded_len > before_flate {
@@ -1150,10 +1156,11 @@ fn compact_collinear_form_paths(
 
 pub fn compact_collinear_paths(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<CollinearPathStats> {
     let mut stats = CollinearPathStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -1180,8 +1187,8 @@ pub fn compact_collinear_paths(
         if vertices_removed == 0 || compacted == normalized {
             continue;
         }
-        let before_flate = compressed_len(&normalized, flate_level)?;
-        let after_flate = compressed_len(&compacted, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&normalized, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&compacted, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
@@ -1928,14 +1935,14 @@ struct StrokeFormPlan {
 )]
 pub fn factor_repeated_stroke_forms(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<StrokeFormFactorStats> {
-    let pages = document.page_handles()?;
     let mut page_data = Vec::<StrokeFormPageData>::new();
     let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
     let mut occupied_names = BTreeSet::<Vec<u8>>::new();
 
-    for page in pages {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2041,17 +2048,27 @@ pub fn factor_repeated_stroke_forms(
     let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
     for &page_index in &affected_pages {
         let page = &page_data[page_index];
-        before_flate = before_flate.saturating_add(compressed_len(&page.decoded, flate_level)?);
-        let Some(rewritten) =
-            apply_replacements(&page.decoded, replacements_by_page[page_index].clone())
-        else {
+        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.decoded,
+            flate_level,
+        )?);
+        let Some(rewritten) = crate::content_stream::apply_replacements(
+            &page.decoded,
+            &replacements_by_page[page_index],
+        ) else {
             return Ok(StrokeFormFactorStats::default());
         };
-        after_flate = after_flate.saturating_add(compressed_len(&rewritten, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
         rewritten_pages.insert(page_index, rewritten);
     }
     for plan in &plans {
-        after_flate = after_flate.saturating_add(compressed_len(&plan.body, flate_level)?);
+        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+            &plan.body,
+            flate_level,
+        )?);
     }
     after_flate = after_flate
         .saturating_add(plans.len().saturating_mul(STROKE_FORM_OVERHEAD_BYTES))
@@ -2206,11 +2223,14 @@ fn outlined_glyph_estimated_after_flate(
     plans: &[GlyphFontPlan],
     flate_level: crate::FlateLevel,
 ) -> Result<usize> {
-    let mut total = compressed_len(rewritten, flate_level)?;
+    let mut total = crate::stream_codec::flate_encoded_len(rewritten, flate_level)?;
     let glyphs = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
     for plan in plans {
         for shape in &plan.shapes {
-            total = total.saturating_add(compressed_len(&shape.charproc, flate_level)?);
+            total = total.saturating_add(crate::stream_codec::flate_encoded_len(
+                &shape.charproc,
+                flate_level,
+            )?);
         }
     }
     Ok(total
@@ -2292,10 +2312,11 @@ fn outlined_glyph_font_dictionary(
 
 pub fn factor_outlined_glyphs(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = OutlinedGlyphFactorStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2318,10 +2339,12 @@ pub fn factor_outlined_glyphs(
         let Some(replacement_plan) = outlined_glyph_replacements(&plans) else {
             continue;
         };
-        let Some(rewritten) = apply_replacements(&decoded, replacement_plan.replacements) else {
+        let Some(rewritten) =
+            crate::content_stream::apply_replacements(&decoded, &replacement_plan.replacements)
+        else {
             continue;
         };
-        let before_flate = compressed_len(&decoded, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let after_flate = outlined_glyph_estimated_after_flate(&rewritten, &plans, flate_level)?;
         if before_flate <= after_flate
             || before_flate.saturating_sub(after_flate) < MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS
@@ -2355,13 +2378,12 @@ pub fn factor_outlined_glyphs(
     Ok(stats)
 }
 
-fn compressed_len(bytes: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
-}
-
-pub fn batch_page_paints(document: &mut EditDocument) -> Result<PaintBatchStats> {
+pub fn batch_page_paints(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -2379,10 +2401,12 @@ pub fn batch_page_paints(document: &mut EditDocument) -> Result<PaintBatchStats>
         let Some((batched, page_stats)) = batch_content(&decoded) else {
             continue;
         };
-        if page_stats.paints_eliminated < MIN_PAINTS_ELIMINATED || batched == decoded {
+        if page_stats.paints_eliminated < MIN_PAINTS_ELIMINATED
+            || batched.as_ref() == decoded.as_slice()
+        {
             continue;
         }
-        replace_page_content(document, page, batched)?;
+        replace_page_content(document, page, batched.into_owned())?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.groups_created = stats
             .groups_created
@@ -2410,6 +2434,35 @@ mod tests {
             };
             value
         }};
+    }
+
+    fn batch_content_reparsed(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
+        let fill_events = events_for(input, "reference fill paint batching")?;
+        if !page_paint_batching_is_safe(&fill_events) {
+            return Some((input.to_vec(), ContentBatchStats::default()));
+        }
+        let (filled, fill_stats) = batch_closed_fills(input, &fill_events)?;
+
+        let stroke_events = events_for(&filled, "reference stroke paint batching")?;
+        let (stroked, stroke_stats) = if page_paint_batching_is_safe(&stroke_events) {
+            batch_strokes(&filled, &stroke_events)?
+        } else {
+            (filled, ContentBatchStats::default())
+        };
+        Some((
+            stroked.into_owned(),
+            ContentBatchStats {
+                groups_created: fill_stats
+                    .groups_created
+                    .saturating_add(stroke_stats.groups_created),
+                source_paints_batched: fill_stats
+                    .source_paints_batched
+                    .saturating_add(stroke_stats.source_paints_batched),
+                paints_eliminated: fill_stats
+                    .paints_eliminated
+                    .saturating_add(stroke_stats.paints_eliminated),
+            },
+        ))
     }
 
     fn operator_count(output: &[u8], operator: &[u8]) -> usize {
@@ -2456,6 +2509,20 @@ mod tests {
     }
 
     #[test]
+    fn same_snapshot_event_reuse_matches_reparsed_reference() {
+        let inputs: [&[u8]; 2] = [
+            b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S",
+            b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 3 0 l 3 1 l h b Q 4 0 m 5 0 l S 6 0 m 7 0 l S",
+        ];
+        for input in inputs {
+            let optimized = some!(batch_content(input), "optimized parse");
+            let reparsed = some!(batch_content_reparsed(input), "reference parse");
+            assert_eq!(optimized.0.as_ref(), reparsed.0.as_slice());
+            assert_eq!(optimized.1, reparsed.1);
+        }
+    }
+
+    #[test]
     fn batches_consecutive_strokes_without_reordering() {
         let input = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
         let (output, stats) = some!(batch_content(input), "parse");
@@ -2472,7 +2539,7 @@ mod tests {
         let input = b"0 0 m 1 0 l S 2 w 2 0 m 3 0 l S";
         let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), &input[..]);
     }
 
     #[test]
@@ -2480,7 +2547,7 @@ mod tests {
         let input = b"/GS1 gs 0 0 m 1 0 l S 2 0 m 3 0 l S";
         let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), &input[..]);
     }
 
     #[test]
@@ -2498,7 +2565,7 @@ mod tests {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 0.5 0 m 0.5 1 l 1.5 1 l h b Q";
         let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), &input[..]);
     }
 
     #[test]
@@ -2522,7 +2589,7 @@ mod tests {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 2 M 2 0 m 3 0 l 3 1 l h b Q";
         let (output, stats) = some!(batch_content(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), &input[..]);
     }
 
     #[test]
@@ -2544,8 +2611,8 @@ mod tests {
         };
         assert!(candidate_stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
         assert!(
-            compressed_len(&batched, crate::FlateLevel::PROCESSING)?
-                > compressed_len(&content, crate::FlateLevel::PROCESSING)?,
+            crate::stream_codec::flate_encoded_len(&batched, crate::FlateLevel::PROCESSING)?
+                > crate::stream_codec::flate_encoded_len(&content, crate::FlateLevel::PROCESSING)?,
             "fixture must exercise the structural-over-size policy"
         );
 
@@ -2559,7 +2626,8 @@ mod tests {
         pdf.stream(4, b"", &content)?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = batch_page_paints(&mut document)?;
+        let pages = document.page_handles()?;
+        let stats = batch_page_paints(&mut document, &pages)?;
         assert_eq!(stats.pages_rewritten, 1);
         assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
         Ok(())
@@ -2662,7 +2730,8 @@ mod tests {
         pdf.stream(4, b"", &content)?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        let pages = document.page_handles()?;
+        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
         assert_eq!(stats.pages_rewritten, 1);
         assert_eq!(stats.forms_rewritten, 0);
         assert_eq!(stats.vertices_removed, 4000);
@@ -2713,7 +2782,8 @@ mod tests {
         )?;
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let stats = compact_collinear_paths(&mut document, crate::FlateLevel::PROCESSING)?;
+        let pages = document.page_handles()?;
+        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
         assert_eq!(stats.pages_rewritten, 0);
         assert_eq!(stats.forms_rewritten, 1);
         assert!(stats.vertices_removed > 10_000);

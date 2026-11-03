@@ -58,6 +58,38 @@ pub fn resolved_number(
     resolved_number_value(document, value)
 }
 
+/// Resolve an array containing exactly `N` numeric values.
+pub fn resolved_number_array<const N: usize>(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<[f64; N]>> {
+    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+        return Ok(None);
+    };
+    if values.len() != N {
+        return Ok(None);
+    }
+    let mut out = [0.0; N];
+    for (index, value) in values.iter().enumerate() {
+        let Some(number) = resolved_number_value(document, value)? else {
+            return Ok(None);
+        };
+        out[index] = number;
+    }
+    Ok(Some(out))
+}
+
+/// Resolve an exact-length numeric array and reject non-finite members.
+pub fn resolved_finite_number_array<const N: usize>(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<[f64; N]>> {
+    let Some(values) = resolved_number_array::<N>(document, value)? else {
+        return Ok(None);
+    };
+    Ok(values.into_iter().all(f64::is_finite).then_some(values))
+}
+
 pub fn resolved_bool_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
     Ok(match document.resolve_owned_value(value)? {
         Some(OwnedObject::Boolean(value)) => Some(value),
@@ -70,6 +102,31 @@ pub fn resolved_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Re
         return Ok(None);
     };
     resolved_bool_value(document, value)
+}
+
+/// Resolve a PDF name value, returning `None` for missing or non-name values.
+pub fn resolved_name(
+    document: &EditDocument,
+    value: Option<&OwnedObject>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(match document.resolve_owned_value(value)? {
+        Some(OwnedObject::Name(name)) => Some(name),
+        _ => None,
+    })
+}
+
+/// Return whether a present value resolves to something other than PDF `null`.
+pub fn resolved_non_null(document: &EditDocument, value: Option<&OwnedObject>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    Ok(!matches!(
+        document.resolve_owned_value(value)?,
+        None | Some(OwnedObject::Null)
+    ))
 }
 
 pub fn resolved_dictionary(
@@ -101,6 +158,31 @@ pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u
 
 pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
     document.decoded_content_stream_data(form)
+}
+
+/// Resolve the first inherited `CropBox`/`MediaBox` numeric array accepted by `accept`.
+pub fn page_box_numbers_matching(
+    document: &EditDocument,
+    page: ObjectHandle,
+    mut accept: impl FnMut([f64; 4]) -> bool,
+) -> Result<Option<[f64; 4]>> {
+    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+        let Some(value) = document.inherited_page_value(page, key)? else {
+            continue;
+        };
+        let Some(values) = resolved_number_array::<4>(document, &value)? else {
+            continue;
+        };
+        if accept(values) {
+            return Ok(Some(values));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the first inherited numeric `CropBox`/`MediaBox`.
+pub fn page_box_numbers(document: &EditDocument, page: ObjectHandle) -> Result<Option<[f64; 4]>> {
+    page_box_numbers_matching(document, page, |_| true)
 }
 
 pub fn page_resources(
@@ -192,8 +274,8 @@ pub fn replace_page_content(
     replace_page_content_with_handle(document, page, bytes).map(|_| ())
 }
 
-pub fn normalize_page_contents(document: &mut EditDocument) -> Result<()> {
-    for page in document.page_handles()? {
+pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandle]) -> Result<()> {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -211,4 +293,33 @@ pub fn normalize_page_contents(document: &mut EditDocument) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test intentionally models exact zero-area page-box rejection"
+    )]
+    fn page_box_matching_falls_back_after_rejected_crop_box() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /CropBox [0 0 0 0] /MediaBox [0 0 100 200] >>",
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = document.page_handles()?[0];
+
+        let values = page_box_numbers_matching(&document, page, |values| {
+            values[0] != values[2] && values[1] != values[3]
+        })?;
+        assert_eq!(values, Some([0.0, 0.0, 100.0, 200.0]));
+        Ok(())
+    }
 }

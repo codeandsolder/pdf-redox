@@ -145,6 +145,11 @@ pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>>
     Ok(encoder.finish()?)
 }
 
+/// Return the encoded byte length of ordinary zlib/Flate data.
+pub fn flate_encoded_len(decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
+    Ok(encode_flate(decoded, level)?.len())
+}
+
 /// Return true when the stream is unfiltered or has exactly one Flate filter.
 ///
 /// This intentionally accepts `/Filter /FlateDecode`, `/Filter /Fl`, and

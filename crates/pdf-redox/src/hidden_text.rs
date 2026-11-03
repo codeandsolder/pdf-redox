@@ -1,5 +1,8 @@
 use crate::config::HiddenTextPolicy;
-use crate::content::{replace_page_content, resolved_dictionary, resolved_number_value};
+use crate::content::{
+    page_box_numbers, page_content, replace_page_content, resolved_dictionary, resolved_name,
+    resolved_number_value,
+};
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
     HiddenTextAction, HiddenTextCategory, HiddenTextFinding, HiddenTextMechanism, PageRect,
@@ -1066,6 +1069,12 @@ struct PageScan {
     findings: Vec<InternalFinding>,
 }
 
+#[derive(Debug, Clone)]
+struct ScannedPage {
+    content: Vec<u8>,
+    scan: PageScan,
+}
+
 #[derive(Debug, Default)]
 pub struct HiddenTextApplyStats {
     pub removed: usize,
@@ -1355,39 +1364,41 @@ pub fn analyze_hidden_text(document: &EditDocument) -> Result<Vec<HiddenTextFind
     let pages = document.page_handles()?;
     let mut findings = Vec::new();
     for (index, page) in pages.into_iter().enumerate() {
-        let scan = scan_page(document, page, index + 1, &ocg)?;
-        findings.extend(scan.findings.into_iter().map(|finding| finding.public));
+        let scanned = scan_page(document, page, index + 1, &ocg)?;
+        findings.extend(
+            scanned
+                .scan
+                .findings
+                .into_iter()
+                .map(|finding| finding.public),
+        );
     }
     Ok(findings)
 }
 
 pub fn apply_hidden_text_policy(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     policy: &HiddenTextPolicy,
 ) -> Result<HiddenTextApplyStats> {
     if policy.remove_categories.is_empty() && policy.overrides.is_empty() {
         return Ok(HiddenTextApplyStats::default());
     }
     let ocg = optional_content_state(document)?;
-    let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
-    for (index, page) in pages.into_iter().enumerate() {
-        let mut scan = scan_page(document, page, index + 1, &ocg)?;
+    for (index, &page) in pages.iter().enumerate() {
+        let ScannedPage {
+            content: decoded,
+            mut scan,
+        } = scan_page(document, page, index + 1, &ocg)?;
         scan.findings
             .retain(|finding| policy.should_remove(&finding.public));
         if scan.findings.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes(document, page)?;
-        let selected: BTreeSet<String> = scan
-            .findings
-            .iter()
-            .map(|finding| finding.public.id.clone())
-            .collect();
-        let mut ranges: Vec<(usize, usize)> = scan_page(document, page, index + 1, &ocg)?
+        let mut ranges: Vec<(usize, usize)> = scan
             .findings
             .into_iter()
-            .filter(|finding| selected.contains(&finding.public.id))
             .map(|finding| (finding.span_start, finding.span_end))
             .collect();
         if ranges.is_empty() {
@@ -1491,11 +1502,13 @@ fn may_contain_diagonal_text_transform(input: &[u8]) -> bool {
     false
 }
 
-pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenTextApplyStats> {
-    let pages = document.page_handles()?;
+pub fn remove_large_diagonal_text(
+    document: &mut EditDocument,
+    pages: &[CowObjectHandle],
+) -> Result<HiddenTextApplyStats> {
     let mut stats = HiddenTextApplyStats::default();
-    for page in pages {
-        let decoded = page_content_bytes(document, page)?;
+    for &page in pages {
+        let decoded = page_content(document, page)?;
         if !may_contain_diagonal_text_transform(&decoded) {
             continue;
         }
@@ -1520,21 +1533,23 @@ pub fn remove_large_diagonal_text(document: &mut EditDocument) -> Result<HiddenT
 /// to remove, because approximate glyph bounds are not a proof of invisibility.
 pub fn prune_physically_hidden_text(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     candidate_pages: Option<&BTreeSet<CowObjectHandle>>,
 ) -> Result<HiddenTextApplyStats> {
     let ocg = optional_content_state(document)?;
-    let pages = document.page_handles()?;
     let mut stats = HiddenTextApplyStats::default();
-    for (index, page) in pages.into_iter().enumerate() {
+    for (index, &page) in pages.iter().enumerate() {
         if candidate_pages.is_some_and(|pages| !pages.contains(&page)) {
             continue;
         }
-        let scan = scan_page(document, page, index + 1, &ocg)?;
+        let ScannedPage {
+            content: decoded,
+            scan,
+        } = scan_page(document, page, index + 1, &ocg)?;
         let ranges = physical_hidden_ranges(scan);
         if ranges.is_empty() {
             continue;
         }
-        let decoded = page_content_bytes(document, page)?;
         stats.removed += ranges.len();
         replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
     }
@@ -1568,16 +1583,6 @@ fn resolved_array(
     })
 }
 
-fn resolved_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Vec<u8>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => name,
-        _ => Vec::new(),
-    })
-}
-
 fn resolved_u32(document: &EditDocument, value: &OwnedObject) -> Result<Option<u32>> {
     Ok(match document.resolve_owned_value(value)? {
         Some(OwnedObject::Integer(value)) => u32::try_from(value).ok(),
@@ -1604,8 +1609,8 @@ fn build_fonts(
 
 fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo> {
     let mut info = FontInfo::default();
-    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?;
-    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?;
+    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?.unwrap_or_default();
+    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?.unwrap_or_default();
     info.identity_two_byte =
         subtype == b"Type0" && matches!(encoding.as_slice(), b"Identity-H" | b"Identity-V");
     if info.identity_two_byte {
@@ -1760,7 +1765,8 @@ fn build_images(
             out.insert(key.clone(), false);
             continue;
         };
-        let is_image = resolved_name(document, dictionary.get(b"Subtype".as_slice()))? == b"Image";
+        let is_image = resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            == Some(b"Image");
         let unmasked = is_image
             && !dictionary.contains_key(b"SMask".as_slice())
             && !dictionary.contains_key(b"Mask".as_slice());
@@ -1870,82 +1876,11 @@ fn optional_content_state(document: &EditDocument) -> Result<OptionalContentStat
     Ok(out)
 }
 
-fn decoded_content_value(
-    document: &EditDocument,
-    value: &OwnedObject,
-    output: &mut Vec<u8>,
-) -> Result<()> {
-    let value = match value {
-        OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            value
-        }
-        value => value.clone(),
-    };
-    match value {
-        OwnedObject::Stream { .. } => {
-            let bytes = document.decoded_owned_stream_data(&value)?;
-            if !output.is_empty() && output.last() != Some(&b'\n') {
-                output.push(b'\n');
-            }
-            output.extend_from_slice(&bytes);
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                decoded_content_value(document, &value, output)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn page_content_bytes(document: &EditDocument, page: CowObjectHandle) -> Result<Vec<u8>> {
-    let Some(page) = document.current_owned_object(page)? else {
-        return Ok(Vec::new());
-    };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(Vec::new());
-    };
-    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-        return Ok(Vec::new());
-    };
-    let mut output = Vec::new();
-    decoded_content_value(document, contents, &mut output)?;
-    Ok(output)
-}
-
-fn owned_number_array<const N: usize>(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<[f64; N]>> {
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    if values.len() != N {
-        return Ok(None);
-    }
-    let mut out = [0.0; N];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number_value(document, value)? else {
-            return Ok(None);
-        };
-        out[index] = number;
-    }
-    Ok(Some(out))
-}
-
 fn page_crop(document: &EditDocument, page: CowObjectHandle) -> Result<Rect> {
-    for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        if let Some(value) = document.inherited_page_value(page, key)?
-            && let Some(values) = owned_number_array::<4>(document, &value)?
-        {
-            return Ok(Rect::new(values[0], values[1], values[2], values[3]));
-        }
-    }
-    Ok(Rect::new(0.0, 0.0, 612.0, 792.0))
+    let Some([x0, y0, x1, y1]) = page_box_numbers(document, page)? else {
+        return Ok(Rect::new(0.0, 0.0, 612.0, 792.0));
+    };
+    Ok(Rect::new(x0, y0, x1, y1))
 }
 
 pub struct HiddenTextSharedContext {
@@ -2038,14 +1973,14 @@ fn scan_page(
     page: CowObjectHandle,
     page_number: usize,
     ocg: &OptionalContentState,
-) -> Result<PageScan> {
+) -> Result<ScannedPage> {
     let crop = page_crop(document, page)?;
     let resources = build_resources(
         document,
         document.inherited_page_value(page, b"Resources")?,
         ocg,
     )?;
-    let content = page_content_bytes(document, page)?;
+    let content = page_content(document, page)?;
     let mut scanner = PageScanner::new(
         page_number,
         crop,
@@ -2055,7 +1990,10 @@ fn scan_page(
         &ocg.on,
     );
     let _incomplete = scanner.scan(&content)?;
-    Ok(scanner.finish())
+    Ok(ScannedPage {
+        content,
+        scan: scanner.finish(),
+    })
 }
 
 fn parse_to_unicode(data: &[u8]) -> HashMap<Vec<u8>, String> {

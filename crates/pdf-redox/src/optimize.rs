@@ -15,7 +15,7 @@ use crate::{
     font::{
         FontGlyphUsageHints, FontOptimizationStats, FontUsageGraph, collect_font_usage_graph,
         dense_compact_cidfont_type2_programs, dense_compact_cidfont_type2_programs_with_graph,
-        has_profitable_font_outline_subset_candidate, strip_cidfont_type2_cmaps_after_dedup,
+        probe_profitable_font_outline_subset, strip_cidfont_type2_cmaps_after_dedup,
         strip_font_editing_tables, subset_font_outlines_after_dedup,
         union_sparse_cid_font_programs_after_dedup,
     },
@@ -62,6 +62,8 @@ use std::{
     time::Instant,
 };
 
+mod reporting;
+
 fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let value = f();
@@ -91,6 +93,140 @@ fn ensure_font_usage_graph<'a>(
     graph
         .as_ref()
         .ok_or_else(|| crate::Error::Invalid("font usage graph was not materialized".to_owned()))
+}
+
+struct FontGraphPhaseResult {
+    font_dense: FontOptimizationStats,
+    post_dedup_font_graph: Option<FontUsageGraph>,
+    cid_cmap_source_inventory_still_valid: bool,
+}
+
+const fn add_font_rendering_stats(total: &mut FontOptimizationStats, delta: FontOptimizationStats) {
+    total.programs_optimized += delta.programs_optimized;
+    total.programs_glyph_subset += delta.programs_glyph_subset;
+    total.original_encoded_bytes += delta.original_encoded_bytes;
+    total.optimized_encoded_bytes += delta.optimized_encoded_bytes;
+    total.decoded_table_bytes_removed += delta.decoded_table_bytes_removed;
+    total.glyph_subset_decoded_bytes_removed += delta.glyph_subset_decoded_bytes_removed;
+}
+
+fn run_font_graph_phase(
+    document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
+    cfg: &Config,
+    before: &PdfAnalysis,
+    flate_level: crate::FlateLevel,
+    timings: &mut BTreeMap<String, f64>,
+    font_rendering: &mut FontOptimizationStats,
+) -> Result<FontGraphPhaseResult> {
+    // These source inventories mirror the two extra scopes scanned by
+    // `font_glyph_usage`. Earlier stages may delete or rewrite those scopes but
+    // do not create new Type3 fonts or tiling Pattern streams, so a complete
+    // source-negative inventory remains a valid negative hint here. Old cached
+    // analyses default to version 0 and therefore take both full scans.
+    let font_glyph_usage_hints = FontGlyphUsageHints {
+        no_tiling_pattern_scopes: before.font_glyph_scope_inventory_version >= 1
+            && before.tiling_pattern_scope_count == 0,
+        no_type3_font_scopes: before.font_glyph_scope_inventory_version >= 1
+            && before.type3_font_scope_count == 0,
+    };
+    // The authoritative font ownership/subtype graph is expensive and most
+    // documents have no profitable consumer for it. Source preflight records
+    // conservative negative-only opportunities; old/incomplete analyses fall
+    // back to the historical eager proofs. Any possible winner still uses the
+    // same graph before mutation.
+    let font_opportunity_inventory_complete = before.font_opportunity_inventory_version >= 1;
+    let sparse_union_possible = !cfg.preservation.font_editing_support
+        && (!font_opportunity_inventory_complete
+            || before.font_sparse_union_duplicate_skeleton_groups > 0);
+    let dense_gid_possible =
+        !font_opportunity_inventory_complete || before.font_explicit_cid_to_gid_ref_count > 0;
+    let mut post_dedup_font_graph = None::<FontUsageGraph>;
+
+    let font_sparse_union = if sparse_union_possible {
+        let graph = ensure_font_usage_graph(document, &mut post_dedup_font_graph, timings)?;
+        timed(timings, "font-sparse-union", || {
+            union_sparse_cid_font_programs_after_dedup(
+                document,
+                pages,
+                flate_level,
+                graph,
+                font_glyph_usage_hints,
+            )
+        })?
+    } else {
+        timings.insert("font-sparse-union".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    };
+    add_font_rendering_stats(font_rendering, font_sparse_union);
+
+    let mut outline_probe = None;
+    let outline_subset_possible = if cfg.preservation.font_editing_support {
+        false
+    } else if post_dedup_font_graph.is_some() {
+        // A prior font stage already mutated the document. The ownership graph
+        // can still be reused, but glyph usage must be scanned from current content.
+        timings.insert("font-outline-opportunity".to_owned(), 0.0);
+        true
+    } else if !search_font_outline_subset(cfg) {
+        timings.insert("font-outline-opportunity".to_owned(), 0.0);
+        false
+    } else {
+        outline_probe = timed(timings, "font-outline-opportunity", || {
+            probe_profitable_font_outline_subset(
+                document,
+                pages,
+                flate_level,
+                font_glyph_usage_hints,
+            )
+        })?;
+        outline_probe.is_some()
+    };
+    let font_outline_subset = if outline_subset_possible {
+        let graph = ensure_font_usage_graph(document, &mut post_dedup_font_graph, timings)?;
+        timed(timings, "font-outline-subset", || {
+            subset_font_outlines_after_dedup(
+                document,
+                pages,
+                flate_level,
+                graph,
+                outline_probe,
+                font_glyph_usage_hints,
+            )
+        })?
+    } else {
+        timings.insert("font-outline-subset".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    };
+    add_font_rendering_stats(font_rendering, font_outline_subset);
+
+    let font_dense = if cfg.preservation.font_editing_support
+        || cfg.optimization_goal != crate::OptimizationGoal::Processing
+        || !dense_gid_possible
+    {
+        timings.insert("font-dense-gid".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    } else if font_sparse_union.programs_optimized == 0 {
+        let graph = ensure_font_usage_graph(document, &mut post_dedup_font_graph, timings)?;
+        timed(timings, "font-dense-gid", || {
+            dense_compact_cidfont_type2_programs_with_graph(document, flate_level, graph)
+        })?
+    } else {
+        timed(timings, "font-dense-gid", || {
+            dense_compact_cidfont_type2_programs(document, flate_level)
+        })?
+    };
+    if post_dedup_font_graph.is_none() {
+        timings.insert("font-post-dedup-usage-graph".to_owned(), 0.0);
+    }
+
+    Ok(FontGraphPhaseResult {
+        font_dense,
+        post_dedup_font_graph,
+        cid_cmap_source_inventory_still_valid: font_sparse_union.programs_optimized == 0
+            && font_outline_subset.programs_optimized == 0
+            && font_dense.programs_optimized == 0,
+    })
 }
 
 fn signed_size_delta(before: usize, after: usize) -> isize {
@@ -150,7 +286,8 @@ pub fn analyze_microstroke_rasterization(
     optimization_goal: crate::OptimizationGoal,
 ) -> Result<MicrostrokeRasterStats> {
     let mut document = EditDocument::from_bytes(input.to_vec())?;
-    rasterize_pathological_microstrokes(&mut document, optimization_goal.flate_level())
+    let pages = document.page_handles()?;
+    rasterize_pathological_microstrokes(&mut document, &pages, optimization_goal.flate_level())
 }
 
 /// Optimize a PDF according to the supplied configuration.
@@ -206,9 +343,57 @@ fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
     *policy == fast_path_policy
 }
 
+struct OptimizationRunStats {
+    preservation_fast_path: bool,
+    preservation: PreservationStats,
+    hidden_text: HiddenTextApplyStats,
+    large_diagonal_text: HiddenTextApplyStats,
+    scrub: crate::scrub::ScrubStats,
+    font_rendering: FontOptimizationStats,
+    metadata_dedup: crate::dedup::TargetedDedupStats,
+    font_dedup: crate::dedup::TargetedDedupStats,
+    font_dense: FontOptimizationStats,
+    to_unicode_dedup: crate::dedup::TargetedDedupStats,
+    font_object_dedup: crate::dedup::ExactObjectDedupStats,
+    sampled_function_dedup: crate::dedup::TargetedDedupStats,
+    extgstate_object_dedup: crate::dedup::ExactObjectDedupStats,
+    structure_attribute_dedup: crate::dedup::ExactObjectDedupStats,
+    icc_dedup: crate::dedup::TargetedDedupStats,
+    icc_alternate: IccAlternateElisionStats,
+    raster_layout: crate::raster_layout::RasterLayoutStats,
+    physically_hidden_text: HiddenTextApplyStats,
+    inline_image_dedup: DuplicateInlineImageStats,
+    jpeg_entropy: crate::jpeg_optimize::JpegEntropyStats,
+    image_dedup: crate::dedup::TargetedDedupStats,
+    pattern_payload_factor: crate::dedup::PatternPayloadFactorStats,
+    form_dedup: crate::dedup::TargetedDedupStats,
+    form_metadata_payload_factor: crate::dedup::FormMetadataPayloadFactorStats,
+    appearance_dedup: crate::dedup::TargetedDedupStats,
+    type3_charproc_dedup: crate::dedup::TargetedDedupStats,
+    repeated_page_objects: RepeatedPageObjectStats,
+    print_plan: PrintPlanHayro,
+    print_plan_error: Option<String>,
+    raster_transform: ImageOptimizationStats,
+    repeated_clips: RepeatedClipStats,
+    vector_compaction: VectorCompactionStats,
+    marked_content: MarkedContentCoalesceStats,
+    collinear_paths: CollinearPathStats,
+    outlined_glyphs: OutlinedGlyphFactorStats,
+    paint_batch: PaintBatchStats,
+    stroke_forms: StrokeFormFactorStats,
+    polyline_simplification: PolylineSimplificationStats,
+    resource_prune: crate::prune::ResourcePruneStats,
+    microstroke_raster: MicrostrokeRasterStats,
+    flate: crate::flate::FlateOptimizationStats,
+    page_content_dedup: crate::dedup::TargetedDedupStats,
+    structure_compaction: crate::structure_compact::StructureCompactionStats,
+    unfiltered_flate: crate::flate::FlateOptimizationStats,
+    font_cid_cmap_strip: FontOptimizationStats,
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "the optimization pipeline intentionally keeps stage ordering, shared document state, timings, and report accounting together"
+    reason = "the optimization pipeline intentionally keeps ordered mutations and their shared document state together"
 )]
 fn optimize_pdf_with_document(
     mut document: EditDocument,
@@ -254,12 +439,19 @@ fn optimize_pdf_with_document(
             Ok(())
         }
     })?;
+    // Preservation is the last stage before structure compaction that can touch
+    // page-tree dictionaries. Page membership/order is stable across the remaining
+    // optimization passes even though page contents/resources continue to mutate.
+    // Snapshot ordered page identity once instead of repeatedly recovering /Pages.
+    let stable_pages = timed(&mut timings, "stable-page-index", || {
+        document.page_handles()
+    })?;
     let hidden_text = timed(&mut timings, "hidden-text", || {
-        apply_hidden_text_policy(&mut document, &cfg.hidden_text)
+        apply_hidden_text_policy(&mut document, &stable_pages, &cfg.hidden_text)
     })?;
     let large_diagonal_text = timed(&mut timings, "large-diagonal-text", || {
         if cfg.remove_large_diagonal_text {
-            remove_large_diagonal_text(&mut document)
+            remove_large_diagonal_text(&mut document, &stable_pages)
         } else {
             Ok(HiddenTextApplyStats::default())
         }
@@ -297,113 +489,19 @@ fn optimize_pdf_with_document(
             canonicalize_font_program_streams(&mut document)
         }
     })?;
-    // These source inventories mirror the two extra scopes scanned by
-    // `font_glyph_usage`. Earlier stages may delete or rewrite those scopes but
-    // do not create new Type3 fonts or tiling Pattern streams, so a complete
-    // source-negative inventory remains a valid negative hint here. Old cached
-    // analyses default to version 0 and therefore take both full scans.
-    let font_glyph_usage_hints = FontGlyphUsageHints {
-        no_tiling_pattern_scopes: before.font_glyph_scope_inventory_version >= 1
-            && before.tiling_pattern_scope_count == 0,
-        no_type3_font_scopes: before.font_glyph_scope_inventory_version >= 1
-            && before.type3_font_scope_count == 0,
-    };
-    // The authoritative font ownership/subtype graph is expensive and most
-    // documents have no profitable consumer for it. Source preflight records
-    // conservative negative-only opportunities; old/incomplete analyses fall
-    // back to the historical eager proofs. Any possible winner still uses the
-    // same graph before mutation.
-    let font_opportunity_inventory_complete = before.font_opportunity_inventory_version >= 1;
-    let sparse_union_possible = !cfg.preservation.font_editing_support
-        && (!font_opportunity_inventory_complete
-            || before.font_sparse_union_duplicate_skeleton_groups > 0);
-    let dense_gid_possible =
-        !font_opportunity_inventory_complete || before.font_explicit_cid_to_gid_ref_count > 0;
-    let mut post_dedup_font_graph = None::<FontUsageGraph>;
-
-    let font_sparse_union = if sparse_union_possible {
-        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
-        timed(&mut timings, "font-sparse-union", || {
-            union_sparse_cid_font_programs_after_dedup(
-                &mut document,
-                flate_level,
-                graph,
-                font_glyph_usage_hints,
-            )
-        })?
-    } else {
-        timings.insert("font-sparse-union".to_owned(), 0.0);
-        FontOptimizationStats::default()
-    };
-    font_rendering.programs_optimized += font_sparse_union.programs_optimized;
-    font_rendering.programs_glyph_subset += font_sparse_union.programs_glyph_subset;
-    font_rendering.original_encoded_bytes += font_sparse_union.original_encoded_bytes;
-    font_rendering.optimized_encoded_bytes += font_sparse_union.optimized_encoded_bytes;
-    font_rendering.decoded_table_bytes_removed += font_sparse_union.decoded_table_bytes_removed;
-    font_rendering.glyph_subset_decoded_bytes_removed +=
-        font_sparse_union.glyph_subset_decoded_bytes_removed;
-
-    let outline_subset_possible = if cfg.preservation.font_editing_support {
-        false
-    } else if post_dedup_font_graph.is_some() {
-        // Another font stage already paid for the authoritative graph; running
-        // the negative-only subset probe first would only duplicate the same
-        // glyph/subsetter work before the full proof below.
-        timings.insert("font-outline-opportunity".to_owned(), 0.0);
-        true
-    } else if !search_font_outline_subset(cfg) {
-        timings.insert("font-outline-opportunity".to_owned(), 0.0);
-        false
-    } else {
-        timed(&mut timings, "font-outline-opportunity", || {
-            has_profitable_font_outline_subset_candidate(
-                &document,
-                flate_level,
-                font_glyph_usage_hints,
-            )
-        })?
-    };
-    let font_outline_subset = if outline_subset_possible {
-        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
-        timed(&mut timings, "font-outline-subset", || {
-            subset_font_outlines_after_dedup(
-                &mut document,
-                flate_level,
-                graph,
-                font_glyph_usage_hints,
-            )
-        })?
-    } else {
-        timings.insert("font-outline-subset".to_owned(), 0.0);
-        FontOptimizationStats::default()
-    };
-    font_rendering.programs_optimized += font_outline_subset.programs_optimized;
-    font_rendering.programs_glyph_subset += font_outline_subset.programs_glyph_subset;
-    font_rendering.original_encoded_bytes += font_outline_subset.original_encoded_bytes;
-    font_rendering.optimized_encoded_bytes += font_outline_subset.optimized_encoded_bytes;
-    font_rendering.decoded_table_bytes_removed += font_outline_subset.decoded_table_bytes_removed;
-    font_rendering.glyph_subset_decoded_bytes_removed +=
-        font_outline_subset.glyph_subset_decoded_bytes_removed;
-
-    let font_dense = if cfg.preservation.font_editing_support
-        || cfg.optimization_goal != crate::OptimizationGoal::Processing
-        || !dense_gid_possible
-    {
-        timings.insert("font-dense-gid".to_owned(), 0.0);
-        FontOptimizationStats::default()
-    } else if font_sparse_union.programs_optimized == 0 {
-        let graph = ensure_font_usage_graph(&document, &mut post_dedup_font_graph, &mut timings)?;
-        timed(&mut timings, "font-dense-gid", || {
-            dense_compact_cidfont_type2_programs_with_graph(&mut document, flate_level, graph)
-        })?
-    } else {
-        timed(&mut timings, "font-dense-gid", || {
-            dense_compact_cidfont_type2_programs(&mut document, flate_level)
-        })?
-    };
-    if post_dedup_font_graph.is_none() {
-        timings.insert("font-post-dedup-usage-graph".to_owned(), 0.0);
-    }
+    let FontGraphPhaseResult {
+        font_dense,
+        post_dedup_font_graph,
+        cid_cmap_source_inventory_still_valid,
+    } = run_font_graph_phase(
+        &mut document,
+        &stable_pages,
+        cfg,
+        &before,
+        flate_level,
+        &mut timings,
+        &mut font_rendering,
+    )?;
     let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
             || before.to_unicode_raw_payload_inventory_version >= 1
@@ -481,13 +579,9 @@ fn optimize_pdf_with_document(
             Ok(IccAlternateElisionStats::default())
         }
     })?;
-    let repeated_page_objects_may_rewrite = if cfg.remove_repeated_page_objects
+    let repeated_page_objects_may_rewrite = cfg.remove_repeated_page_objects
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
-    {
-        repeated_page_objects_prefix_possible(&document)?
-    } else {
-        false
-    };
+        && repeated_page_objects_prefix_possible(&document, &stable_pages)?;
     let mut raster_vector_cache = BTreeMap::new();
     let raster_layout = timed(&mut timings, "raster-layout", || {
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
@@ -495,6 +589,7 @@ fn optimize_pdf_with_document(
             .then_some(&mut raster_vector_cache);
         normalize_raster_layout(
             &mut document,
+            &stable_pages,
             &cfg.raster_layout,
             flate_level,
             cfg.optimization_goal == crate::OptimizationGoal::Processing,
@@ -531,10 +626,10 @@ fn optimize_pdf_with_document(
             if fallback.is_empty() {
                 Ok(HiddenTextApplyStats::default())
             } else {
-                prune_physically_hidden_text(&mut document, Some(&fallback))
+                prune_physically_hidden_text(&mut document, &stable_pages, Some(&fallback))
             }
         } else {
-            prune_physically_hidden_text(&mut document, None)
+            prune_physically_hidden_text(&mut document, &stable_pages, None)
         }
     })?;
 
@@ -545,7 +640,7 @@ fn optimize_pdf_with_document(
         if raster_proved_no_inline {
             Ok(DuplicateInlineImageStats::default())
         } else {
-            externalize_duplicate_inline_images(&mut document)
+            externalize_duplicate_inline_images(&mut document, &stable_pages)
         }
     })?;
 
@@ -594,7 +689,7 @@ fn optimize_pdf_with_document(
     })?;
     let repeated_page_objects = timed(&mut timings, "repeated-page-objects", || {
         if cfg.remove_repeated_page_objects {
-            remove_repeated_page_objects(&mut document)
+            remove_repeated_page_objects(&mut document, &stable_pages)
         } else {
             Ok(RepeatedPageObjectStats::default())
         }
@@ -604,7 +699,7 @@ fn optimize_pdf_with_document(
     let (print_plan, print_plan_error) = match &cfg.image_policy {
         ImagePolicy::Print { target_ppi, .. } => {
             let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
-            match plan_print_downsampling(&document, u32::from(target_ppi)) {
+            match plan_print_downsampling(&document, &stable_pages, u32::from(target_ppi)) {
                 Ok(plan) => (plan, None),
                 Err(error) => (PrintPlanHayro::default(), Some(error.to_string())),
             }
@@ -649,6 +744,7 @@ fn optimize_pdf_with_document(
             ..
         } => optimize_images(
             &mut document,
+            &stable_pages,
             ImageOptimizationOptions {
                 keep_inline_images: true,
                 jpeg_quality: *jpeg_quality,
@@ -666,7 +762,7 @@ fn optimize_pdf_with_document(
 
     let repeated_clips = timed(&mut timings, "repeated-clip-hoist", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            hoist_repeated_clip_prefixes(&mut document, flate_level)
+            hoist_repeated_clip_prefixes(&mut document, &stable_pages, flate_level)
         } else {
             Ok(RepeatedClipStats::default())
         }
@@ -687,18 +783,14 @@ fn optimize_pdf_with_document(
                 raster_vector_cache.remove(page);
             }
         }
-        let processing_proved_no_vector_candidate = if cfg.optimization_goal
+        let processing_proved_no_vector_candidate = cfg.optimization_goal
             == crate::OptimizationGoal::Processing
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
             && raster_cache_is_exact
             && !raster_layout.page_vector_merge_candidate
-        {
-            raster_vector_cache.len() == raster_layout.page_count
-                && !processing_factor_candidate(&raster_vector_cache)
-        } else {
-            false
-        };
+            && raster_vector_cache.len() == raster_layout.page_count
+            && !processing_factor_candidate(&raster_vector_cache);
         if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
             let vector_cache = if raster_cache_is_exact {
                 std::mem::take(&mut raster_vector_cache)
@@ -707,6 +799,7 @@ fn optimize_pdf_with_document(
             };
             compact_vector_paths_with_flate_cache(
                 &mut document,
+                &stable_pages,
                 flate_level,
                 cfg.optimization_goal,
                 vector_cache,
@@ -719,7 +812,7 @@ fn optimize_pdf_with_document(
 
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            coalesce_optional_content(&mut document, flate_level)
+            coalesce_optional_content(&mut document, &stable_pages, flate_level)
         } else {
             Ok(MarkedContentCoalesceStats::default())
         }
@@ -727,7 +820,7 @@ fn optimize_pdf_with_document(
 
     let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            compact_collinear_paths(&mut document, flate_level)
+            compact_collinear_paths(&mut document, &stable_pages, flate_level)
         } else {
             Ok(CollinearPathStats::default())
         }
@@ -735,7 +828,7 @@ fn optimize_pdf_with_document(
 
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(&mut document, flate_level)
+            factor_outlined_glyphs(&mut document, &stable_pages, flate_level)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -743,7 +836,7 @@ fn optimize_pdf_with_document(
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            batch_page_paints(&mut document)
+            batch_page_paints(&mut document, &stable_pages)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -751,7 +844,7 @@ fn optimize_pdf_with_document(
 
     let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_repeated_stroke_forms(&mut document, flate_level)
+            factor_repeated_stroke_forms(&mut document, &stable_pages, flate_level)
         } else {
             Ok(StrokeFormFactorStats::default())
         }
@@ -759,7 +852,7 @@ fn optimize_pdf_with_document(
 
     let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            simplify_page_polylines(&mut document, flate_level)
+            simplify_page_polylines(&mut document, &stable_pages, flate_level)
         } else {
             Ok(PolylineSimplificationStats::default())
         }
@@ -782,12 +875,12 @@ fn optimize_pdf_with_document(
                 &vector_compaction.generated_page_xobjects,
             )
         } else {
-            prune_resources(&mut document)
+            prune_resources(&mut document, &stable_pages)
         }
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(&mut document, flate_level)
+            rasterize_pathological_microstrokes(&mut document, &stable_pages, flate_level)
         } else {
             Ok(MicrostrokeRasterStats::default())
         }
@@ -797,14 +890,14 @@ fn optimize_pdf_with_document(
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            normalize_page_contents(&mut document)?;
+            normalize_page_contents(&mut document, &stable_pages)?;
         }
         Ok(())
     })?;
     // Content streams are canonicalized only after every pass that can mutate
     // them, including lexical normalization.
     let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
-        canonicalize_page_contents(&mut document)
+        canonicalize_page_contents(&mut document, &stable_pages)
     })?;
     let structure_compaction = timed(&mut timings, "structure-compaction", || {
         compact_structure(&mut document)
@@ -818,11 +911,8 @@ fn optimize_pdf_with_document(
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
     // the stream bytes against which the rewrite's actual size win is gated.
-    let cid_cmap_source_inventory_still_valid = font_sparse_union.programs_optimized == 0
-        && font_outline_subset.programs_optimized == 0
-        && font_dense.programs_optimized == 0;
     let cid_cmap_possible = !cfg.preservation.font_editing_support
-        && (!font_opportunity_inventory_complete
+        && (before.font_opportunity_inventory_version < 1
             || !cid_cmap_source_inventory_still_valid
             || before.font_material_cid_cmap_decoded_bytes
                 >= crate::font::MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT);
@@ -842,711 +932,54 @@ fn optimize_pdf_with_document(
         crate::writer::write_pdf_with_object_streams(&document, flate_level)
     })?;
 
-    let mut notes = Vec::new();
-    if !preservation_fast_path {
-        notes.push(format!(
-            "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring/metadata keys: {:?}.",
-            preservation.pages,
-            preservation.annotation_entries_flattened,
-            preservation.annotation_entries_seen,
-            preservation.link_visual_shells_retained,
-            preservation.annotation_entries_dropped_unflattened,
-            preservation.annotation_subtypes_seen,
-            preservation.unflattened_annotation_subtypes,
-            preservation.dropped_page_keys,
-            preservation.dropped_page_tree_keys,
-            preservation.dropped_catalog_keys,
-            preservation.dropped_authoring_keys
-        ));
-        if preservation
-            .dropped_catalog_keys
-            .contains_key("/OCProperties")
-        {
-            notes.push(
-                "Optional-content configuration (/OCProperties) was discarded by preservation policy; content whose default visibility depends on OCG state may render differently."
-                    .to_owned(),
-            );
-        }
-    }
-    if preservation_fast_path {
-        let thumbnails = preservation
-            .dropped_page_keys
-            .get("/Thumb")
-            .copied()
-            .unwrap_or_default();
-        if thumbnails > 0 {
-            notes.push(format!(
-                "Dropped {thumbnails} embedded page thumbnail cache entr{}; viewers can regenerate previews from final page content when needed.",
-                if thumbnails == 1 { "y" } else { "ies" }
-            ));
-        }
-        let private_authoring = preservation
-            .dropped_authoring_keys
-            .get("/PieceInfo")
-            .copied()
-            .unwrap_or_default();
-        if private_authoring > 0 {
-            notes.push(format!(
-                "Dropped {private_authoring} producer-private /PieceInfo entr{}; use --preserve-authoring-data when editor round-tripping is explicitly required.",
-                if private_authoring == 1 { "y" } else { "ies" }
-            ));
-        }
-    }
-    if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
-        let target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
-        if let Some(error) = &print_plan_error {
-            notes.push(format!(
-                "Print placement analysis failed ({error}); resolution-aware raster resizing was disabled for this document."
-            ));
-        } else if print_plan.stats.geometry_complete {
-            let images_placed = print_plan.stats.images_placed;
-            let image_uses = print_plan.stats.image_uses;
-            let downsample_candidates = print_plan.stats.downsample_candidates;
-            let existing_jpeg_candidates = print_plan.stats.existing_jpeg_resize_candidates;
-            let flate_candidates = print_plan.stats.flate_resize_candidates;
-            let images_resized = raster_transform.images_resized;
-            let jpeg_images_resized = raster_transform.jpeg_images_resized;
-            let flate_images_resized = raster_transform.flate_images_resized;
-            notes.push(format!(
-                "Print placement analysis found {images_placed} raster image object(s) across {image_uses} use(s); {downsample_candidates} exceed the {target_ppi} PPI target, {existing_jpeg_candidates} are conservative existing-JPEG candidates, {flate_candidates} are conservative Flate-encoded resize candidates, and {images_resized} were resized ({jpeg_images_resized} JPEG, {flate_images_resized} Flate-encoded)."
-            ));
-        } else {
-            notes.push(format!(
-                "Print placement analysis was incomplete after finding {} raster image object(s) across {} use(s); resolution-aware raster resizing was disabled for this document.",
-                print_plan.stats.images_placed, print_plan.stats.image_uses
-            ));
-        }
-    }
-    if raster_transform.images_optimized > 0
-        && let ImagePolicy::Perceptual { jpeg_quality, .. } = &cfg.image_policy
-    {
-        let images_optimized = raster_transform.images_optimized;
-        let paper_indexed_images = raster_transform.paper_indexed_images;
-        let layered_indexed_images = raster_transform.paper_indexed_layered_images;
-        let residual_indexed_images = raster_transform.paper_indexed_residual_images;
-        let jpeg_images = images_optimized.saturating_sub(paper_indexed_images);
-        let saved_bytes = raster_transform.saved_bytes();
-        notes.push(format!(
-            "Transformed {images_optimized} eligible raster image(s): {jpeg_images} to JPEG at quality {jpeg_quality} and {paper_indexed_images} paper-like RGB image(s) to Indexed color ({layered_indexed_images} using source-grid local-palette layers, {residual_indexed_images} using sparse residual overlays); reduced their encoded payload by {saved_bytes} bytes."
-        ));
-    }
-    if jpeg_entropy.streams_optimized > 0 {
-        notes.push(format!(
-            "Entropy-optimized {} JPEG stream(s) without changing quantized DCT coefficients: {} -> {} encoded bytes ({} bytes saved).",
-            jpeg_entropy.streams_optimized,
-            jpeg_entropy.original_encoded_bytes,
-            jpeg_entropy.optimized_encoded_bytes,
-            jpeg_entropy.saved_bytes()
-        ));
-    }
-    if repeated_page_objects.objects_removed > 0 {
-        notes.push(format!(
-            "Removed {} persistent page object(s) from {} repeated group(s) across {} page(s): {} text object(s), {} Image/Form paint(s).",
-            repeated_page_objects.objects_removed,
-            repeated_page_objects.groups_removed,
-            repeated_page_objects.pages_rewritten,
-            repeated_page_objects.text_objects_removed,
-            repeated_page_objects.xobject_paints_removed
-        ));
-    }
-    if inline_image_dedup.occurrences_externalized > 0 {
-        notes.push(format!(
-            "Externalized {} repeated inline-image occurrence(s) from {} exact semantic fingerprint(s) into {} shared Image XObject(s), representing {} duplicated encoded payload bytes.",
-            inline_image_dedup.occurrences_externalized,
-            inline_image_dedup.fingerprints_selected,
-            inline_image_dedup.xobjects_created,
-            inline_image_dedup.duplicate_payload_bytes
-        ));
-    }
-    if before.incremental_update_count > 0 {
-        notes.push(format!(
-            "Fresh rewrite discarded {} incremental revision(s) from the source byte history.",
-            before.incremental_update_count
-        ));
-    }
-    if metadata_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate metadata reference(s) across {} duplicate stream object(s).",
-            metadata_dedup.references_canonicalized, metadata_dedup.duplicate_streams_detected
-        ));
-    }
-    if font_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate embedded-font reference(s) across {} duplicate font-program stream object(s).",
-            font_dedup.references_canonicalized, font_dedup.duplicate_streams_detected
-        ));
-    }
-    if font_object_dedup.duplicate_objects_detected > 0 {
-        notes.push(format!(
-            "Interned {} exact duplicate Font dictionary object(s), canonicalizing {} reference(s) without changing font semantics.",
-            font_object_dedup.duplicate_objects_detected,
-            font_object_dedup.references_canonicalized
-        ));
-    }
-    if extgstate_object_dedup.duplicate_objects_detected > 0 {
-        notes.push(format!(
-            "Interned {} exact duplicate ExtGState dictionary object(s), canonicalizing {} resource reference(s).",
-            extgstate_object_dedup.duplicate_objects_detected,
-            extgstate_object_dedup.references_canonicalized
-        ));
-    }
-    if structure_attribute_dedup.duplicate_objects_detected > 0 {
-        notes.push(format!(
-            "Interned {} exact duplicate structure-attribute dictionary object(s), canonicalizing {} StructElem /A reference(s).",
-            structure_attribute_dedup.duplicate_objects_detected,
-            structure_attribute_dedup.references_canonicalized
-        ));
-    }
-    if sampled_function_dedup.duplicate_streams_detected > 0 {
-        notes.push(format!(
-            "Interned {} exact duplicate sampled Function stream object(s), canonicalizing {} reference(s) and removing about {} duplicate encoded payload bytes.",
-            sampled_function_dedup.duplicate_streams_detected,
-            sampled_function_dedup.references_canonicalized,
-            sampled_function_dedup.duplicate_raw_bytes
-        ));
-    }
-    if to_unicode_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate ToUnicode reference(s) across {} duplicate CMap stream object(s).",
-            to_unicode_dedup.references_canonicalized, to_unicode_dedup.duplicate_streams_detected
-        ));
-    }
-    if image_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate Image XObject reference(s) across {} duplicate image stream object(s).",
-            image_dedup.references_canonicalized, image_dedup.duplicate_streams_detected
-        ));
-    }
-    if form_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate Form XObject reference(s) across {} duplicate form stream object(s).",
-            form_dedup.references_canonicalized, form_dedup.duplicate_streams_detected
-        ));
-    }
-    if form_metadata_payload_factor.wrappers_rewritten > 0 {
-        notes.push(format!(
-            "Factored {} metadata-variant Form payload group(s) behind {} metadata-preserving wrapper(s), sharing about {} encoded payload bytes before wrapper overhead.",
-            form_metadata_payload_factor.groups_factored,
-            form_metadata_payload_factor.wrappers_rewritten,
-            form_metadata_payload_factor.duplicate_raw_bytes_factored
-        ));
-    }
-    if appearance_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate annotation appearance reference(s) across {} duplicate Form stream object(s).",
-            appearance_dedup.references_canonicalized,
-            appearance_dedup.duplicate_streams_detected
-        ));
-    }
-    if page_content_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate page-content reference(s) across {} duplicate content stream object(s).",
-            page_content_dedup.references_canonicalized,
-            page_content_dedup.duplicate_streams_detected
-        ));
-    }
-    if type3_charproc_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate Type3 CharProc reference(s) across {} duplicate glyph stream object(s).",
-            type3_charproc_dedup.references_canonicalized,
-            type3_charproc_dedup.duplicate_streams_detected
-        ));
-    }
-    if icc_dedup.references_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} duplicate ICCBased profile reference(s) across {} duplicate ICC stream object(s).",
-            icc_dedup.references_canonicalized, icc_dedup.duplicate_streams_detected
-        ));
-    }
-    if icc_alternate.references_rewritten > 0 {
-        notes.push(format!(
-            "Replaced {} ICCBased color-space value(s) with their declared Device alternate, making {} large ICC profile(s) unreachable and removing about {} encoded profile bytes. Color management is intentionally simplified.",
-            icc_alternate.references_rewritten,
-            icc_alternate.profiles_elided,
-            icc_alternate.encoded_profile_bytes_elided
-        ));
-    }
-    if font_rendering.programs_optimized > 0 {
-        notes.push(format!(
-            "Removed PDF-rendering-unused embedded-font editing/layout tables from {} font program(s): {} -> {} encoded bytes ({} decoded table bytes removed).",
-            font_rendering.programs_optimized,
-            font_rendering.original_encoded_bytes,
-            font_rendering.optimized_encoded_bytes,
-            font_rendering.decoded_table_bytes_removed
-        ));
-    }
-    if font_cid_cmap_strip.cid_cmaps_removed > 0 {
-        notes.push(format!(
-            "Removed redundant internal cmap table(s) from {} CIDFontType2-only TrueType program(s): {} -> {} encoded bytes ({} decoded cmap bytes removed).",
-            font_cid_cmap_strip.cid_cmaps_removed,
-            font_cid_cmap_strip.original_encoded_bytes,
-            font_cid_cmap_strip.optimized_encoded_bytes,
-            font_cid_cmap_strip.cid_cmap_decoded_bytes_removed
-        ));
-    }
-    if font_rendering.programs_glyph_subset > 0 {
-        notes.push(format!(
-            "Subset {} embedded font program(s), removing about {} decoded font-program bytes.",
-            font_rendering.programs_glyph_subset, font_rendering.glyph_subset_decoded_bytes_removed
-        ));
-    }
-    if font_dense.programs_dense_remapped > 0 {
-        notes.push(format!(
-            "Densely remapped {} CIDFontType2 TrueType program(s), rewriting {} explicit CIDToGIDMap stream(s), removing {} dead glyph slot(s) and about {} decoded font bytes ({} -> {} encoded bytes including maps).",
-            font_dense.programs_dense_remapped,
-            font_dense.cid_to_gid_maps_rewritten,
-            font_dense.dense_glyph_slots_removed,
-            font_dense.dense_decoded_bytes_removed,
-            font_dense.original_encoded_bytes,
-            font_dense.optimized_encoded_bytes
-        ));
-    }
-    if vector_compaction.path_forms_created > 0 {
-        notes.push(format!(
-            "Factored {} repeated painted path block(s) into Form XObjects across {} page(s), replacing {} occurrence(s) and removing about {} decoded duplicate bytes.",
-            vector_compaction.path_forms_created,
-            vector_compaction.path_form_pages_rewritten,
-            vector_compaction.path_form_occurrences_replaced,
-            vector_compaction.path_form_decoded_bytes_factored
-        ));
-    }
-    if vector_compaction.transformed_forms_created > 0 {
-        notes.push(format!(
-            "Factored {} repeated affine-placed vector block(s) into Form XObjects across {} page(s), replacing {} occurrence(s), eliminating {} repeated operators, and saving about {} encoded bytes in page/Form streams.",
-            vector_compaction.transformed_forms_created,
-            vector_compaction.transformed_form_pages_rewritten,
-            vector_compaction.transformed_form_occurrences_replaced,
-            vector_compaction.transformed_form_operators_eliminated,
-            vector_compaction.transformed_form_estimated_flate_bytes_saved
-        ));
-    }
-    if vector_compaction.shared_run_forms_created > 0 {
-        notes.push(format!(
-            "Factored {} shared resource-aware q-block run(s) into Form XObjects across {} page(s), replacing {} block occurrence(s), removing about {} decoded duplicate bytes, and saving about {} encoded bytes.",
-            vector_compaction.shared_run_forms_created,
-            vector_compaction.shared_run_pages_rewritten,
-            vector_compaction.shared_run_blocks_replaced,
-            vector_compaction.shared_run_decoded_bytes_factored,
-            vector_compaction.shared_run_estimated_flate_bytes_saved
-        ));
-    }
-    if repeated_clips.blocks_hoisted > 0 {
-        let pages_rewritten = repeated_clips.pages_rewritten;
-        let runs_hoisted = repeated_clips.runs_hoisted;
-        let blocks_hoisted = repeated_clips.blocks_hoisted;
-        let decoded_bytes_removed = repeated_clips.decoded_bytes_removed;
-        let estimated_flate_bytes_saved = repeated_clips.estimated_flate_bytes_saved;
-        notes.push(format!(
-            "Hoisted {runs_hoisted} repeated clipping-path run(s) across {pages_rewritten} page(s), collapsing {blocks_hoisted} q-block clip prefixes, removing about {decoded_bytes_removed} decoded bytes and saving about {estimated_flate_bytes_saved} encoded bytes."
-        ));
-    }
-    if vector_compaction.path_coordinates_canonicalized > 0 {
-        notes.push(format!(
-            "Canonicalized {} path-coordinate operand(s) across {} page(s) within a 0.0071 pt page-space error bound, removing about {} decoded bytes and saving about {} encoded bytes.",
-            vector_compaction.path_coordinates_canonicalized,
-            vector_compaction.path_coordinate_pages_rewritten,
-            vector_compaction.path_coordinate_decoded_bytes_removed,
-            vector_compaction.path_coordinate_estimated_flate_bytes_saved
-        ));
-    }
-    if polyline_simplification.vertices_removed > 0 {
-        let vertices_removed = polyline_simplification.vertices_removed;
-        let pages_rewritten = polyline_simplification.pages_rewritten;
-        let decoded_bytes_removed = polyline_simplification.decoded_bytes_removed;
-        let estimated_flate_bytes_saved = polyline_simplification.estimated_flate_bytes_saved;
-        notes.push(format!(
-            "Simplified {vertices_removed} oversampled filled-polyline vertex/vertices across {pages_rewritten} page(s) within a {MAX_POLYLINE_PAGE_ERROR_PT:.3} pt page-space deviation bound, removing about {decoded_bytes_removed} decoded bytes and saving about {estimated_flate_bytes_saved} encoded bytes."
-        ));
-    }
-    if marked_content.boundaries_coalesced > 0 {
-        notes.push(format!(
-            "Coalesced {} redundant adjacent optional-content boundary pair(s) across {} page(s), removing about {} decoded bytes and saving about {} encoded bytes while preserving the OCG layer scopes.",
-            marked_content.boundaries_coalesced,
-            marked_content.pages_rewritten,
-            marked_content.decoded_bytes_removed,
-            marked_content.estimated_flate_bytes_saved
-        ));
-    }
-    if collinear_paths.vertices_removed > 0 {
-        notes.push(format!(
-            "Removed {} exact forward-collinear line vertex/vertices across {} page(s) and {} Form XObject(s), removing about {} decoded bytes and saving about {} encoded bytes without changing path geometry.",
-            collinear_paths.vertices_removed,
-            collinear_paths.pages_rewritten,
-            collinear_paths.forms_rewritten,
-            collinear_paths.decoded_bytes_removed,
-            collinear_paths.estimated_flate_bytes_saved
-        ));
-    }
-    if outlined_glyphs.occurrences_replaced > 0 {
-        notes.push(format!(
-            "Recovered {} reusable outlined glyph shape(s) in {} synthetic Type3 font(s), replacing {} glyph occurrence(s) spanning {} source paint operation(s), removing about {} decoded bytes and saving about {} encoded bytes.",
-            outlined_glyphs.glyphs_created,
-            outlined_glyphs.fonts_created,
-            outlined_glyphs.occurrences_replaced,
-            outlined_glyphs.source_paints_replaced,
-            outlined_glyphs.decoded_bytes_removed,
-            outlined_glyphs.estimated_flate_bytes_saved
-        ));
-    }
-    if paint_batch.paints_eliminated > 0 {
-        notes.push(format!(
-            "Collapsed {} source paint operation(s) into {} bounded compound paint group(s) across {} page(s), eliminating {} paint operations.",
-            paint_batch.source_paints_batched,
-            paint_batch.groups_created,
-            paint_batch.pages_rewritten,
-            paint_batch.paints_eliminated
-        ));
-    }
-    if stroke_forms.forms_created > 0 {
-        notes.push(format!(
-            "Factored {} repeated independently-stroked path block occurrence(s) into {} translation-reused Form XObject(s) across {} page(s), factoring about {} decoded bytes and saving about {} encoded bytes.",
-            stroke_forms.occurrences_replaced,
-            stroke_forms.forms_created,
-            stroke_forms.pages_rewritten,
-            stroke_forms.decoded_bytes_factored,
-            stroke_forms.estimated_flate_bytes_saved
-        ));
-    }
-    if microstroke_raster.runs_rasterized > 0 {
-        notes.push(format!(
-            "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
-            microstroke_raster.runs_rasterized,
-            microstroke_raster.pages_rewritten,
-            microstroke_raster.strokes_rasterized,
-            microstroke_raster.estimated_flate_bytes_saved
-        ));
-    }
-    if raster_layout.constant_color_mask_stencils_emitted > 0 {
-        notes.push(format!(
-            "Collapsed {} constant-color Image+binary-SMask pair(s) into single native-resolution stencil image(s).",
-            raster_layout.constant_color_mask_stencils_emitted
-        ));
-    }
-    if structure_compaction.page_tree_nodes_removed > 0
-        || structure_compaction.shadowed_page_tree_inherited_entries_removed > 0
-        || structure_compaction.name_tree_nodes_removed > 0
-        || structure_compaction.named_destination_wrappers_inlined > 0
-        || structure_compaction.named_destination_arrays_inlined > 0
-        || structure_compaction.stale_page_destination_references_rewritten > 0
-    {
-        notes.push(format!(
-            "Canonicalized document trees: page-tree nodes {} -> {}, removed {} shadowed inherited page-tree entry/entries, name-tree nodes {} -> {}, inlined {} trivial named-destination wrapper object(s), inlined {} indirect destination array(s), and retargeted {} stale page destination reference(s).",
-            structure_compaction.page_tree_nodes_before,
-            structure_compaction.page_tree_nodes_after,
-            structure_compaction.shadowed_page_tree_inherited_entries_removed,
-            structure_compaction.name_tree_nodes_before,
-            structure_compaction.name_tree_nodes_after,
-            structure_compaction.named_destination_wrappers_inlined,
-            structure_compaction.named_destination_arrays_inlined,
-            structure_compaction.stale_page_destination_references_rewritten
-        ));
-    }
-    if pattern_payload_factor.groups_factored > 0 {
-        notes.push(format!(
-            "Factored {} duplicate coloured tiling-pattern payload group(s) across {} Pattern stream(s) into {} shared Form XObject(s), eliminating {} bytes of duplicate encoded cell payload before wrapper overhead.",
-            pattern_payload_factor.groups_factored,
-            pattern_payload_factor.patterns_rewritten,
-            pattern_payload_factor.forms_created,
-            pattern_payload_factor.duplicate_raw_bytes_factored
-        ));
-    }
-    if flate.streams_selected > 0 {
-        notes.push(format!(
-            "Selected {} lone-Flate stream(s) for recompression after measuring about {} bytes of encoded savings.",
-            flate.streams_selected, flate.estimated_savings_bytes
-        ));
-    }
-
-    let adaptive_flate_streams_tested = flate
-        .high_effort_streams_tested
-        .saturating_add(unfiltered_flate.high_effort_streams_tested);
-    let adaptive_flate_streams_selected = flate
-        .high_effort_streams_selected
-        .saturating_add(unfiltered_flate.high_effort_streams_selected);
-    let adaptive_flate_extra_savings = flate
-        .high_effort_extra_savings_bytes
-        .saturating_add(unfiltered_flate.high_effort_extra_savings_bytes);
-    if adaptive_flate_streams_selected > 0 {
-        notes.push(format!(
-            "Selected high-effort Flate for {adaptive_flate_streams_selected} of {adaptive_flate_streams_tested} highly-compressible large stream(s), saving about {adaptive_flate_extra_savings} additional encoded bytes beyond level {flate_level}."
-        ));
-    }
-
-    let input_bytes = before.input_bytes;
-    let saved_bytes = signed_size_delta(input_bytes, output.len());
-    let saved_percent = savings_percent(saved_bytes, input_bytes);
-    let reachability_cache = document.reachability_cache_stats();
-    let report = OptimizationReport {
-        before,
-        after_bytes: output.len(),
-        saved_bytes,
-        saved_percent,
-        stage_timings_ms: timings,
-        reachability_queries: reachability_cache.queries,
-        reachability_rebuilds: reachability_cache.rebuilds,
-        reachability_cache_hits: reachability_cache.cache_hits,
-        reachability_edge_checks: reachability_cache.edge_checks,
-        reachability_edge_stable_reuses: reachability_cache.edge_stable_reuses,
-        privacy_items_removed: scrub.removed,
-        jpeg_metadata_bytes_removed: scrub.jpeg_metadata_bytes_removed,
-        jpeg_entropy_streams_considered: jpeg_entropy.streams_considered,
-        jpeg_entropy_streams_optimized: jpeg_entropy.streams_optimized,
-        jpeg_entropy_original_encoded_bytes: jpeg_entropy.original_encoded_bytes,
-        jpeg_entropy_optimized_encoded_bytes: jpeg_entropy.optimized_encoded_bytes,
-        hidden_text_items_removed: hidden_text.removed,
-        large_diagonal_text_objects_removed: large_diagonal_text.removed,
-        repeated_page_object_groups_removed: repeated_page_objects.groups_removed,
-        repeated_page_objects_removed: repeated_page_objects.objects_removed,
-        repeated_page_text_objects_removed: repeated_page_objects.text_objects_removed,
-        repeated_page_xobject_paints_removed: repeated_page_objects.xobject_paints_removed,
-        repeated_page_object_pages_rewritten: repeated_page_objects.pages_rewritten,
-        raster_hidden_text_items_pruned: physically_hidden_text
-            .removed
-            .saturating_add(raster_layout.shared_hidden_text_paints_pruned),
-        vector_pages_compacted: vector_compaction.pages_compacted,
-        vector_fill_groups_batched: vector_compaction.fill_groups_batched,
-        vector_covered_fills_pruned: vector_compaction.covered_fills_pruned,
-        vector_fill_paints_eliminated: vector_compaction.fill_paints_eliminated,
-        vector_decoded_bytes_removed: vector_compaction.decoded_bytes_removed,
-        vector_estimated_flate_bytes_saved: vector_compaction.estimated_flate_bytes_saved,
-        vector_path_forms_created: vector_compaction.path_forms_created,
-        vector_path_form_pages_rewritten: vector_compaction.path_form_pages_rewritten,
-        vector_path_form_occurrences_replaced: vector_compaction.path_form_occurrences_replaced,
-        vector_path_form_decoded_bytes_factored: vector_compaction.path_form_decoded_bytes_factored,
-        vector_path_form_estimated_flate_bytes_saved: vector_compaction
-            .path_form_estimated_flate_bytes_saved,
-        vector_transformed_forms_created: vector_compaction.transformed_forms_created,
-        vector_transformed_form_pages_rewritten: vector_compaction.transformed_form_pages_rewritten,
-        vector_transformed_form_occurrences_replaced: vector_compaction
-            .transformed_form_occurrences_replaced,
-        vector_transformed_form_operators_eliminated: vector_compaction
-            .transformed_form_operators_eliminated,
-        vector_transformed_form_estimated_flate_bytes_saved: vector_compaction
-            .transformed_form_estimated_flate_bytes_saved,
-        vector_shared_run_forms_created: vector_compaction.shared_run_forms_created,
-        vector_shared_run_pages_rewritten: vector_compaction.shared_run_pages_rewritten,
-        vector_shared_run_blocks_replaced: vector_compaction.shared_run_blocks_replaced,
-        vector_shared_run_decoded_bytes_factored: vector_compaction
-            .shared_run_decoded_bytes_factored,
-        vector_shared_run_estimated_flate_bytes_saved: vector_compaction
-            .shared_run_estimated_flate_bytes_saved,
-        repeated_clip_pages_rewritten: repeated_clips.pages_rewritten,
-        repeated_clip_runs_hoisted: repeated_clips.runs_hoisted,
-        repeated_clip_blocks_hoisted: repeated_clips.blocks_hoisted,
-        repeated_clip_decoded_bytes_removed: repeated_clips.decoded_bytes_removed,
-        repeated_clip_estimated_flate_bytes_saved: repeated_clips.estimated_flate_bytes_saved,
-        vector_path_coordinates_canonicalized: vector_compaction.path_coordinates_canonicalized,
-        vector_path_coordinate_pages_rewritten: vector_compaction.path_coordinate_pages_rewritten,
-        vector_path_coordinate_decoded_bytes_removed: vector_compaction
-            .path_coordinate_decoded_bytes_removed,
-        vector_path_coordinate_estimated_flate_bytes_saved: vector_compaction
-            .path_coordinate_estimated_flate_bytes_saved,
-        marked_content_pages_rewritten: marked_content.pages_rewritten,
-        marked_content_boundaries_coalesced: marked_content.boundaries_coalesced,
-        marked_content_decoded_bytes_removed: marked_content.decoded_bytes_removed,
-        marked_content_estimated_flate_bytes_saved: marked_content.estimated_flate_bytes_saved,
-        polyline_simplification_pages_rewritten: polyline_simplification.pages_rewritten,
-        polyline_simplification_vertices_removed: polyline_simplification.vertices_removed,
-        polyline_simplification_decoded_bytes_removed: polyline_simplification
-            .decoded_bytes_removed,
-        polyline_simplification_estimated_flate_bytes_saved: polyline_simplification
-            .estimated_flate_bytes_saved,
-        collinear_path_pages_rewritten: collinear_paths.pages_rewritten,
-        collinear_path_forms_rewritten: collinear_paths.forms_rewritten,
-        collinear_path_vertices_removed: collinear_paths.vertices_removed,
-        collinear_path_decoded_bytes_removed: collinear_paths.decoded_bytes_removed,
-        collinear_path_estimated_flate_bytes_saved: collinear_paths.estimated_flate_bytes_saved,
-        outlined_glyph_pages_rewritten: outlined_glyphs.pages_rewritten,
-        outlined_glyph_fonts_created: outlined_glyphs.fonts_created,
-        outlined_glyph_shapes_created: outlined_glyphs.glyphs_created,
-        outlined_glyph_occurrences_replaced: outlined_glyphs.occurrences_replaced,
-        outlined_glyph_source_paints_replaced: outlined_glyphs.source_paints_replaced,
-        outlined_glyph_decoded_bytes_removed: outlined_glyphs.decoded_bytes_removed,
-        outlined_glyph_estimated_flate_bytes_saved: outlined_glyphs.estimated_flate_bytes_saved,
-        paint_batch_pages_rewritten: paint_batch.pages_rewritten,
-        paint_batch_groups_created: paint_batch.groups_created,
-        paint_batch_source_paints_batched: paint_batch.source_paints_batched,
-        paint_batch_paints_eliminated: paint_batch.paints_eliminated,
-        stroke_form_pages_rewritten: stroke_forms.pages_rewritten,
-        stroke_forms_created: stroke_forms.forms_created,
-        stroke_form_occurrences_replaced: stroke_forms.occurrences_replaced,
-        stroke_form_decoded_bytes_factored: stroke_forms.decoded_bytes_factored,
-        stroke_form_estimated_flate_bytes_saved: stroke_forms.estimated_flate_bytes_saved,
-        metadata_duplicate_streams_detected: metadata_dedup.duplicate_streams_detected,
-        metadata_duplicate_raw_bytes: metadata_dedup.duplicate_raw_bytes,
-        metadata_references_canonicalized: metadata_dedup.references_canonicalized,
-        font_duplicate_streams_detected: font_dedup.duplicate_streams_detected,
-        font_duplicate_raw_bytes: font_dedup.duplicate_raw_bytes,
-        font_references_canonicalized: font_dedup.references_canonicalized,
-        font_duplicate_dictionaries_detected: font_object_dedup.duplicate_objects_detected,
-        font_dictionary_references_canonicalized: font_object_dedup.references_canonicalized,
-        extgstate_duplicate_dictionaries_detected: extgstate_object_dedup
-            .duplicate_objects_detected,
-        extgstate_dictionary_references_canonicalized: extgstate_object_dedup
-            .references_canonicalized,
-        structure_attribute_duplicate_dictionaries_detected: structure_attribute_dedup
-            .duplicate_objects_detected,
-        structure_attribute_references_canonicalized: structure_attribute_dedup
-            .references_canonicalized,
-        sampled_function_duplicate_streams_detected: sampled_function_dedup
-            .duplicate_streams_detected,
-        sampled_function_duplicate_raw_bytes: sampled_function_dedup.duplicate_raw_bytes,
-        sampled_function_references_canonicalized: sampled_function_dedup.references_canonicalized,
-        font_programs_rendering_optimized: font_rendering.programs_optimized,
-        font_rendering_original_encoded_bytes: font_rendering.original_encoded_bytes,
-        font_rendering_optimized_encoded_bytes: font_rendering.optimized_encoded_bytes,
-        font_rendering_decoded_table_bytes_removed: font_rendering.decoded_table_bytes_removed,
-        font_programs_glyph_subset: font_rendering.programs_glyph_subset,
-        font_glyph_subset_decoded_bytes_removed: font_rendering.glyph_subset_decoded_bytes_removed,
-        font_cid_cmaps_removed: font_cid_cmap_strip.cid_cmaps_removed,
-        font_cid_cmap_decoded_bytes_removed: font_cid_cmap_strip.cid_cmap_decoded_bytes_removed,
-        font_cid_cmap_original_encoded_bytes: font_cid_cmap_strip.original_encoded_bytes,
-        font_cid_cmap_optimized_encoded_bytes: font_cid_cmap_strip.optimized_encoded_bytes,
-        font_dense_programs_remapped: font_dense.programs_dense_remapped,
-        font_dense_cid_to_gid_maps_rewritten: font_dense.cid_to_gid_maps_rewritten,
-        font_dense_glyph_slots_removed: font_dense.dense_glyph_slots_removed,
-        font_dense_decoded_bytes_removed: font_dense.dense_decoded_bytes_removed,
-        font_dense_original_encoded_bytes: font_dense.original_encoded_bytes,
-        font_dense_optimized_encoded_bytes: font_dense.optimized_encoded_bytes,
-        to_unicode_duplicate_streams_detected: to_unicode_dedup.duplicate_streams_detected,
-        to_unicode_duplicate_raw_bytes: to_unicode_dedup.duplicate_raw_bytes,
-        to_unicode_references_canonicalized: to_unicode_dedup.references_canonicalized,
-        inline_image_fingerprints_selected: inline_image_dedup.fingerprints_selected,
-        inline_image_occurrences_externalized: inline_image_dedup.occurrences_externalized,
-        inline_image_xobjects_created: inline_image_dedup.xobjects_created,
-        inline_image_xobject_references_reused: inline_image_dedup.xobject_references_reused,
-        inline_image_duplicate_payload_bytes: inline_image_dedup.duplicate_payload_bytes,
-        image_duplicate_streams_detected: image_dedup.duplicate_streams_detected,
-        image_duplicate_raw_bytes: image_dedup.duplicate_raw_bytes,
-        image_references_canonicalized: image_dedup.references_canonicalized,
-        pattern_payload_groups_factored: pattern_payload_factor.groups_factored,
-        pattern_payload_patterns_rewritten: pattern_payload_factor.patterns_rewritten,
-        pattern_payload_forms_created: pattern_payload_factor.forms_created,
-        pattern_payload_duplicate_raw_bytes_factored: pattern_payload_factor
-            .duplicate_raw_bytes_factored,
-        form_metadata_payload_groups_factored: form_metadata_payload_factor.groups_factored,
-        form_metadata_payload_wrappers_rewritten: form_metadata_payload_factor.wrappers_rewritten,
-        form_metadata_payload_duplicate_raw_bytes_factored: form_metadata_payload_factor
-            .duplicate_raw_bytes_factored,
-        form_duplicate_streams_detected: form_dedup.duplicate_streams_detected,
-        form_duplicate_raw_bytes: form_dedup.duplicate_raw_bytes,
-        form_references_canonicalized: form_dedup.references_canonicalized,
-        appearance_duplicate_streams_detected: appearance_dedup.duplicate_streams_detected,
-        appearance_duplicate_raw_bytes: appearance_dedup.duplicate_raw_bytes,
-        appearance_references_canonicalized: appearance_dedup.references_canonicalized,
-        page_content_duplicate_streams_detected: page_content_dedup.duplicate_streams_detected,
-        page_content_duplicate_raw_bytes: page_content_dedup.duplicate_raw_bytes,
-        page_content_references_canonicalized: page_content_dedup.references_canonicalized,
-        type3_charproc_duplicate_streams_detected: type3_charproc_dedup.duplicate_streams_detected,
-        type3_charproc_duplicate_raw_bytes: type3_charproc_dedup.duplicate_raw_bytes,
-        type3_charproc_references_canonicalized: type3_charproc_dedup.references_canonicalized,
-        icc_duplicate_streams_detected: icc_dedup.duplicate_streams_detected,
-        icc_duplicate_raw_bytes: icc_dedup.duplicate_raw_bytes,
-        icc_references_canonicalized: icc_dedup.references_canonicalized,
-        icc_alternate_profiles_eligible: icc_alternate.profiles_eligible,
-        icc_alternate_profiles_elided: icc_alternate.profiles_elided,
-        icc_alternate_references_rewritten: icc_alternate.references_rewritten,
-        icc_alternate_encoded_bytes_elided: icc_alternate.encoded_profile_bytes_elided,
-        raster_images_transcoded: raster_transform.images_optimized,
-        raster_paper_indexed_images: raster_transform.paper_indexed_images,
-        raster_paper_indexed_layered_images: raster_transform.paper_indexed_layered_images,
-        raster_paper_indexed_residual_images: raster_transform.paper_indexed_residual_images,
-        raster_images_resized: raster_transform.images_resized,
-        raster_jpeg_images_resized: raster_transform.jpeg_images_resized,
-        raster_flate_images_resized: raster_transform.flate_images_resized,
-        raster_references_reused: raster_transform.references_reused,
-        raster_original_encoded_bytes: raster_transform.original_encoded_bytes,
-        raster_optimized_encoded_bytes: raster_transform.optimized_encoded_bytes,
-        raster_original_pixels: raster_transform.original_pixels,
-        raster_optimized_pixels: raster_transform.optimized_pixels,
-        raster_inline_fragmented_scopes_rewritten: raster_layout.inline.scopes_rewritten,
-        raster_inline_occurrences_externalized: raster_layout.inline.occurrences_externalized,
-        raster_pixel_clusters_reconstructed: raster_layout.pixel_clusters_reconstructed,
-        raster_pixel_paints_reconstructed: raster_layout.pixel_paints_reconstructed,
-        raster_native_fragment_groups_reconstructed: raster_layout
-            .native_fragment_groups_reconstructed,
-        raster_native_fragment_paints_reconstructed: raster_layout
-            .native_fragment_paints_reconstructed,
-        raster_stripe_groups_merged: raster_layout.stripe_groups_merged,
-        raster_stripe_paints_merged: raster_layout.stripe_paints_merged,
-        raster_masks_baked: raster_layout.masks_baked,
-        raster_transparent_paints_pruned: raster_layout.transparent_paints_pruned,
-        raster_occluded_paints_pruned: raster_layout.occluded_raster_paints_pruned,
-        raster_transparent_margins_cropped: raster_layout.transparent_margins_cropped,
-        raster_background_margins_cropped: raster_layout.background_margins_cropped,
-        raster_cropped_pixels_removed: raster_layout.cropped_pixels_removed,
-        raster_binary_images_packed: raster_layout.binary_images_packed,
-        raster_binary_masks_packed: raster_layout.binary_masks_packed,
-        raster_stencil_images_emitted: raster_layout.stencil_images_emitted,
-        raster_constant_color_mask_stencils_emitted: raster_layout
-            .constant_color_mask_stencils_emitted,
-        raster_relaxed_stencil_images_emitted: raster_layout.relaxed_stencil_images_emitted,
-        raster_bilevel_ccitt_images_emitted: raster_layout.bilevel_ccitt_images_emitted,
-        raster_bilevel_flate_images_emitted: raster_layout.bilevel_flate_images_emitted,
-        exact_raster_rendering: cfg.raster_layout.exact_raster_rendering,
-        raster_binary_image_encoded_bytes_saved: raster_layout.binary_image_encoded_bytes_saved,
-        raster_deferred_tile_candidates: raster_layout.deferred_tile_candidates,
-        raster_deferred_tile_paints_consumed: raster_layout.deferred_tile_paints_consumed,
-        raster_staging_xobject_entries_removed: raster_layout.staging_xobject_entries_removed,
-        raster_inline_reconstruction_payload_rejections: raster_layout
-            .inline_reconstruction_payload_rejections,
-        raster_rewritten_xobject_entries_removed: raster_layout.rewritten_xobject_entries_removed,
-        resource_entries_pruned: resource_prune.entries_removed,
-        resource_font_entries_pruned: resource_prune.font_entries_removed,
-        resource_xobject_entries_pruned: resource_prune.xobject_entries_removed,
-        resource_ext_gstate_entries_pruned: resource_prune.ext_gstate_entries_removed,
-        resource_pattern_entries_pruned: resource_prune.pattern_entries_removed,
-        resource_properties_entries_pruned: resource_prune.properties_entries_removed,
-        resource_shading_entries_pruned: resource_prune.shading_entries_removed,
-        page_tree_nodes_before: structure_compaction.page_tree_nodes_before,
-        page_tree_nodes_after: structure_compaction.page_tree_nodes_after,
-        page_tree_nodes_removed: structure_compaction.page_tree_nodes_removed,
-        page_tree_pages_reparented: structure_compaction.page_tree_pages_reparented,
-        shadowed_page_tree_inherited_entries_removed: structure_compaction
-            .shadowed_page_tree_inherited_entries_removed,
-        name_trees_repacked: structure_compaction.name_trees_repacked,
-        name_tree_nodes_before: structure_compaction.name_tree_nodes_before,
-        name_tree_nodes_after: structure_compaction.name_tree_nodes_after,
-        name_tree_nodes_removed: structure_compaction.name_tree_nodes_removed,
-        named_destination_wrappers_inlined: structure_compaction.named_destination_wrappers_inlined,
-        named_destination_arrays_inlined: structure_compaction.named_destination_arrays_inlined,
-        stale_page_destination_references_rewritten: structure_compaction
-            .stale_page_destination_references_rewritten,
-        microstroke_pages_rasterized: microstroke_raster.pages_rewritten,
-        microstroke_runs_rasterized: microstroke_raster.runs_rasterized,
-        microstroke_strokes_rasterized: microstroke_raster.strokes_rasterized,
-        microstroke_image_payload_bytes: microstroke_raster.image_payload_bytes,
-        microstroke_ccitt_images: microstroke_raster.ccitt_images,
-        microstroke_flate_images: microstroke_raster.flate_images,
-        microstroke_estimated_flate_bytes_saved: microstroke_raster.estimated_flate_bytes_saved,
-        print_images_placed: print_plan.stats.images_placed,
-        print_image_uses: print_plan.stats.image_uses,
-        print_geometry_complete: print_plan.stats.geometry_complete,
-        print_downsample_candidates: print_plan.stats.downsample_candidates,
-        print_existing_jpeg_resize_candidates: print_plan.stats.existing_jpeg_resize_candidates,
-        print_flate_resize_candidates: print_plan.stats.flate_resize_candidates,
-        print_source_pixels: print_plan.stats.source_pixels,
-        print_target_pixels: print_plan.stats.target_pixels,
-        flate_streams_selected_for_recompression: flate.streams_selected,
-        flate_estimated_savings_bytes: flate.estimated_savings_bytes,
-        flate_high_effort_streams_tested: adaptive_flate_streams_tested,
-        flate_high_effort_streams_selected: adaptive_flate_streams_selected,
-        flate_high_effort_extra_savings_bytes: adaptive_flate_extra_savings,
-        preservation_pages: preservation.pages,
-        preservation_annotation_entries_seen: preservation.annotation_entries_seen,
-        preservation_annotation_entries_flattened: preservation.annotation_entries_flattened,
-        preservation_annotation_entries_dropped_unflattened: preservation
-            .annotation_entries_dropped_unflattened,
-        preservation_link_visual_shells_retained: preservation.link_visual_shells_retained,
-        preservation_annotation_subtypes_seen: preservation.annotation_subtypes_seen,
-        preservation_unflattened_annotation_subtypes: preservation.unflattened_annotation_subtypes,
-        preservation_dropped_page_keys: preservation.dropped_page_keys,
-        preservation_dropped_page_tree_keys: preservation.dropped_page_tree_keys,
-        preservation_dropped_catalog_keys: preservation.dropped_catalog_keys,
-        preservation_dropped_authoring_keys: preservation.dropped_authoring_keys,
-        preservation_spliced_unknown_wrapper_keys: preservation.spliced_unknown_wrapper_keys,
-        notes,
+    let run_stats = OptimizationRunStats {
+        preservation_fast_path,
+        preservation,
+        hidden_text,
+        large_diagonal_text,
+        scrub,
+        font_rendering,
+        metadata_dedup,
+        font_dedup,
+        font_dense,
+        to_unicode_dedup,
+        font_object_dedup,
+        sampled_function_dedup,
+        extgstate_object_dedup,
+        structure_attribute_dedup,
+        icc_dedup,
+        icc_alternate,
+        raster_layout,
+        physically_hidden_text,
+        inline_image_dedup,
+        jpeg_entropy,
+        image_dedup,
+        pattern_payload_factor,
+        form_dedup,
+        form_metadata_payload_factor,
+        appearance_dedup,
+        type3_charproc_dedup,
+        repeated_page_objects,
+        print_plan,
+        print_plan_error,
+        raster_transform,
+        repeated_clips,
+        vector_compaction,
+        marked_content,
+        collinear_paths,
+        outlined_glyphs,
+        paint_batch,
+        stroke_forms,
+        polyline_simplification,
+        resource_prune,
+        microstroke_raster,
+        flate,
+        page_content_dedup,
+        structure_compaction,
+        unfiltered_flate,
+        font_cid_cmap_strip,
     };
+    let report = run_stats.into_report(&document, cfg, before, output.len(), timings);
     Ok((output, report))
 }
 

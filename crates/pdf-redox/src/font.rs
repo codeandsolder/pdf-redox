@@ -3,11 +3,15 @@ use crate::stream_codec::{
 };
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    StreamData, content::decoded_content_value, source::CurrentObject,
+    StreamData,
+    content::decoded_content_value,
+    direct_object::{
+        DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
+        walk_direct_output_objects,
+    },
+    source::CurrentObject,
 };
-use hayro_syntax::object::{
-    Dict as HayroDict, MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject,
-};
+use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -454,6 +458,7 @@ struct SparseCidUnionCandidate {
 )]
 fn union_sparse_cid_font_programs(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     program_usage: &HashMap<CowObjectHandle, FontProgramUsage>,
     program_descriptors: &HashMap<CowObjectHandle, Vec<CowObjectHandle>>,
@@ -549,7 +554,8 @@ fn union_sparse_cid_font_programs(
 
     // Only pay the page-content glyph-usage scan after proving that at least
     // one 2+ program rendering-skeleton group exists.
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
+    let (identity_glyph_usage, _) =
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?;
     let incoming_references = incoming_reference_owners(document)?;
 
     let mut stats = FontOptimizationStats::default();
@@ -1708,11 +1714,12 @@ pub struct FontGlyphUsageHints {
 
 fn font_glyph_usage_with_hints(
     document: &EditDocument,
+    pages: &[CowObjectHandle],
     hints: FontGlyphUsageHints,
 ) -> Result<FontGlyphUsage> {
     let mut usage = FontUsageAccumulator::default();
 
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
             continue;
         };
@@ -1806,68 +1813,8 @@ fn font_glyph_usage_with_hints(
 
 #[cfg(test)]
 fn font_glyph_usage(document: &EditDocument) -> Result<FontGlyphUsage> {
-    font_glyph_usage_with_hints(document, FontGlyphUsageHints::default())
-}
-
-fn inspect_source_font_dictionary(
-    holder: CowObjectHandle,
-    dictionary: &HayroDict<'_>,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    descriptor_program_edges: &mut Vec<(CowObjectHandle, CowObjectHandle)>,
-) {
-    if let Some(descriptor) = dictionary.get_ref(b"FontDescriptor") {
-        let subtype = dictionary.get::<HayroName<'_>>(b"Subtype");
-        let usage = FontProgramUsage::from_subtype(subtype.as_ref().map(AsRef::<[u8]>::as_ref));
-        if usage != FontProgramUsage::default() {
-            descriptor_usage_edges.push((CowObjectHandle::Existing(descriptor.into()), usage));
-        }
-    }
-
-    for key in FONT_FILE_KEYS {
-        if let Some(program) = dictionary.get_ref(key) {
-            descriptor_program_edges.push((holder, CowObjectHandle::Existing(program.into())));
-        }
-    }
-}
-
-fn inspect_owned_font_dictionary(
-    document: &EditDocument,
-    holder: CowObjectHandle,
-    dictionary: &OwnedDictionary,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    descriptor_program_edges: &mut Vec<(CowObjectHandle, CowObjectHandle)>,
-) -> Result<()> {
-    if let Some(descriptor) = direct_owned_reference(dictionary.get(b"FontDescriptor".as_slice())) {
-        let usage =
-            match owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref() {
-                Some(b"TrueType") => FontProgramUsage {
-                    simple_truetype: true,
-                    cidfont_type2: false,
-                    cidfont_type0: false,
-                },
-                Some(b"CIDFontType2") => FontProgramUsage {
-                    simple_truetype: false,
-                    cidfont_type2: true,
-                    cidfont_type0: false,
-                },
-                Some(b"CIDFontType0") => FontProgramUsage {
-                    simple_truetype: false,
-                    cidfont_type2: false,
-                    cidfont_type0: true,
-                },
-                _ => FontProgramUsage::default(),
-            };
-        if usage != FontProgramUsage::default() {
-            descriptor_usage_edges.push((descriptor, usage));
-        }
-    }
-
-    for key in FONT_FILE_KEYS {
-        if let Some(program) = direct_owned_reference(dictionary.get(key)) {
-            descriptor_program_edges.push((holder, program));
-        }
-    }
-    Ok(())
+    let pages = document.page_handles()?;
+    font_glyph_usage_with_hints(document, &pages, FontGlyphUsageHints::default())
 }
 
 fn merge_program_usage(
@@ -1878,270 +1825,86 @@ fn merge_program_usage(
     program_usage.entry(program).or_default().merge(usage);
 }
 
-fn source_dictionary_font_usage(dictionary: &HayroDict<'_>) -> FontProgramUsage {
-    FontProgramUsage::from_subtype(
-        dictionary
-            .get::<HayroName<'_>>(b"Subtype")
-            .as_ref()
-            .map(AsRef::<[u8]>::as_ref),
-    )
-}
-
-fn record_source_dense_cid_program_user(
+fn direct_dictionary_font_usage(
     document: &EditDocument,
-    dictionary: &HayroDict<'_>,
-    users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
-) -> Result<()> {
-    if !source_dictionary_font_usage(dictionary).cidfont_type2 {
-        return Ok(());
-    }
-    let mut program = None;
-    for (name, value) in dictionary.entries() {
-        if name.as_ref() != b"FontDescriptor" {
-            continue;
-        }
-        program = match value {
-            HayroMaybeRef::Ref(descriptor) => {
-                let handle = CowObjectHandle::Existing(descriptor.into());
-                document
-                    .current_owned_object(handle)?
-                    .and_then(|object| object.as_dictionary().cloned())
-                    .and_then(|descriptor| {
-                        direct_owned_reference(descriptor.get(b"FontFile2".as_slice()))
-                    })
-            }
-            HayroMaybeRef::NotRef(HayroObject::Dict(descriptor)) => descriptor
-                .get_ref(b"FontFile2")
-                .map(|program| CowObjectHandle::Existing(program.into())),
-            HayroMaybeRef::NotRef(_) => None,
-        };
-        break;
-    }
-    let Some(program) = program else {
-        return Ok(());
-    };
-    let entry = users.entry(program).or_default();
-    let Some(map) = dictionary.get_ref(b"CIDToGIDMap") else {
-        entry.unsafe_mapping = true;
-        return Ok(());
-    };
-    let map = CowObjectHandle::Existing(map.into());
-    if document
-        .current_object(map)?
-        .is_some_and(|object| object.is_stream())
-    {
-        entry.maps.insert(map);
-    } else {
-        entry.unsafe_mapping = true;
-    }
-    Ok(())
-}
-
-fn inspect_source_direct_font_dictionary(
-    document: &EditDocument,
-    dictionary: &HayroDict<'_>,
-    program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
-) -> Result<()> {
-    record_source_dense_cid_program_user(document, dictionary, dense_users)?;
-    let usage = source_dictionary_font_usage(dictionary);
-    if usage != FontProgramUsage::default() {
-        for (name, value) in dictionary.entries() {
-            if name.as_ref() != b"FontDescriptor" {
-                continue;
-            }
-            match value {
-                HayroMaybeRef::Ref(descriptor) => {
-                    descriptor_usage_edges
-                        .push((CowObjectHandle::Existing(descriptor.into()), usage));
-                }
-                HayroMaybeRef::NotRef(HayroObject::Dict(descriptor)) => {
-                    for key in FONT_FILE_KEYS {
-                        if let Some(program) = descriptor.get_ref(key) {
-                            merge_program_usage(
-                                program_usage,
-                                CowObjectHandle::Existing(program.into()),
-                                usage,
-                            );
-                        }
-                    }
-                }
-                HayroMaybeRef::NotRef(_) => {}
-            }
-            break;
-        }
-    }
-
-    for (_, value) in dictionary.entries() {
-        let HayroMaybeRef::NotRef(value) = value else {
-            continue;
-        };
-        inspect_source_direct_font_object(
-            document,
-            &value,
-            program_usage,
-            descriptor_usage_edges,
-            dense_users,
-        )?;
-    }
-    Ok(())
-}
-
-fn inspect_source_direct_font_object(
-    document: &EditDocument,
-    object: &HayroObject<'_>,
-    program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
-) -> Result<()> {
-    match object {
-        HayroObject::Dict(dictionary) => {
-            inspect_source_direct_font_dictionary(
-                document,
-                dictionary,
-                program_usage,
-                descriptor_usage_edges,
-                dense_users,
-            )?;
-        }
-        HayroObject::Stream(stream) => {
-            inspect_source_direct_font_dictionary(
-                document,
-                stream.dict(),
-                program_usage,
-                descriptor_usage_edges,
-                dense_users,
-            )?;
-        }
-        HayroObject::Array(array) => {
-            for value in array.raw_iter() {
-                let HayroMaybeRef::NotRef(value) = value else {
-                    continue;
-                };
-                inspect_source_direct_font_object(
-                    document,
-                    &value,
-                    program_usage,
-                    descriptor_usage_edges,
-                    dense_users,
-                )?;
-            }
-        }
-        HayroObject::Null(_)
-        | HayroObject::Boolean(_)
-        | HayroObject::Number(_)
-        | HayroObject::String(_)
-        | HayroObject::Name(_) => {}
-    }
-    Ok(())
-}
-
-fn owned_dictionary_font_usage(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
+    dictionary: DirectDictionaryView<'_, '_>,
 ) -> Result<FontProgramUsage> {
-    let subtype = owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?;
+    let subtype = dictionary.resolved_name(document, b"Subtype")?;
     Ok(FontProgramUsage::from_subtype(subtype.as_deref()))
 }
 
-fn inspect_owned_direct_font_dictionary(
+fn direct_dictionary_descriptor_program_ref(
     document: &EditDocument,
-    dictionary: &OwnedDictionary,
-    program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
-) -> Result<()> {
-    let usage = owned_dictionary_font_usage(document, dictionary)?;
-    if usage.cidfont_type2
-        && let Some(program) =
-            descriptor_program_ref(document, dictionary.get(b"FontDescriptor".as_slice()))?
-    {
-        let entry = dense_users.entry(program).or_default();
-        match dictionary.get(b"CIDToGIDMap".as_slice()) {
-            Some(OwnedObject::Reference(map))
-                if document
-                    .current_object(*map)?
-                    .is_some_and(|object| object.is_stream()) =>
-            {
-                entry.maps.insert(*map);
-            }
-            _ => entry.unsafe_mapping = true,
-        }
+    dictionary: DirectDictionaryView<'_, '_>,
+    key: &[u8],
+) -> Result<Option<CowObjectHandle>> {
+    if let Some(descriptor) = dictionary.reference(b"FontDescriptor") {
+        let descriptor = OwnedObject::Reference(descriptor);
+        return descriptor_program_ref_for(document, Some(&descriptor), key);
     }
-    if usage != FontProgramUsage::default()
-        && let Some(descriptor) = dictionary.get(b"FontDescriptor".as_slice())
-    {
-        match descriptor {
-            OwnedObject::Reference(descriptor) => {
-                descriptor_usage_edges.push((*descriptor, usage));
+    Ok(dictionary.direct_dictionary_reference(b"FontDescriptor", key))
+}
+
+struct FontUsageGraphVisitor<'a> {
+    program_usage: &'a mut HashMap<CowObjectHandle, FontProgramUsage>,
+    descriptor_usage_edges: &'a mut Vec<(CowObjectHandle, FontProgramUsage)>,
+    descriptor_program_edges: &'a mut Vec<(CowObjectHandle, CowObjectHandle)>,
+    dense_users: &'a mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
+}
+
+impl DirectObjectVisitor for FontUsageGraphVisitor<'_> {
+    fn visit_dictionary(
+        &mut self,
+        document: &EditDocument,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        // Only an indirect root itself can own a descriptor program. Direct
+        // dictionaries nested below it are inspected for font semantics but do
+        // not acquire the root handle as their own identity.
+        if path.is_empty() {
+            for key in FONT_FILE_KEYS {
+                if let Some(program) = dictionary.reference(key) {
+                    self.descriptor_program_edges.push((root, program));
+                }
             }
-            OwnedObject::Dictionary(descriptor) => {
+        }
+
+        let usage = direct_dictionary_font_usage(document, dictionary)?;
+        if usage.cidfont_type2
+            && let Some(program) =
+                direct_dictionary_descriptor_program_ref(document, dictionary, b"FontFile2")?
+        {
+            let entry = self.dense_users.entry(program).or_default();
+            match dictionary.reference(b"CIDToGIDMap") {
+                Some(map)
+                    if document
+                        .current_object(map)?
+                        .is_some_and(|object| object.is_stream()) =>
+                {
+                    entry.maps.insert(map);
+                }
+                _ => entry.unsafe_mapping = true,
+            }
+        }
+
+        if usage != FontProgramUsage::default() {
+            if let Some(descriptor) = dictionary.reference(b"FontDescriptor") {
+                self.descriptor_usage_edges.push((descriptor, usage));
+            } else {
                 for key in FONT_FILE_KEYS {
-                    if let Some(program) = direct_owned_reference(descriptor.get(key)) {
-                        merge_program_usage(program_usage, program, usage);
+                    if let Some(program) =
+                        dictionary.direct_dictionary_reference(b"FontDescriptor", key)
+                    {
+                        merge_program_usage(self.program_usage, program, usage);
                     }
                 }
             }
-            _ => {}
         }
-    }
 
-    for value in dictionary.values() {
-        if matches!(value, OwnedObject::Reference(_)) {
-            continue;
-        }
-        inspect_owned_direct_font_object(
-            document,
-            value,
-            program_usage,
-            descriptor_usage_edges,
-            dense_users,
-        )?;
+        Ok(DirectWalkControl::Descend)
     }
-    Ok(())
-}
-
-fn inspect_owned_direct_font_object(
-    document: &EditDocument,
-    object: &OwnedObject,
-    program_usage: &mut HashMap<CowObjectHandle, FontProgramUsage>,
-    descriptor_usage_edges: &mut Vec<(CowObjectHandle, FontProgramUsage)>,
-    dense_users: &mut HashMap<CowObjectHandle, DenseCidProgramUsers>,
-) -> Result<()> {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            inspect_owned_direct_font_dictionary(
-                document,
-                dictionary,
-                program_usage,
-                descriptor_usage_edges,
-                dense_users,
-            )?;
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                inspect_owned_direct_font_object(
-                    document,
-                    value,
-                    program_usage,
-                    descriptor_usage_edges,
-                    dense_users,
-                )?;
-            }
-        }
-        OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_)
-        | OwnedObject::Reference(_) => {}
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -2176,50 +1939,15 @@ impl FontUsageGraph {
 pub fn collect_font_usage_graph(document: &EditDocument) -> Result<FontUsageGraph> {
     let mut descriptor_usage_edges = Vec::new();
     let mut graph = FontUsageGraph::default();
-    document.walk_output_objects(|handle, object| match object {
-        CurrentObject::Source(object) => {
-            match &object {
-                HayroObject::Dict(dictionary) => inspect_source_font_dictionary(
-                    handle,
-                    dictionary,
-                    &mut descriptor_usage_edges,
-                    &mut graph.descriptor_program_edges,
-                ),
-                HayroObject::Stream(stream) => inspect_source_font_dictionary(
-                    handle,
-                    stream.dict(),
-                    &mut descriptor_usage_edges,
-                    &mut graph.descriptor_program_edges,
-                ),
-                _ => {}
-            }
-            inspect_source_direct_font_object(
-                document,
-                &object,
-                &mut graph.direct_program_usage,
-                &mut descriptor_usage_edges,
-                &mut graph.dense_cid_program_users,
-            )
-        }
-        CurrentObject::Owned(object) => {
-            if let Some(dictionary) = object.as_dictionary() {
-                inspect_owned_font_dictionary(
-                    document,
-                    handle,
-                    dictionary,
-                    &mut descriptor_usage_edges,
-                    &mut graph.descriptor_program_edges,
-                )?;
-            }
-            inspect_owned_direct_font_object(
-                document,
-                object,
-                &mut graph.direct_program_usage,
-                &mut descriptor_usage_edges,
-                &mut graph.dense_cid_program_users,
-            )
-        }
-    })?;
+    walk_direct_output_objects(
+        document,
+        &mut FontUsageGraphVisitor {
+            program_usage: &mut graph.direct_program_usage,
+            descriptor_usage_edges: &mut descriptor_usage_edges,
+            descriptor_program_edges: &mut graph.descriptor_program_edges,
+            dense_users: &mut graph.dense_cid_program_users,
+        },
+    )?;
     for (descriptor, usage) in descriptor_usage_edges {
         graph
             .descriptor_usage
@@ -2581,6 +2309,7 @@ fn dense_compact_cidfont_type2_programs_with_usage(
 /// deduplication has already canonicalized byte-identical stripped subsets.
 pub fn union_sparse_cid_font_programs_after_dedup(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
     glyph_usage_hints: FontGlyphUsageHints,
@@ -2614,6 +2343,7 @@ pub fn union_sparse_cid_font_programs_after_dedup(
 
     union_sparse_cid_font_programs(
         document,
+        pages,
         flate_level,
         &program_usage,
         &program_descriptors,
@@ -2919,54 +2649,68 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 /// the same final Flate size gate. If neither backend can produce a smaller
 /// stream for any live program, the authoritative ownership/subtype graph
 /// cannot make an outline rewrite possible and may be skipped entirely.
-pub fn has_profitable_font_outline_subset_candidate(
+#[derive(Debug)]
+pub struct FontOutlineSubsetProbe {
+    identity_glyph_usage: IdentityGlyphUsage,
+}
+
+pub fn probe_profitable_font_outline_subset(
     document: &EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     glyph_usage_hints: FontGlyphUsageHints,
-) -> Result<bool> {
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
-    for (program, gids) in identity_glyph_usage {
-        if gids.is_empty() {
-            continue;
-        }
-        let Some(OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(program)?
-        else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Filter".as_slice())
-            || !is_unfiltered_or_lone_flate(document, &dictionary)?
-        {
-            continue;
-        }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
-            continue;
-        };
-        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-        let subsets = [
-            crate::cff_cid::subset_cid_font(&candidate, &gids),
-            sfnt_blank_unused_glyph_outlines(&candidate, &gids),
-        ];
-        for (mut subset, _) in subsets.into_iter().flatten() {
-            if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
-                subset = trimmed;
+) -> Result<Option<FontOutlineSubsetProbe>> {
+    let (identity_glyph_usage, _) =
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?;
+    let profitable = 'programs: {
+        for (program, gids) in &identity_glyph_usage {
+            if gids.is_empty() {
+                continue;
             }
-            let Ok(encoded) = encode_flate(&subset, flate_level) else {
+            let Some(OwnedObject::Stream { dictionary, data }) =
+                document.current_owned_object(*program)?
+            else {
                 continue;
             };
-            if encoded.len() < raw.len() {
-                return Ok(true);
+            if !dictionary.contains_key(b"Filter".as_slice())
+                || !is_unfiltered_or_lone_flate(document, &dictionary)?
+            {
+                continue;
+            }
+            let raw = data.bytes(document.source())?;
+            let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+                continue;
+            };
+            let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+            let subsets = [
+                crate::cff_cid::subset_cid_font(&candidate, gids),
+                sfnt_blank_unused_glyph_outlines(&candidate, gids),
+            ];
+            for (mut subset, _) in subsets.into_iter().flatten() {
+                if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
+                    subset = trimmed;
+                }
+                let Ok(encoded) = encode_flate(&subset, flate_level) else {
+                    continue;
+                };
+                if encoded.len() < raw.len() {
+                    break 'programs true;
+                }
             }
         }
-    }
-    Ok(false)
+        false
+    };
+    Ok(profitable.then_some(FontOutlineSubsetProbe {
+        identity_glyph_usage,
+    }))
 }
 
 pub fn subset_font_outlines_after_dedup(
     document: &mut EditDocument,
+    pages: &[CowObjectHandle],
     flate_level: crate::FlateLevel,
     graph: &FontUsageGraph,
+    pre_scanned: Option<FontOutlineSubsetProbe>,
     glyph_usage_hints: FontGlyphUsageHints,
 ) -> Result<FontOptimizationStats> {
     let program_usage = graph.indirect_program_usage();
@@ -2974,7 +2718,11 @@ pub fn subset_font_outlines_after_dedup(
         return Ok(FontOptimizationStats::default());
     }
 
-    let (identity_glyph_usage, _) = font_glyph_usage_with_hints(document, glyph_usage_hints)?;
+    let identity_glyph_usage = if let Some(pre_scanned) = pre_scanned {
+        pre_scanned.identity_glyph_usage
+    } else {
+        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?.0
+    };
     if identity_glyph_usage.is_empty() {
         return Ok(FontOptimizationStats::default());
     }
@@ -3873,8 +3621,10 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_tiling_patterns() -> Result<()> {
         let document = EditDocument::from_bytes(pattern_font_usage_fixture())?;
+        let pages = document.page_handles()?;
         let (identity, winansi) = font_glyph_usage_with_hints(
             &document,
+            &pages,
             FontGlyphUsageHints {
                 no_type3_font_scopes: true,
                 ..FontGlyphUsageHints::default()
@@ -3889,8 +3639,10 @@ mod tests {
     #[test]
     fn glyph_usage_scans_text_inside_type3_charprocs() -> Result<()> {
         let document = EditDocument::from_bytes(type3_font_usage_fixture(true))?;
+        let pages = document.page_handles()?;
         let (identity, winansi) = font_glyph_usage_with_hints(
             &document,
+            &pages,
             FontGlyphUsageHints {
                 no_tiling_pattern_scopes: true,
                 ..FontGlyphUsageHints::default()
@@ -4386,23 +4138,32 @@ mod tests {
         use write_fonts::read::{FontRef, TableProvider};
 
         let mut document = EditDocument::from_bytes(identity_cid_outline_fixture()?)?;
-        assert!(has_profitable_font_outline_subset_candidate(
-            &document,
-            crate::FlateLevel::SIZE,
-            FontGlyphUsageHints::default(),
-        )?);
+        let pages = document.page_handles()?;
+        assert!(
+            probe_profitable_font_outline_subset(
+                &document,
+                &pages,
+                crate::FlateLevel::SIZE,
+                FontGlyphUsageHints::default(),
+            )?
+            .is_some()
+        );
         let stripped = strip_font_editing_tables(&mut document, crate::FlateLevel::SIZE)?;
         assert_eq!(stripped.programs_glyph_subset, 0);
-        assert!(has_profitable_font_outline_subset_candidate(
+        let probe = probe_profitable_font_outline_subset(
             &document,
+            &pages,
             crate::FlateLevel::SIZE,
             FontGlyphUsageHints::default(),
-        )?);
+        )?
+        .ok_or_else(|| Error::Invalid("outline subset probe should find a candidate".to_owned()))?;
         let graph = collect_font_usage_graph(&document)?;
         let first = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            Some(probe),
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(first.programs_optimized, 1);
@@ -4429,16 +4190,23 @@ mod tests {
 
         let output = document.write_compact()?;
         let mut reparsed = EditDocument::from_bytes(output)?;
+        let reparsed_pages = reparsed.page_handles()?;
         let graph = collect_font_usage_graph(&reparsed)?;
-        assert!(!has_profitable_font_outline_subset_candidate(
-            &reparsed,
-            crate::FlateLevel::SIZE,
-            FontGlyphUsageHints::default(),
-        )?);
+        assert!(
+            probe_profitable_font_outline_subset(
+                &reparsed,
+                &reparsed_pages,
+                crate::FlateLevel::SIZE,
+                FontGlyphUsageHints::default(),
+            )?
+            .is_none()
+        );
         let second = subset_font_outlines_after_dedup(
             &mut reparsed,
+            &reparsed_pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(second.programs_optimized, 0);
@@ -4572,10 +4340,13 @@ mod tests {
             .ok_or_else(|| Error::Invalid("deduplicated font program is missing".to_owned()))?;
 
         let graph = collect_font_usage_graph(&document)?;
+        let pages = document.page_handles()?;
         let subset = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         assert_eq!(subset.programs_glyph_subset, 1);
@@ -4625,8 +4396,10 @@ mod tests {
         let dedup = crate::dedup::canonicalize_font_program_streams(&mut document)?;
         assert_eq!(dedup.duplicate_streams_detected, 0);
         let graph = collect_font_usage_graph(&document)?;
+        let pages = document.page_handles()?;
         let union = union_sparse_cid_font_programs_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
             FontGlyphUsageHints::default(),
@@ -4651,8 +4424,10 @@ mod tests {
 
         let _ = subset_font_outlines_after_dedup(
             &mut document,
+            &pages,
             crate::FlateLevel::SIZE,
             &graph,
+            None,
             FontGlyphUsageHints::default(),
         )?;
         let decoded = document.decoded_stream_data(program)?;

@@ -534,12 +534,13 @@ fn cow_image_resize_safe(
 
 pub fn plan_print_downsampling(
     document: &crate::EditDocument,
+    pages: &[crate::ObjectHandle],
     target_ppi: u32,
 ) -> Result<PrintPlanHayro> {
     let mut placements = HashMap::new();
     let mut direct_page_bindings = HashSet::new();
     let mut complete = true;
-    for page in document.page_handles()? {
+    for &page in pages {
         let resources = document.inherited_page_value(page, b"Resources")?;
         let (xobjects, scope_complete) = cow_xobjects(document, resources)?;
         if !scope_complete {

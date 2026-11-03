@@ -1,10 +1,11 @@
+use crate::ext_gstate::ext_gstate_semantics;
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster},
     content::{
         decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
-        replace_page_content, resolved_bool_value, resolved_dictionary, resolved_number_value,
+        replace_page_content, resolved_dictionary,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -920,101 +921,27 @@ fn replacement_bytes(name: &[u8], run: &MicroStrokeRun, raster: &RasterizedRun) 
     out
 }
 
-fn compressed_len(data: &[u8], flate_level: crate::FlateLevel) -> Result<usize> {
-    Ok(crate::stream_codec::encode_flate(data, flate_level)?.len())
-}
-
-fn apply_replacements(input: &[u8], replacements: &[(usize, usize, Vec<u8>)]) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut out = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || end > input.len() || start > end {
-            return None;
-        }
-        out.extend_from_slice(&input[cursor..start]);
-        out.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    out.extend_from_slice(&input[cursor..]);
-    Some(out)
-}
-
-fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(Some(resolved_number_value(document, value)?.is_some_and(
-        |value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12,
-    )))
-}
-
-fn disabled_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(Some(resolved_bool_value(document, value)? == Some(false)))
-}
-
 fn ext_gstate_patches(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStatePatch>> {
-    const SUPPORTED_EXT_GSTATE_KEYS: &[&[u8]] = &[
-        b"Type", b"CA", b"ca", b"BM", b"SMask", b"OP", b"op", b"OPM", b"AIS", b"SA",
-    ];
-    let Some(states) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let mut out = BTreeMap::new();
-    for (name, value) in states {
-        let Some(state) = resolved_dictionary(document, Some(&value))? else {
-            continue;
-        };
-        let normal_blend = match state.get(b"BM".as_slice()) {
-            None => None,
-            Some(value) => Some(matches!(
-                document.resolve_owned_value(value)?,
-                Some(OwnedObject::Name(name)) if name == b"Normal"
-            )),
-        };
-        let no_soft_mask = match state.get(b"SMask".as_slice()) {
-            None => None,
-            Some(value) => Some(matches!(
-                document.resolve_owned_value(value)?,
-                Some(OwnedObject::Name(name)) if name == b"None"
-            )),
-        };
-        let supported_keys = state
-            .keys()
-            .all(|key| SUPPORTED_EXT_GSTATE_KEYS.contains(&key.as_slice()));
-        let alpha_is_shape_safe = match state.get(b"AIS".as_slice()) {
-            None => true,
-            Some(value) => resolved_bool_value(document, value)? == Some(false),
-        };
-        // Stroke adjustment is a device-space rendering hint. Either boolean value is
-        // acceptable here because this pass is explicitly freezing the vector field into
-        // a raster representation; reject only malformed/non-boolean values.
-        let stroke_adjust_supported = match state.get(b"SA".as_slice()) {
-            None => true,
-            Some(value) => resolved_bool_value(document, value)?.is_some(),
-        };
-        out.insert(
-            name,
-            ExtGStatePatch {
-                supported: supported_keys && alpha_is_shape_safe && stroke_adjust_supported,
-                stroke_alpha_opaque: opaque_number(document, state.get(b"CA".as_slice()))?,
-                fill_alpha_opaque: opaque_number(document, state.get(b"ca".as_slice()))?,
-                normal_blend,
-                no_soft_mask,
-                stroke_overprint_disabled: disabled_bool(document, state.get(b"OP".as_slice()))?,
-                fill_overprint_disabled: disabled_bool(document, state.get(b"op".as_slice()))?,
-            },
-        );
-    }
-    Ok(out)
+    Ok(ext_gstate_semantics(document, resources)?
+        .into_iter()
+        .map(|(name, state)| {
+            (
+                name,
+                ExtGStatePatch {
+                    supported: state.stencil_raster_supported,
+                    stroke_alpha_opaque: state.stroke_alpha_opaque,
+                    fill_alpha_opaque: state.fill_alpha_opaque,
+                    normal_blend: state.normal_blend,
+                    no_soft_mask: state.no_soft_mask,
+                    stroke_overprint_disabled: state.stroke_overprint_disabled,
+                    fill_overprint_disabled: state.fill_overprint_disabled,
+                },
+            )
+        })
+        .collect())
 }
 
 fn next_image_name(index: &mut usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
@@ -1044,10 +971,11 @@ struct Candidate {
 )]
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<MicrostrokeRasterStats> {
     let mut stats = MicrostrokeRasterStats::default();
-    for page in document.page_handles()? {
+    for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -1090,7 +1018,8 @@ pub fn rasterize_pathological_microstrokes(
             let payload = image_payload(&raster, flate_level)?;
             let name = next_image_name(&mut name_index, &mut occupied);
             let replacement = replacement_bytes(&name, &run, &raster);
-            let local_before = compressed_len(&decoded[run.start..run.end], flate_level)?;
+            let local_before =
+                crate::stream_codec::flate_encoded_len(&decoded[run.start..run.end], flate_level)?;
             let local_after = payload
                 .data
                 .len()
@@ -1124,15 +1053,17 @@ pub fn rasterize_pathological_microstrokes(
                 )
             })
             .collect::<Vec<_>>();
-        let Some(rewritten) = apply_replacements(&decoded, &replacements) else {
+        let Some(rewritten) = crate::content_stream::apply_replacements(&decoded, &replacements)
+        else {
             continue;
         };
-        let before = compressed_len(&decoded, flate_level)?;
+        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let image_cost = candidates
             .iter()
             .map(|candidate| candidate.data.len().saturating_add(192))
             .sum::<usize>();
-        let after = compressed_len(&rewritten, flate_level)?.saturating_add(image_cost);
+        let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
+            .saturating_add(image_cost);
         if after >= before {
             continue;
         }

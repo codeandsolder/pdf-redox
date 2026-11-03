@@ -254,9 +254,9 @@ fn semantic_fingerprint(
     Ok(Some(hasher.finalize().into()))
 }
 
-fn collect_targets(document: &EditDocument) -> Result<Vec<ContentTarget>> {
+fn collect_targets(document: &EditDocument, pages: &[ObjectHandle]) -> Result<Vec<ContentTarget>> {
     let mut targets = BTreeSet::new();
-    for page in document.page_handles()? {
+    for &page in pages {
         targets.insert(ContentTarget::Page(page));
     }
     for handle in document.reachable_streams_with_subtype(b"Form")? {
@@ -499,10 +499,11 @@ fn install_rewrite(
 
 pub fn externalize_duplicate_inline_images(
     document: &mut EditDocument,
+    pages: &[ObjectHandle],
 ) -> Result<DuplicateInlineImageStats> {
     let mut summaries = Vec::new();
     let mut aggregate: HashMap<InlineImageFingerprint, (usize, usize, usize)> = HashMap::new();
-    for target in collect_targets(document)? {
+    for target in collect_targets(document, pages)? {
         let Some(summary) = summary_for_target(document, target)? else {
             continue;
         };
@@ -716,6 +717,13 @@ fn restore_staged_inline_references(
     Some((output, spans.len()))
 }
 
+#[derive(Debug, Default)]
+pub struct FragmentedInlineCleanup {
+    pub xobject_entries_removed: usize,
+    pub occurrences_restored: usize,
+    pub(crate) restored_targets: BTreeSet<ContentTarget>,
+}
+
 /// Roll back fragmented-inline staging that raster reconstruction did not
 /// consume, then remove the temporary `XObject` bindings. A staged `Do` that is
 /// still present after all plans have run is a failed speculation; restoring
@@ -724,9 +732,8 @@ fn restore_staged_inline_references(
 pub fn cleanup_fragmented_inline_staging(
     document: &mut EditDocument,
     staging: &[FragmentedInlineStaging],
-) -> Result<(usize, BTreeSet<ObjectHandle>)> {
-    let mut removed = 0usize;
-    let mut restored_pages = BTreeSet::new();
+) -> Result<FragmentedInlineCleanup> {
+    let mut result = FragmentedInlineCleanup::default();
     for staged in staging {
         let target = staged.target;
         let mut resources = match target {
@@ -771,14 +778,17 @@ pub fn cleanup_fragmented_inline_staging(
             !staged_binding || used_xobjects.contains(name)
         });
         let removed_here = before.saturating_sub(xobjects.len());
-        removed = removed.saturating_add(removed_here);
+        result.xobject_entries_removed =
+            result.xobject_entries_removed.saturating_add(removed_here);
         resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
 
         match target {
             ContentTarget::Page(page) => {
                 if restored != 0 {
                     replace_page_content(document, page, rewritten)?;
-                    restored_pages.insert(page);
+                    result.occurrences_restored =
+                        result.occurrences_restored.saturating_add(restored);
+                    result.restored_targets.insert(target);
                 }
                 let object = document.edit_handle(page)?;
                 if let Some(dictionary) = object.as_dictionary_mut() {
@@ -794,6 +804,9 @@ pub fn cleanup_fragmented_inline_staging(
                         dictionary.remove(b"DecodeParms".as_slice());
                         dictionary.remove(b"Length".as_slice());
                         *data = StreamData::Owned(rewritten);
+                        result.occurrences_restored =
+                            result.occurrences_restored.saturating_add(restored);
+                        result.restored_targets.insert(target);
                     }
                 }
             }
@@ -802,7 +815,7 @@ pub fn cleanup_fragmented_inline_staging(
             eprintln!("raster-inline rollback {target:?}: restored={restored}");
         }
     }
-    Ok((removed, restored_pages))
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -867,9 +880,13 @@ mod tests {
             }],
         }];
 
-        let (removed, restored_pages) = cleanup_fragmented_inline_staging(&mut document, &staging)?;
-        assert_eq!(removed, 1);
-        assert_eq!(restored_pages, BTreeSet::from([page]));
+        let cleanup = cleanup_fragmented_inline_staging(&mut document, &staging)?;
+        assert_eq!(cleanup.xobject_entries_removed, 1);
+        assert_eq!(cleanup.occurrences_restored, 1);
+        assert_eq!(
+            cleanup.restored_targets,
+            BTreeSet::from([ContentTarget::Page(page)])
+        );
         let content = page_content(&document, page)?;
         assert!(content.starts_with(&original_inline));
         assert!(
@@ -877,6 +894,53 @@ mod tests {
                 .windows(b"IIm1".len())
                 .any(|window| window == b"IIm1")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_reports_form_whose_staging_was_restored() -> Result<()> {
+        use crate::{ObjectId, test_support::ClassicPdfBuilder};
+
+        let original_inline = b"BI /W 1 /H 1 /CS /G /BPC 8 ID \x7f EI".to_vec();
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /IIm1 6 0 R >> >>",
+            b"/IIm1 Do\n",
+        )?;
+        pdf.stream(
+            6,
+            b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0x7f],
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let form = ObjectHandle::Existing(ObjectId::new(5, 0));
+        let image = ObjectHandle::Existing(ObjectId::new(6, 0));
+        let staging = [FragmentedInlineStaging {
+            target: ContentTarget::Form(form),
+            images: vec![InstalledInlineImage {
+                name: b"IIm1".to_vec(),
+                handle: image,
+                original_inline: original_inline.clone(),
+            }],
+        }];
+
+        let cleanup = cleanup_fragmented_inline_staging(&mut document, &staging)?;
+        assert_eq!(cleanup.xobject_entries_removed, 1);
+        assert_eq!(cleanup.occurrences_restored, 1);
+        assert_eq!(
+            cleanup.restored_targets,
+            BTreeSet::from([ContentTarget::Form(form)])
+        );
+        let content = form_content(&document, form)?;
+        assert!(content.starts_with(&original_inline));
         Ok(())
     }
 
