@@ -660,8 +660,8 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -
 
     let mut level = Vec::new();
     for chunk in snapshot.pairs.chunks(NAME_TREE_FANOUT) {
-        let first = chunk.first().map(|pair| pair.0.clone()).unwrap_or_default();
-        let last = chunk.last().map(|pair| pair.0.clone()).unwrap_or_default();
+        let first = chunk.first().map_or_default(|pair| pair.0.clone());
+        let last = chunk.last().map_or_default(|pair| pair.0.clone());
         let handle =
             ObjectHandle::New(document.add_object(OwnedObject::Dictionary(BTreeMap::from([
                 (
@@ -684,14 +684,8 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: &NameTreeSnapshot) -
     while level.len() > NAME_TREE_FANOUT {
         let mut next = Vec::with_capacity(level.len().div_ceil(NAME_TREE_FANOUT));
         for chunk in level.chunks(NAME_TREE_FANOUT) {
-            let first = chunk
-                .first()
-                .map(|child| child.first.clone())
-                .unwrap_or_default();
-            let last = chunk
-                .last()
-                .map(|child| child.last.clone())
-                .unwrap_or_default();
+            let first = chunk.first().map_or_default(|child| child.first.clone());
+            let last = chunk.last().map_or_default(|child| child.last.clone());
             let handle = ObjectHandle::New(
                 document.add_object(OwnedObject::Dictionary(BTreeMap::from([
                     (

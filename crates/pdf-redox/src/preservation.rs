@@ -834,9 +834,7 @@ fn appearance_matrix(document: &EditDocument, dictionary: &OwnedDictionary) -> R
     let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
         return Ok(Matrix::default());
     };
-    Ok(resolved_number_array::<6>(document, value)?
-        .map(Matrix::from)
-        .unwrap_or_default())
+    Ok(resolved_number_array::<6>(document, value)?.map_or_default(Matrix::from))
 }
 
 fn appearance_content(

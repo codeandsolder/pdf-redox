@@ -2156,8 +2156,7 @@ fn outlined_glyph_plans(
 
     let resources = effective_page_resources(document, page)?;
     let mut occupied = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
-        .map(|fonts| fonts.keys().cloned().collect::<BTreeSet<_>>())
-        .unwrap_or_default();
+        .map_or_default(|fonts| fonts.keys().cloned().collect::<BTreeSet<_>>());
 
     let mut plans = Vec::new();
     for (font_index, chunk) in groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT).enumerate() {
