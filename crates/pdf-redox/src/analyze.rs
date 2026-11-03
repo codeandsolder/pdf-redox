@@ -74,8 +74,8 @@ fn record_payload(map: &mut HashMap<[u8; 32], (usize, usize)>, bytes: &[u8]) -> 
     hash
 }
 
-fn duplicate_payload_stats(map: HashMap<[u8; 32], (usize, usize)>) -> (usize, usize) {
-    map.into_values()
+fn duplicate_payload_stats(map: &HashMap<[u8; 32], (usize, usize)>) -> (usize, usize) {
+    map.values()
         .filter(|(count, _)| *count > 1)
         .fold((0, 0), |(groups, wasted), (count, bytes)| {
             (groups + 1, wasted + (count - 1) * bytes)
@@ -989,7 +989,7 @@ fn record_content_analysis(out: &mut PdfAnalysis, content: ContentAnalysisStats)
         .map(|(&reason, &count)| (reason.to_owned(), count))
         .collect();
     let (duplicate_groups, duplicate_wasted_bytes) =
-        duplicate_payload_stats(content.inline_payloads);
+        duplicate_payload_stats(&content.inline_payloads);
     out.inline_image_count = content.inline_count;
     out.inline_image_bytes = content.inline_bytes;
     out.duplicate_inline_image_payload_groups = duplicate_groups;
@@ -1017,6 +1017,498 @@ fn record_content_analysis(out: &mut PdfAnalysis, content: ContentAnalysisStats)
 fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
     Ok(analyze_document_impl(input, &document, deep, content_density)?.report)
+}
+
+struct ObjectAnalysisAccumulator {
+    deep: bool,
+    content_density_reachable_handles: HashSet<CowObjectHandle>,
+    content_analysis: Option<ContentAnalysisStats>,
+    form_content_analysis_error: Option<String>,
+    risks: BTreeMap<RiskKind, (usize, String)>,
+    stream_payloads: HashMap<[u8; 32], (usize, usize)>,
+    stream_payload_members: HashMap<[u8; 32], Vec<CowObjectHandle>>,
+    metadata_payloads: HashMap<[u8; 32], (usize, usize)>,
+    image_payloads: HashMap<[u8; 32], (usize, usize)>,
+    form_payloads: HashMap<[u8; 32], (usize, usize)>,
+    font_payloads: HashMap<[u8; 32], (usize, usize)>,
+    font_raw_payloads: HashMap<[u8; 32], (usize, usize)>,
+    to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)>,
+    font_dictionary_fingerprints: HashMap<[u8; 32], usize>,
+    font_dictionary_fingerprint_inventory_complete: bool,
+    deep_object_facts: HashMap<CowObjectHandle, DeepObjectFacts>,
+    processed_font_refs: HashSet<CowObjectHandle>,
+    processed_font_file2_refs: HashSet<CowObjectHandle>,
+    processed_to_unicode_refs: HashSet<CowObjectHandle>,
+    font_sparse_skeletons: HashMap<[u8; 32], usize>,
+    font_material_cmap_bytes: usize,
+}
+
+impl ObjectAnalysisAccumulator {
+    fn new(
+        deep: bool,
+        content_density: bool,
+        content_density_reachable_handles: HashSet<CowObjectHandle>,
+    ) -> Self {
+        Self {
+            deep,
+            content_density_reachable_handles,
+            content_analysis: content_density.then(ContentAnalysisStats::default),
+            form_content_analysis_error: None,
+            risks: BTreeMap::new(),
+            stream_payloads: HashMap::new(),
+            stream_payload_members: HashMap::new(),
+            metadata_payloads: HashMap::new(),
+            image_payloads: HashMap::new(),
+            form_payloads: HashMap::new(),
+            font_payloads: HashMap::new(),
+            font_raw_payloads: HashMap::new(),
+            to_unicode_raw_payloads: HashMap::new(),
+            font_dictionary_fingerprints: HashMap::new(),
+            font_dictionary_fingerprint_inventory_complete: true,
+            deep_object_facts: HashMap::new(),
+            processed_font_refs: HashSet::new(),
+            processed_font_file2_refs: HashSet::new(),
+            processed_to_unicode_refs: HashSet::new(),
+            font_sparse_skeletons: HashMap::new(),
+            font_material_cmap_bytes: 0,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one object is observed once and contributes several coupled analysis inventories"
+    )]
+    fn analyze_object(
+        &mut self,
+        document: &EditDocument,
+        out: &mut PdfAnalysis,
+        handle: CowObjectHandle,
+        object: &OwnedObject,
+        preflight_refs: &PreflightRefs,
+    ) -> Result<()> {
+        let Some(dictionary) = object.as_dictionary() else {
+            return Ok(());
+        };
+        let type_name = dictionary_name(document, dictionary, b"Type");
+        if matches!(
+            dictionary.get(b"A".as_slice()),
+            Some(OwnedObject::Reference(_))
+        ) {
+            let may_be_struct_elem = match type_name.as_ref() {
+                Ok(Some(name)) => name.as_slice() == b"StructElem",
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if may_be_struct_elem {
+                out.structure_attribute_ref_count =
+                    out.structure_attribute_ref_count.saturating_add(1);
+            }
+        }
+        match type_name.as_ref() {
+            Ok(Some(name)) if name.as_slice() == b"Font" => {
+                match exact_dictionary_fingerprint(object, b"exact-font-dictionary") {
+                    Ok(Some(fingerprint)) => {
+                        *self
+                            .font_dictionary_fingerprints
+                            .entry(fingerprint)
+                            .or_default() += 1;
+                    }
+                    Ok(None) => {}
+                    Err(_) => self.font_dictionary_fingerprint_inventory_complete = false,
+                }
+            }
+            Ok(_) => {}
+            Err(_) => self.font_dictionary_fingerprint_inventory_complete = false,
+        }
+        let is_stream = matches!(object, OwnedObject::Stream { .. });
+        if dictionary.contains_key(b"Thumb".as_slice()) {
+            push_risk(
+                &mut self.risks,
+                RiskKind::Thumbnail,
+                1,
+                "page thumbnail stream is separate hidden raster content",
+            );
+        }
+        if dictionary.contains_key(b"AA".as_slice())
+            || dictionary.contains_key(b"OpenAction".as_slice())
+        {
+            push_risk(
+                &mut self.risks,
+                RiskKind::AutomaticAction,
+                1,
+                "automatic PDF actions are executable/interactive hidden state",
+            );
+        }
+        if dictionary.contains_key(b"OCProperties".as_slice()) {
+            push_risk(
+                &mut self.risks,
+                RiskKind::HiddenLayer,
+                1,
+                "optional-content groups can hide content from the default view",
+            );
+        }
+        if dictionary.contains_key(b"ActualText".as_slice()) {
+            push_risk(
+                &mut self.risks,
+                RiskKind::SuspiciousHiddenText,
+                1,
+                "ActualText may differ from visible glyphs and should be retained but audited in privacy mode",
+            );
+        }
+        if dictionary.contains_key(b"V".as_slice()) && dictionary.contains_key(b"FT".as_slice()) {
+            push_risk(
+                &mut self.risks,
+                RiskKind::FormValue,
+                1,
+                "interactive form field contains a stored value",
+            );
+        }
+        if !is_stream {
+            if self.deep {
+                self.deep_object_facts.insert(
+                    handle,
+                    DeepObjectFacts {
+                        kind: type_name?,
+                        subtype: dictionary_name(document, dictionary, b"Subtype")?,
+                        raw_stream_bytes: None,
+                    },
+                );
+            }
+            return Ok(());
+        }
+
+        let may_be_pattern = match type_name.as_ref() {
+            Ok(Some(name)) => name.as_slice() == b"Pattern",
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if may_be_pattern {
+            out.pattern_stream_count = out.pattern_stream_count.saturating_add(1);
+        }
+        let raw = raw_stream_bytes(document, object)?;
+        out.stream_count += 1;
+        out.stream_raw_bytes += raw.len();
+        if self.deep {
+            let hash = record_payload(&mut self.stream_payloads, raw.as_ref());
+            self.stream_payload_members
+                .entry(hash)
+                .or_default()
+                .push(handle);
+        }
+
+        if preflight_refs.to_unicode.contains(&handle) {
+            record_to_unicode_stream_payload(raw.as_ref(), &mut self.to_unicode_raw_payloads);
+            self.processed_to_unicode_refs.insert(handle);
+        }
+
+        let filter = filter_name(document, dictionary)?;
+        *out.filter_counts.entry(filter.clone()).or_default() += 1;
+
+        let subtype = dictionary_name(document, dictionary, b"Subtype")?;
+        let is_image = subtype.as_deref() == Some(b"Image");
+        let is_form = subtype.as_deref() == Some(b"Form");
+        let is_font = preflight_refs.font.contains(&handle);
+        let is_content_density_form =
+            is_form && self.content_density_reachable_handles.contains(&handle);
+        let decoded = if is_font
+            || (self.deep && (is_form || filter == "/FlateDecode"))
+            || is_content_density_form
+        {
+            match document.decoded_owned_stream_data(object) {
+                Ok(decoded) => Some(decoded),
+                Err(error) => {
+                    if is_content_density_form && self.form_content_analysis_error.is_none() {
+                        self.form_content_analysis_error = Some(error.to_string());
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if is_font {
+            record_font_program_payload(
+                raw.as_ref(),
+                decoded.as_deref(),
+                self.deep,
+                out,
+                &mut self.font_raw_payloads,
+                &mut self.font_payloads,
+            );
+            self.processed_font_refs.insert(handle);
+            if preflight_refs.font_file2.contains(&handle) {
+                if let Some(decoded) = decoded.as_deref() {
+                    record_font_file2_opportunity(
+                        decoded,
+                        &mut self.font_sparse_skeletons,
+                        &mut self.font_material_cmap_bytes,
+                    );
+                }
+                self.processed_font_file2_refs.insert(handle);
+            }
+        }
+        if is_image {
+            out.image_count += 1;
+            out.image_raw_bytes += raw.len();
+            if self.deep {
+                record_payload(&mut self.image_payloads, raw.as_ref());
+            }
+            if filter.contains("DCTDecode") {
+                let marker_hits = count_bytes(raw.as_ref(), &[0xff, 0xe1])
+                    + count_bytes(raw.as_ref(), &[0xff, 0xed])
+                    + count_bytes(raw.as_ref(), &[0xff, 0xfe]);
+                push_risk(
+                    &mut self.risks,
+                    RiskKind::JpegMetadata,
+                    marker_hits,
+                    "embedded JPEG carries EXIF/XMP/IPTC/comment marker candidates",
+                );
+            }
+        }
+        if is_form {
+            out.form_xobject_count += 1;
+            if self.deep {
+                record_payload(
+                    &mut self.form_payloads,
+                    decoded.as_deref().unwrap_or(raw.as_ref()),
+                );
+            }
+            if is_content_density_form
+                && self.form_content_analysis_error.is_none()
+                && let Some(decoded) = decoded.as_deref()
+                && let Some(content_analysis) = self.content_analysis.as_mut()
+                && let Err(error) = record_form_content_analysis(content_analysis, decoded)
+            {
+                self.form_content_analysis_error = Some(error.to_string());
+            }
+        }
+        let type_name = type_name?;
+        if type_name.as_deref() == Some(b"Metadata") {
+            out.metadata_stream_count += 1;
+            out.metadata_stream_bytes += raw.len();
+            if self.deep {
+                record_payload(&mut self.metadata_payloads, raw.as_ref());
+            }
+            push_risk(
+                &mut self.risks,
+                RiskKind::XmpMetadata,
+                1,
+                "XMP metadata stream may contain edit history, usernames, paths, thumbnails, and tool provenance",
+            );
+        }
+
+        if filter == "/FlateDecode" {
+            out.flate_stream_count += 1;
+            if !is_image {
+                out.non_image_flate_stream_count += 1;
+            }
+            if self.deep {
+                if let Some(decoded) = decoded.as_deref()
+                    && let Ok(repacked) =
+                        crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
+                {
+                    let saving = raw.len().saturating_sub(repacked.len());
+                    if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
+                        out.flate_recompress_candidate_count += 1;
+                        out.flate_recompress_potential_saving_bytes += saving;
+                        if !is_image {
+                            out.non_image_flate_recompress_candidate_count += 1;
+                            out.non_image_flate_recompress_potential_saving_bytes += saving;
+                        }
+                    }
+                }
+            }
+        }
+        if self.deep {
+            self.deep_object_facts.insert(
+                handle,
+                DeepObjectFacts {
+                    kind: type_name,
+                    subtype,
+                    raw_stream_bytes: Some(raw.len()),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn complete_preflight_targets(
+        &mut self,
+        document: &EditDocument,
+        out: &mut PdfAnalysis,
+        preflight_refs: &PreflightRefs,
+    ) -> Result<()> {
+        if self.deep {
+            return Ok(());
+        }
+
+        for handle in preflight_refs
+            .to_unicode
+            .difference(&self.processed_to_unicode_refs)
+            .copied()
+        {
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            if !matches!(object, OwnedObject::Stream { .. }) {
+                continue;
+            }
+            let raw = raw_stream_bytes(document, &object)?;
+            record_to_unicode_stream_payload(raw.as_ref(), &mut self.to_unicode_raw_payloads);
+        }
+        for handle in preflight_refs
+            .font
+            .difference(&self.processed_font_refs)
+            .copied()
+        {
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            if !matches!(object, OwnedObject::Stream { .. }) {
+                continue;
+            }
+            let raw = raw_stream_bytes(document, &object)?;
+            let decoded = document.decoded_owned_stream_data(&object).ok();
+            record_font_program_payload(
+                raw.as_ref(),
+                decoded.as_deref(),
+                false,
+                out,
+                &mut self.font_raw_payloads,
+                &mut self.font_payloads,
+            );
+            if preflight_refs.font_file2.contains(&handle) {
+                if let Some(decoded) = decoded.as_deref() {
+                    record_font_file2_opportunity(
+                        decoded,
+                        &mut self.font_sparse_skeletons,
+                        &mut self.font_material_cmap_bytes,
+                    );
+                }
+                self.processed_font_file2_refs.insert(handle);
+            }
+        }
+        // A target can be discovered as a generic FontFile before a later holder
+        // identifies the same stream specifically as FontFile2. Revisit only
+        // those File2 targets whose opportunity inventory was not recorded yet.
+        for handle in preflight_refs
+            .font_file2
+            .difference(&self.processed_font_file2_refs)
+            .copied()
+        {
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
+            if let Ok(decoded) = document.decoded_owned_stream_data(&object) {
+                record_font_file2_opportunity(
+                    &decoded,
+                    &mut self.font_sparse_skeletons,
+                    &mut self.font_material_cmap_bytes,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_object_inventory(
+        &mut self,
+        document: &EditDocument,
+        out: &mut PdfAnalysis,
+        direct_key_inventory: &DirectKeyInventory,
+        preflight_refs: &mut PreflightRefs,
+        objects: Option<&[(CowObjectHandle, OwnedObject)]>,
+        page_content_role_pages: &HashSet<CowObjectHandle>,
+    ) -> Result<Vec<CowObjectHandle>> {
+        out.piece_info_key_count = direct_key_inventory.piece_info;
+        out.authoring_metadata_key_count = direct_key_inventory.authoring_metadata;
+        out.to_unicode_key_count = direct_key_inventory.to_unicode;
+        out.ext_gstate_key_count = direct_key_inventory.ext_gstate;
+        out.char_procs_key_count = direct_key_inventory.char_procs;
+        out.appearance_key_count = direct_key_inventory.appearance;
+        out.icc_based_array_count = direct_key_inventory.icc_based_arrays;
+        out.type3_font_scope_count = direct_key_inventory.type3_font_scopes;
+        out.tiling_pattern_scope_count = direct_key_inventory.tiling_pattern_scopes;
+        push_risk(
+            &mut self.risks,
+            RiskKind::PieceInfo,
+            direct_key_inventory.piece_info_roots,
+            "Adobe/private-piece metadata can contain authoring provenance and source paths",
+        );
+
+        resolve_ext_g_state_map_refs(document, preflight_refs)?;
+        let mut ext_gstate_dictionary_handles: Vec<_> =
+            preflight_refs.ext_gstates.iter().copied().collect();
+        ext_gstate_dictionary_handles.sort_unstable();
+
+        self.complete_preflight_targets(document, out, preflight_refs)?;
+
+        out.font_opportunity_inventory_version = 1;
+        out.font_sparse_union_duplicate_skeleton_groups = self
+            .font_sparse_skeletons
+            .values()
+            .filter(|&&count| count > 1)
+            .count();
+        out.font_material_cid_cmap_decoded_bytes = self.font_material_cmap_bytes;
+        out.font_explicit_cid_to_gid_ref_count = preflight_refs.cid_to_gid.len();
+        out.font_glyph_scope_inventory_version =
+            u8::from(direct_key_inventory.font_glyph_scope_inventory_complete);
+        out.font_dictionary_fingerprint_inventory_version =
+            u8::from(self.font_dictionary_fingerprint_inventory_complete);
+        out.font_dictionary_duplicate_fingerprint_groups = self
+            .font_dictionary_fingerprints
+            .values()
+            .filter(|&&count| count > 1)
+            .count();
+        (out.font_raw_duplicate_payload_groups, _) =
+            duplicate_payload_stats(&self.font_raw_payloads);
+        (out.to_unicode_raw_duplicate_payload_groups, _) =
+            duplicate_payload_stats(&self.to_unicode_raw_payloads);
+
+        if self.deep {
+            let objects = objects.ok_or_else(|| {
+                crate::Error::Invalid("deep analysis object table is missing".to_owned())
+            })?;
+            let incoming_roles = collect_incoming_roles(objects, page_content_role_pages);
+            let stream_roles = record_role_inventory(
+                objects,
+                &self.deep_object_facts,
+                &preflight_refs.font,
+                &preflight_refs.icc_profiles,
+                &incoming_roles,
+                out,
+            )?;
+            (
+                out.duplicate_stream_role_groups,
+                out.duplicate_stream_role_wasted_bytes,
+            ) = duplicate_payload_role_stats(
+                &self.stream_payloads,
+                &self.stream_payload_members,
+                &stream_roles,
+            );
+            (
+                out.duplicate_metadata_payload_groups,
+                out.duplicate_metadata_payload_wasted_bytes,
+            ) = duplicate_payload_stats(&self.metadata_payloads);
+            (
+                out.duplicate_stream_payload_groups,
+                out.duplicate_stream_payload_wasted_bytes,
+            ) = duplicate_payload_stats(&self.stream_payloads);
+            (
+                out.duplicate_image_payload_groups,
+                out.duplicate_image_payload_wasted_bytes,
+            ) = duplicate_payload_stats(&self.image_payloads);
+            (
+                out.duplicate_form_payload_groups,
+                out.duplicate_form_payload_wasted_bytes,
+            ) = duplicate_payload_stats(&self.form_payloads);
+            (
+                out.duplicate_font_payload_groups,
+                out.duplicate_font_payload_wasted_bytes,
+            ) = duplicate_payload_stats(&self.font_payloads);
+        }
+
+        Ok(ext_gstate_dictionary_handles)
+    }
 }
 
 #[expect(
@@ -1081,23 +1573,8 @@ fn analyze_document_impl(
             (Some(Ok(_)), Some(Ok(handles))) => handles.iter().copied().collect(),
             _ => HashSet::new(),
         };
-    let mut content_analysis = content_density.then(ContentAnalysisStats::default);
-    // Form content is observed during the main object pass, before the historical
-    // page-first content-analysis error boundary. Retain its first error but defer
-    // reporting it until page and reachability errors have had their original priority.
-    let mut form_content_analysis_error = None;
-    let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
-    let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut stream_payload_members: HashMap<[u8; 32], Vec<CowObjectHandle>> = HashMap::new();
-    let mut metadata_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut image_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut form_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut font_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut font_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut to_unicode_raw_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
-    let mut font_dictionary_fingerprints = HashMap::<[u8; 32], usize>::new();
-    let mut font_dictionary_fingerprint_inventory_complete = true;
-    let mut deep_object_facts = HashMap::<CowObjectHandle, DeepObjectFacts>::new();
+    let mut object_analysis =
+        ObjectAnalysisAccumulator::new(deep, content_density, content_density_reachable_handles);
     let mut direct_key_inventory = DirectKeyInventory::new();
     let mut preflight_refs = PreflightRefs::default();
     if let Some(objects) = objects.as_deref() {
@@ -1111,274 +1588,15 @@ fn analyze_document_impl(
             )?;
         }
     }
-    let mut processed_font_refs = HashSet::new();
-    let mut processed_font_file2_refs = HashSet::new();
-    let mut processed_to_unicode_refs = HashSet::new();
-    let mut font_sparse_skeletons = HashMap::<[u8; 32], usize>::new();
-    let mut font_material_cmap_bytes = 0_usize;
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
     out.font_raw_payload_inventory_version = 1;
     out.to_unicode_raw_payload_inventory_version = 1;
     out.targeted_dedup_key_inventory_version = 3;
 
-    let mut analyze_object = |handle: CowObjectHandle,
-                              object: &OwnedObject,
-                              preflight_refs: &PreflightRefs,
-                              processed_font_refs: &mut HashSet<CowObjectHandle>,
-                              processed_font_file2_refs: &mut HashSet<CowObjectHandle>,
-                              processed_to_unicode_refs: &mut HashSet<CowObjectHandle>|
-     -> Result<()> {
-        let Some(dictionary) = object.as_dictionary() else {
-            return Ok(());
-        };
-        let type_name = dictionary_name(document, dictionary, b"Type");
-        if matches!(
-            dictionary.get(b"A".as_slice()),
-            Some(OwnedObject::Reference(_))
-        ) {
-            let may_be_struct_elem = match type_name.as_ref() {
-                Ok(Some(name)) => name.as_slice() == b"StructElem",
-                Ok(None) => false,
-                Err(_) => true,
-            };
-            if may_be_struct_elem {
-                out.structure_attribute_ref_count =
-                    out.structure_attribute_ref_count.saturating_add(1);
-            }
-        }
-        match type_name.as_ref() {
-            Ok(Some(name)) if name.as_slice() == b"Font" => {
-                match exact_dictionary_fingerprint(object, b"exact-font-dictionary") {
-                    Ok(Some(fingerprint)) => {
-                        *font_dictionary_fingerprints.entry(fingerprint).or_default() += 1;
-                    }
-                    Ok(None) => {}
-                    Err(_) => font_dictionary_fingerprint_inventory_complete = false,
-                }
-            }
-            Ok(_) => {}
-            Err(_) => font_dictionary_fingerprint_inventory_complete = false,
-        }
-        let is_stream = matches!(object, OwnedObject::Stream { .. });
-        if dictionary.contains_key(b"Thumb".as_slice()) {
-            push_risk(
-                &mut risks,
-                RiskKind::Thumbnail,
-                1,
-                "page thumbnail stream is separate hidden raster content",
-            );
-        }
-        if dictionary.contains_key(b"AA".as_slice())
-            || dictionary.contains_key(b"OpenAction".as_slice())
-        {
-            push_risk(
-                &mut risks,
-                RiskKind::AutomaticAction,
-                1,
-                "automatic PDF actions are executable/interactive hidden state",
-            );
-        }
-        if dictionary.contains_key(b"OCProperties".as_slice()) {
-            push_risk(
-                &mut risks,
-                RiskKind::HiddenLayer,
-                1,
-                "optional-content groups can hide content from the default view",
-            );
-        }
-        if dictionary.contains_key(b"ActualText".as_slice()) {
-            push_risk(
-                &mut risks,
-                RiskKind::SuspiciousHiddenText,
-                1,
-                "ActualText may differ from visible glyphs and should be retained but audited in privacy mode",
-            );
-        }
-        if dictionary.contains_key(b"V".as_slice()) && dictionary.contains_key(b"FT".as_slice()) {
-            push_risk(
-                &mut risks,
-                RiskKind::FormValue,
-                1,
-                "interactive form field contains a stored value",
-            );
-        }
-        if !is_stream {
-            if deep {
-                deep_object_facts.insert(
-                    handle,
-                    DeepObjectFacts {
-                        kind: type_name?,
-                        subtype: dictionary_name(document, dictionary, b"Subtype")?,
-                        raw_stream_bytes: None,
-                    },
-                );
-            }
-            return Ok(());
-        }
-
-        let may_be_pattern = match type_name.as_ref() {
-            Ok(Some(name)) => name.as_slice() == b"Pattern",
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        if may_be_pattern {
-            out.pattern_stream_count = out.pattern_stream_count.saturating_add(1);
-        }
-        let raw = raw_stream_bytes(document, object)?;
-        out.stream_count += 1;
-        out.stream_raw_bytes += raw.len();
-        if deep {
-            let hash = record_payload(&mut stream_payloads, raw.as_ref());
-            stream_payload_members.entry(hash).or_default().push(handle);
-        }
-
-        if preflight_refs.to_unicode.contains(&handle) {
-            record_to_unicode_stream_payload(raw.as_ref(), &mut to_unicode_raw_payloads);
-            processed_to_unicode_refs.insert(handle);
-        }
-
-        let filter = filter_name(document, dictionary)?;
-        *out.filter_counts.entry(filter.clone()).or_default() += 1;
-
-        let subtype = dictionary_name(document, dictionary, b"Subtype")?;
-        let is_image = subtype.as_deref() == Some(b"Image");
-        let is_form = subtype.as_deref() == Some(b"Form");
-        let is_font = preflight_refs.font.contains(&handle);
-        let is_content_density_form =
-            is_form && content_density_reachable_handles.contains(&handle);
-        let decoded = if is_font
-            || (deep && (is_form || filter == "/FlateDecode"))
-            || is_content_density_form
-        {
-            match document.decoded_owned_stream_data(object) {
-                Ok(decoded) => Some(decoded),
-                Err(error) => {
-                    if is_content_density_form && form_content_analysis_error.is_none() {
-                        form_content_analysis_error = Some(error.to_string());
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if is_font {
-            record_font_program_payload(
-                raw.as_ref(),
-                decoded.as_deref(),
-                deep,
-                &mut out,
-                &mut font_raw_payloads,
-                &mut font_payloads,
-            );
-            processed_font_refs.insert(handle);
-            if preflight_refs.font_file2.contains(&handle) {
-                if let Some(decoded) = decoded.as_deref() {
-                    record_font_file2_opportunity(
-                        decoded,
-                        &mut font_sparse_skeletons,
-                        &mut font_material_cmap_bytes,
-                    );
-                }
-                processed_font_file2_refs.insert(handle);
-            }
-        }
-        if is_image {
-            out.image_count += 1;
-            out.image_raw_bytes += raw.len();
-            if deep {
-                record_payload(&mut image_payloads, raw.as_ref());
-            }
-            if filter.contains("DCTDecode") {
-                let marker_hits = count_bytes(raw.as_ref(), &[0xff, 0xe1])
-                    + count_bytes(raw.as_ref(), &[0xff, 0xed])
-                    + count_bytes(raw.as_ref(), &[0xff, 0xfe]);
-                push_risk(
-                    &mut risks,
-                    RiskKind::JpegMetadata,
-                    marker_hits,
-                    "embedded JPEG carries EXIF/XMP/IPTC/comment marker candidates",
-                );
-            }
-        }
-        if is_form {
-            out.form_xobject_count += 1;
-            if deep {
-                record_payload(
-                    &mut form_payloads,
-                    decoded.as_deref().unwrap_or(raw.as_ref()),
-                );
-            }
-            if is_content_density_form
-                && form_content_analysis_error.is_none()
-                && let Some(decoded) = decoded.as_deref()
-                && let Some(content_analysis) = content_analysis.as_mut()
-                && let Err(error) = record_form_content_analysis(content_analysis, decoded)
-            {
-                form_content_analysis_error = Some(error.to_string());
-            }
-        }
-        let type_name = type_name?;
-        if type_name.as_deref() == Some(b"Metadata") {
-            out.metadata_stream_count += 1;
-            out.metadata_stream_bytes += raw.len();
-            if deep {
-                record_payload(&mut metadata_payloads, raw.as_ref());
-            }
-            push_risk(
-                &mut risks,
-                RiskKind::XmpMetadata,
-                1,
-                "XMP metadata stream may contain edit history, usernames, paths, thumbnails, and tool provenance",
-            );
-        }
-
-        if filter == "/FlateDecode" {
-            out.flate_stream_count += 1;
-            if !is_image {
-                out.non_image_flate_stream_count += 1;
-            }
-            if deep {
-                if let Some(decoded) = decoded.as_deref()
-                    && let Ok(repacked) =
-                        crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
-                {
-                    let saving = raw.len().saturating_sub(repacked.len());
-                    if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
-                        out.flate_recompress_candidate_count += 1;
-                        out.flate_recompress_potential_saving_bytes += saving;
-                        if !is_image {
-                            out.non_image_flate_recompress_candidate_count += 1;
-                            out.non_image_flate_recompress_potential_saving_bytes += saving;
-                        }
-                    }
-                }
-            }
-        }
-        if deep {
-            deep_object_facts.insert(
-                handle,
-                DeepObjectFacts {
-                    kind: type_name,
-                    subtype,
-                    raw_stream_bytes: Some(raw.len()),
-                },
-            );
-        }
-        Ok(())
-    };
-
     if let Some(objects) = objects.as_deref() {
         for (handle, object) in objects {
-            analyze_object(
-                *handle,
-                object,
-                &preflight_refs,
-                &mut processed_font_refs,
-                &mut processed_font_file2_refs,
-                &mut processed_to_unicode_refs,
-            )?;
+            object_analysis.analyze_object(document, &mut out, *handle, object, &preflight_refs)?;
         }
     } else {
         for id in document.source().object_ids() {
@@ -1393,173 +1611,28 @@ fn analyze_document_impl(
                 &mut direct_key_inventory,
                 false,
             )?;
-            analyze_object(
-                handle,
-                &object,
-                &preflight_refs,
-                &mut processed_font_refs,
-                &mut processed_font_file2_refs,
-                &mut processed_to_unicode_refs,
-            )?;
+            object_analysis.analyze_object(document, &mut out, handle, &object, &preflight_refs)?;
         }
     }
-    drop(analyze_object);
-
-    out.piece_info_key_count = direct_key_inventory.piece_info;
-    out.authoring_metadata_key_count = direct_key_inventory.authoring_metadata;
-    out.to_unicode_key_count = direct_key_inventory.to_unicode;
-    out.ext_gstate_key_count = direct_key_inventory.ext_gstate;
-    out.char_procs_key_count = direct_key_inventory.char_procs;
-    out.appearance_key_count = direct_key_inventory.appearance;
-    out.icc_based_array_count = direct_key_inventory.icc_based_arrays;
-    out.type3_font_scope_count = direct_key_inventory.type3_font_scopes;
-    out.tiling_pattern_scope_count = direct_key_inventory.tiling_pattern_scopes;
-    push_risk(
-        &mut risks,
-        RiskKind::PieceInfo,
-        direct_key_inventory.piece_info_roots,
-        "Adobe/private-piece metadata can contain authoring provenance and source paths",
-    );
-
-    resolve_ext_g_state_map_refs(document, &mut preflight_refs)?;
-    let mut ext_gstate_dictionary_handles: Vec<_> =
-        preflight_refs.ext_gstates.iter().copied().collect();
-    ext_gstate_dictionary_handles.sort_unstable();
-
-    if !deep {
-        for handle in preflight_refs
-            .to_unicode
-            .difference(&processed_to_unicode_refs)
-            .copied()
-        {
-            let Some(object) = document.current_owned_object(handle)? else {
-                continue;
-            };
-            if !matches!(object, OwnedObject::Stream { .. }) {
-                continue;
-            }
-            let raw = raw_stream_bytes(document, &object)?;
-            record_to_unicode_stream_payload(raw.as_ref(), &mut to_unicode_raw_payloads);
-        }
-        for handle in preflight_refs
-            .font
-            .difference(&processed_font_refs)
-            .copied()
-        {
-            let Some(object) = document.current_owned_object(handle)? else {
-                continue;
-            };
-            if !matches!(object, OwnedObject::Stream { .. }) {
-                continue;
-            }
-            let raw = raw_stream_bytes(document, &object)?;
-            let decoded = document.decoded_owned_stream_data(&object).ok();
-            record_font_program_payload(
-                raw.as_ref(),
-                decoded.as_deref(),
-                false,
-                &mut out,
-                &mut font_raw_payloads,
-                &mut font_payloads,
-            );
-            if preflight_refs.font_file2.contains(&handle) {
-                if let Some(decoded) = decoded.as_deref() {
-                    record_font_file2_opportunity(
-                        decoded,
-                        &mut font_sparse_skeletons,
-                        &mut font_material_cmap_bytes,
-                    );
-                }
-                processed_font_file2_refs.insert(handle);
-            }
-        }
-        // A target can be discovered as a generic FontFile before a later holder
-        // identifies the same stream specifically as FontFile2. Revisit only
-        // those File2 targets whose opportunity inventory was not recorded yet.
-        for handle in preflight_refs
-            .font_file2
-            .difference(&processed_font_file2_refs)
-            .copied()
-        {
-            let Some(object) = document.current_owned_object(handle)? else {
-                continue;
-            };
-            if let Ok(decoded) = document.decoded_owned_stream_data(&object) {
-                record_font_file2_opportunity(
-                    &decoded,
-                    &mut font_sparse_skeletons,
-                    &mut font_material_cmap_bytes,
-                );
-            }
-        }
-    }
-
-    out.font_opportunity_inventory_version = 1;
-    out.font_sparse_union_duplicate_skeleton_groups = font_sparse_skeletons
-        .values()
-        .filter(|&&count| count > 1)
-        .count();
-    out.font_material_cid_cmap_decoded_bytes = font_material_cmap_bytes;
-    out.font_explicit_cid_to_gid_ref_count = preflight_refs.cid_to_gid.len();
-    out.font_glyph_scope_inventory_version =
-        u8::from(direct_key_inventory.font_glyph_scope_inventory_complete);
-    out.font_dictionary_fingerprint_inventory_version =
-        u8::from(font_dictionary_fingerprint_inventory_complete);
-    out.font_dictionary_duplicate_fingerprint_groups = font_dictionary_fingerprints
-        .values()
-        .filter(|&&count| count > 1)
-        .count();
-    (out.font_raw_duplicate_payload_groups, _) = duplicate_payload_stats(font_raw_payloads);
-    (out.to_unicode_raw_duplicate_payload_groups, _) =
-        duplicate_payload_stats(to_unicode_raw_payloads);
-
-    if deep {
-        let objects = objects.as_deref().ok_or_else(|| {
-            crate::Error::Invalid("deep analysis object table is missing".to_owned())
-        })?;
-        let incoming_roles = collect_incoming_roles(objects, &page_content_role_pages);
-        let stream_roles = record_role_inventory(
-            objects,
-            &deep_object_facts,
-            &preflight_refs.font,
-            &preflight_refs.icc_profiles,
-            &incoming_roles,
-            &mut out,
-        )?;
-        (
-            out.duplicate_stream_role_groups,
-            out.duplicate_stream_role_wasted_bytes,
-        ) = duplicate_payload_role_stats(&stream_payloads, &stream_payload_members, &stream_roles);
-
-        (
-            out.duplicate_metadata_payload_groups,
-            out.duplicate_metadata_payload_wasted_bytes,
-        ) = duplicate_payload_stats(metadata_payloads);
-        (
-            out.duplicate_stream_payload_groups,
-            out.duplicate_stream_payload_wasted_bytes,
-        ) = duplicate_payload_stats(stream_payloads);
-        (
-            out.duplicate_image_payload_groups,
-            out.duplicate_image_payload_wasted_bytes,
-        ) = duplicate_payload_stats(image_payloads);
-        (
-            out.duplicate_form_payload_groups,
-            out.duplicate_form_payload_wasted_bytes,
-        ) = duplicate_payload_stats(form_payloads);
-        (
-            out.duplicate_font_payload_groups,
-            out.duplicate_font_payload_wasted_bytes,
-        ) = duplicate_payload_stats(font_payloads);
-    }
+    let ext_gstate_dictionary_handles = object_analysis.finalize_object_inventory(
+        document,
+        &mut out,
+        &direct_key_inventory,
+        &mut preflight_refs,
+        objects.as_deref(),
+        &page_content_role_pages,
+    )?;
 
     if content_density {
         let page_content_analysis_error = match analysis_pages.as_ref() {
-            Some(Ok(pages)) => content_analysis.as_mut().and_then(|content| {
-                analyze_page_content(document, pages, content)
-                    .err()
-                    .map(|error| error.to_string())
-            }),
+            Some(Ok(pages)) => object_analysis
+                .content_analysis
+                .as_mut()
+                .and_then(|content| {
+                    analyze_page_content(document, pages, content)
+                        .err()
+                        .map(|error| error.to_string())
+                }),
             Some(Err(error)) => Some(error.to_string()),
             None => None,
         };
@@ -1569,11 +1642,11 @@ fn analyze_document_impl(
             .map(ToString::to_string);
         if let Some(error) = page_content_analysis_error
             .or(reachability_error)
-            .or(form_content_analysis_error)
+            .or(object_analysis.form_content_analysis_error)
         {
             out.warnings
                 .push(format!("content-stream analysis skipped: {error}"));
-        } else if let Some(content) = content_analysis {
+        } else if let Some(content) = object_analysis.content_analysis {
             record_content_analysis(&mut out, content);
         }
     }
@@ -1581,31 +1654,31 @@ fn analyze_document_impl(
     let startxrefs = count_bytes(input, b"startxref");
     out.incremental_update_count = startxrefs.saturating_sub(1);
     push_risk(
-        &mut risks,
+        &mut object_analysis.risks,
         RiskKind::IncrementalHistory,
         out.incremental_update_count,
         "incremental revisions can retain previous object bodies, old metadata, or pre-redaction content; a fresh rewrite drops the /Prev chain",
     );
     push_risk(
-        &mut risks,
+        &mut object_analysis.risks,
         RiskKind::InfoDictionary,
         count_bytes(input, b"/Info"),
         "document Info dictionary commonly stores author, creator, producer, and timestamps",
     );
     push_risk(
-        &mut risks,
+        &mut object_analysis.risks,
         RiskKind::EmbeddedFile,
         count_bytes(input, b"/EmbeddedFiles") + count_bytes(input, b"/EmbeddedFile"),
         "PDF can carry arbitrary attached files invisibly to normal page rendering",
     );
     push_risk(
-        &mut risks,
+        &mut object_analysis.risks,
         RiskKind::Javascript,
         count_bytes(input, b"/JavaScript") + count_bytes(input, b"/JS"),
         "document or annotation JavaScript is active hidden content",
     );
     push_risk(
-        &mut risks,
+        &mut object_analysis.risks,
         RiskKind::Signature,
         count_bytes(input, b"/Sig"),
         "digital signatures can contain signer identity, certificates, timestamps, reason, and location",
@@ -1625,7 +1698,7 @@ fn analyze_document_impl(
                     })
                     .count();
                 push_risk(
-                    &mut risks,
+                    &mut object_analysis.risks,
                     RiskKind::SuspiciousHiddenText,
                     suspicious,
                     "text that is not visible in the default page appearance; inspect the categorized findings before removing it",
@@ -1638,7 +1711,8 @@ fn analyze_document_impl(
         }
     }
 
-    out.risks = risks
+    out.risks = object_analysis
+        .risks
         .into_iter()
         .map(|(kind, (count, note))| RiskFinding { kind, count, note })
         .collect();
