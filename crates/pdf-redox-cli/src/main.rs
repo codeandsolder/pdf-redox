@@ -7,6 +7,7 @@ use pdf_redox::{
 };
 use std::{
     io::{self, Write},
+    num::NonZeroUsize,
     path::PathBuf,
 };
 
@@ -119,6 +120,9 @@ struct Args {
     /// Processing may skip expensive searches that only reduce encoded bytes.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
+    /// Maximum persistent workers used for independent whole-stream Flate compression.
+    #[arg(long)]
+    flate_workers: Option<NonZeroUsize>,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by the Print profile.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -256,6 +260,9 @@ fn config_from_args(args: &Args) -> Config {
         OptimizeForArg::Size => OptimizationGoal::Size,
         OptimizeForArg::Processing => OptimizationGoal::Processing,
     };
+    if let Some(flate_workers) = args.flate_workers {
+        cfg.flate_workers = flate_workers;
+    }
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
         && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled =
@@ -397,6 +404,14 @@ mod tests {
             config_from_args(&args).optimization_goal,
             OptimizationGoal::Processing
         );
+        Ok(())
+    }
+
+    #[test]
+    fn flate_worker_count_is_explicitly_configurable() -> Result<(), clap::Error> {
+        let args = Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-workers", "2"])?;
+        assert_eq!(config_from_args(&args).flate_workers.get(), 2);
+        assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-workers", "0"]).is_err());
         Ok(())
     }
 

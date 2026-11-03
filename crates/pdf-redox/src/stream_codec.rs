@@ -1,8 +1,6 @@
 //! Stream filter decoding and encoding for the copy-on-write document layer.
 
 use crate::{EditDocument, Error, OwnedDictionary, OwnedObject, Result};
-use flate2::{Compression, write::ZlibEncoder};
-use std::io::Write as _;
 
 fn write_resolved_value(
     document: &EditDocument,
@@ -138,11 +136,87 @@ pub fn decode_image_stream(
     .map_err(|error| Error::Invalid(format!("failed to decode image stream filters: {error:?}")))
 }
 
+fn flate_config(level: crate::FlateLevel) -> zlib_rs::DeflateConfig {
+    zlib_rs::DeflateConfig::new(level.value())
+}
+
+fn compression_code_error(code: zlib_rs::ReturnCode) -> Error {
+    Error::Compression(format!("zlib-rs returned {code:?}"))
+}
+
 /// Encode ordinary zlib/Flate data at an explicit PDF compression level.
 pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level.value()));
-    encoder.write_all(decoded)?;
-    Ok(encoder.finish()?)
+    let mut output = vec![0_u8; zlib_rs::compress_bound(decoded.len())];
+    let (encoded, code) = zlib_rs::compress_slice(&mut output, decoded, flate_config(level));
+    if code != zlib_rs::ReturnCode::Ok {
+        return Err(compression_code_error(code));
+    }
+    let encoded_len = encoded.len();
+    output.truncate(encoded_len);
+    Ok(output)
+}
+
+/// Persistent whole-stream Flate executor used by document-level batch phases.
+pub(crate) struct FlateBatchEncoder {
+    #[cfg(not(target_family = "wasm"))]
+    compressor: Option<zlib_rs::BatchCompressor>,
+}
+
+impl FlateBatchEncoder {
+    pub(crate) fn new(workers: std::num::NonZeroUsize) -> Result<Self> {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = workers;
+            Ok(Self {})
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let compressor = if workers.get() > 1 {
+                Some(zlib_rs::BatchCompressor::new(workers).map_err(|error| {
+                    Error::Compression(format!("failed to create Flate worker pool: {error}"))
+                })?)
+            } else {
+                None
+            };
+            Ok(Self { compressor })
+        }
+    }
+
+    pub(crate) fn encode_many(
+        &self,
+        inputs: &[&[u8]],
+        level: crate::FlateLevel,
+    ) -> Result<Vec<Vec<u8>>> {
+        #[cfg(not(target_family = "wasm"))]
+        if inputs.len() > 1
+            && let Some(compressor) = &self.compressor
+        {
+            let mut outputs = inputs
+                .iter()
+                .map(|input| vec![0_u8; zlib_rs::compress_bound(input.len())])
+                .collect::<Vec<_>>();
+            let mut jobs = inputs
+                .iter()
+                .zip(&mut outputs)
+                .map(|(input, output)| zlib_rs::BatchCompressJob::new(input, output))
+                .collect::<Vec<_>>();
+            let results = compressor.compress(&mut jobs, flate_config(level));
+            drop(jobs);
+
+            for (output, result) in outputs.iter_mut().zip(results) {
+                if result.code != zlib_rs::ReturnCode::Ok {
+                    return Err(compression_code_error(result.code));
+                }
+                output.truncate(result.written);
+            }
+            return Ok(outputs);
+        }
+
+        inputs
+            .iter()
+            .map(|input| encode_flate(input, level))
+            .collect()
+    }
 }
 
 /// Return the encoded byte length of ordinary zlib/Flate data.
@@ -192,4 +266,31 @@ pub fn set_plain_flate(dictionary: &mut OwnedDictionary) {
     dictionary.remove(b"FFilter".as_slice());
     dictionary.remove(b"FDecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_encoder_is_byte_exact_across_worker_counts() -> Result<()> {
+        let buffers = [
+            b"BT /F1 12 Tf (hello) Tj ET".repeat(64),
+            (0_u8..=255).cycle().take(256 * 1024).collect::<Vec<_>>(),
+            vec![0_u8; 1024 * 1024],
+            b"pdf-redox-zlib-batch/".repeat(40_000),
+        ];
+        let inputs = buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let serial = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+        let parallel =
+            FlateBatchEncoder::new(std::num::NonZeroUsize::new(4).expect("four is non-zero"))?;
+
+        for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+            assert_eq!(
+                parallel.encode_many(&inputs, level)?,
+                serial.encode_many(&inputs, level)?
+            );
+        }
+        Ok(())
+    }
 }

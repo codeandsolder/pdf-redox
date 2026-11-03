@@ -52,6 +52,7 @@ use crate::{
         repeated_page_objects_prefix_possible,
     },
     scrub::scrub_edit_document_cos_privacy,
+    stream_codec::FlateBatchEncoder,
     structure_compact::compact_structure,
     vector_compact::{
         VectorCompactionStats, compact_vector_paths_with_flate_cache, processing_factor_candidate,
@@ -885,8 +886,16 @@ fn optimize_pdf_with_document(
             Ok(MicrostrokeRasterStats::default())
         }
     })?;
+    let flate_encoder = timed(&mut timings, "flate-executor-init", || {
+        FlateBatchEncoder::new(cfg.flate_workers)
+    })?;
     let flate = timed(&mut timings, "flate-policy", || {
-        optimize_flate_streams_with_cache(&mut document, flate_level, &mut flate_reuse_cache)
+        optimize_flate_streams_with_cache(
+            &mut document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
     })?;
     timed(&mut timings, "content-normalize", || -> Result<()> {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -906,7 +915,12 @@ fn optimize_pdf_with_document(
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(&mut document, flate_level, &mut flate_reuse_cache)
+        compress_unfiltered_streams(
+            &mut document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
     })?;
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
