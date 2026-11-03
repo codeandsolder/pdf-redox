@@ -16,7 +16,7 @@ use crate::{
     geometry::{Matrix, Rect},
     report::{DocumentRepresentation, PageRepresentation},
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const RASTER_PAGE_COVERAGE: f64 = 0.98;
 const MIXED_PAGE_COVERAGE: f64 = 0.50;
@@ -133,6 +133,28 @@ impl PagePaintFacts {
     }
 }
 
+// Resource maps can contain tens of thousands of entries. Reusing a resolved
+// indirect map, or borrowing a direct one, avoids copying the whole dictionary
+// for every paint. The classifier owns the cache for its single read-only scan.
+fn cached_resource_dictionary<'a>(
+    document: &EditDocument,
+    cache: &'a mut HashMap<ObjectHandle, Option<OwnedDictionary>>,
+    value: Option<&'a OwnedObject>,
+) -> Result<Option<&'a OwnedDictionary>> {
+    match value {
+        Some(OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. }) => {
+            Ok(Some(dictionary))
+        }
+        Some(OwnedObject::Reference(handle)) => {
+            if !cache.contains_key(handle) {
+                cache.insert(*handle, resolved_dictionary(document, value)?);
+            }
+            Ok(cache.get(handle).and_then(Option::as_ref))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub struct PageClassifier<'a> {
     document: &'a EditDocument,
     page: Rect,
@@ -140,6 +162,7 @@ pub struct PageClassifier<'a> {
     state: GraphicsState,
     stack: Vec<GraphicsState>,
     active_forms: HashSet<ObjectHandle>,
+    resource_dictionaries: HashMap<ObjectHandle, Option<OwnedDictionary>>,
     compatibility_depth: usize,
     path_rect: Option<Rect>,
     path_reliable: bool,
@@ -155,6 +178,7 @@ impl<'a> PageClassifier<'a> {
             state: GraphicsState::new(page),
             stack: Vec::new(),
             active_forms: HashSet::new(),
+            resource_dictionaries: HashMap::new(),
             compatibility_depth: 0,
             path_rect: None,
             path_reliable: true,
@@ -410,14 +434,20 @@ impl<'a> PageClassifier<'a> {
             self.facts.complete = false;
             return Ok(());
         };
-        let Some(ext_gstates) =
-            resolved_dictionary(self.document, resources.get(b"ExtGState".as_slice()))?
-        else {
-            self.facts.complete = false;
-            return Ok(());
-        };
-        let Some(dictionary) =
-            resolved_dictionary(self.document, ext_gstates.get(name.as_slice()))?
+        // Copy at most the selected entry (usually an indirect reference), not
+        // the complete resource map, before resolving its graphics-state value.
+        let entry = cached_resource_dictionary(
+            self.document,
+            &mut self.resource_dictionaries,
+            resources.get(b"ExtGState".as_slice()),
+        )?
+        .and_then(|states| states.get(name.as_slice()))
+        .cloned();
+        let Some(dictionary) = cached_resource_dictionary(
+            self.document,
+            &mut self.resource_dictionaries,
+            entry.as_ref(),
+        )?
         else {
             self.facts.complete = false;
             return Ok(());
@@ -453,29 +483,27 @@ impl<'a> PageClassifier<'a> {
             self.facts.complete = false;
             return Ok(());
         };
-        let Some(xobjects) =
-            resolved_dictionary(self.document, resources.get(b"XObject".as_slice()))?
-        else {
-            self.facts.mark_unknown("xobject-resolution");
-            self.facts.complete = false;
-            return Ok(());
-        };
-        let Some(value) = xobjects.get(name.as_slice()) else {
-            self.facts.mark_unknown("xobject-resolution");
-            self.facts.complete = false;
-            return Ok(());
-        };
-        let OwnedObject::Reference(handle) = value else {
+        let handle = cached_resource_dictionary(
+            self.document,
+            &mut self.resource_dictionaries,
+            resources.get(b"XObject".as_slice()),
+        )?
+        .and_then(|objects| objects.get(name.as_slice()))
+        .and_then(|value| match value {
+            OwnedObject::Reference(handle) => Some(*handle),
+            _ => None,
+        });
+        let Some(handle) = handle else {
             self.facts.mark_unknown("xobject-resolution");
             self.facts.complete = false;
             return Ok(());
         };
 
-        if self.document.stream_subtype_is(*handle, b"Image")? {
-            return self.paint_image(*handle);
+        if self.document.stream_subtype_is(handle, b"Image")? {
+            return self.paint_image(handle);
         }
-        if self.document.stream_subtype_is(*handle, b"Form")? {
-            return self.paint_form(*handle, resources);
+        if self.document.stream_subtype_is(handle, b"Form")? {
+            return self.paint_form(handle, resources);
         }
 
         self.facts.mark_unknown("xobject-subtype");
@@ -894,6 +922,31 @@ mod tests {
             DocumentRepresentation::Raster
         );
         assert_eq!(analysis.raster_page_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_indirect_resource_maps_preserve_image_and_graphics_state() -> Result<()> {
+        let content =
+            b"q 100 0 0 100 0 0 cm /Opaque gs /Im Do Q q 100 0 0 100 0 0 cm /Opaque gs /Im Do Q";
+        for resources in [
+            b"<< /XObject << /Im 5 0 R >> /ExtGState << /Opaque 6 0 R >> >>".as_slice(),
+            b"<< /XObject 7 0 R /ExtGState 8 0 R >>".as_slice(),
+        ] {
+            let input = one_page_pdf(resources, content, |pdf| {
+                image_object(pdf, 5)?;
+                pdf.object(6, b"<< /Type /ExtGState /ca 1 >>")?;
+                pdf.object(7, b"<< /Im 5 0 R >>")?;
+                pdf.object(8, b"<< /Opaque 6 0 R >>")
+            })?;
+            let analysis = analyze_pdf_preflight(&input)?;
+            assert_eq!(
+                analysis.document_representation,
+                DocumentRepresentation::Raster
+            );
+            assert_eq!(analysis.raster_page_count, 1);
+            assert_eq!(analysis.page_content_xobject_paint_operator_count, 2);
+        }
         Ok(())
     }
 
