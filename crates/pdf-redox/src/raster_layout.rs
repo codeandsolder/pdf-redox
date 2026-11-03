@@ -6368,11 +6368,28 @@ pub fn normalize_raster_layout(
         }
     }
     let staging_cleanup_started = Instant::now();
-    let (staging_entries_removed, staging_restored_pages) =
-        cleanup_fragmented_inline_staging(document, &inline_staging)?;
-    stats.staging_xobject_entries_removed = staging_entries_removed;
-    for page in staging_restored_pages {
-        page_state.invalidate_page_vector(page);
+    let staging_cleanup = cleanup_fragmented_inline_staging(document, &inline_staging)?;
+    stats.staging_xobject_entries_removed = staging_cleanup.xobject_entries_removed;
+    stats.inline_occurrences_remaining = stats
+        .inline_occurrences_remaining
+        .saturating_add(staging_cleanup.occurrences_restored);
+    if !staging_cleanup.restored_targets.is_empty() {
+        // The shared resource scan observes temporary `Do` operands, while an
+        // original inline image can carry named resource aliases in its own
+        // dictionary. Restoring `BI ... EI` therefore invalidates the typed
+        // page/Form resource inventory even though the rendered image is the same.
+        stats.resource_inventory_complete = false;
+    }
+    for target in staging_cleanup.restored_targets {
+        if let InlineContentTarget::Page(page) = target {
+            page_state.invalidate_page_vector(page);
+            // The physical hidden-text scanner models Image XObject `Do` coverage
+            // but intentionally ignores inline `BI` bodies. Force the final page
+            // through the canonical scanner after restoring its original bytes.
+            stats.page_physical_hidden_text_candidate = true;
+            stats.page_hidden_text_candidates.insert(page);
+            stats.page_hidden_text_shared_complete.remove(&page);
+        }
     }
     stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
     if *DEBUG_RASTER {
@@ -7002,6 +7019,61 @@ mod tests {
         assert!(candidate_payload_fits_budget(Some(1_000), 999));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_000));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_001));
+    }
+
+    #[test]
+    fn restored_inline_staging_invalidates_same_snapshot_proofs() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>",
+        )?;
+        let mut content = b"q 1 0 0 1 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        content.push(0x7f);
+        content.extend_from_slice(b" EI Q");
+        pdf.stream(4, b"", &content)?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let config = RasterLayoutConfig {
+            enabled: true,
+            crop_transparent: false,
+            crop_background: false,
+            prune_hidden_paints: true,
+            bake_masks: false,
+            reconstruct_pixel_clusters: false,
+            merge_stripes: false,
+            fragmented_paint_threshold: 1,
+            ..RasterLayoutConfig::default()
+        };
+        let mut vector_cache = BTreeMap::new();
+
+        let stats = normalize_raster_layout(
+            &mut document,
+            &[page],
+            &config,
+            FlateLevel::PROCESSING,
+            true,
+            Some(&mut vector_cache),
+        )?;
+
+        assert!(stats.inline_inventory_complete);
+        assert_eq!(stats.inline_occurrences_remaining, 1);
+        assert!(!stats.resource_inventory_complete);
+        assert!(stats.page_hidden_text_candidates.contains(&page));
+        assert!(!stats.page_hidden_text_shared_complete.contains(&page));
+        assert!(!vector_cache.contains_key(&page));
+        assert_eq!(stats.staging_xobject_entries_removed, 1);
+        assert!(
+            page_content(&document, page)?
+                .windows(2)
+                .any(|bytes| bytes == b"BI")
+        );
+        Ok(())
     }
 
     #[test]
