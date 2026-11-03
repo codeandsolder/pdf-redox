@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-/// Cached classification of a source object as a non-stream or a stream with an optional subtype.
+/// Cached classification of a source object as a non-stream or a stream with an optional resolved subtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceStreamKind {
     NotStream,
@@ -1506,6 +1506,7 @@ pub fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ClassicPdfBuilder;
 
     #[test]
     fn exact_i64_to_f64_rejects_only_lossy_conversions() {
@@ -1567,6 +1568,34 @@ mod tests {
         assert!(
             !document
                 .stream_subtype_is(ObjectHandle::Existing(ObjectId::new(999_999, 0)), b"Image",)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_stream_subtype_resolves_indirect_name() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /F 4 0 R >> >> /Contents 6 0 R >>",
+        )?;
+        pdf.stream(
+            4,
+            b"/Type /XObject /Subtype 5 0 R /BBox [0 0 1 1] /Resources <<>>",
+            b"q Q",
+        )?;
+        pdf.object(5, b"/Form")?;
+        pdf.stream(6, b"", b"q Q")?;
+
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let form = ObjectHandle::Existing(ObjectId::new(4, 0));
+        assert!(document.stream_subtype_is(form, b"Form")?);
+        assert!(
+            document
+                .reachable_streams_with_subtype(b"Form")?
+                .contains(&form)
         );
         Ok(())
     }

@@ -6,7 +6,7 @@ use crate::{
     hidden_text::analyze_hidden_text,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -562,11 +562,40 @@ fn scan_content(
     })
 }
 
-fn analyze_content(
+fn record_form_content_analysis(out: &mut ContentAnalysisStats, content: &[u8]) -> Result<()> {
+    let mut form_stats = PageInstructionCounter::default();
+    let incomplete = scan_content(
+        content,
+        &mut out.inline_count,
+        &mut out.inline_bytes,
+        &mut out.inline_payloads,
+        Some(&mut form_stats),
+        None,
+        None,
+    )?;
+    out.form_instruction_count = out
+        .form_instruction_count
+        .saturating_add(form_stats.instructions);
+    out.form_max_instructions = out.form_max_instructions.max(form_stats.instructions);
+    out.form_path_construction_count = out
+        .form_path_construction_count
+        .saturating_add(form_stats.path_construction);
+    out.form_max_path_construction = out
+        .form_max_path_construction
+        .max(form_stats.path_construction);
+    out.form_paint_count = out.form_paint_count.saturating_add(form_stats.paints);
+    out.form_max_paints = out.form_max_paints.max(form_stats.paints);
+    out.form_incomplete_parse_count = out
+        .form_incomplete_parse_count
+        .saturating_add(usize::from(incomplete));
+    Ok(())
+}
+
+fn analyze_page_content(
     document: &EditDocument,
     pages: &[CowObjectHandle],
-) -> Result<ContentAnalysisStats> {
-    let mut out = ContentAnalysisStats::default();
+    out: &mut ContentAnalysisStats,
+) -> Result<()> {
     for &page in pages {
         let content = page_content(document, page)?;
         let resources = page_resources(document, page)?.unwrap_or_default();
@@ -610,50 +639,8 @@ fn analyze_content(
             .page_incomplete_parse_count
             .saturating_add(usize::from(incomplete));
     }
-
-    let mut seen_forms = BTreeSet::new();
-    for handle in document.reachable_output_objects()? {
-        if !seen_forms.insert(handle) {
-            continue;
-        }
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, .. } = &object else {
-            continue;
-        };
-        if dictionary_name(document, dictionary, b"Subtype")?.as_deref() != Some(b"Form") {
-            continue;
-        }
-        let content = document.decoded_owned_stream_data(&object)?;
-        let mut form_stats = PageInstructionCounter::default();
-        let incomplete = scan_content(
-            &content,
-            &mut out.inline_count,
-            &mut out.inline_bytes,
-            &mut out.inline_payloads,
-            Some(&mut form_stats),
-            None,
-            None,
-        )?;
-        out.form_instruction_count = out
-            .form_instruction_count
-            .saturating_add(form_stats.instructions);
-        out.form_max_instructions = out.form_max_instructions.max(form_stats.instructions);
-        out.form_path_construction_count = out
-            .form_path_construction_count
-            .saturating_add(form_stats.path_construction);
-        out.form_max_path_construction = out
-            .form_max_path_construction
-            .max(form_stats.path_construction);
-        out.form_paint_count = out.form_paint_count.saturating_add(form_stats.paints);
-        out.form_max_paints = out.form_max_paints.max(form_stats.paints);
-        out.form_incomplete_parse_count = out
-            .form_incomplete_parse_count
-            .saturating_add(usize::from(incomplete));
-    }
     out.representation.finish_document();
-    Ok(out)
+    Ok(())
 }
 
 fn raw_stream_bytes<'a>(
@@ -1059,6 +1046,9 @@ fn analyze_document_impl(
     // the same ordered page identity. Recover the page tree once when either
     // analysis needs it, while preserving each analysis' warning-on-failure behavior.
     let analysis_pages = (deep || content_density).then(|| document.page_handles());
+    // Content-density Form metrics are output-graph metrics. Snapshot reachability
+    // once, then let the authoritative object pass classify which live objects are Forms.
+    let analysis_reachable_objects = content_density.then(|| document.reachable_output_objects());
 
     match document_info_text(document, b"Producer") {
         Ok(value) => out.producer = value,
@@ -1086,6 +1076,16 @@ fn analyze_document_impl(
     } else {
         HashSet::new()
     };
+    let content_density_reachable_handles: HashSet<_> =
+        match (analysis_pages.as_ref(), analysis_reachable_objects.as_ref()) {
+            (Some(Ok(_)), Some(Ok(handles))) => handles.iter().copied().collect(),
+            _ => HashSet::new(),
+        };
+    let mut content_analysis = content_density.then(ContentAnalysisStats::default);
+    // Form content is observed during the main object pass, before the historical
+    // page-first content-analysis error boundary. Retain its first error but defer
+    // reporting it until page and reachability errors have had their original priority.
+    let mut form_content_analysis_error = None;
     let mut risks: BTreeMap<RiskKind, (usize, String)> = BTreeMap::new();
     let mut stream_payloads: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
     let mut stream_payload_members: HashMap<[u8; 32], Vec<CowObjectHandle>> = HashMap::new();
@@ -1245,8 +1245,21 @@ fn analyze_document_impl(
         let is_image = subtype.as_deref() == Some(b"Image");
         let is_form = subtype.as_deref() == Some(b"Form");
         let is_font = preflight_refs.font.contains(&handle);
-        let decoded = if is_font || (deep && (is_form || filter == "/FlateDecode")) {
-            document.decoded_owned_stream_data(object).ok()
+        let is_content_density_form =
+            is_form && content_density_reachable_handles.contains(&handle);
+        let decoded = if is_font
+            || (deep && (is_form || filter == "/FlateDecode"))
+            || is_content_density_form
+        {
+            match document.decoded_owned_stream_data(object) {
+                Ok(decoded) => Some(decoded),
+                Err(error) => {
+                    if is_content_density_form && form_content_analysis_error.is_none() {
+                        form_content_analysis_error = Some(error.to_string());
+                    }
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1296,6 +1309,14 @@ fn analyze_document_impl(
                     &mut form_payloads,
                     decoded.as_deref().unwrap_or(raw.as_ref()),
                 );
+            }
+            if is_content_density_form
+                && form_content_analysis_error.is_none()
+                && let Some(decoded) = decoded.as_deref()
+                && let Some(content_analysis) = content_analysis.as_mut()
+                && let Err(error) = record_form_content_analysis(content_analysis, decoded)
+            {
+                form_content_analysis_error = Some(error.to_string());
             }
         }
         let type_name = type_name?;
@@ -1533,17 +1554,27 @@ fn analyze_document_impl(
     }
 
     if content_density {
-        match analysis_pages.as_ref() {
-            Some(Ok(pages)) => match analyze_content(document, pages) {
-                Ok(content) => record_content_analysis(&mut out, content),
-                Err(error) => out
-                    .warnings
-                    .push(format!("content-stream analysis skipped: {error}")),
-            },
-            Some(Err(error)) => out
-                .warnings
-                .push(format!("content-stream analysis skipped: {error}")),
-            None => {}
+        let page_content_analysis_error = match analysis_pages.as_ref() {
+            Some(Ok(pages)) => content_analysis.as_mut().and_then(|content| {
+                analyze_page_content(document, pages, content)
+                    .err()
+                    .map(|error| error.to_string())
+            }),
+            Some(Err(error)) => Some(error.to_string()),
+            None => None,
+        };
+        let reachability_error = analysis_reachable_objects
+            .as_ref()
+            .and_then(|handles| handles.as_ref().err())
+            .map(ToString::to_string);
+        if let Some(error) = page_content_analysis_error
+            .or(reachability_error)
+            .or(form_content_analysis_error)
+        {
+            out.warnings
+                .push(format!("content-stream analysis skipped: {error}"));
+        } else if let Some(content) = content_analysis {
+            record_content_analysis(&mut out, content);
         }
     }
 
@@ -2033,6 +2064,44 @@ mod tests {
         );
         assert_eq!(analysis.object_role_counts.get("stream:other"), Some(&1));
         assert_eq!(analysis.object_role_counts.get("dict:Page"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_content_density_accepts_indirect_form_subtype() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /F 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q /F Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype 6 0 R /BBox [0 0 10 10] /Resources <<>>",
+            b"0 0 m 5 5 l S",
+        )?;
+        pdf.object(6, b"/Form")?;
+        // This Form is indexed by xref but unreachable from the output graph. The
+        // fused object pass must not let all-source structural analysis leak it into
+        // live content-density metrics.
+        pdf.stream(
+            7,
+            b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources <<>>",
+            b"q 0 0 m 1 1 l S Q",
+        )?;
+
+        let input = pdf.finish(1)?;
+        let preflight = analyze_pdf_preflight(&input)?;
+        assert_eq!(preflight.form_content_instruction_count, 3);
+        assert_eq!(preflight.form_content_path_construction_operator_count, 2);
+        assert_eq!(preflight.form_content_paint_operator_count, 1);
+
+        let deep = analyze_pdf(&input)?;
+        assert_eq!(deep.form_content_instruction_count, 3);
+        assert_eq!(deep.form_content_path_construction_operator_count, 2);
+        assert_eq!(deep.form_content_paint_operator_count, 1);
         Ok(())
     }
 
