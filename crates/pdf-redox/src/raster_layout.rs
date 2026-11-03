@@ -1159,7 +1159,6 @@ fn new_raster_scanner(
 
 fn scan_target(
     document: &EditDocument,
-    target: ContentTarget,
     resources: &OwnedDictionary,
     content: &[u8],
 ) -> Result<Option<RasterScanner>> {
@@ -1168,7 +1167,6 @@ fn scan_target(
     if stopped_on_container_eof || !scanner.complete {
         return Ok(None);
     }
-    let _ = target;
     Ok(Some(scanner))
 }
 
@@ -1176,6 +1174,19 @@ struct TargetScanResult {
     scanner: RasterScanner,
     vector_analysis: Option<ProcessingVectorAnalysis>,
     hidden_ranges: Option<Vec<(usize, usize)>>,
+}
+
+struct ScannedTarget {
+    resources: OwnedDictionary,
+    content: Vec<u8>,
+    scanner: RasterScanner,
+    hidden_ranges: Option<Vec<(usize, usize)>>,
+}
+
+enum TargetLoadResult {
+    MissingResources,
+    Incomplete { content_len: usize },
+    Complete(ScannedTarget),
 }
 
 // Raster normalization mutates page content/resources but not page geometry. Keep
@@ -1257,7 +1268,7 @@ fn scan_target_shared(
 ) -> Result<Option<TargetScanResult>> {
     let ContentTarget::Page(page) = target else {
         return Ok(
-            scan_target(document, target, resources, content)?.map(|scanner| TargetScanResult {
+            scan_target(document, resources, content)?.map(|scanner| TargetScanResult {
                 scanner,
                 vector_analysis: None,
                 hidden_ranges: None,
@@ -1320,6 +1331,42 @@ fn scan_target_shared(
         scanner,
         vector_analysis: None,
         hidden_ranges,
+    }))
+}
+
+fn load_scanned_target(
+    document: &EditDocument,
+    target: ContentTarget,
+    hidden_context: Option<&HiddenTextSharedContext>,
+    page_numbers: &BTreeMap<ObjectHandle, usize>,
+    page_state: &mut RasterPageState<'_>,
+) -> Result<TargetLoadResult> {
+    let Some(resources) = target_resources(document, target)? else {
+        return Ok(TargetLoadResult::MissingResources);
+    };
+    let content = target_content(document, target)?;
+    let collect_vector = page_state.collect_vector(target);
+    let Some(scan) = scan_target_shared(
+        document,
+        target,
+        &resources,
+        &content,
+        hidden_context,
+        page_numbers,
+        page_state,
+        collect_vector,
+    )?
+    else {
+        return Ok(TargetLoadResult::Incomplete {
+            content_len: content.len(),
+        });
+    };
+    page_state.record_vector(target, scan.vector_analysis);
+    Ok(TargetLoadResult::Complete(ScannedTarget {
+        resources,
+        content,
+        scanner: scan.scanner,
+        hidden_ranges: scan.hidden_ranges,
     }))
 }
 
@@ -5738,54 +5785,51 @@ pub fn normalize_raster_layout(
 
     for target in collect_targets(document, pages)? {
         let scan_started = Instant::now();
-        let Some(mut resources) = target_resources(document, target)? else {
-            // A resource-less Form borrows its caller's resource scope. The
-            // per-target inventory cannot represent that dependency exactly,
-            // so force the canonical borrowing-aware resource-pruning path.
-            stats.resource_inventory_complete = false;
-            if matches!(target, ContentTarget::Page(_)) {
-                stats.page_vector_inventory_complete = false;
-                stats.page_hidden_text_inventory_complete = false;
-            }
-            stats.target_scan_us = stats
-                .target_scan_us
-                .saturating_add(elapsed_micros_u64(scan_started));
-            continue;
-        };
-        let mut content = target_content(document, target)?;
-        let collect_vector = page_state.collect_vector(target);
-        let Some(scan) = scan_target_shared(
+        let scanned = load_scanned_target(
             document,
             target,
-            &resources,
-            &content,
             hidden_context.as_ref(),
             &page_numbers,
             &mut page_state,
-            collect_vector,
-        )?
-        else {
-            stats.inline_inventory_complete = false;
-            stats.resource_inventory_complete = false;
-            if matches!(target, ContentTarget::Page(_)) {
-                stats.page_vector_inventory_complete = false;
-                stats.page_hidden_text_inventory_complete = false;
+        )?;
+        let ScannedTarget {
+            mut resources,
+            mut content,
+            mut scanner,
+            hidden_ranges: mut shared_hidden_ranges,
+        } = match scanned {
+            TargetLoadResult::MissingResources => {
+                // A resource-less Form borrows its caller's resource scope. The
+                // per-target inventory cannot represent that dependency exactly,
+                // so force the canonical borrowing-aware resource-pruning path.
                 stats.resource_inventory_complete = false;
+                if matches!(target, ContentTarget::Page(_)) {
+                    stats.page_vector_inventory_complete = false;
+                    stats.page_hidden_text_inventory_complete = false;
+                }
+                stats.target_scan_us = stats
+                    .target_scan_us
+                    .saturating_add(elapsed_micros_u64(scan_started));
+                continue;
             }
-            stats.target_scan_us = stats
-                .target_scan_us
-                .saturating_add(elapsed_micros_u64(scan_started));
-            if *DEBUG_RASTER {
-                eprintln!(
-                    "raster-target {target:?}: scanner incomplete content={}",
-                    content.len()
-                );
+            TargetLoadResult::Incomplete { content_len } => {
+                stats.inline_inventory_complete = false;
+                stats.resource_inventory_complete = false;
+                if matches!(target, ContentTarget::Page(_)) {
+                    stats.page_vector_inventory_complete = false;
+                    stats.page_hidden_text_inventory_complete = false;
+                    stats.resource_inventory_complete = false;
+                }
+                stats.target_scan_us = stats
+                    .target_scan_us
+                    .saturating_add(elapsed_micros_u64(scan_started));
+                if *DEBUG_RASTER {
+                    eprintln!("raster-target {target:?}: scanner incomplete content={content_len}");
+                }
+                continue;
             }
-            continue;
+            TargetLoadResult::Complete(scanned) => scanned,
         };
-        let mut scanner = scan.scanner;
-        let mut shared_hidden_ranges = scan.hidden_ranges;
-        page_state.record_vector(target, scan.vector_analysis);
         stats.target_scan_us = stats
             .target_scan_us
             .saturating_add(elapsed_micros_u64(scan_started));
@@ -5847,35 +5891,37 @@ pub fn normalize_raster_layout(
 
             page_state.invalidate_vector(target);
             let rescan_started = Instant::now();
-            let Some(updated_resources) = target_resources(document, target)? else {
-                continue;
-            };
-            resources = updated_resources;
-            content = target_content(document, target)?;
-            let Some(rescanned) = scan_target_shared(
+            let rescanned = load_scanned_target(
                 document,
                 target,
-                &resources,
-                &content,
                 hidden_context.as_ref(),
                 &page_numbers,
                 &mut page_state,
-                collect_vector,
-            )?
-            else {
-                stats.inline_inventory_complete = false;
-                if matches!(target, ContentTarget::Page(_)) {
-                    stats.page_vector_inventory_complete = false;
-                    stats.page_hidden_text_inventory_complete = false;
+            )?;
+            let ScannedTarget {
+                resources: rescanned_resources,
+                content: rescanned_content,
+                scanner: rescanned_scanner,
+                hidden_ranges: rescanned_hidden_ranges,
+            } = match rescanned {
+                TargetLoadResult::MissingResources => continue,
+                TargetLoadResult::Incomplete { .. } => {
+                    stats.inline_inventory_complete = false;
+                    if matches!(target, ContentTarget::Page(_)) {
+                        stats.page_vector_inventory_complete = false;
+                        stats.page_hidden_text_inventory_complete = false;
+                    }
+                    continue;
                 }
-                continue;
+                TargetLoadResult::Complete(scanned) => scanned,
             };
             stats.target_scan_us = stats
                 .target_scan_us
                 .saturating_add(elapsed_micros_u64(rescan_started));
-            scanner = rescanned.scanner;
-            shared_hidden_ranges = rescanned.hidden_ranges;
-            page_state.record_vector(target, rescanned.vector_analysis);
+            resources = rescanned_resources;
+            content = rescanned_content;
+            scanner = rescanned_scanner;
+            shared_hidden_ranges = rescanned_hidden_ranges;
             if scanner.inline_occurrences != 0 {
                 stats.inline_inventory_complete = false;
                 continue;
@@ -6042,7 +6088,7 @@ pub fn normalize_raster_layout(
             // explicit content/resources snapshot. Hidden-text results from the
             // original token offsets are deliberately discarded.
             let rescan_started = Instant::now();
-            let Some(rescanned) = scan_target(document, target, &resources, &content)? else {
+            let Some(rescanned) = scan_target(document, &resources, &content)? else {
                 install_target(document, target, resources, content)?;
                 continue;
             };
