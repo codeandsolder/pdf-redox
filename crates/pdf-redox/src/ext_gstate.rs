@@ -11,14 +11,14 @@ const STENCIL_RASTER_SUPPORTED_KEYS: &[&[u8]] = &[
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ExtGStateSemantics {
-    pub(crate) stencil_raster_supported: bool,
-    pub(crate) stroke_alpha_opaque: Option<bool>,
-    pub(crate) fill_alpha_opaque: Option<bool>,
-    pub(crate) normal_blend: Option<bool>,
-    pub(crate) no_soft_mask: Option<bool>,
-    pub(crate) stroke_overprint_disabled: Option<bool>,
-    pub(crate) fill_overprint_disabled: Option<bool>,
+pub struct ExtGStateSemantics {
+    pub stencil_raster_supported: bool,
+    pub stroke_alpha_opaque: Option<bool>,
+    pub fill_alpha_opaque: Option<bool>,
+    pub normal_blend: Option<bool>,
+    pub no_soft_mask: Option<bool>,
+    pub stroke_overprint_disabled: Option<bool>,
+    pub fill_overprint_disabled: Option<bool>,
 }
 
 fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
@@ -37,7 +37,7 @@ fn disabled_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result
     Ok(Some(resolved_bool_value(document, value)? == Some(false)))
 }
 
-pub(crate) fn ext_gstate_semantics(
+pub fn ext_gstate_semantics(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ExtGStateSemantics>> {

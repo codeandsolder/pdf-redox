@@ -8,19 +8,19 @@ use hayro_syntax::object::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum DirectPathStep {
+pub enum DirectPathStep {
     DictKey(Vec<u8>),
     ArrayIndex(usize),
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DirectDictionaryView<'a, 'pdf> {
+pub enum DirectDictionaryView<'a, 'pdf> {
     Source(&'a HayroDict<'pdf>),
     Owned(&'a OwnedDictionary),
 }
 
 impl DirectDictionaryView<'_, '_> {
-    pub(crate) fn reference(self, key: &[u8]) -> Option<CowObjectHandle> {
+    pub fn reference(self, key: &[u8]) -> Option<CowObjectHandle> {
         match self {
             Self::Source(dictionary) => dictionary
                 .get_ref(key)
@@ -32,11 +32,7 @@ impl DirectDictionaryView<'_, '_> {
         }
     }
 
-    pub(crate) fn resolved_name(
-        self,
-        document: &EditDocument,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn resolved_name(self, document: &EditDocument, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self {
             Self::Source(dictionary) => Ok(dictionary
                 .get::<HayroName<'_>>(key)
@@ -53,7 +49,7 @@ impl DirectDictionaryView<'_, '_> {
         }
     }
 
-    pub(crate) fn resolved_name_is(
+    pub fn resolved_name_is(
         self,
         document: &EditDocument,
         key: &[u8],
@@ -64,7 +60,7 @@ impl DirectDictionaryView<'_, '_> {
             .is_some_and(|name| name == expected))
     }
 
-    pub(crate) fn direct_dictionary_reference(
+    pub fn direct_dictionary_reference(
         self,
         dictionary_key: &[u8],
         reference_key: &[u8],
@@ -87,7 +83,7 @@ impl DirectDictionaryView<'_, '_> {
         }
     }
 
-    pub(crate) fn has_direct_dictionary(self, key: &[u8]) -> bool {
+    pub fn has_direct_dictionary(self, key: &[u8]) -> bool {
         match self {
             Self::Source(dictionary) => matches!(
                 dictionary.get_raw::<HayroObject<'_>>(key),
@@ -101,13 +97,13 @@ impl DirectDictionaryView<'_, '_> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DirectArrayView<'a, 'pdf> {
+pub enum DirectArrayView<'a, 'pdf> {
     Source(&'a HayroArray<'pdf>),
     Owned(&'a [OwnedObject]),
 }
 
 impl DirectArrayView<'_, '_> {
-    pub(crate) fn resolved_name_is(
+    pub fn resolved_name_is(
         self,
         document: &EditDocument,
         index: usize,
@@ -130,7 +126,7 @@ impl DirectArrayView<'_, '_> {
         }
     }
 
-    pub(crate) fn reference(self, index: usize) -> Option<CowObjectHandle> {
+    pub fn reference(self, index: usize) -> Option<CowObjectHandle> {
         match self {
             Self::Source(array) => match array.raw_iter().nth(index) {
                 Some(HayroMaybeRef::Ref(reference)) => {
@@ -147,12 +143,12 @@ impl DirectArrayView<'_, '_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectWalkControl {
+pub enum DirectWalkControl {
     Descend,
     SkipChildren,
 }
 
-pub(crate) trait DirectObjectVisitor {
+pub trait DirectObjectVisitor {
     fn visit_dictionary(
         &mut self,
         _document: &EditDocument,
@@ -208,7 +204,7 @@ fn walk_source_direct_dictionary(
         path.push(DirectPathStep::DictKey(key.to_vec()));
         match value {
             HayroMaybeRef::Ref(target) => {
-                visitor.visit_reference(root, path, CowObjectHandle::Existing(target.into()))?
+                visitor.visit_reference(root, path, CowObjectHandle::Existing(target.into()))?;
             }
             HayroMaybeRef::NotRef(value) if visitor.descend_dictionary_value(key) => {
                 walk_source_direct_object(document, root, &value, path, visitor)?;
@@ -232,7 +228,7 @@ fn walk_source_direct_object(
             walk_source_direct_dictionary(document, root, dictionary, path, visitor)?;
         }
         HayroObject::Stream(stream) => {
-            walk_source_direct_dictionary(document, root, &stream.dict(), path, visitor)?;
+            walk_source_direct_dictionary(document, root, stream.dict(), path, visitor)?;
         }
         HayroObject::Array(array) => {
             if visitor.visit_array(document, root, path, DirectArrayView::Source(array))?
@@ -315,7 +311,7 @@ fn walk_owned_direct_object(
     Ok(())
 }
 
-pub(crate) fn walk_direct_output_objects(
+pub fn walk_direct_output_objects(
     document: &EditDocument,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {

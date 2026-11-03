@@ -789,166 +789,187 @@ impl DirectKeyInventory {
     }
 }
 
-fn scan_direct_preflight(
-    document: &EditDocument,
-    object: &OwnedObject,
-    refs: &mut PreflightRefs,
-    inventory: &mut DirectKeyInventory,
+#[derive(Clone, Copy)]
+struct DirectPreflightMode {
     collect_refs: bool,
     collect_icc_profiles: bool,
     count_targeted_keys: bool,
-) -> Result<()> {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if dictionary.contains_key(b"Subtype".as_slice()) {
-                match dictionary_name(document, dictionary, b"Subtype") {
-                    Ok(Some(name)) if name == b"Type3" => {
-                        inventory.type3_font_scopes = inventory.type3_font_scopes.saturating_add(1);
-                    }
-                    Ok(_) => {}
-                    Err(_) => inventory.font_glyph_scope_inventory_complete = false,
-                }
-            }
-            if matches!(object, OwnedObject::Stream { .. })
-                && let Some(pattern_type) = dictionary.get(b"PatternType".as_slice())
-            {
-                match document.resolve_owned_value(pattern_type) {
-                    Ok(Some(OwnedObject::Integer(1))) => {
-                        inventory.tiling_pattern_scopes =
-                            inventory.tiling_pattern_scopes.saturating_add(1);
-                    }
-                    Ok(_) => {}
-                    Err(_) => inventory.font_glyph_scope_inventory_complete = false,
-                }
-            }
+}
 
-            if count_targeted_keys {
-                inventory.piece_info = inventory.piece_info.saturating_add(usize::from(
-                    dictionary.contains_key(b"PieceInfo".as_slice()),
-                ));
-                inventory.authoring_metadata = inventory
-                    .authoring_metadata
-                    .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
-                inventory.authoring_metadata = inventory.authoring_metadata.saturating_add(
-                    usize::from(dictionary.contains_key(b"LastModified".as_slice())),
-                );
-                inventory.to_unicode = inventory.to_unicode.saturating_add(usize::from(
-                    dictionary.contains_key(b"ToUnicode".as_slice()),
-                ));
-                inventory.ext_gstate = inventory.ext_gstate.saturating_add(usize::from(
-                    dictionary.contains_key(b"ExtGState".as_slice()),
-                ));
-                inventory.char_procs = inventory.char_procs.saturating_add(usize::from(
-                    dictionary.contains_key(b"CharProcs".as_slice()),
-                ));
-                inventory.appearance = inventory
-                    .appearance
-                    .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
-            }
+struct DirectPreflightScanner<'a> {
+    document: &'a EditDocument,
+    refs: &'a mut PreflightRefs,
+    inventory: &'a mut DirectKeyInventory,
+}
 
-            for (key, value) in dictionary {
-                let child_collect_refs = if collect_refs {
-                    if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
-                        if let OwnedObject::Reference(handle) = value {
-                            refs.font.insert(*handle);
-                            if key.as_slice() == b"FontFile2" {
-                                refs.font_file2.insert(*handle);
-                            }
-                        }
-                        false
-                    } else if key.as_slice() == b"ToUnicode" {
-                        if let OwnedObject::Reference(handle) = value {
-                            refs.to_unicode.insert(*handle);
-                        }
-                        false
-                    } else if key.as_slice() == b"CIDToGIDMap" {
-                        if let OwnedObject::Reference(handle) = value {
-                            refs.cid_to_gid.insert(*handle);
-                        }
-                        false
-                    } else if key.as_slice() == b"ExtGState" {
-                        collect_ext_g_state_map_refs(value, refs);
-                        false
-                    } else {
-                        !matches!(value, OwnedObject::Reference(_))
-                    }
-                } else {
-                    false
-                };
-                if !matches!(value, OwnedObject::Reference(_)) {
-                    scan_direct_preflight(
-                        document,
-                        value,
-                        refs,
-                        inventory,
-                        child_collect_refs,
-                        collect_icc_profiles,
-                        count_targeted_keys,
-                    )?;
-                }
+impl DirectPreflightScanner<'_> {
+    fn scan(&mut self, object: &OwnedObject, mode: DirectPreflightMode) -> Result<()> {
+        match object {
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+                self.scan_dictionary(object, dictionary, mode)
             }
+            OwnedObject::Array(values) => self.scan_array(values, mode),
+            OwnedObject::Reference(_)
+            | OwnedObject::Null
+            | OwnedObject::Boolean(_)
+            | OwnedObject::Integer(_)
+            | OwnedObject::Real(_)
+            | OwnedObject::Name(_)
+            | OwnedObject::String(_) => Ok(()),
         }
-        OwnedObject::Array(values) => {
-            let mut child_collect_icc_profiles = collect_icc_profiles;
-            let mut resolved_icc_based = None;
-            if collect_icc_profiles && values.len() >= 2 {
-                let is_icc_based = matches!(
-                    document.resolve_owned_value(&values[0])?,
-                    Some(OwnedObject::Name(name)) if name == b"ICCBased"
-                );
-                resolved_icc_based = Some(is_icc_based);
-                if is_icc_based {
-                    if let Some(OwnedObject::Reference(handle)) = values.get(1) {
-                        refs.icc_profiles.insert(*handle);
-                    }
-                    // ICCBased arrays are terminal for profile-reference discovery.
-                    child_collect_icc_profiles = false;
-                }
-            }
-
-            let mut count_child_targeted_keys = count_targeted_keys;
-            if count_targeted_keys {
-                let icc_status = resolved_icc_based.or_else(|| {
-                    values
-                        .first()
-                        .map(|first| match document.resolve_owned_value(first) {
-                            Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
-                            Ok(_) => false,
-                            Err(_) => true,
-                        })
-                });
-                if icc_status == Some(true)
-                    && matches!(values.get(1), Some(OwnedObject::Reference(_)))
-                {
-                    inventory.icc_based_arrays = inventory.icc_based_arrays.saturating_add(1);
-                    // Preserve the targeted-key inventory's ICCBased terminal semantics,
-                    // but continue the physical walk for reference and glyph-scope proofs.
-                    count_child_targeted_keys = false;
-                }
-            }
-            for value in values {
-                if !matches!(value, OwnedObject::Reference(_)) {
-                    scan_direct_preflight(
-                        document,
-                        value,
-                        refs,
-                        inventory,
-                        collect_refs,
-                        child_collect_icc_profiles,
-                        count_child_targeted_keys,
-                    )?;
-                }
-            }
-        }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
     }
-    Ok(())
+
+    fn scan_dictionary(
+        &mut self,
+        object: &OwnedObject,
+        dictionary: &crate::OwnedDictionary,
+        mode: DirectPreflightMode,
+    ) -> Result<()> {
+        if dictionary.contains_key(b"Subtype".as_slice()) {
+            match dictionary_name(self.document, dictionary, b"Subtype") {
+                Ok(Some(name)) if name == b"Type3" => {
+                    self.inventory.type3_font_scopes =
+                        self.inventory.type3_font_scopes.saturating_add(1);
+                }
+                Ok(_) => {}
+                Err(_) => self.inventory.font_glyph_scope_inventory_complete = false,
+            }
+        }
+        if matches!(object, OwnedObject::Stream { .. })
+            && let Some(pattern_type) = dictionary.get(b"PatternType".as_slice())
+        {
+            match self.document.resolve_owned_value(pattern_type) {
+                Ok(Some(OwnedObject::Integer(1))) => {
+                    self.inventory.tiling_pattern_scopes =
+                        self.inventory.tiling_pattern_scopes.saturating_add(1);
+                }
+                Ok(_) => {}
+                Err(_) => self.inventory.font_glyph_scope_inventory_complete = false,
+            }
+        }
+
+        if mode.count_targeted_keys {
+            self.inventory.piece_info = self.inventory.piece_info.saturating_add(usize::from(
+                dictionary.contains_key(b"PieceInfo".as_slice()),
+            ));
+            self.inventory.authoring_metadata = self
+                .inventory
+                .authoring_metadata
+                .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
+            self.inventory.authoring_metadata =
+                self.inventory
+                    .authoring_metadata
+                    .saturating_add(usize::from(
+                        dictionary.contains_key(b"LastModified".as_slice()),
+                    ));
+            self.inventory.to_unicode = self.inventory.to_unicode.saturating_add(usize::from(
+                dictionary.contains_key(b"ToUnicode".as_slice()),
+            ));
+            self.inventory.ext_gstate = self.inventory.ext_gstate.saturating_add(usize::from(
+                dictionary.contains_key(b"ExtGState".as_slice()),
+            ));
+            self.inventory.char_procs = self.inventory.char_procs.saturating_add(usize::from(
+                dictionary.contains_key(b"CharProcs".as_slice()),
+            ));
+            self.inventory.appearance = self
+                .inventory
+                .appearance
+                .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
+        }
+
+        for (key, value) in dictionary {
+            let child_collect_refs = if mode.collect_refs {
+                if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
+                    if let OwnedObject::Reference(handle) = value {
+                        self.refs.font.insert(*handle);
+                        if key.as_slice() == b"FontFile2" {
+                            self.refs.font_file2.insert(*handle);
+                        }
+                    }
+                    false
+                } else if key.as_slice() == b"ToUnicode" {
+                    if let OwnedObject::Reference(handle) = value {
+                        self.refs.to_unicode.insert(*handle);
+                    }
+                    false
+                } else if key.as_slice() == b"CIDToGIDMap" {
+                    if let OwnedObject::Reference(handle) = value {
+                        self.refs.cid_to_gid.insert(*handle);
+                    }
+                    false
+                } else if key.as_slice() == b"ExtGState" {
+                    collect_ext_g_state_map_refs(value, self.refs);
+                    false
+                } else {
+                    !matches!(value, OwnedObject::Reference(_))
+                }
+            } else {
+                false
+            };
+            if !matches!(value, OwnedObject::Reference(_)) {
+                self.scan(
+                    value,
+                    DirectPreflightMode {
+                        collect_refs: child_collect_refs,
+                        ..mode
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_array(&mut self, values: &[OwnedObject], mode: DirectPreflightMode) -> Result<()> {
+        let mut child_collect_icc_profiles = mode.collect_icc_profiles;
+        let mut resolved_icc_based = None;
+        if mode.collect_icc_profiles && values.len() >= 2 {
+            let is_icc_based = matches!(
+                self.document.resolve_owned_value(&values[0])?,
+                Some(OwnedObject::Name(name)) if name == b"ICCBased"
+            );
+            resolved_icc_based = Some(is_icc_based);
+            if is_icc_based {
+                if let Some(OwnedObject::Reference(handle)) = values.get(1) {
+                    self.refs.icc_profiles.insert(*handle);
+                }
+                // ICCBased arrays are terminal for profile-reference discovery.
+                child_collect_icc_profiles = false;
+            }
+        }
+
+        let mut count_child_targeted_keys = mode.count_targeted_keys;
+        if mode.count_targeted_keys {
+            let icc_status = resolved_icc_based.or_else(|| {
+                values
+                    .first()
+                    .map(|first| match self.document.resolve_owned_value(first) {
+                        Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
+                        Ok(_) => false,
+                        Err(_) => true,
+                    })
+            });
+            if icc_status == Some(true) && matches!(values.get(1), Some(OwnedObject::Reference(_)))
+            {
+                self.inventory.icc_based_arrays = self.inventory.icc_based_arrays.saturating_add(1);
+                // Preserve the targeted-key inventory's ICCBased terminal semantics,
+                // but continue the physical walk for reference and glyph-scope proofs.
+                count_child_targeted_keys = false;
+            }
+        }
+        for value in values {
+            if !matches!(value, OwnedObject::Reference(_)) {
+                self.scan(
+                    value,
+                    DirectPreflightMode {
+                        collect_icc_profiles: child_collect_icc_profiles,
+                        count_targeted_keys: count_child_targeted_keys,
+                        ..mode
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn scan_direct_preflight_root(
@@ -959,14 +980,18 @@ fn scan_direct_preflight_root(
     collect_icc_profiles: bool,
 ) -> Result<()> {
     let piece_info_before = inventory.piece_info;
-    scan_direct_preflight(
+    DirectPreflightScanner {
         document,
-        object,
         refs,
         inventory,
-        true,
-        collect_icc_profiles,
-        true,
+    }
+    .scan(
+        object,
+        DirectPreflightMode {
+            collect_refs: true,
+            collect_icc_profiles,
+            count_targeted_keys: true,
+        },
     )?;
     inventory.piece_info_roots = inventory
         .piece_info_roots
@@ -974,7 +999,7 @@ fn scan_direct_preflight_root(
     Ok(())
 }
 
-fn record_content_analysis(out: &mut PdfAnalysis, content: ContentAnalysisStats) {
+fn record_content_analysis(out: &mut PdfAnalysis, content: &ContentAnalysisStats) {
     out.page_representation_inventory_version = 1;
     out.document_representation = content.representation.document;
     out.raster_page_count = content.representation.raster_pages;
@@ -1270,7 +1295,7 @@ impl ObjectAnalysisAccumulator {
             if self.deep {
                 record_payload(
                     &mut self.form_payloads,
-                    decoded.as_deref().unwrap_or(raw.as_ref()),
+                    decoded.as_deref().unwrap_or_else(|| raw.as_ref()),
                 );
             }
             if is_content_density_form
@@ -1302,19 +1327,18 @@ impl ObjectAnalysisAccumulator {
             if !is_image {
                 out.non_image_flate_stream_count += 1;
             }
-            if self.deep {
-                if let Some(decoded) = decoded.as_deref()
-                    && let Ok(repacked) =
-                        crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
-                {
-                    let saving = raw.len().saturating_sub(repacked.len());
-                    if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
-                        out.flate_recompress_candidate_count += 1;
-                        out.flate_recompress_potential_saving_bytes += saving;
-                        if !is_image {
-                            out.non_image_flate_recompress_candidate_count += 1;
-                            out.non_image_flate_recompress_potential_saving_bytes += saving;
-                        }
+            if self.deep
+                && let Some(decoded) = decoded.as_deref()
+                && let Ok(repacked) =
+                    crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
+            {
+                let saving = raw.len().saturating_sub(repacked.len());
+                if saving >= 1024 && saving * 100 >= raw.len().saturating_mul(5) {
+                    out.flate_recompress_candidate_count += 1;
+                    out.flate_recompress_potential_saving_bytes += saving;
+                    if !is_image {
+                        out.non_image_flate_recompress_candidate_count += 1;
+                        out.non_image_flate_recompress_potential_saving_bytes += saving;
                     }
                 }
             }
@@ -1647,7 +1671,7 @@ fn analyze_document_impl(
             out.warnings
                 .push(format!("content-stream analysis skipped: {error}"));
         } else if let Some(content) = object_analysis.content_analysis {
-            record_content_analysis(&mut out, content);
+            record_content_analysis(&mut out, &content);
         }
     }
 

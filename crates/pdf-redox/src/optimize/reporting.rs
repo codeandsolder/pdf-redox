@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BTreeMap, Config, EditDocument, ImagePolicy, MAX_POLYLINE_PAGE_ERROR_PT, OptimizationReport,
+    OptimizationRunStats, PdfAnalysis, savings_percent, signed_size_delta,
+};
 
 impl OptimizationRunStats {
     #[expect(

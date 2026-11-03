@@ -301,6 +301,10 @@ mod tests {
     use crate::test_support::ClassicPdfBuilder;
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the test intentionally models exact zero-area page-box rejection"
+    )]
     fn page_box_matching_falls_back_after_rejected_crop_box() -> Result<()> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;

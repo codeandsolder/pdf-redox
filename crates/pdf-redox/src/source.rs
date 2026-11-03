@@ -454,7 +454,7 @@ impl OwnedObject {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct NewObjectCheckpoint(usize);
+pub struct NewObjectCheckpoint(usize);
 
 /// Mutation applied to an object that already exists in the source PDF.
 #[derive(Debug, Clone, PartialEq)]
@@ -777,7 +777,7 @@ impl EditDocument {
     /// allocated handles into the reachable object graph. Handles allocated after the
     /// checkpoint must be discarded together with a rollback because their indices may
     /// be reused by later allocations.
-    pub(crate) fn new_object_checkpoint(&self) -> NewObjectCheckpoint {
+    pub(crate) const fn new_object_checkpoint(&self) -> NewObjectCheckpoint {
         NewObjectCheckpoint(self.overlay.added.len())
     }
 

@@ -101,7 +101,7 @@ struct FontGraphPhaseResult {
     cid_cmap_source_inventory_still_valid: bool,
 }
 
-fn add_font_rendering_stats(total: &mut FontOptimizationStats, delta: FontOptimizationStats) {
+const fn add_font_rendering_stats(total: &mut FontOptimizationStats, delta: FontOptimizationStats) {
     total.programs_optimized += delta.programs_optimized;
     total.programs_glyph_subset += delta.programs_glyph_subset;
     total.original_encoded_bytes += delta.original_encoded_bytes;
@@ -110,10 +110,6 @@ fn add_font_rendering_stats(total: &mut FontOptimizationStats, delta: FontOptimi
     total.glyph_subset_decoded_bytes_removed += delta.glyph_subset_decoded_bytes_removed;
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "font graph consumers share one deliberately scoped graph lifecycle and ordered mutation phase"
-)]
 fn run_font_graph_phase(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],

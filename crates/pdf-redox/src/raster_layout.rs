@@ -112,7 +112,7 @@ enum ContentTarget {
 }
 
 impl RasterLayoutStats {
-    fn invalidate_target_scan(&mut self, target: ContentTarget) {
+    const fn invalidate_target_scan(&mut self, target: ContentTarget) {
         self.inline_inventory_complete = false;
         self.resource_inventory_complete = false;
         if matches!(target, ContentTarget::Page(_)) {
@@ -153,13 +153,17 @@ impl RasterLayoutStats {
         }
     }
 
-    fn record_page_vector_candidate(&mut self, target: ContentTarget, scanner: &RasterScanner) {
+    const fn record_page_vector_candidate(
+        &mut self,
+        target: ContentTarget,
+        scanner: &RasterScanner,
+    ) {
         if matches!(target, ContentTarget::Page(_)) {
             self.page_vector_merge_candidate |= scanner.vector_merge_candidate;
         }
     }
 
-    fn invalidate_page_vector_scan(&mut self, target: ContentTarget) {
+    const fn invalidate_page_vector_scan(&mut self, target: ContentTarget) {
         if matches!(target, ContentTarget::Page(_)) {
             self.page_vector_inventory_complete = false;
         }
@@ -1260,7 +1264,7 @@ struct ScannedTarget {
 enum TargetLoadResult {
     MissingResources,
     Incomplete { content_len: usize },
-    Complete(ScannedTarget),
+    Complete(Box<ScannedTarget>),
 }
 
 // Raster normalization mutates page content/resources but not page geometry. Keep
@@ -1282,7 +1286,7 @@ impl<'a> RasterPageState<'a> {
         }
     }
 
-    fn collect_vector(&self, target: ContentTarget) -> bool {
+    const fn collect_vector(&self, target: ContentTarget) -> bool {
         self.vector_cache.is_some() && matches!(target, ContentTarget::Page(_))
     }
 
@@ -1330,33 +1334,71 @@ impl<'a> RasterPageState<'a> {
     }
 }
 
-fn scan_target_shared(
-    document: &EditDocument,
-    target: ContentTarget,
-    resources: &OwnedDictionary,
-    content: &[u8],
-    hidden_context: Option<&HiddenTextSharedContext>,
-    page_numbers: &BTreeMap<ObjectHandle, usize>,
-    page_state: &mut RasterPageState<'_>,
-    collect_vector: bool,
-) -> Result<Option<TargetScanResult>> {
-    let ContentTarget::Page(page) = target else {
-        return Ok(
-            scan_target(document, resources, content)?.map(|scanner| TargetScanResult {
-                scanner,
-                vector_analysis: None,
-                hidden_ranges: None,
-            }),
-        );
-    };
+struct TargetScanContext<'a> {
+    document: &'a EditDocument,
+    hidden_context: Option<&'a HiddenTextSharedContext>,
+    page_numbers: &'a BTreeMap<ObjectHandle, usize>,
+}
 
-    let page_number = page_numbers.get(&page).copied().unwrap_or(1);
-    if collect_vector {
-        let user_unit = page_state.user_unit(document, page)?;
-        let mut scanner = RasterVectorScanner::new(document, resources, user_unit)?;
-        let hidden_ranges = if let Some(context) = hidden_context {
-            let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
-            if scanner.scan_with_hidden(content, &mut hidden)? {
+impl TargetScanContext<'_> {
+    fn scan(
+        &self,
+        target: ContentTarget,
+        resources: &OwnedDictionary,
+        content: &[u8],
+        page_state: &mut RasterPageState<'_>,
+    ) -> Result<Option<TargetScanResult>> {
+        let ContentTarget::Page(page) = target else {
+            return Ok(
+                scan_target(self.document, resources, content)?.map(|scanner| TargetScanResult {
+                    scanner,
+                    vector_analysis: None,
+                    hidden_ranges: None,
+                }),
+            );
+        };
+
+        let page_number = self.page_numbers.get(&page).copied().unwrap_or(1);
+        let collect_vector = page_state.collect_vector(target);
+        if collect_vector {
+            let user_unit = page_state.user_unit(self.document, page)?;
+            let mut scanner = RasterVectorScanner::new(self.document, resources, user_unit)?;
+            let hidden_ranges = if let Some(context) = self.hidden_context {
+                let mut hidden =
+                    PhysicalHiddenTextScanner::new(self.document, page, page_number, context)?;
+                if scanner.scan_with_hidden(content, &mut hidden)? {
+                    return Ok(None);
+                }
+                Some(hidden.finish())
+            } else {
+                let stopped_on_container_eof = scanner.scan(content)?;
+                if stopped_on_container_eof {
+                    return Ok(None);
+                }
+                None
+            };
+            let (raster, vector_analysis) = scanner.finish(content);
+            if !raster.complete {
+                return Ok(None);
+            }
+            return Ok(Some(TargetScanResult {
+                scanner: raster,
+                vector_analysis: Some(vector_analysis),
+                hidden_ranges,
+            }));
+        }
+
+        let mut scanner = new_raster_scanner(self.document, resources)?;
+        let hidden_ranges = if let Some(context) = self.hidden_context {
+            let mut hidden =
+                PhysicalHiddenTextScanner::new(self.document, page, page_number, context)?;
+            let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
+                scanner.instruction(content, instruction);
+                hidden.instruction(content, instruction);
+                Ok(())
+            })?;
+            scanner.finish_scan();
+            if incomplete {
                 return Ok(None);
             }
             Some(hidden.finish())
@@ -1367,45 +1409,15 @@ fn scan_target_shared(
             }
             None
         };
-        let (raster, vector_analysis) = scanner.finish(content);
-        if !raster.complete {
+        if !scanner.complete {
             return Ok(None);
         }
-        return Ok(Some(TargetScanResult {
-            scanner: raster,
-            vector_analysis: Some(vector_analysis),
+        Ok(Some(TargetScanResult {
+            scanner,
+            vector_analysis: None,
             hidden_ranges,
-        }));
+        }))
     }
-
-    let mut scanner = new_raster_scanner(document, resources)?;
-    let hidden_ranges = if let Some(context) = hidden_context {
-        let mut hidden = PhysicalHiddenTextScanner::new(document, page, page_number, context)?;
-        let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            scanner.instruction(content, instruction);
-            hidden.instruction(content, instruction);
-            Ok(())
-        })?;
-        scanner.finish_scan();
-        if incomplete {
-            return Ok(None);
-        }
-        Some(hidden.finish())
-    } else {
-        let stopped_on_container_eof = scanner.scan(content)?;
-        if stopped_on_container_eof {
-            return Ok(None);
-        }
-        None
-    };
-    if !scanner.complete {
-        return Ok(None);
-    }
-    Ok(Some(TargetScanResult {
-        scanner,
-        vector_analysis: None,
-        hidden_ranges,
-    }))
 }
 
 fn load_scanned_target(
@@ -1419,29 +1431,23 @@ fn load_scanned_target(
         return Ok(TargetLoadResult::MissingResources);
     };
     let content = target_content(document, target)?;
-    let collect_vector = page_state.collect_vector(target);
-    let Some(scan) = scan_target_shared(
+    let scan_context = TargetScanContext {
         document,
-        target,
-        &resources,
-        &content,
         hidden_context,
         page_numbers,
-        page_state,
-        collect_vector,
-    )?
-    else {
+    };
+    let Some(scan) = scan_context.scan(target, &resources, &content, page_state)? else {
         return Ok(TargetLoadResult::Incomplete {
             content_len: content.len(),
         });
     };
     page_state.record_vector(target, scan.vector_analysis);
-    Ok(TargetLoadResult::Complete(ScannedTarget {
+    Ok(TargetLoadResult::Complete(Box::new(ScannedTarget {
         resources,
         content,
         scanner: scan.scanner,
         hidden_ranges: scan.hidden_ranges,
-    }))
+    })))
 }
 
 fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
@@ -5089,7 +5095,7 @@ impl ApplyPlanStats {
             .saturating_add(encoding.encoded_bytes_saved);
     }
 
-    fn commit_to(self, stats: &mut RasterLayoutStats) {
+    const fn commit_to(self, stats: &mut RasterLayoutStats) {
         stats.pixel_clusters_reconstructed += self.pixel_clusters_reconstructed;
         stats.pixel_paints_reconstructed += self.pixel_paints_reconstructed;
         stats.native_fragment_groups_reconstructed += self.native_fragment_groups_reconstructed;
@@ -5973,7 +5979,7 @@ pub fn normalize_raster_layout(
                 }
                 continue;
             }
-            TargetLoadResult::Complete(scanned) => scanned,
+            TargetLoadResult::Complete(scanned) => *scanned,
         };
         stats.target_scan_us = stats
             .target_scan_us
@@ -6040,7 +6046,7 @@ pub fn normalize_raster_layout(
                     stats.invalidate_target_scan(target);
                     continue;
                 }
-                TargetLoadResult::Complete(scanned) => scanned,
+                TargetLoadResult::Complete(scanned) => *scanned,
             };
             stats.target_scan_us = stats
                 .target_scan_us
@@ -6301,8 +6307,7 @@ pub fn normalize_raster_layout(
             }
         };
 
-        let mut rejected_apply = false;
-        if let Some(budget) = inline_budget_rejection {
+        let rejected_apply = if let Some(budget) = inline_budget_rejection {
             if *DEBUG_RASTER {
                 eprintln!(
                     "raster-inline payload rollback {target:?}: candidate={} fallback={} image_payload={}",
@@ -6323,33 +6328,36 @@ pub fn normalize_raster_layout(
                 .saturating_add(1);
             resources = rollback_resources;
             applied = ApplyPlansResult::default();
-            rejected_apply = true;
+            true
         } else {
             resources = candidate_resources;
             if let Some(rewritten) = applied.rewritten_content.take() {
                 content = rewritten;
                 target_changed = true;
             }
-        }
+            false
+        };
 
-        let mut rewritten_xobject_entries_removed = 0usize;
-        if !rejected_apply && applied_changed && !applied.obsolete_resource_names.is_empty() {
-            let pruned = prune_xobject_candidates_for_content(
-                document,
-                resources,
-                &content,
-                &applied.obsolete_resource_names,
-            );
-            let (updated_resources, removed) = match pruned {
-                Ok(result) => result,
-                Err(error) => {
-                    document.rollback_new_objects(new_object_checkpoint)?;
-                    return Err(error);
-                }
+        let rewritten_xobject_entries_removed =
+            if !rejected_apply && applied_changed && !applied.obsolete_resource_names.is_empty() {
+                let pruned = prune_xobject_candidates_for_content(
+                    document,
+                    resources,
+                    &content,
+                    &applied.obsolete_resource_names,
+                );
+                let (updated_resources, removed) = match pruned {
+                    Ok(result) => result,
+                    Err(error) => {
+                        document.rollback_new_objects(new_object_checkpoint)?;
+                        return Err(error);
+                    }
+                };
+                resources = updated_resources;
+                removed
+            } else {
+                0
             };
-            resources = updated_resources;
-            rewritten_xobject_entries_removed = removed;
-        }
 
         if target_changed {
             if let Err(error) = install_target(document, target, resources, content) {
