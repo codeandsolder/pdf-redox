@@ -4,7 +4,7 @@ use crate::stream_codec::{
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData,
-    content::decoded_content_value,
+    content::{decoded_content_value, resolved_dictionary, resolved_name},
     direct_object::{
         DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
         walk_direct_output_objects,
@@ -121,7 +121,7 @@ fn descriptor_base_font_name(
         return Ok(None);
     };
     Ok(
-        owned_name_value(document, dictionary.get(b"FontName".as_slice()))?
+        resolved_name(document, dictionary.get(b"FontName".as_slice()))?
             .map(|name| subset_base_font_name(&name)),
     )
 }
@@ -707,19 +707,6 @@ fn union_sparse_cid_font_programs(
 
 const FONT_FILE_KEYS: [&[u8]; 2] = [b"FontFile2", b"FontFile3"];
 
-fn owned_name_value(
-    document: &EditDocument,
-    value: Option<&OwnedObject>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
-}
-
 const fn direct_owned_reference(value: Option<&OwnedObject>) -> Option<CowObjectHandle> {
     match value {
         Some(OwnedObject::Reference(handle)) => Some(*handle),
@@ -727,24 +714,12 @@ const fn direct_owned_reference(value: Option<&OwnedObject>) -> Option<CowObject
     }
 }
 
-fn resolved_owned_dictionary(
-    document: &EditDocument,
-    value: Option<&OwnedObject>,
-) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|value| value.as_dictionary().cloned()))
-}
-
 fn descriptor_program_ref_for(
     document: &EditDocument,
     descriptor: Option<&OwnedObject>,
     key: &[u8],
 ) -> Result<Option<CowObjectHandle>> {
-    let Some(descriptor) = resolved_owned_dictionary(document, descriptor)? else {
+    let Some(descriptor) = resolved_dictionary(document, descriptor)? else {
         return Ok(None);
     };
     Ok(direct_owned_reference(descriptor.get(key)))
@@ -763,7 +738,7 @@ fn is_cidfont_type0c_program(document: &EditDocument, program: CowObjectHandle) 
         return Ok(false);
     };
     Ok(
-        owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+        resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
             == Some(b"CIDFontType0C"),
     )
 }
@@ -813,7 +788,7 @@ fn cid_to_gid_mapping(
     let Some(value) = value else {
         return Ok(Some(CidToGidMapping::Identity));
     };
-    if owned_name_value(document, Some(value))?.as_deref() == Some(b"Identity") {
+    if resolved_name(document, Some(value))?.as_deref() == Some(b"Identity") {
         return Ok(Some(CidToGidMapping::Identity));
     }
 
@@ -845,10 +820,10 @@ fn page_font_program(
     document: &EditDocument,
     value: &OwnedObject,
 ) -> Result<Option<PageCidFontProgram>> {
-    let Some(font) = resolved_owned_dictionary(document, Some(value))? else {
+    let Some(font) = resolved_dictionary(document, Some(value))? else {
         return Ok(None);
     };
-    let subtype = owned_name_value(document, font.get(b"Subtype".as_slice()))?;
+    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?;
     if subtype.as_deref() == Some(b"TrueType") {
         return Ok(
             descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
@@ -859,7 +834,7 @@ fn page_font_program(
         return Ok(None);
     }
 
-    let encoding = owned_name_value(document, font.get(b"Encoding".as_slice()))?;
+    let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?;
     let identity_encoding = matches!(encoding.as_deref(), Some(b"Identity-H" | b"Identity-V"));
     let Some(descendants) = font.get(b"DescendantFonts".as_slice()) else {
         return Ok(None);
@@ -870,10 +845,10 @@ fn page_font_program(
     if descendants.len() != 1 {
         return Ok(None);
     }
-    let Some(cid_font) = resolved_owned_dictionary(document, descendants.first())? else {
+    let Some(cid_font) = resolved_dictionary(document, descendants.first())? else {
         return Ok(None);
     };
-    let cid_subtype = owned_name_value(document, cid_font.get(b"Subtype".as_slice()))?;
+    let cid_subtype = resolved_name(document, cid_font.get(b"Subtype".as_slice()))?;
 
     match cid_subtype.as_deref() {
         Some(b"CIDFontType2") => {
@@ -920,14 +895,13 @@ fn font_neutral_ext_gstates(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeSet<Vec<u8>>> {
-    let Some(ext_gstates) =
-        resolved_owned_dictionary(document, resources.get(b"ExtGState".as_slice()))?
+    let Some(ext_gstates) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
     else {
         return Ok(BTreeSet::new());
     };
     let mut neutral = BTreeSet::new();
     for (name, value) in &ext_gstates {
-        let Some(dictionary) = resolved_owned_dictionary(document, Some(value))? else {
+        let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
             continue;
         };
         if !dictionary.contains_key(b"Font".as_slice()) {
@@ -1290,18 +1264,17 @@ fn page_simple_truetype_program(
     document: &EditDocument,
     value: &OwnedObject,
 ) -> Result<Option<(CowObjectHandle, bool)>> {
-    let Some(font) = resolved_owned_dictionary(document, Some(value))? else {
+    let Some(font) = resolved_dictionary(document, Some(value))? else {
         return Ok(None);
     };
-    if owned_name_value(document, font.get(b"Subtype".as_slice()))?.as_deref() != Some(b"TrueType")
-    {
+    if resolved_name(document, font.get(b"Subtype".as_slice()))?.as_deref() != Some(b"TrueType") {
         return Ok(None);
     }
     let Some(program) = descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
     else {
         return Ok(None);
     };
-    let winansi = owned_name_value(document, font.get(b"Encoding".as_slice()))?.as_deref()
+    let winansi = resolved_name(document, font.get(b"Encoding".as_slice()))?.as_deref()
         == Some(b"WinAnsiEncoding");
     Ok(Some((program, winansi)))
 }
@@ -1393,8 +1366,7 @@ fn eligible_winansi_fonts(
     resources: &OwnedDictionary,
     unsafe_programs: &mut BTreeSet<CowObjectHandle>,
 ) -> Result<HashMap<Vec<u8>, CowObjectHandle>> {
-    let Some(font_resources) =
-        resolved_owned_dictionary(document, resources.get(b"Font".as_slice()))?
+    let Some(font_resources) = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
     else {
         return Ok(HashMap::new());
     };
@@ -1417,8 +1389,7 @@ fn eligible_identity_fonts(
     resources: &OwnedDictionary,
     unsafe_programs: &mut BTreeSet<CowObjectHandle>,
 ) -> Result<HashMap<Vec<u8>, CidFontGlyphSpec>> {
-    let Some(font_resources) =
-        resolved_owned_dictionary(document, resources.get(b"Font".as_slice()))?
+    let Some(font_resources) = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
     else {
         return Ok(HashMap::new());
     };
@@ -1518,7 +1489,7 @@ fn form_xobject_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>>
                 .get::<HayroName<'_>>(b"Subtype")
                 .map(|name| name.as_ref().to_vec()),
             CurrentObject::Owned(OwnedObject::Stream { dictionary, .. }) => {
-                owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?
+                resolved_name(document, dictionary.get(b"Subtype".as_slice()))?
             }
             _ => None,
         };
@@ -1557,7 +1528,7 @@ fn collect_type3_font_dictionaries(
 ) -> Result<()> {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            if resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
                 == Some(b"Type3")
             {
                 fonts.push(dictionary.clone());
@@ -1623,7 +1594,7 @@ fn scan_tiling_pattern_font_usage(
         let Some(resources_value) = dictionary.get(b"Resources".as_slice()) else {
             return Ok(true);
         };
-        let Some(resources) = resolved_owned_dictionary(document, Some(resources_value))? else {
+        let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
             return Ok(true);
         };
         let identity_eligible =
@@ -1661,7 +1632,7 @@ fn scan_type3_charproc_font_usage(
             // Without a call graph, we cannot attribute that inherited scope.
             return Ok(true);
         };
-        let Some(resources) = resolved_owned_dictionary(document, Some(resources_value))? else {
+        let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
             return Ok(true);
         };
         let identity_eligible =
@@ -1676,7 +1647,7 @@ fn scan_type3_charproc_font_usage(
             poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
             continue;
         };
-        let Some(char_procs) = resolved_owned_dictionary(document, Some(char_procs_value))? else {
+        let Some(char_procs) = resolved_dictionary(document, Some(char_procs_value))? else {
             poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
             continue;
         };
@@ -1723,7 +1694,7 @@ fn font_glyph_usage_with_hints(
         let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
             continue;
         };
-        let Some(resources) = resolved_owned_dictionary(document, Some(&resources_value))? else {
+        let Some(resources) = resolved_dictionary(document, Some(&resources_value))? else {
             continue;
         };
         let identity_eligible =
@@ -1763,7 +1734,7 @@ fn font_glyph_usage_with_hints(
             continue;
         };
         let Some(resources) =
-            resolved_owned_dictionary(document, dictionary.get(b"Resources".as_slice()))?
+            resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))?
         else {
             // A resource-less Form borrows its caller's scope. Until usage scanning
             // is call-graph-aware, it poisons both retain-GID proofs.
@@ -1992,7 +1963,7 @@ fn collect_dense_cidfont_users_from_object(
 ) -> Result<()> {
     match object {
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if owned_name_value(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
+            if resolved_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
                 == Some(b"CIDFontType2")
                 && let Some(program) =
                     descriptor_program_ref(document, dictionary.get(b"FontDescriptor".as_slice()))?

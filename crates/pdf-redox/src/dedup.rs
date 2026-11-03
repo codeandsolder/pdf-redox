@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    StreamData, source::CurrentObject,
+    StreamData, content::resolved_dictionary, source::CurrentObject,
 };
 use hayro_syntax::{
     PdfVersion,
@@ -1013,7 +1013,7 @@ fn pattern_already_factored(document: &EditDocument, dictionary: &OwnedDictionar
     let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
         return Ok(false);
     };
-    let Some(resources) = resolved_dictionary_clone(document, resources)? else {
+    let Some(resources) = resolved_dictionary(document, Some(resources))? else {
         return Ok(false);
     };
     if resources.len() != 1 {
@@ -1022,7 +1022,7 @@ fn pattern_already_factored(document: &EditDocument, dictionary: &OwnedDictionar
     let Some(xobjects) = resources.get(b"XObject".as_slice()) else {
         return Ok(false);
     };
-    let Some(xobjects) = resolved_dictionary_clone(document, xobjects)? else {
+    let Some(xobjects) = resolved_dictionary(document, Some(xobjects))? else {
         return Ok(false);
     };
     Ok(xobjects.len() == 1 && xobjects.contains_key(FACTORED_PATTERN_CELL_NAME))
@@ -1051,7 +1051,7 @@ fn pattern_payload_fingerprint(
     ) else {
         return Ok(None);
     };
-    let Some(resources) = resolved_dictionary_clone(document, resources_value)? else {
+    let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
         return Ok(None);
     };
     let raw = data.bytes(document.source())?;
@@ -1108,8 +1108,8 @@ fn pattern_payloads_equal(
     ) else {
         return Ok(false);
     };
-    Ok(resolved_dictionary_clone(document, left_resources)?
-        == resolved_dictionary_clone(document, right_resources)?)
+    Ok(resolved_dictionary(document, Some(left_resources))?
+        == resolved_dictionary(document, Some(right_resources))?)
 }
 
 fn shared_pattern_form(
@@ -1829,20 +1829,6 @@ fn redirect_reference_value(
     }
 }
 
-fn resolved_dictionary_clone(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<OwnedDictionary>> {
-    Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|object| match object {
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-                Some(dictionary)
-            }
-            _ => None,
-        }))
-}
-
 fn normalized_named_form_resource(
     document: &EditDocument,
     value: &OwnedObject,
@@ -1852,7 +1838,7 @@ fn normalized_named_form_resource(
     image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
     form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<OwnedObject> {
-    let Some(dictionary) = resolved_dictionary_clone(document, value)? else {
+    let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
         return Ok(value.clone());
     };
     let normalized = dictionary
@@ -1886,7 +1872,7 @@ fn normalized_form_resources(
     image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
     form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<OwnedObject> {
-    let Some(dictionary) = resolved_dictionary_clone(document, value)? else {
+    let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
         return Ok(value.clone());
     };
     let mut normalized = OwnedDictionary::new();
@@ -2205,7 +2191,7 @@ fn metadata_wrapper_safe_form(
     let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
         return Ok(None);
     };
-    let Some(resources) = resolved_dictionary_clone(document, resources)? else {
+    let Some(resources) = resolved_dictionary(document, Some(resources))? else {
         return Ok(None);
     };
     if !resources.is_empty() {
