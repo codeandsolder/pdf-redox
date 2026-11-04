@@ -84,6 +84,8 @@ fn duplicate_payload_stats(map: &HashMap<[u8; 32], (usize, usize)>) -> (usize, u
 
 // Compact, lossless role topology: reference handles, ordered dictionary keys
 // and COS types are retained, while scalar payloads and stream bytes are not.
+type RoleDictionaryEntry = (Box<[u8]>, RoleValue);
+
 #[derive(Debug)]
 enum RoleValue {
     Null,
@@ -124,7 +126,7 @@ impl RoleValue {
         }
     }
 
-    fn as_dictionary(&self) -> Option<&[(Box<[u8]>, Self)]> {
+    fn as_dictionary(&self) -> Option<&[RoleDictionaryEntry]> {
         match self {
             Self::Dictionary(dictionary) | Self::Stream(dictionary) => Some(dictionary),
             _ => None,
