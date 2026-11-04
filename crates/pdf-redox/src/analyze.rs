@@ -6,7 +6,7 @@ use crate::{
     hidden_text::analyze_hidden_text,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 pub fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -82,15 +82,88 @@ fn duplicate_payload_stats(map: &HashMap<[u8; 32], (usize, usize)>) -> (usize, u
         })
 }
 
-fn all_source_objects(document: &EditDocument) -> Result<Vec<(CowObjectHandle, OwnedObject)>> {
-    let mut objects = Vec::new();
-    for id in document.source().object_ids() {
-        let handle = CowObjectHandle::Existing(id);
-        if let Some(object) = document.current_owned_object(handle)? {
-            objects.push((handle, object));
+// Compact, lossless role topology: reference handles, ordered dictionary keys
+// and COS types are retained, while scalar payloads and stream bytes are not.
+#[derive(Debug)]
+enum RoleValue {
+    Null,
+    Boolean,
+    Number,
+    Name,
+    String,
+    Reference(CowObjectHandle),
+    Array(Vec<Self>),
+    Dictionary(Vec<(Box<[u8]>, Self)>),
+    Stream(Vec<(Box<[u8]>, Self)>),
+}
+
+impl RoleValue {
+    fn from_object(object: &OwnedObject) -> Self {
+        match object {
+            OwnedObject::Null => Self::Null,
+            OwnedObject::Boolean(_) => Self::Boolean,
+            OwnedObject::Integer(_) | OwnedObject::Real(_) => Self::Number,
+            OwnedObject::Name(_) => Self::Name,
+            OwnedObject::String(_) => Self::String,
+            OwnedObject::Reference(handle) => Self::Reference(*handle),
+            OwnedObject::Array(values) => {
+                Self::Array(values.iter().map(Self::from_object).collect())
+            }
+            OwnedObject::Dictionary(dictionary) => Self::Dictionary(
+                dictionary
+                    .iter()
+                    .map(|(key, value)| (key.clone().into_boxed_slice(), Self::from_object(value)))
+                    .collect(),
+            ),
+            OwnedObject::Stream { dictionary, .. } => Self::Stream(
+                dictionary
+                    .iter()
+                    .map(|(key, value)| (key.clone().into_boxed_slice(), Self::from_object(value)))
+                    .collect(),
+            ),
         }
     }
-    Ok(objects)
+
+    fn as_dictionary(&self) -> Option<&[(Box<[u8]>, Self)]> {
+        match self {
+            Self::Dictionary(dictionary) | Self::Stream(dictionary) => Some(dictionary),
+            _ => None,
+        }
+    }
+
+    fn collect_references(&self, refs: &mut BTreeSet<CowObjectHandle>) {
+        match self {
+            Self::Reference(handle) => {
+                refs.insert(*handle);
+            }
+            Self::Array(values) => {
+                for value in values {
+                    value.collect_references(refs);
+                }
+            }
+            Self::Dictionary(dictionary) => {
+                for (_, value) in dictionary {
+                    value.collect_references(refs);
+                }
+            }
+            Self::Stream(dictionary) => {
+                // Match OwnedObject::references(): stream /Length is transport
+                // metadata and must not contribute an indirect reference edge.
+                for (key, value) in dictionary {
+                    if key.as_ref() != b"Length" {
+                        value.collect_references(refs);
+                    }
+                }
+            }
+            Self::Null | Self::Boolean | Self::Number | Self::Name | Self::String => {}
+        }
+    }
+
+    fn references(&self) -> Vec<CowObjectHandle> {
+        let mut refs = BTreeSet::new();
+        self.collect_references(&mut refs);
+        refs.into_iter().collect()
+    }
 }
 
 #[derive(Default)]
@@ -162,7 +235,7 @@ fn role_descends_into_dictionary(role: &str) -> bool {
 }
 
 fn collect_incoming_roles(
-    objects: &[(CowObjectHandle, OwnedObject)],
+    objects: &[(CowObjectHandle, RoleValue)],
     page_handles: &HashSet<CowObjectHandle>,
 ) -> HashMap<CowObjectHandle, HashSet<&'static str>> {
     let objects_by_handle: HashMap<_, _> = objects
@@ -178,7 +251,10 @@ fn collect_incoming_roles(
             continue;
         };
         if page_handles.contains(handle)
-            && let Some(contents) = dictionary.get(b"Contents".as_slice())
+            && let Some(contents) = dictionary
+                .iter()
+                .find(|(key, _)| key.as_ref() == b"Contents")
+                .map(|(_, value)| value)
         {
             queue.push_back((contents, "page-content"));
         }
@@ -191,7 +267,7 @@ fn collect_incoming_roles(
 
     while let Some((value, role)) = queue.pop_front() {
         match value {
-            OwnedObject::Reference(handle) => {
+            RoleValue::Reference(handle) => {
                 if !seen.insert((*handle, role)) {
                     continue;
                 }
@@ -199,15 +275,15 @@ fn collect_incoming_roles(
                     continue;
                 };
                 match *target {
-                    OwnedObject::Stream { .. } => {
+                    RoleValue::Stream(_) => {
                         roles.entry(*handle).or_default().insert(role);
                     }
-                    OwnedObject::Array(values) => {
+                    RoleValue::Array(values) => {
                         for value in values {
                             queue.push_back((value, role));
                         }
                     }
-                    OwnedObject::Dictionary(dictionary) if role_descends_into_dictionary(role) => {
+                    RoleValue::Dictionary(dictionary) if role_descends_into_dictionary(role) => {
                         for (key, child) in dictionary {
                             queue.push_back((child, incoming_role_for_key(key).unwrap_or(role)));
                         }
@@ -215,12 +291,12 @@ fn collect_incoming_roles(
                     _ => {}
                 }
             }
-            OwnedObject::Array(values) => {
+            RoleValue::Array(values) => {
                 for value in values {
                     queue.push_back((value, role));
                 }
             }
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. }
+            RoleValue::Dictionary(dictionary) | RoleValue::Stream(dictionary)
                 if role_descends_into_dictionary(role) =>
             {
                 for (key, child) in dictionary {
@@ -256,14 +332,14 @@ struct DeepObjectFacts {
 }
 
 fn stream_role(
-    object: &OwnedObject,
+    object: &RoleValue,
     handle: CowObjectHandle,
     facts: &DeepObjectFacts,
     font_refs: &HashSet<CowObjectHandle>,
     icc_profile_refs: &HashSet<CowObjectHandle>,
     incoming_roles: &HashMap<CowObjectHandle, HashSet<&'static str>>,
 ) -> &'static str {
-    let OwnedObject::Stream { dictionary, .. } = object else {
+    let RoleValue::Stream(dictionary) = object else {
         return "other";
     };
     if let Some(kind) = facts.kind.as_deref() {
@@ -306,30 +382,28 @@ fn stream_role(
     // Several common stream classes are identified by their defining dictionary
     // keys rather than `/Type` or `/Subtype`. Keeping them out of the generic
     // `other` bucket makes corpus byte anatomy actionable.
-    if dictionary.contains_key(b"PatternType".as_slice()) {
+    let contains = |needle: &[u8]| dictionary.iter().any(|(key, _)| key.as_ref() == needle);
+    if contains(b"PatternType") {
         return "pattern";
     }
-    if dictionary.contains_key(b"ShadingType".as_slice()) {
+    if contains(b"ShadingType") {
         return "shading";
     }
-    if dictionary.contains_key(b"FunctionType".as_slice()) {
+    if contains(b"FunctionType") {
         return "function";
     }
-    if dictionary.contains_key(b"Width".as_slice())
-        && dictionary.contains_key(b"Height".as_slice())
-        && dictionary.contains_key(b"BitsPerComponent".as_slice())
-    {
+    if contains(b"Width") && contains(b"Height") && contains(b"BitsPerComponent") {
         return "image-like";
     }
     "other"
 }
 
 fn structural_object_role(
-    object: &OwnedObject,
+    object: &RoleValue,
     stream_role_name: Option<&str>,
     facts: Option<&DeepObjectFacts>,
 ) -> Result<String> {
-    if matches!(object, OwnedObject::Stream { .. }) {
+    if matches!(object, RoleValue::Stream(_)) {
         return Ok(format!("stream:{}", stream_role_name.unwrap_or("other")));
     }
     if object.as_dictionary().is_some() {
@@ -352,19 +426,19 @@ fn structural_object_role(
         });
     }
     Ok(match object {
-        OwnedObject::Array(_) => "array".to_owned(),
-        OwnedObject::Name(_) => "name".to_owned(),
-        OwnedObject::String(_) => "string".to_owned(),
-        OwnedObject::Integer(_) | OwnedObject::Real(_) => "number".to_owned(),
-        OwnedObject::Boolean(_) => "boolean".to_owned(),
-        OwnedObject::Null => "null".to_owned(),
-        OwnedObject::Reference(_) => "reference".to_owned(),
-        OwnedObject::Dictionary(_) | OwnedObject::Stream { .. } => unreachable!(),
+        RoleValue::Array(_) => "array".to_owned(),
+        RoleValue::Name => "name".to_owned(),
+        RoleValue::String => "string".to_owned(),
+        RoleValue::Number => "number".to_owned(),
+        RoleValue::Boolean => "boolean".to_owned(),
+        RoleValue::Null => "null".to_owned(),
+        RoleValue::Reference(_) => "reference".to_owned(),
+        RoleValue::Dictionary(_) | RoleValue::Stream(_) => unreachable!(),
     })
 }
 
 fn record_role_inventory(
-    objects: &[(CowObjectHandle, OwnedObject)],
+    objects: &[(CowObjectHandle, RoleValue)],
     deep_object_facts: &HashMap<CowObjectHandle, DeepObjectFacts>,
     font_refs: &HashSet<CowObjectHandle>,
     icc_profile_refs: &HashSet<CowObjectHandle>,
@@ -374,7 +448,7 @@ fn record_role_inventory(
     let mut stream_roles = HashMap::new();
     let mut object_roles = HashMap::new();
     for (handle, object) in objects {
-        let stream_role_name = if matches!(object, OwnedObject::Stream { .. }) {
+        let stream_role_name = if matches!(object, RoleValue::Stream(_)) {
             let Some(facts) = deep_object_facts.get(handle) else {
                 return Err(crate::Error::Invalid(
                     "deep analysis stream facts are missing".to_owned(),
@@ -1582,7 +1656,7 @@ impl ObjectAnalysisAccumulator {
         out: &mut PdfAnalysis,
         direct_key_inventory: &DirectKeyInventory,
         preflight_refs: &mut PreflightRefs,
-        objects: Option<&[(CowObjectHandle, OwnedObject)]>,
+        objects: Option<&[(CowObjectHandle, RoleValue)]>,
         page_content_role_pages: &HashSet<CowObjectHandle>,
     ) -> Result<Vec<CowObjectHandle>> {
         out.piece_info_key_count = direct_key_inventory.piece_info;
@@ -1687,11 +1761,10 @@ fn analyze_document_impl(
     deep: bool,
     content_density: bool,
 ) -> Result<OptimizationAnalysis> {
-    let objects = if deep {
-        Some(all_source_objects(document)?)
-    } else {
-        None
-    };
+    let object_ids = deep.then(|| document.source().object_ids());
+    let mut objects = object_ids
+        .as_ref()
+        .map(|ids| Vec::<(CowObjectHandle, RoleValue)>::with_capacity(ids.len()));
     let mut out = PdfAnalysis {
         input_bytes: input.len(),
         analysis_complete: deep,
@@ -1743,16 +1816,28 @@ fn analyze_document_impl(
         ObjectAnalysisAccumulator::new(deep, content_density, content_density_reachable_handles);
     let mut direct_key_inventory = DirectKeyInventory::new();
     let mut preflight_refs = PreflightRefs::default();
-    if let Some(objects) = objects.as_deref() {
-        for (_, object) in objects {
+    if let Some(ids) = object_ids.as_deref() {
+        let role_objects = objects
+            .as_mut()
+            .ok_or_else(|| crate::Error::Invalid("deep role graph missing".to_owned()))?;
+        for &id in ids {
+            let handle = CowObjectHandle::Existing(id);
+            let Some(object) = document.current_owned_object(handle)? else {
+                continue;
+            };
             scan_direct_preflight_root(
                 document,
-                object,
+                &object,
                 &mut preflight_refs,
                 &mut direct_key_inventory,
                 true,
             )?;
+            role_objects.push((handle, RoleValue::from_object(&object)));
         }
+        // The source xref inventory can change as lazy object-stream entries
+        // are materialized. Preserve the original deep-analysis observation
+        // point, after all indexed source objects have been inspected.
+        out.object_count = document.source().object_count();
     }
     out.preservation_key_inventory_complete = true;
     out.font_rendering_table_inventory_complete = true;
@@ -1761,8 +1846,17 @@ fn analyze_document_impl(
     out.targeted_dedup_key_inventory_version = 3;
 
     if let Some(objects) = objects.as_deref() {
-        for (handle, object) in objects {
-            object_analysis.analyze_object(document, &mut out, *handle, object, &preflight_refs)?;
+        for (handle, _) in objects {
+            let Some(object) = document.current_owned_object(*handle)? else {
+                continue;
+            };
+            object_analysis.analyze_object(
+                document,
+                &mut out,
+                *handle,
+                &object,
+                &preflight_refs,
+            )?;
         }
     } else {
         for id in document.source().object_ids() {
@@ -1893,6 +1987,64 @@ fn analyze_document_impl(
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn packed_role_topology_preserves_nested_references_and_incoming_roles() {
+        let page = CowObjectHandle::Existing(crate::ObjectId::new(3, 0));
+        let contents = CowObjectHandle::Existing(crate::ObjectId::new(4, 0));
+        let metadata = CowObjectHandle::Existing(crate::ObjectId::new(5, 0));
+        let page_object = OwnedObject::Dictionary(BTreeMap::from([
+            (b"Contents".to_vec(), OwnedObject::Reference(contents)),
+            (b"Metadata".to_vec(), OwnedObject::Reference(metadata)),
+            (
+                b"Private".to_vec(),
+                OwnedObject::Array(vec![
+                    OwnedObject::Name(b"private".to_vec()),
+                    OwnedObject::String(vec![7_u8; 128]),
+                    OwnedObject::Integer(42),
+                    OwnedObject::Reference(contents),
+                ]),
+            ),
+        ]));
+        let metadata_object = OwnedObject::Dictionary(BTreeMap::from([(
+            b"Nested".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Reference(contents)]),
+        )]));
+        let content_object = OwnedObject::Stream {
+            dictionary: BTreeMap::from([(b"Length".to_vec(), OwnedObject::Reference(metadata))]),
+            data: crate::StreamData::Owned(vec![0_u8; 1024]),
+        };
+        let objects = [
+            (page, &page_object),
+            (contents, &content_object),
+            (metadata, &metadata_object),
+        ];
+        let compact = objects
+            .iter()
+            .map(|(handle, object)| {
+                let role = RoleValue::from_object(object);
+                assert_eq!(role.references(), object.references());
+                assert_eq!(
+                    role.as_dictionary().map(<[_]>::len),
+                    object.as_dictionary().map(BTreeMap::len)
+                );
+                (*handle, role)
+            })
+            .collect::<Vec<_>>();
+        let incoming = collect_incoming_roles(&compact, &HashSet::from([page]));
+        assert_eq!(
+            incoming
+                .get(&contents)
+                .map(|roles| roles.contains("page-content")),
+            Some(true)
+        );
+        assert_eq!(
+            incoming
+                .get(&contents)
+                .map(|roles| roles.contains("metadata")),
+            Some(true)
+        );
+    }
 
     #[test]
     fn deep_flate_estimator_overlaps_two_moderately_large_jobs_but_flushes_giant() {
