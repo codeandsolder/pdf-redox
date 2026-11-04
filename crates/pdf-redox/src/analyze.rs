@@ -1098,30 +1098,45 @@ impl DeepFlateEstimator {
             .iter()
             .map(|job| job.decoded.as_slice())
             .collect::<Vec<_>>();
+        // Only output sizes that meet both saving thresholds can change the
+        // report. The cap is exact: saving >= max(1024, ceil(raw_len / 20)).
+        // For highly compressible inputs this avoids allocating an output
+        // buffer hundreds of megabytes larger than the source PDF stream.
+        let maximum_lengths = self
+            .pending
+            .iter()
+            .map(|job| {
+                job.raw_len
+                    .saturating_sub(1024.max(job.raw_len.div_ceil(20)))
+            })
+            .collect::<Vec<_>>();
         let lengths = self
             .encoder
             .as_ref()
-            .and_then(|encoder| encoder.encode_many(&inputs, crate::FlateLevel::SIZE).ok())
-            .map_or_else(
-                || {
-                    inputs
-                        .iter()
-                        .map(|decoded| {
+            .and_then(|encoder| {
+                encoder
+                    .encode_many_capped_lengths(&inputs, &maximum_lengths, crate::FlateLevel::SIZE)
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                inputs
+                    .iter()
+                    .zip(&maximum_lengths)
+                    .map(|(&decoded, &maximum_length)| {
+                        crate::stream_codec::flate_capped_encoded_len(
+                            decoded,
+                            maximum_length,
+                            crate::FlateLevel::SIZE,
+                        )
+                        .unwrap_or_else(|_| {
                             crate::stream_codec::encode_flate(decoded, crate::FlateLevel::SIZE)
                                 .ok()
-                                .map(|encoded| encoded.len())
+                                .map(|output| output.len())
                         })
-                        .collect()
-                },
-                |outputs| {
-                    outputs
-                        .iter()
-                        .map(|output| Some(output.len()))
-                        .collect::<Vec<_>>()
-                },
-            );
+                    })
+                    .collect()
+            });
         drop(inputs);
-
         for (job, encoded_len) in self.pending.drain(..).zip(lengths) {
             let Some(encoded_len) = encoded_len else {
                 continue;
