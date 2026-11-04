@@ -1059,10 +1059,28 @@ struct DeepFlateEstimator {
 
 impl DeepFlateEstimator {
     const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+    // Allow two independent very large streams to share the existing worker
+    // pool. The decoded working set remains bounded; a single stream exceeding
+    // the limit is still processed by itself.
+    const MAX_LARGE_BATCH_BYTES: usize = 576 * 1024 * 1024;
+    // Do not retain a giant decoded buffer while the next stream is decoded:
+    // its size is unknown until decompression completes, and two such buffers
+    // can exceed the memory required by the original serial implementation.
+    const MAX_STAGED_LARGE_BYTES: usize = 128 * 1024 * 1024;
     const MAX_BATCH_STREAMS: usize = 64;
 
     fn queue(&mut self, decoded: Vec<u8>, raw_len: usize, non_image: bool, out: &mut PdfAnalysis) {
-        if self.pending_bytes.saturating_add(decoded.len()) > Self::MAX_BATCH_BYTES {
+        let incoming_large = decoded.len() >= Self::MAX_BATCH_BYTES;
+        let pending_large = self
+            .pending
+            .iter()
+            .any(|job| job.decoded.len() >= Self::MAX_BATCH_BYTES);
+        let limit = if incoming_large || pending_large {
+            Self::MAX_LARGE_BATCH_BYTES
+        } else {
+            Self::MAX_BATCH_BYTES
+        };
+        if self.pending_bytes.saturating_add(decoded.len()) > limit {
             self.flush(out);
         }
         self.pending_bytes = self.pending_bytes.saturating_add(decoded.len());
@@ -1071,8 +1089,25 @@ impl DeepFlateEstimator {
             raw_len,
             non_image,
         });
-        if self.pending_bytes >= Self::MAX_BATCH_BYTES
-            || self.pending.len() >= Self::MAX_BATCH_STREAMS
+
+        let mut large_count = 0;
+        let mut largest_large_bytes = 0_usize;
+        let mut small_bytes = 0_usize;
+        for job in &self.pending {
+            if job.decoded.len() >= Self::MAX_BATCH_BYTES {
+                large_count += 1;
+                largest_large_bytes = largest_large_bytes.max(job.decoded.len());
+            } else {
+                small_bytes = small_bytes.saturating_add(job.decoded.len());
+            }
+        }
+        if self.pending.len() >= Self::MAX_BATCH_STREAMS
+            || (large_count == 0 && self.pending_bytes >= Self::MAX_BATCH_BYTES)
+            || (large_count > 0
+                && (large_count >= 2
+                    || largest_large_bytes > Self::MAX_STAGED_LARGE_BYTES
+                    || small_bytes >= Self::MAX_BATCH_BYTES
+                    || self.pending_bytes >= Self::MAX_LARGE_BATCH_BYTES))
         {
             self.flush(out);
         }
@@ -1858,6 +1893,25 @@ fn analyze_document_impl(
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn deep_flate_estimator_overlaps_two_moderately_large_jobs_but_flushes_giant() {
+        let mut estimator = DeepFlateEstimator::default();
+        let mut report = PdfAnalysis::default();
+        estimator.queue(vec![0_u8; 35 * 1024 * 1024], 1_000_000, true, &mut report);
+        assert_eq!(estimator.pending.len(), 1);
+        estimator.queue(vec![1_u8; 36 * 1024 * 1024], 1_000_000, false, &mut report);
+        assert!(estimator.pending.is_empty());
+        assert_eq!(report.flate_recompress_candidate_count, 2);
+        assert_eq!(report.non_image_flate_recompress_candidate_count, 1);
+
+        // A giant must not survive to the next stream's decode, where its
+        // retained buffer could make a formerly successful PDF run out of RAM.
+        estimator.queue(vec![2_u8; 129 * 1024 * 1024], 2_000_000, true, &mut report);
+        assert!(estimator.pending.is_empty());
+        assert_eq!(estimator.pending_bytes, 0);
+        assert_eq!(report.flate_recompress_candidate_count, 3);
+    }
 
     #[test]
     fn deep_flate_estimate_batches_preserve_scalar_thresholds_and_classification() -> Result<()> {
