@@ -483,6 +483,8 @@ pub fn subset_embedded_bitmaps(
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
     fn font_from_tables(eblc: Vec<u8>, ebdt: Vec<u8>) -> Vec<u8> {
         let mut builder = FontBuilder::new();
         let mut maxp = vec![0_u8; 32];
@@ -510,7 +512,7 @@ mod tests {
         result
     }
 
-    fn fixture(index_format: u16, image_format: u16) -> (Vec<u8>, Vec<u8>) {
+    fn fixture(index_format: u16, image_format: u16) -> TestResult<(Vec<u8>, Vec<u8>)> {
         let mut images = [
             image_data(image_format, 0xf0),
             image_data(image_format, 0x0f),
@@ -540,16 +542,19 @@ mod tests {
         match index_format {
             1 => {
                 for x in offsets {
-                    push32(&mut table, u32::try_from(x).unwrap());
+                    push32(&mut table, u32::try_from(x)?);
                 }
             }
             3 => {
                 for x in offsets {
-                    push16(&mut table, u16::try_from(x).unwrap());
+                    push16(&mut table, u16::try_from(x)?);
                 }
             }
             2 => {
-                push32(&mut table, usize32(len).unwrap());
+                push32(
+                    &mut table,
+                    usize32(len).ok_or("bitmap test fixture offset exceeds u32")?,
+                );
                 table.extend([80, 80, 0, 0, 80, 0, 0, 80]);
             }
             4 => {
@@ -561,11 +566,14 @@ mod tests {
                     (u16::MAX, offsets[3]),
                 ] {
                     push16(&mut table, gid);
-                    push16(&mut table, u16::try_from(offset).unwrap());
+                    push16(&mut table, u16::try_from(offset)?);
                 }
             }
             5 => {
-                push32(&mut table, usize32(len).unwrap());
+                push32(
+                    &mut table,
+                    usize32(len).ok_or("bitmap test fixture offset exceeds u32")?,
+                );
                 table.extend([80, 80, 0, 0, 80, 0, 0, 80]);
                 push32(&mut table, 3);
                 for gid in [1, 2, 3] {
@@ -579,28 +587,40 @@ mod tests {
         let mut eblc = vec![0, 2, 0, 0];
         push32(&mut eblc, 1);
         let mut rec = [0_u8; 48];
-        put32(&mut rec, 0, usize32(array_start).unwrap()).unwrap();
-        put32(&mut rec, 4, usize32(8 + table.len()).unwrap()).unwrap();
-        put32(&mut rec, 8, 1).unwrap();
-        put16(&mut rec, 40, 1).unwrap();
-        put16(&mut rec, 42, 3).unwrap();
+        put32(
+            &mut rec,
+            0,
+            usize32(array_start).ok_or("bitmap test fixture offset exceeds u32")?,
+        )
+        .ok_or("bitmap fixture or parse failed")?;
+        put32(
+            &mut rec,
+            4,
+            usize32(8 + table.len()).ok_or("bitmap test fixture offset exceeds u32")?,
+        )
+        .ok_or("bitmap fixture or parse failed")?;
+        put32(&mut rec, 8, 1).ok_or("bitmap fixture or parse failed")?;
+        put16(&mut rec, 40, 1).ok_or("bitmap fixture or parse failed")?;
+        put16(&mut rec, 42, 3).ok_or("bitmap fixture or parse failed")?;
         rec[44..48].copy_from_slice(&[12, 12, 1, 1]);
         eblc.extend_from_slice(&rec);
         push16(&mut eblc, 1);
         push16(&mut eblc, 3);
         push32(&mut eblc, 8);
         eblc.extend(table);
-        (eblc, ebdt)
+        Ok((eblc, ebdt))
     }
 
     #[test]
-    fn round_trip_all_five_index_formats_with_live_ink_and_orig_gids() {
+    fn round_trip_all_five_index_formats_with_live_ink_and_orig_gids() -> TestResult {
         for (index_fmt, image_fmt) in [(1, 7), (2, 5), (3, 6), (4, 1), (5, 5)] {
-            let (eblc, ebdt) = fixture(index_fmt, image_fmt);
-            let source = parse_strikes(&eblc, &ebdt, 4).unwrap();
+            let (eblc, ebdt) = fixture(index_fmt, image_fmt)?;
+            let source = parse_strikes(&eblc, &ebdt, 4).ok_or("bitmap fixture or parse failed")?;
             let used = BTreeSet::from([2]);
-            let (new_eblc, new_ebdt) = rebuild_strikes(&eblc, &ebdt, &source, &used).unwrap();
-            let new = parse_strikes(&new_eblc, &new_ebdt, 4).unwrap();
+            let (new_eblc, new_ebdt) = rebuild_strikes(&eblc, &ebdt, &source, &used)
+                .ok_or("bitmap fixture or parse failed")?;
+            let new =
+                parse_strikes(&new_eblc, &new_ebdt, 4).ok_or("bitmap fixture or parse failed")?;
             assert_eq!(new[0].glyph(2, &new_ebdt), source[0].glyph(2, &ebdt));
             assert!(new[0].glyph(1, &new_ebdt).is_none(), "{index_fmt}");
             assert!(new[0].glyph(3, &new_ebdt).is_none(), "{index_fmt}");
@@ -608,17 +628,27 @@ mod tests {
             let original_font = font_from_tables(eblc, ebdt);
             let subset = subset_embedded_bitmaps(&original_font, &used);
             assert!(subset.is_some(), "index {index_fmt} must be profitable");
-            let (out, _) = subset.unwrap();
-            let parsed = FontRef::new(&out).unwrap();
+            let (out, _) = subset.ok_or("bitmap fixture or parse failed")?;
+            let parsed = FontRef::new(&out)?;
             assert!(parsed.maxp().is_ok());
-            let out_ebdt = parsed.data_for_tag(EBDT).unwrap();
-            let out_eblc = parsed.data_for_tag(EBLC).unwrap();
-            let after = parse_strikes(out_eblc.as_bytes(), out_ebdt.as_bytes(), 4).unwrap();
+            let out_ebdt = parsed
+                .data_for_tag(EBDT)
+                .ok_or("bitmap fixture or parse failed")?;
+            let out_eblc = parsed
+                .data_for_tag(EBLC)
+                .ok_or("bitmap fixture or parse failed")?;
+            let after = parse_strikes(out_eblc.as_bytes(), out_ebdt.as_bytes(), 4)
+                .ok_or("bitmap fixture or parse failed")?;
             assert_eq!(
-                after[0].glyph(2, out_ebdt.as_bytes()).unwrap().bytes.len(),
+                after[0]
+                    .glyph(2, out_ebdt.as_bytes())
+                    .ok_or("bitmap fixture or parse failed")?
+                    .bytes
+                    .len(),
                 len_for(image_fmt)
             );
         }
+        Ok(())
     }
 
     fn len_for(image_fmt: u16) -> usize {
@@ -631,15 +661,18 @@ mod tests {
     }
 
     #[test]
-    fn composite_bitmaps_keep_recursive_components_and_reject_cycles() {
+    fn composite_bitmaps_keep_recursive_components_and_reject_cycles() -> TestResult {
         for (fmt, index_fmt) in [(8, 1), (9, 4)] {
-            let (eblc, mut ebdt) = fixture(index_fmt, fmt);
+            let (eblc, mut ebdt) = fixture(index_fmt, fmt)?;
             // img format 8/9 uses gid2 as a composite of gid1, and gid3 is
             // irrelevant. The raw component bytes survive without remapping.
-            let original = parse_strikes(&eblc, &ebdt, 4).unwrap();
+            let original =
+                parse_strikes(&eblc, &ebdt, 4).ok_or("bitmap fixture or parse failed")?;
             let keep = BTreeSet::from([2]);
-            let (new_eblc, new_ebdt) = rebuild_strikes(&eblc, &ebdt, &original, &keep).unwrap();
-            let result = parse_strikes(&new_eblc, &new_ebdt, 4).unwrap();
+            let (new_eblc, new_ebdt) = rebuild_strikes(&eblc, &ebdt, &original, &keep)
+                .ok_or("bitmap fixture or parse failed")?;
+            let result =
+                parse_strikes(&new_eblc, &new_ebdt, 4).ok_or("bitmap fixture or parse failed")?;
             for gid in [1, 2] {
                 assert_eq!(
                     result[0].glyph(gid, &new_ebdt),
@@ -648,43 +681,54 @@ mod tests {
             }
             assert!(result[0].glyph(3, &new_ebdt).is_none());
             // Make gid2 reference itself, creating a cyclic bitmap.
-            let composite = original[0].glyph(2, &ebdt).unwrap();
+            let composite = original[0]
+                .glyph(2, &ebdt)
+                .ok_or("bitmap fixture or parse failed")?;
             let offset = composite.bytes.as_ptr() as usize - ebdt.as_ptr() as usize;
             let header = if fmt == 8 { 8 } else { 10 };
             ebdt[offset + header..offset + header + 2].copy_from_slice(&2u16.to_be_bytes());
-            let source = parse_strikes(&eblc, &ebdt, 4).unwrap();
+            let source = parse_strikes(&eblc, &ebdt, 4).ok_or("bitmap fixture or parse failed")?;
             assert!(rebuild_strikes(&eblc, &ebdt, &source, &keep).is_none());
         }
+        Ok(())
     }
 
     #[test]
-    fn zero_length_shared_metrics_are_still_a_present_glyph() {
-        let (mut eblc, ebdt) = fixture(2, 5);
+    fn zero_length_shared_metrics_are_still_a_present_glyph() -> TestResult {
+        let (mut eblc, ebdt) = fixture(2, 5)?;
         // The three indexed glyphs have zero image bytes but retain shared
         // advances/bearings in EBLC. This is distinct from a missing glyph.
-        put32(&mut eblc, 8 + 48 + 8 + 8, 0).unwrap();
-        let src = parse_strikes(&eblc, &ebdt, 4).unwrap();
-        let metrics = src[0].glyph(2, &ebdt).unwrap().shared_metrics.unwrap();
-        let (new_eblc, new_ebdt) =
-            rebuild_strikes(&eblc, &ebdt, &src, &BTreeSet::from([2])).unwrap();
-        let dst = parse_strikes(&new_eblc, &new_ebdt, 4).unwrap();
-        let glyph = dst[0].glyph(2, &new_ebdt).unwrap();
+        put32(&mut eblc, 8 + 48 + 8 + 8, 0).ok_or("bitmap fixture or parse failed")?;
+        let src = parse_strikes(&eblc, &ebdt, 4).ok_or("bitmap fixture or parse failed")?;
+        let metrics = src[0]
+            .glyph(2, &ebdt)
+            .ok_or("bitmap fixture or parse failed")?
+            .shared_metrics
+            .ok_or("bitmap fixture or parse failed")?;
+        let (new_eblc, new_ebdt) = rebuild_strikes(&eblc, &ebdt, &src, &BTreeSet::from([2]))
+            .ok_or("bitmap fixture or parse failed")?;
+        let dst = parse_strikes(&new_eblc, &new_ebdt, 4).ok_or("bitmap fixture or parse failed")?;
+        let glyph = dst[0]
+            .glyph(2, &new_ebdt)
+            .ok_or("bitmap fixture or parse failed")?;
         assert_eq!(glyph.bytes.len(), 0);
         assert_eq!(glyph.shared_metrics, Some(metrics));
         assert!(dst[0].glyph(1, &new_ebdt).is_none());
+        Ok(())
     }
 
     #[test]
-    fn truncated_offsets_and_unknown_formats_reject_whole_font() {
-        let (mut eblc, ebdt) = fixture(1, 7);
+    fn truncated_offsets_and_unknown_formats_reject_whole_font() -> TestResult {
+        let (mut eblc, ebdt) = fixture(1, 7)?;
         let table = 8 + 48 + 8;
-        put32(&mut eblc, table + 8 + 3 * 4, u32::MAX).unwrap();
+        put32(&mut eblc, table + 8 + 3 * 4, u32::MAX).ok_or("bitmap fixture or parse failed")?;
         assert!(parse_strikes(&eblc, &ebdt, 4).is_none());
-        let (mut eblc, ebdt) = fixture(3, 7);
-        put16(&mut eblc, 8 + 48 + 8 + 2, 3).unwrap();
+        let (mut eblc, ebdt) = fixture(3, 7)?;
+        put16(&mut eblc, 8 + 48 + 8 + 2, 3).ok_or("bitmap fixture or parse failed")?;
         assert!(parse_strikes(&eblc, &ebdt, 4).is_none());
-        let (mut eblc, ebdt) = fixture(1, 7);
-        put16(&mut eblc, 8 + 48 + 8 + 2, 4).unwrap(); // image format 4 unsupported
+        let (mut eblc, ebdt) = fixture(1, 7)?;
+        put16(&mut eblc, 8 + 48 + 8 + 2, 4).ok_or("bitmap fixture or parse failed")?; // image format 4 unsupported
         assert!(parse_strikes(&eblc, &ebdt, 4).is_none());
+        Ok(())
     }
 }
