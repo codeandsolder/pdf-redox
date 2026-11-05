@@ -465,6 +465,7 @@ impl Config {
                 min_savings_percent: 20,
                 preserve_resolution: true,
             },
+            rasterize_excessive_small_vectors: true,
             ..Self::optimize_only()
         }
     }
@@ -538,9 +539,9 @@ mod tests {
     }
 
     #[test]
-    fn print_profile_controls_microstroke_rasterization_explicitly() {
+    fn image_optimized_profiles_enable_microstroke_rasterization() {
         assert!(!Config::optimize_only().rasterize_excessive_small_vectors);
-        assert!(!Config::perceptual().rasterize_excessive_small_vectors);
+        assert!(Config::perceptual().rasterize_excessive_small_vectors);
         assert!(Config::print().rasterize_excessive_small_vectors);
     }
 }

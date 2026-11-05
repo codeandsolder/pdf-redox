@@ -11,8 +11,6 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MIN_MICROSTROKE_RUN: usize = 500;
-const MIN_RUN_SAVINGS_BYTES: usize = 1024;
-const MIN_RUN_SAVINGS_PERCENT: usize = 20;
 const MIN_PITCH: f64 = 0.04;
 const MAX_PITCH: f64 = 0.25;
 const MAX_RASTER_DIMENSION: usize = 16_384;
@@ -676,15 +674,6 @@ fn raster_sample_pitch(state: StrokeState, geometry_pitch: f64, user_unit: f64) 
     (pitch.is_finite() && pitch > 0.0).then_some(pitch)
 }
 
-const fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
-    if after >= before {
-        return false;
-    }
-    let saved = before - after;
-    saved >= MIN_RUN_SAVINGS_BYTES
-        && saved.saturating_mul(100) >= before.saturating_mul(MIN_RUN_SAVINGS_PERCENT)
-}
-
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the value is finite, nonnegative, integral-valued by construction, and bounded by the 16384-pixel raster limit"
@@ -992,7 +981,7 @@ struct Candidate {
     data: Vec<u8>,
     codec: BilevelCodec,
     strokes: usize,
-    estimated_encoded_gain: i128,
+    estimated_encoded_gain: usize,
 }
 
 #[expect(
@@ -1055,9 +1044,8 @@ pub fn rasterize_pathological_microstrokes(
                 .saturating_add(chosen_replacement.len())
                 .saturating_add(192);
 
-            if goal == crate::OptimizationGoal::Processing
-                && let Some(coarser_pitch) =
-                    coarser_microstroke_sample_pitch(run.state, pitch, user_unit)
+            if let Some(coarser_pitch) =
+                coarser_microstroke_sample_pitch(run.state, pitch, user_unit)
                 && let Some(coarser) = rasterize_run_at_pitch(&run, pitch, coarser_pitch, user_unit)
             {
                 let payload = image_payload(&coarser, flate_level)?;
@@ -1075,11 +1063,7 @@ pub fn rasterize_pathological_microstrokes(
             }
             let local_before =
                 crate::stream_codec::flate_encoded_len(&decoded[run.start..run.end], flate_level)?;
-            if goal == crate::OptimizationGoal::Size {
-                if !worthwhile_raster_savings(local_before, chosen_cost) {
-                    continue;
-                }
-            } else if chosen_cost >= local_before {
+            if chosen_cost >= local_before {
                 // More paints have no value if the available raster encoding
                 // already costs more than the original repeated vector run.
                 continue;
@@ -1093,8 +1077,7 @@ pub fn rasterize_pathological_microstrokes(
                 data: chosen_payload.data,
                 codec: chosen_payload.codec,
                 strokes: run.lines.len(),
-                estimated_encoded_gain: i128::try_from(local_before).unwrap_or(i128::MAX)
-                    - i128::try_from(chosen_cost).unwrap_or(i128::MAX),
+                estimated_encoded_gain: local_before.saturating_sub(chosen_cost),
             });
         }
         if candidates.is_empty() {
@@ -1129,9 +1112,6 @@ pub fn rasterize_pathological_microstrokes(
                 .saturating_add(image_cost);
             if after < before {
                 break Some((rewritten, after));
-            }
-            if goal == crate::OptimizationGoal::Size {
-                break None;
             }
             // Whole-page Flate has contextual effects not reflected in each
             // isolated run estimate. If the full rewrite grows the PDF, drop
@@ -1280,15 +1260,6 @@ mod tests {
         assert!(coarser.mask.packed().len() < natural.mask.packed().len());
         assert!(coarser.mask.packed().iter().any(|byte| *byte != 0xff));
         Ok(())
-    }
-
-    #[test]
-    fn lossy_rasterization_requires_material_encoded_savings() {
-        assert!(!worthwhile_raster_savings(100_000, 98_000));
-        assert!(worthwhile_raster_savings(100_000, 79_000));
-        assert!(!worthwhile_raster_savings(4_000, 3_100));
-        assert!(worthwhile_raster_savings(4_000, 2_900));
-        assert!(!worthwhile_raster_savings(1_000, 0));
     }
 
     #[test]

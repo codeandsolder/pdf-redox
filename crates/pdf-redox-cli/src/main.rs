@@ -124,7 +124,7 @@ struct Args {
     #[arg(long)]
     flate_workers: Option<NonZeroUsize>,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
-    /// Enabled automatically by the Print profile and Processing objective.
+    /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
     rasterize_excessive_small_vectors: bool,
     /// Preserve pathological tiny-vector fields even when the Print profile would rasterize them.
@@ -413,6 +413,17 @@ mod tests {
     fn processing_rasterizes_pathological_microstrokes_by_default() -> Result<(), clap::Error> {
         let normal = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
         assert!(!config_from_args(&normal).rasterize_excessive_small_vectors);
+        let perceptual =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--profile", "perceptual"])?;
+        assert!(config_from_args(&perceptual).rasterize_excessive_small_vectors);
+        let keep_perceptual = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--profile",
+            "perceptual",
+            "--keep-excessive-small-vectors",
+        ])?;
+        assert!(!config_from_args(&keep_perceptual).rasterize_excessive_small_vectors);
         let processing =
             Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
         assert!(config_from_args(&processing).rasterize_excessive_small_vectors);
