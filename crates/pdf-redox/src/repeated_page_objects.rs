@@ -1,7 +1,7 @@
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, Result,
-    content::{page_content, replace_page_content, resolved_dictionary},
+    content::{PageRewriteResult, page_content, replace_page_content, resolved_dictionary},
 };
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +18,6 @@ pub struct RepeatedPageObjectStats {
     pub text_objects_removed: usize,
     pub xobject_paints_removed: usize,
     pub pages_rewritten: usize,
-    pub rewritten_pages: BTreeSet<CowObjectHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -559,9 +558,9 @@ pub fn repeated_page_objects_prefix_possible(
 pub fn remove_repeated_page_objects(
     document: &mut EditDocument,
     pages: &[CowObjectHandle],
-) -> Result<RepeatedPageObjectStats> {
+) -> Result<PageRewriteResult<RepeatedPageObjectStats>> {
     if pages.len() < MIN_SUPPORT_PAGES {
-        return Ok(RepeatedPageObjectStats::default());
+        return Ok(PageRewriteResult::default());
     }
     let mut contents = Vec::with_capacity(pages.len());
     let mut candidates = Vec::new();
@@ -580,7 +579,7 @@ pub fn remove_repeated_page_objects(
             .0
             .is_empty()
     {
-        return Ok(RepeatedPageObjectStats::default());
+        return Ok(PageRewriteResult::default());
     }
     for (page_index, &page) in pages.iter().enumerate().skip(seed_pages) {
         let content = page_content(document, page)?;
@@ -594,20 +593,23 @@ pub fn remove_repeated_page_objects(
 
     let (selected, modes) = select_persistent_candidates(&candidates, pages.len());
     if selected.is_empty() {
-        return Ok(RepeatedPageObjectStats::default());
+        return Ok(PageRewriteResult::default());
     }
     let mut by_page: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
-    let mut stats = RepeatedPageObjectStats {
-        groups_removed: modes.len(),
-        all_pages_groups_removed: modes
-            .iter()
-            .filter(|mode| matches!(mode, CoverageMode::AllPages))
-            .count(),
-        after_first_groups_removed: modes
-            .iter()
-            .filter(|mode| matches!(mode, CoverageMode::AfterFirst))
-            .count(),
-        ..RepeatedPageObjectStats::default()
+    let mut result = PageRewriteResult {
+        stats: RepeatedPageObjectStats {
+            groups_removed: modes.len(),
+            all_pages_groups_removed: modes
+                .iter()
+                .filter(|mode| matches!(mode, CoverageMode::AllPages))
+                .count(),
+            after_first_groups_removed: modes
+                .iter()
+                .filter(|mode| matches!(mode, CoverageMode::AfterFirst))
+                .count(),
+            ..RepeatedPageObjectStats::default()
+        },
+        ..PageRewriteResult::default()
     };
     for index in selected {
         let candidate = &candidates[index];
@@ -615,13 +617,15 @@ pub fn remove_repeated_page_objects(
             .entry(candidate.page_index)
             .or_default()
             .push((candidate.start, candidate.end));
-        stats.objects_removed = stats.objects_removed.saturating_add(1);
+        result.stats.objects_removed = result.stats.objects_removed.saturating_add(1);
         match candidate.kind {
             CandidateKind::Text => {
-                stats.text_objects_removed = stats.text_objects_removed.saturating_add(1);
+                result.stats.text_objects_removed =
+                    result.stats.text_objects_removed.saturating_add(1);
             }
             CandidateKind::XObject => {
-                stats.xobject_paints_removed = stats.xobject_paints_removed.saturating_add(1);
+                result.stats.xobject_paints_removed =
+                    result.stats.xobject_paints_removed.saturating_add(1);
             }
         }
     }
@@ -632,10 +636,10 @@ pub fn remove_repeated_page_objects(
             pages[page_index],
             remove_ranges(&contents[page_index], &ranges),
         )?;
-        stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
-        stats.rewritten_pages.insert(pages[page_index]);
+        result.stats.pages_rewritten = result.stats.pages_rewritten.saturating_add(1);
+        result.rewritten_pages.insert(pages[page_index]);
     }
-    Ok(stats)
+    Ok(result)
 }
 
 #[cfg(test)]

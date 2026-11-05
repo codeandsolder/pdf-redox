@@ -1,4 +1,11 @@
 use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
+use std::collections::BTreeSet;
+
+#[derive(Debug, Default)]
+pub struct PageRewriteResult<S> {
+    pub stats: S,
+    pub rewritten_pages: BTreeSet<ObjectHandle>,
+}
 
 pub fn decoded_content_value(
     document: &EditDocument,

@@ -1,7 +1,7 @@
 use crate::config::HiddenTextPolicy;
 use crate::content::{
-    page_box_numbers, page_content, replace_page_content, resolved_dictionary, resolved_name,
-    resolved_number_value,
+    PageRewriteResult, page_box_numbers, page_content, replace_page_content, resolved_dictionary,
+    resolved_name, resolved_number_value,
 };
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
@@ -1535,9 +1535,9 @@ pub fn prune_physically_hidden_text(
     document: &mut EditDocument,
     pages: &[CowObjectHandle],
     candidate_pages: Option<&BTreeSet<CowObjectHandle>>,
-) -> Result<HiddenTextApplyStats> {
+) -> Result<PageRewriteResult<HiddenTextApplyStats>> {
     let ocg = optional_content_state(document)?;
-    let mut stats = HiddenTextApplyStats::default();
+    let mut result: PageRewriteResult<HiddenTextApplyStats> = PageRewriteResult::default();
     for (index, &page) in pages.iter().enumerate() {
         if candidate_pages.is_some_and(|pages| !pages.contains(&page)) {
             continue;
@@ -1550,10 +1550,11 @@ pub fn prune_physically_hidden_text(
         if ranges.is_empty() {
             continue;
         }
-        stats.removed += ranges.len();
+        result.stats.removed += ranges.len();
         replace_page_content(document, page, remove_ranges(&decoded, &ranges))?;
+        result.rewritten_pages.insert(page);
     }
-    Ok(stats)
+    Ok(result)
 }
 
 fn remove_ranges(input: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {

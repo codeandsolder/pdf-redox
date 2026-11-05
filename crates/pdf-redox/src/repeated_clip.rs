@@ -9,7 +9,7 @@
 
 use crate::{
     EditDocument, Result,
-    content::{decoded_content_value, replace_page_content},
+    content::{PageRewriteResult, decoded_content_value, replace_page_content},
 };
 
 const MIN_CLIP_PREFIX_BYTES: usize = 4 * 1024;
@@ -342,8 +342,8 @@ pub fn hoist_repeated_clip_prefixes(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
-) -> Result<RepeatedClipStats> {
-    let mut stats = RepeatedClipStats::default();
+) -> Result<PageRewriteResult<RepeatedClipStats>> {
+    let mut result: PageRewriteResult<RepeatedClipStats> = PageRewriteResult::default();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
             continue;
@@ -392,20 +392,26 @@ pub fn hoist_repeated_clip_prefixes(
         }
 
         replace_page_content(document, page, rewritten)?;
-        stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
-        stats.runs_hoisted = stats.runs_hoisted.saturating_add(run_count);
-        stats.blocks_hoisted = stats.blocks_hoisted.saturating_add(block_count);
-        stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(decoded_savings);
-        stats.estimated_flate_bytes_saved = stats
+        result.stats.pages_rewritten = result.stats.pages_rewritten.saturating_add(1);
+        result.rewritten_pages.insert(page);
+        result.stats.runs_hoisted = result.stats.runs_hoisted.saturating_add(run_count);
+        result.stats.blocks_hoisted = result.stats.blocks_hoisted.saturating_add(block_count);
+        result.stats.decoded_bytes_removed = result
+            .stats
+            .decoded_bytes_removed
+            .saturating_add(decoded_savings);
+        result.stats.estimated_flate_bytes_saved = result
+            .stats
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
-    Ok(stats)
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ClassicPdfBuilder;
 
     fn large_clip() -> String {
         "0 0 m ".to_owned() + &"1 0 l ".repeat(3000) + "1 1 l h W* n "
@@ -442,6 +448,38 @@ mod tests {
         let rewritten = String::from_utf8_lossy(&rewritten);
         assert_eq!(rewritten.matches("W*").count(), 1);
         assert_eq!(rewritten.matches(" re f").count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_exact_rewritten_pages() -> Result<()> {
+        let clip = large_clip();
+        let repeated = format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f Q");
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>",
+        )?;
+        pdf.object(
+            4,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R >>",
+        )?;
+        pdf.stream(5, b"", repeated.as_bytes())?;
+        pdf.stream(6, b"", b"0 0 1 1 re f")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        let rewritten_page = pages[0];
+
+        let result =
+            hoist_repeated_clip_prefixes(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+
+        assert_eq!(result.stats.pages_rewritten, 1);
+        assert_eq!(
+            result.rewritten_pages,
+            std::collections::BTreeSet::from([rewritten_page])
+        );
         Ok(())
     }
 
