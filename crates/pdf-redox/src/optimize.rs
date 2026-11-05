@@ -1088,6 +1088,67 @@ mod tests {
         Ok(())
     }
 
+    fn processing_coordinate_form_fixture() -> Result<Vec<u8>> {
+        use std::io::Write as _;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        for page_number in 0..2_u32 {
+            let page_id = 3 + page_number;
+            let stream_id = 5 + page_number;
+            pdf.object(
+                page_id,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 20000] /Resources <<>> /Contents {stream_id} 0 R >>"
+                )
+                .as_bytes(),
+            )?;
+        }
+        for page_number in 0..2_u32 {
+            let mut content = Vec::new();
+            for row in 0..1500_u32 {
+                let index = page_number * 1500 + row;
+                // Every body is initially distinct, but its differences are
+                // within the single-shot 0.0071pt coordinate error budget.
+                // Two pages are intentional: structural keys match globally.
+                let tiny = f64::from(100 + (index * 197 % 3000)) / 1_000_000.0;
+                writeln!(&mut content, "q 1 0 0 1 0 {} cm", row * 12)?;
+                for col in 0..6_u32 {
+                    writeln!(
+                        &mut content,
+                        "{tiny:.6} {col} m 20 {col} l 20 {} l h f",
+                        col + 1
+                    )?;
+                }
+                content.extend_from_slice(b"Q\n");
+            }
+            pdf.stream(5 + page_number, b"", &content)?;
+        }
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn processing_factors_transformed_forms_exposed_by_coordinate_canonicalization() -> Result<()> {
+        let input = processing_coordinate_form_fixture()?;
+        let mut config = Config::optimize_only();
+        config.optimization_goal = crate::OptimizationGoal::Processing;
+
+        let (first, first_report) = optimize_pdf(&input, &config)?;
+        assert!(first_report.vector_path_coordinate_pages_rewritten > 0);
+        assert!(
+            first_report.vector_transformed_forms_created > 0,
+            "exact structural factoring must close after single-shot coordinate rounding"
+        );
+        assert_eq!(first_report.vector_transformed_form_pages_rewritten, 2);
+
+        let (second, second_report) = optimize_pdf(&first, &config)?;
+        assert_eq!(second_report.vector_transformed_forms_created, 0);
+        assert_eq!(second_report.vector_path_coordinate_pages_rewritten, 0);
+        assert_eq!(second, first);
+        Ok(())
+    }
+
     fn practical_cleanup_fixture() -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>")?;
