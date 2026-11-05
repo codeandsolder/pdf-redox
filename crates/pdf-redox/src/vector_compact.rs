@@ -75,7 +75,7 @@ pub struct VectorCompactionStats {
 }
 
 impl VectorCompactionStats {
-    fn absorb(&mut self, delta: Self) {
+    pub fn absorb(&mut self, delta: Self) {
         self.pages_compacted += delta.pages_compacted;
         self.fill_groups_batched += delta.fill_groups_batched;
         self.covered_fills_pruned += delta.covered_fills_pruned;
@@ -2577,6 +2577,21 @@ struct SelectedSharedRun {
     body: Vec<u8>,
     resources: BTreeSet<SharedResourceRef>,
     compressed_body_bytes: usize,
+}
+
+/// Exact cross-page q-run factoring for Size, independent of rectangle/fill
+/// compaction. A fill-only raster preflight cannot prove these Forms absent.
+/// The underlying scanner checks page-box/resource identity and only admits
+/// profitable, exact, balanced graphics-state scopes.
+pub fn factor_size_shared_forms(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    pages: &[ObjectHandle],
+) -> Result<VectorCompactionStats> {
+    if pages.len() < 2 {
+        return Ok(VectorCompactionStats::default());
+    }
+    factor_shared_q_prefix_runs(document, flate_level, pages)
 }
 
 #[expect(
