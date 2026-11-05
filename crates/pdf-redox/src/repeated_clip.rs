@@ -1,4 +1,4 @@
-//! Processing-mode compaction for repeated expensive clipping paths.
+//! Exact, goal-independent compaction for repeated expensive clipping paths.
 //!
 //! Some printer drivers emit a complete, identical clipping polygon around every
 //! small paint transaction. Deflate compresses that reasonably well, but PDF
@@ -8,7 +8,7 @@
 //! once while each original body remains isolated in its own `q`/`Q` scope.
 
 use crate::{
-    EditDocument, Result,
+    EditDocument, OptimizationGoal, Result,
     content::{PageRewriteResult, decoded_content_value, replace_page_content},
 };
 
@@ -338,10 +338,25 @@ fn hoisted_run(input: &[u8], blocks: &[ClipBlock], run: ClipRun) -> Option<(Repl
     Some(((first.start, last.end, output), decoded_savings))
 }
 
+/// Size mode only admits strictly smaller compressed page streams. Processing
+/// also accepts equal-sized output because eliminating repeated clip work is
+/// valuable independently of PDF bytes.
+const fn clip_rewrite_accepted(
+    before_encoded: usize,
+    after_encoded: usize,
+    goal: OptimizationGoal,
+) -> bool {
+    match goal {
+        OptimizationGoal::Size => after_encoded < before_encoded,
+        OptimizationGoal::Processing => after_encoded <= before_encoded,
+    }
+}
+
 pub fn hoist_repeated_clip_prefixes(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
+    goal: OptimizationGoal,
 ) -> Result<PageRewriteResult<RepeatedClipStats>> {
     let mut result: PageRewriteResult<RepeatedClipStats> = PageRewriteResult::default();
     for &page in pages {
@@ -387,7 +402,7 @@ pub fn hoist_repeated_clip_prefixes(
         };
         let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
         let after_flate = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?;
-        if after_flate > before_flate {
+        if !clip_rewrite_accepted(before_flate, after_flate, goal) {
             continue;
         }
 
@@ -412,6 +427,24 @@ pub fn hoist_repeated_clip_prefixes(
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn clip_admission_is_goal_specific_at_encoded_size_equality() {
+        assert!(clip_rewrite_accepted(100, 99, OptimizationGoal::Size));
+        assert!(!clip_rewrite_accepted(100, 100, OptimizationGoal::Size));
+        assert!(!clip_rewrite_accepted(100, 101, OptimizationGoal::Size));
+        assert!(clip_rewrite_accepted(100, 99, OptimizationGoal::Processing));
+        assert!(clip_rewrite_accepted(
+            100,
+            100,
+            OptimizationGoal::Processing
+        ));
+        assert!(!clip_rewrite_accepted(
+            100,
+            101,
+            OptimizationGoal::Processing
+        ));
+    }
 
     fn large_clip() -> String {
         "0 0 m ".to_owned() + &"1 0 l ".repeat(3000) + "1 1 l h W* n "
@@ -472,8 +505,12 @@ mod tests {
         let pages = document.page_handles()?;
         let rewritten_page = pages[0];
 
-        let result =
-            hoist_repeated_clip_prefixes(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+        let result = hoist_repeated_clip_prefixes(
+            &mut document,
+            &pages,
+            crate::FlateLevel::PROCESSING,
+            OptimizationGoal::Processing,
+        )?;
 
         assert_eq!(result.stats.pages_rewritten, 1);
         assert_eq!(
