@@ -2625,6 +2625,43 @@ pub struct FontOutlineSubsetProbe {
     identity_glyph_usage: IdentityGlyphUsage,
 }
 
+/// Build alternative rendering-preserving subsets from the same immutable
+/// program: outlines and bitmap strikes may each win independently, or both
+/// may be beneficial together. The PDF caller still owns complete usage
+/// and subtype/ownership proofs plus the strict final encoded size gate.
+fn font_program_subset_candidates(
+    candidate: &[u8],
+    gids: &BTreeSet<u16>,
+    allow_cff: bool,
+    allow_truetype: bool,
+) -> Vec<(Vec<u8>, usize)> {
+    let outlines = [
+        allow_cff
+            .then(|| crate::cff_cid::subset_cid_font(candidate, gids))
+            .flatten(),
+        allow_truetype
+            .then(|| sfnt_blank_unused_glyph_outlines(candidate, gids))
+            .flatten(),
+    ];
+    let mut variants = Vec::new();
+    // Bitmap-only is needed even when all outlines were already subset.
+    if allow_truetype
+        && let Some(bitmap) = crate::font_bitmap::subset_embedded_bitmaps(candidate, gids)
+    {
+        variants.push(bitmap);
+    }
+    for (outline, removed) in outlines.into_iter().flatten() {
+        if allow_truetype
+            && let Some((both, bitmap_removed)) =
+                crate::font_bitmap::subset_embedded_bitmaps(&outline, gids)
+        {
+            variants.push((both, removed.saturating_add(bitmap_removed)));
+        }
+        variants.push((outline, removed));
+    }
+    variants
+}
+
 pub fn probe_profitable_font_outline_subset(
     document: &EditDocument,
     pages: &[CowObjectHandle],
@@ -2653,11 +2690,7 @@ pub fn probe_profitable_font_outline_subset(
                 continue;
             };
             let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-            let subsets = [
-                crate::cff_cid::subset_cid_font(&candidate, gids),
-                sfnt_blank_unused_glyph_outlines(&candidate, gids),
-            ];
-            for (mut subset, _) in subsets.into_iter().flatten() {
+            for (mut subset, _) in font_program_subset_candidates(&candidate, gids, true, true) {
                 if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
                     subset = trimmed;
                 }
@@ -2726,30 +2759,36 @@ pub fn subset_font_outlines_after_dedup(
             continue;
         };
         let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-        let subset = if usage.cidfont_type0_only() {
-            crate::cff_cid::subset_cid_font(&candidate, gids)
-        } else if usage.cidfont_type2_only() {
-            sfnt_blank_unused_glyph_outlines(&candidate, gids)
-        } else {
-            None
-        };
-        let Some((mut candidate, glyph_subset_removed_bytes)) = subset else {
-            continue;
-        };
-
-        let removed_decoded_bytes =
-            if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&candidate) {
-                candidate = trimmed;
-                removed
-            } else {
-                0
+        let variants = font_program_subset_candidates(
+            &candidate,
+            gids,
+            usage.cidfont_type0_only(),
+            usage.cidfont_type2_only(),
+        );
+        let mut best = None::<(Vec<u8>, usize, usize)>;
+        for (mut subset, glyph_subset_removed_bytes) in variants {
+            let removed_decoded_bytes =
+                if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&subset) {
+                    subset = trimmed;
+                    removed
+                } else {
+                    0
+                };
+            let Ok(encoded) = encode_flate(&subset, flate_level) else {
+                continue;
             };
-        let Ok(encoded) = encode_flate(&candidate, flate_level) else {
+            if encoded.len() >= raw.len()
+                || best
+                    .as_ref()
+                    .is_some_and(|(bytes, _, _)| bytes.len() <= encoded.len())
+            {
+                continue;
+            }
+            best = Some((encoded, glyph_subset_removed_bytes, removed_decoded_bytes));
+        }
+        let Some((encoded, glyph_subset_removed_bytes, removed_decoded_bytes)) = best else {
             continue;
         };
-        if encoded.len() >= raw.len() {
-            continue;
-        }
 
         stats.programs_optimized += 1;
         stats.programs_glyph_subset += 1;
