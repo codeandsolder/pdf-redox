@@ -382,11 +382,12 @@ impl OptimizationRunStats {
         }
         if self.microstroke_raster.runs_rasterized > 0 {
             notes.push(format!(
-                "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with compact binary image masks and saving about {} encoded bytes.",
+                "Rasterized {} pathological micro-stroke run(s) across {} page(s), replacing {} individually painted strokes with binary image masks (estimated encoded bytes saved: {}, added: {}).",
                 self.microstroke_raster.runs_rasterized,
                 self.microstroke_raster.pages_rewritten,
                 self.microstroke_raster.strokes_rasterized,
-                self.microstroke_raster.estimated_flate_bytes_saved
+                self.microstroke_raster.estimated_flate_bytes_saved,
+                self.microstroke_raster.estimated_flate_bytes_added
             ));
         }
         if self.raster_layout.constant_color_mask_stencils_emitted > 0 {
@@ -801,6 +802,9 @@ impl OptimizationRunStats {
             microstroke_estimated_flate_bytes_saved: self
                 .microstroke_raster
                 .estimated_flate_bytes_saved,
+            microstroke_estimated_flate_bytes_added: self
+                .microstroke_raster
+                .estimated_flate_bytes_added,
             print_images_placed: self.print_plan.stats.images_placed,
             print_image_uses: self.print_plan.stats.image_uses,
             print_geometry_complete: self.print_plan.stats.geometry_complete,

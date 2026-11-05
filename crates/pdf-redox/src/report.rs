@@ -1111,6 +1111,9 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Estimated encoded bytes saved by microstroke.
     pub microstroke_estimated_flate_bytes_saved: usize,
+    #[serde(default)]
+    /// Estimated encoded bytes added in exchange for simplifying a Processing display list.
+    pub microstroke_estimated_flate_bytes_added: usize,
     /// Number of print images placed.
     pub print_images_placed: usize,
     /// Number of print image uses.

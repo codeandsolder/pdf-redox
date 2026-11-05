@@ -289,7 +289,7 @@ pub fn analyze_microstroke_rasterization(
 ) -> Result<MicrostrokeRasterStats> {
     let mut document = EditDocument::from_bytes(input.to_vec())?;
     let pages = document.page_handles()?;
-    rasterize_pathological_microstrokes(&mut document, &pages, optimization_goal.flate_level())
+    rasterize_pathological_microstrokes(&mut document, &pages, optimization_goal)
 }
 
 /// Optimize a PDF according to the supplied configuration.
@@ -916,7 +916,7 @@ fn optimize_pdf_with_document(
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(&mut document, &stable_pages, flate_level)
+            rasterize_pathological_microstrokes(&mut document, &stable_pages, cfg.optimization_goal)
         } else {
             Ok(MicrostrokeRasterStats::default())
         }

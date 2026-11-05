@@ -124,7 +124,7 @@ struct Args {
     #[arg(long)]
     flate_workers: Option<NonZeroUsize>,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
-    /// Enabled automatically by the Print profile.
+    /// Enabled automatically by the Print profile and Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
     rasterize_excessive_small_vectors: bool,
     /// Preserve pathological tiny-vector fields even when the Print profile would rasterize them.
@@ -264,7 +264,9 @@ fn config_from_args(args: &Args) -> Config {
         cfg.flate_workers = flate_workers;
     }
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
-        && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
+        && (cfg.rasterize_excessive_small_vectors
+            || args.rasterize_excessive_small_vectors
+            || matches!(args.optimize_for, OptimizeForArg::Processing));
     cfg.raster_layout.enabled =
         args.normalize_raster_layout || matches!(args.optimize_for, OptimizeForArg::Processing);
     cfg.raster_layout.bake_masks =
@@ -404,6 +406,24 @@ mod tests {
             config_from_args(&args).optimization_goal,
             OptimizationGoal::Processing
         );
+        Ok(())
+    }
+
+    #[test]
+    fn processing_rasterizes_pathological_microstrokes_by_default() -> Result<(), clap::Error> {
+        let normal = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
+        assert!(!config_from_args(&normal).rasterize_excessive_small_vectors);
+        let processing =
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
+        assert!(config_from_args(&processing).rasterize_excessive_small_vectors);
+        let keep = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--optimize-for",
+            "processing",
+            "--keep-excessive-small-vectors",
+        ])?;
+        assert!(!config_from_args(&keep).rasterize_excessive_small_vectors);
         Ok(())
     }
 

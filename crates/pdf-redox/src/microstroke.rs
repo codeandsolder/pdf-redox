@@ -41,6 +41,8 @@ pub struct MicrostrokeRasterStats {
     pub flate_images: usize,
     /// Estimated encoded bytes saved relative to the equivalent Flate representation.
     pub estimated_flate_bytes_saved: usize,
+    /// Estimated encoded bytes added when the Processing objective prefers fewer paints.
+    pub estimated_flate_bytes_added: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -972,8 +974,9 @@ struct Candidate {
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
-    flate_level: crate::FlateLevel,
+    goal: crate::OptimizationGoal,
 ) -> Result<MicrostrokeRasterStats> {
+    let flate_level = goal.flate_level();
     let mut stats = MicrostrokeRasterStats::default();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
@@ -1025,7 +1028,9 @@ pub fn rasterize_pathological_microstrokes(
                 .len()
                 .saturating_add(replacement.len())
                 .saturating_add(192);
-            if !worthwhile_raster_savings(local_before, local_after) {
+            if goal == crate::OptimizationGoal::Size
+                && !worthwhile_raster_savings(local_before, local_after)
+            {
                 continue;
             }
             candidates.push(Candidate {
@@ -1064,7 +1069,7 @@ pub fn rasterize_pathological_microstrokes(
             .sum::<usize>();
         let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
             .saturating_add(image_cost);
-        if after >= before {
+        if goal == crate::OptimizationGoal::Size && after >= before {
             continue;
         }
 
@@ -1110,6 +1115,9 @@ pub fn rasterize_pathological_microstrokes(
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
             .saturating_add(before.saturating_sub(after));
+        stats.estimated_flate_bytes_added = stats
+            .estimated_flate_bytes_added
+            .saturating_add(after.saturating_sub(before));
     }
     Ok(stats)
 }
