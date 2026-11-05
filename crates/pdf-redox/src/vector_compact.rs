@@ -74,6 +74,44 @@ pub struct VectorCompactionStats {
     pub generated_page_xobjects: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
 }
 
+impl VectorCompactionStats {
+    fn absorb(&mut self, delta: Self) {
+        self.pages_compacted += delta.pages_compacted;
+        self.fill_groups_batched += delta.fill_groups_batched;
+        self.covered_fills_pruned += delta.covered_fills_pruned;
+        self.fill_paints_eliminated += delta.fill_paints_eliminated;
+        self.decoded_bytes_removed += delta.decoded_bytes_removed;
+        self.estimated_flate_bytes_saved += delta.estimated_flate_bytes_saved;
+        self.path_forms_created += delta.path_forms_created;
+        self.path_form_pages_rewritten += delta.path_form_pages_rewritten;
+        self.path_form_occurrences_replaced += delta.path_form_occurrences_replaced;
+        self.path_form_decoded_bytes_factored += delta.path_form_decoded_bytes_factored;
+        self.path_form_estimated_flate_bytes_saved += delta.path_form_estimated_flate_bytes_saved;
+        self.transformed_forms_created += delta.transformed_forms_created;
+        self.transformed_form_pages_rewritten += delta.transformed_form_pages_rewritten;
+        self.transformed_form_occurrences_replaced += delta.transformed_form_occurrences_replaced;
+        self.transformed_form_operators_eliminated += delta.transformed_form_operators_eliminated;
+        self.transformed_form_estimated_flate_bytes_saved +=
+            delta.transformed_form_estimated_flate_bytes_saved;
+        self.shared_run_forms_created += delta.shared_run_forms_created;
+        self.shared_run_pages_rewritten += delta.shared_run_pages_rewritten;
+        self.shared_run_blocks_replaced += delta.shared_run_blocks_replaced;
+        self.shared_run_decoded_bytes_factored += delta.shared_run_decoded_bytes_factored;
+        self.shared_run_estimated_flate_bytes_saved += delta.shared_run_estimated_flate_bytes_saved;
+        self.path_coordinates_canonicalized += delta.path_coordinates_canonicalized;
+        self.path_coordinate_pages_rewritten += delta.path_coordinate_pages_rewritten;
+        self.path_coordinate_decoded_bytes_removed += delta.path_coordinate_decoded_bytes_removed;
+        self.path_coordinate_estimated_flate_bytes_saved +=
+            delta.path_coordinate_estimated_flate_bytes_saved;
+        for (page, names) in delta.generated_page_xobjects {
+            self.generated_page_xobjects
+                .entry(page)
+                .or_default()
+                .extend(names);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FillPaint {
     epoch: usize,
@@ -3165,6 +3203,69 @@ fn compact_processing_fill_tail(
     Ok(total)
 }
 
+// Exact, structure-only stages. These may be revisited after a content rewrite,
+// but bounded-error coordinate canonicalization must remain a one-shot stage.
+fn factor_processing_structural_forms(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    pages: &[ObjectHandle],
+    pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
+) -> Result<(VectorCompactionStats, BTreeSet<ObjectHandle>)> {
+    let PathFactoringOutcome {
+        stats: path_stats,
+        cached_transformed,
+        rewritten_pages: path_rewritten,
+    } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages)?;
+    let transformed = factor_repeated_transformed_blocks(
+        document,
+        flate_level,
+        cached_transformed,
+        &path_rewritten,
+        pages,
+    )?;
+    let shared = factor_shared_q_prefix_runs(document, flate_level, pages)?;
+    let mut rewritten = path_rewritten;
+    rewritten.extend(transformed.generated_page_xobjects.keys().copied());
+    rewritten.extend(shared.generated_page_xobjects.keys().copied());
+    let mut stats = VectorCompactionStats::default();
+    stats.absorb(path_stats);
+    stats.absorb(transformed);
+    stats.absorb(shared);
+    Ok((stats, rewritten))
+}
+
+// Every accepted Form factor replaces a page span containing native operators
+// (or q/Q scope delimiters) with one `Do`: the number of page-level non-`Do`
+// instructions strictly decreases. Form streams are not searched by these
+// page-only factor stages; exact fill compaction also only removes paint work.
+// This finite, decreasing potential proves termination without a guessed pass
+// limit. Neither bounded-error coordinate nor polyline rewriting runs here.
+// Candidate discovery must consider all pages, including ones not just rewritten,
+// because semantic matches can span pages.
+fn close_processing_exact_factoring(
+    document: &mut EditDocument,
+    flate_level: crate::FlateLevel,
+    pages: &[ObjectHandle],
+) -> Result<VectorCompactionStats> {
+    let mut total = VectorCompactionStats::default();
+    loop {
+        let (forms, rewritten) =
+            factor_processing_structural_forms(document, flate_level, pages, BTreeMap::new())?;
+        let changed = forms.path_forms_created != 0
+            || forms.transformed_forms_created != 0
+            || forms.shared_run_forms_created != 0;
+        if !changed {
+            break;
+        }
+        // A page rewritten by any Form pass must be scanned using its new
+        // content and resources; do not recycle pre-mutation raster/path proofs.
+        let fills = compact_processing_fill_tail(document, flate_level, &rewritten)?;
+        total.absorb(forms);
+        total.absorb(fills);
+    }
+    Ok(total)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "vector compaction coordinates scan, factoring, rewrite, and statistics stages over shared document state"
@@ -3279,82 +3380,18 @@ pub fn compact_vector_paths_with_flate_cache(
         for page in &vector_rewritten_pages {
             path_coordinate_plans.remove(page);
         }
-        let mut late_rewritten_pages = BTreeSet::<ObjectHandle>::new();
-        let factored =
-            factor_repeated_path_forms(document, flate_level, pre_scanned_processing, pages)?;
-        total.path_forms_created += factored.stats.path_forms_created;
-        total.path_form_pages_rewritten += factored.stats.path_form_pages_rewritten;
-        total.path_form_occurrences_replaced += factored.stats.path_form_occurrences_replaced;
-        total.path_form_decoded_bytes_factored += factored.stats.path_form_decoded_bytes_factored;
-        total.path_form_estimated_flate_bytes_saved +=
-            factored.stats.path_form_estimated_flate_bytes_saved;
-        total.decoded_bytes_removed += factored.stats.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += factored.stats.estimated_flate_bytes_saved;
-        for (page, names) in &factored.stats.generated_page_xobjects {
-            total
-                .generated_page_xobjects
-                .entry(*page)
-                .or_default()
-                .extend(names.iter().cloned());
-        }
-
-        for page in &factored.rewritten_pages {
-            path_coordinate_plans.remove(page);
-        }
-        vector_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
-        late_rewritten_pages.extend(factored.rewritten_pages.iter().copied());
-        let transformed = factor_repeated_transformed_blocks(
+        let (factored, factored_pages) = factor_processing_structural_forms(
             document,
             flate_level,
-            factored.cached_transformed,
-            &factored.rewritten_pages,
             pages,
+            pre_scanned_processing,
         )?;
-        total.pages_compacted += transformed.pages_compacted;
-        total.transformed_forms_created += transformed.transformed_forms_created;
-        total.transformed_form_pages_rewritten += transformed.transformed_form_pages_rewritten;
-        total.transformed_form_occurrences_replaced +=
-            transformed.transformed_form_occurrences_replaced;
-        total.transformed_form_operators_eliminated +=
-            transformed.transformed_form_operators_eliminated;
-        total.transformed_form_estimated_flate_bytes_saved +=
-            transformed.transformed_form_estimated_flate_bytes_saved;
-        total.estimated_flate_bytes_saved += transformed.estimated_flate_bytes_saved;
-        for page in transformed.generated_page_xobjects.keys() {
+        for page in &factored_pages {
             path_coordinate_plans.remove(page);
         }
-        vector_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
-        late_rewritten_pages.extend(transformed.generated_page_xobjects.keys().copied());
-        for (page, names) in &transformed.generated_page_xobjects {
-            total
-                .generated_page_xobjects
-                .entry(*page)
-                .or_default()
-                .extend(names.iter().cloned());
-        }
-
-        let shared_runs = factor_shared_q_prefix_runs(document, flate_level, pages)?;
-        total.pages_compacted += shared_runs.pages_compacted;
-        total.decoded_bytes_removed += shared_runs.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += shared_runs.estimated_flate_bytes_saved;
-        total.shared_run_forms_created += shared_runs.shared_run_forms_created;
-        total.shared_run_pages_rewritten += shared_runs.shared_run_pages_rewritten;
-        total.shared_run_blocks_replaced += shared_runs.shared_run_blocks_replaced;
-        total.shared_run_decoded_bytes_factored += shared_runs.shared_run_decoded_bytes_factored;
-        total.shared_run_estimated_flate_bytes_saved +=
-            shared_runs.shared_run_estimated_flate_bytes_saved;
-        for page in shared_runs.generated_page_xobjects.keys() {
-            path_coordinate_plans.remove(page);
-        }
-        vector_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
-        late_rewritten_pages.extend(shared_runs.generated_page_xobjects.keys().copied());
-        for (page, names) in &shared_runs.generated_page_xobjects {
-            total
-                .generated_page_xobjects
-                .entry(*page)
-                .or_default()
-                .extend(names.iter().cloned());
-        }
+        vector_rewritten_pages.extend(factored_pages.iter().copied());
+        let mut late_rewritten_pages = factored_pages;
+        total.absorb(factored);
 
         let path_coordinates = canonicalize_page_path_coordinates(
             document,
@@ -3383,12 +3420,14 @@ pub fn compact_vector_paths_with_flate_cache(
         // adjacency visible only after the initial fill scan. Close that local
         // dependency here instead of requiring another whole optimizer pass.
         let fill_tail = compact_processing_fill_tail(document, flate_level, &late_rewritten_pages)?;
-        total.pages_compacted += fill_tail.pages_compacted;
-        total.fill_groups_batched += fill_tail.fill_groups_batched;
-        total.covered_fills_pruned += fill_tail.covered_fills_pruned;
-        total.fill_paints_eliminated += fill_tail.fill_paints_eliminated;
-        total.decoded_bytes_removed += fill_tail.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += fill_tail.estimated_flate_bytes_saved;
+        total.absorb(fill_tail);
+        // The earlier lossless factor passes had already run before bounded-error
+        // coordinate rewriting and the fill tail. Close only the exact stages
+        // that those mutations may expose, without rounding any path twice.
+        if !late_rewritten_pages.is_empty() {
+            let closure = close_processing_exact_factoring(document, flate_level, pages)?;
+            total.absorb(closure);
+        }
     }
     Ok(total)
 }
