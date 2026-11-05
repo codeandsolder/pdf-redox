@@ -792,11 +792,15 @@ fn optimize_pdf_with_document(
         stats: repeated_clips,
         rewritten_pages: repeated_clip_rewritten_pages,
     } = timed(&mut timings, "repeated-clip-hoist", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            hoist_repeated_clip_prefixes(&mut document, &stable_pages, flate_level)
-        } else {
-            Ok(PageRewriteResult::default())
-        }
+        // The clip/body rewrite is exact in either mode. Size requires a
+        // strictly smaller encoded stream; Processing also accepts equal-sized
+        // rewrites when they eliminate redundant clipping work.
+        hoist_repeated_clip_prefixes(
+            &mut document,
+            &stable_pages,
+            flate_level,
+            cfg.optimization_goal,
+        )
     })?;
     raster_vector_cache.retain(|page, _| !repeated_clip_rewritten_pages.contains(page));
 
@@ -1035,6 +1039,50 @@ mod tests {
 
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn size_hoists_large_exact_repeated_clip_without_coordinate_rounding() -> Result<()> {
+        use std::io::Write as _;
+
+        // The repeated clip exceeds Deflate's 32-KiB history window. This
+        // ensures that repeating the exact path really costs encoded bytes,
+        // rather than accidentally testing just the decoded-size heuristic.
+        let mut clip = b"0 0 m\n".to_vec();
+        for idx in 0..7_000_u32 {
+            let x = idx.wrapping_mul(7_919) % 65_521;
+            let y = idx.wrapping_mul(1_543) % 65_521;
+            writeln!(&mut clip, "{x} {y} l")?;
+        }
+        clip.extend_from_slice(b"h W* n\n");
+
+        let mut content = Vec::new();
+        for row in 0..6_u32 {
+            content.extend_from_slice(b"q\n");
+            content.extend_from_slice(&clip);
+            writeln!(&mut content, "{row} 0 2 2 re f\nQ")?;
+        }
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 65521 65521] /Resources <<>> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", &content)?;
+        let input = pdf.finish(1)?;
+        let config = Config::optimize_only();
+        assert_eq!(config.optimization_goal, crate::OptimizationGoal::Size);
+
+        let (output, report) = optimize_pdf(&input, &config)?;
+        assert!(report.repeated_clip_runs_hoisted > 0);
+        assert!(report.repeated_clip_blocks_hoisted >= 6);
+        assert!(report.repeated_clip_estimated_flate_bytes_saved > 0);
+        assert_eq!(report.vector_path_coordinate_pages_rewritten, 0);
+        let (second, replay) = optimize_pdf(&output, &config)?;
+        assert_eq!(replay.repeated_clip_runs_hoisted, 0);
+        assert_eq!(output, second);
+        Ok(())
+    }
 
     #[test]
     fn processing_skips_pure_size_outline_search() {
