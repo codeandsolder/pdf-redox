@@ -14,6 +14,7 @@ mod error;
 mod ext_gstate;
 mod flate;
 mod font;
+mod font_bitmap;
 mod font_subset;
 pub(crate) mod geometry;
 pub(crate) mod hidden_text;
