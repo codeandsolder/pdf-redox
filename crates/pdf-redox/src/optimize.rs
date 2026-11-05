@@ -55,7 +55,8 @@ use crate::{
     stream_codec::FlateBatchEncoder,
     structure_compact::compact_structure,
     vector_compact::{
-        VectorCompactionStats, compact_vector_paths_with_flate_cache, processing_factor_candidate,
+        VectorCompactionStats, compact_vector_paths_with_flate_cache, factor_size_shared_forms,
+        processing_factor_candidate,
     },
 };
 use std::{
@@ -805,7 +806,7 @@ fn optimize_pdf_with_document(
     raster_vector_cache.retain(|page, _| !repeated_clip_rewritten_pages.contains(page));
 
     let mut flate_reuse_cache = FlateReuseCache::default();
-    let vector_compaction = timed(&mut timings, "vector-compaction", || {
+    let mut vector_compaction = timed(&mut timings, "vector-compaction", || {
         let raster_proved_no_vector_candidate = cfg.optimization_goal
             != crate::OptimizationGoal::Processing
             && cfg.raster_layout.enabled
@@ -832,6 +833,17 @@ fn optimize_pdf_with_document(
             Ok(VectorCompactionStats::default())
         }
     })?;
+    // A proof that there are no mergeable page fills says nothing about
+    // identical, resource-proven q runs across different page streams.
+    // Keep the cheap fill-compaction fast path while considering exact
+    // shared Forms independently in Size mode. Processing already runs
+    // this factor as part of its ordered structural-Form closure.
+    if cfg.optimization_goal == crate::OptimizationGoal::Size {
+        let forms = timed(&mut timings, "size-shared-form-factor", || {
+            factor_size_shared_forms(&mut document, flate_level, &stable_pages)
+        })?;
+        vector_compaction.absorb(forms);
+    }
     if vector_compaction.shared_run_forms_created != 0 {
         raster_resource_usage_exact = false;
     }
@@ -1081,6 +1093,76 @@ mod tests {
         let (second, replay) = optimize_pdf(&output, &config)?;
         assert_eq!(replay.repeated_clip_runs_hoisted, 0);
         assert_eq!(output, second);
+        Ok(())
+    }
+
+    fn size_shared_form_fixture(shared_resource: bool, matching_boxes: bool) -> Result<Vec<u8>> {
+        use std::io::Write as _;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        // Aliases differ, but sharing is safe when the underlying object is
+        // identical. Distinct opacity objects must never be combined.
+        for page in 0..2_u32 {
+            let target = if shared_resource || page == 0 { 9 } else { 10 };
+            let box_height = if matching_boxes || page == 0 {
+                500
+            } else {
+                600
+            };
+            let page_object = format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 {box_height}] /Resources << /ExtGState << /G{page} {target} 0 R >> >> /Contents {} 0 R >>",
+                page + 5
+            );
+            pdf.object(page + 3, page_object.as_bytes())?;
+        }
+        pdf.object(9, b"<< /Type /ExtGState /ca 0.5 /CA 0.5 >>")?;
+        pdf.object(10, b"<< /Type /ExtGState /ca 0.7 /CA 0.7 >>")?;
+        for page in 0..2_u32 {
+            let mut content = Vec::new();
+            writeln!(&mut content, "q /G{page} gs")?;
+            for row in 0..7_000_u32 {
+                let x = row.wrapping_mul(7_919) % 997;
+                let y = row.wrapping_mul(3_149) % 997;
+                writeln!(
+                    &mut content,
+                    "{x} {y} m {} {} l S",
+                    (x + 17) % 997,
+                    (y + 29) % 997
+                )?;
+            }
+            content.extend_from_slice(b"Q\n");
+            pdf.stream(page + 5, b"", &content)?;
+        }
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn size_factors_resource_identical_shared_forms_without_fill_candidate() -> Result<()> {
+        let input = size_shared_form_fixture(true, true)?;
+        let config = Config::optimize_only();
+        assert_eq!(config.optimization_goal, crate::OptimizationGoal::Size);
+        let (first, report) = optimize_pdf(&input, &config)?;
+        assert_eq!(report.vector_shared_run_forms_created, 1);
+        assert_eq!(report.vector_shared_run_pages_rewritten, 2);
+        assert!(report.vector_shared_run_estimated_flate_bytes_saved > 0);
+        assert_eq!(report.vector_path_coordinate_pages_rewritten, 0);
+        assert_eq!(report.vector_fill_groups_batched, 0);
+        let (second, replay) = optimize_pdf(&first, &config)?;
+        assert_eq!(replay.vector_shared_run_forms_created, 0);
+        assert_eq!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn size_never_shares_forms_across_distinct_resource_targets_or_page_boxes() -> Result<()> {
+        for (shared_resources, matching_boxes) in [(false, true), (true, false)] {
+            let input = size_shared_form_fixture(shared_resources, matching_boxes)?;
+            let (_, report) = optimize_pdf(&input, &Config::optimize_only())?;
+            assert_eq!(report.vector_shared_run_forms_created, 0);
+            assert_eq!(report.vector_shared_run_pages_rewritten, 0);
+        }
         Ok(())
     }
 
