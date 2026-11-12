@@ -5247,6 +5247,36 @@ struct ApplyPlansResult {
     stats: ApplyPlanStats,
 }
 
+impl ApplyPlansResult {
+    /// Account for an admitted candidate before writing its streams.
+    fn record_prepared_plan(&mut self, prepared: &PreparedMergePlan) {
+        let payload = prepared
+            .prepared_main
+            .as_ref()
+            .map_or(0, PreparedImage::payload_bytes)
+            .saturating_add(
+                prepared
+                    .prepared_background
+                    .as_ref()
+                    .map_or(0, |(_, background)| background.payload_bytes()),
+            );
+        if matches!(
+            prepared.plan.kind,
+            MergeKind::PixelCluster | MergeKind::NativeFragment | MergeKind::Stripe
+        ) {
+            self.added_image_payload_bytes = self.added_image_payload_bytes.saturating_add(payload);
+        } else {
+            self.has_non_fragment_plan = true;
+        }
+        self.stats.transparent_margins_cropped += usize::from(prepared.transparent_cropped);
+        self.stats.background_margins_cropped += usize::from(prepared.background_cropped);
+        self.stats.cropped_pixels_removed = self
+            .stats
+            .cropped_pixels_removed
+            .saturating_add(prepared.removed_pixels);
+    }
+}
+
 fn encoded_content_payload_len(
     content: &[u8],
     flate_level: crate::FlateLevel,
@@ -5308,36 +5338,8 @@ struct PreparedMergePlan {
     mask_baked: bool,
 }
 
-// Both rejections skip the candidate; only cost rejection releases its draw
-// reservations so another candidate can reuse them.
-struct PlanPreparation {
-    ready: Option<PreparedMergePlan>,
-    release_claims: Option<Vec<usize>>,
-}
-
-impl PlanPreparation {
-    const fn ineligible() -> Self {
-        Self {
-            ready: None,
-            release_claims: None,
-        }
-    }
-
-    const fn over_budget(members: Vec<usize>) -> Self {
-        Self {
-            ready: None,
-            release_claims: Some(members),
-        }
-    }
-
-    const fn ready(plan: PreparedMergePlan) -> Self {
-        Self {
-            ready: Some(plan),
-            release_claims: None,
-        }
-    }
-}
-
+// No rejected candidate reserves draws. Cost admission is decided entirely
+// before the resource graph or the claim set is mutated.
 fn prepared_merge_payload_fits(
     plan: &MergePlan,
     prepared_main: Option<&PreparedImage>,
@@ -5401,7 +5403,7 @@ fn prepare_merge_plan(
     flate_level: crate::FlateLevel,
     alpha_crop_cache_entries: &HashMap<ObjectHandle, AlphaCropCacheEntry>,
     alpha_crop_cache: &HashMap<ObjectHandle, AlphaCropCacheEntry>,
-) -> Result<PlanPreparation> {
+) -> Result<Option<PreparedMergePlan>> {
     let source_crop_hint = plan.alpha_crop_hint;
     let cached_crop = if plan.kind == MergeKind::AlphaCrop {
         alpha_crop_cache_entries
@@ -5420,10 +5422,10 @@ fn prepare_merge_plan(
         crop_merge_plan(&mut plan, config)
     };
     let Some((transparent_cropped, background_cropped, removed_pixels)) = crop_result else {
-        return Ok(PlanPreparation::ineligible());
+        return Ok(None);
     };
     let Some(relative) = relative_matrix(first_draw.replace_ctm, plan.desired_ctm) else {
-        return Ok(PlanPreparation::ineligible());
+        return Ok(None);
     };
     let mask_baked = plan.image.alpha.is_some() || plan.alpha.is_some();
 
@@ -5435,7 +5437,7 @@ fn prepare_merge_plan(
         let Some(background_relative) =
             relative_matrix(first_draw.replace_ctm, background.desired_ctm)
         else {
-            return Ok(PlanPreparation::ineligible());
+            return Ok(None);
         };
         let prepared = prepare_image(
             &plan.image,
@@ -5457,7 +5459,7 @@ fn prepare_merge_plan(
     let prepared_main = if cached_crop.is_none() {
         if plan.kind == MergeKind::ConstantColorMaskStencil {
             let Some(alpha) = plan.alpha.as_deref() else {
-                return Ok(PlanPreparation::over_budget(plan.members));
+                return Ok(None);
             };
             let Some(prepared) = prepare_constant_color_mask_stencil(
                 &plan.image,
@@ -5467,7 +5469,7 @@ fn prepare_merge_plan(
                 flate_level,
             )?
             else {
-                return Ok(PlanPreparation::over_budget(plan.members));
+                return Ok(None);
             };
             Some(prepared)
         } else {
@@ -5494,10 +5496,10 @@ fn prepare_merge_plan(
         prepared_background.as_ref().map(|(_, prepared)| prepared),
         cached_crop.is_none(),
     ) {
-        return Ok(PlanPreparation::over_budget(plan.members));
+        return Ok(None);
     }
 
-    Ok(PlanPreparation::ready(PreparedMergePlan {
+    Ok(Some(PreparedMergePlan {
         plan,
         relative,
         source_crop_hint,
@@ -5545,10 +5547,118 @@ fn emit_merge_image_paint(
     replacement
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "plan application coordinates ordered graph resource insertion and draw rewrite accounting"
-)]
+/// Handles created by the resource installation stage, including an optional
+/// reconstructed background paint.
+struct InstalledMergeImages {
+    name: Vec<u8>,
+    encoding: ImageEncodingStats,
+    image_created: bool,
+    background: Option<(Matrix, Vec<u8>)>,
+}
+
+fn register_merge_image_resource(
+    xobjects: &mut OwnedDictionary,
+    suffix: &mut usize,
+    added_resource_names: &mut BTreeSet<Vec<u8>>,
+    image: ObjectHandle,
+) -> Vec<u8> {
+    let name = unique_xobject_name(xobjects, suffix);
+    xobjects.insert(name.clone(), OwnedObject::Reference(image));
+    added_resource_names.insert(name.clone());
+    name
+}
+
+fn install_prepared_merge_images(
+    document: &mut EditDocument,
+    prepared: &mut PreparedMergePlan,
+    draw: &RasterDraw,
+    xobjects: &mut OwnedDictionary,
+    suffix: &mut usize,
+    result: &mut ApplyPlansResult,
+) -> Result<InstalledMergeImages> {
+    // Validate the main candidate before installing optional background
+    // resources; an incomplete plan must not leave an orphan background.
+    if prepared.cached_crop.is_none() && prepared.prepared_main.is_none() {
+        return Err(Error::Invalid(
+            "missing prepared image for uncached raster plan".to_owned(),
+        ));
+    }
+
+    let background = if let Some((relative, image)) = prepared.prepared_background.take() {
+        let (handle, encoding) = install_prepared_image(document, image, 1, 1);
+        result.stats.record_image_encoding(encoding);
+        let name = register_merge_image_resource(
+            xobjects,
+            suffix,
+            &mut result.added_resource_names,
+            handle,
+        );
+        Some((relative, name))
+    } else {
+        None
+    };
+
+    let (name, encoding, image_created) = if let Some(cached) = prepared.cached_crop {
+        let name = register_merge_image_resource(
+            xobjects,
+            suffix,
+            &mut result.added_resource_names,
+            cached.image,
+        );
+        (name, cached.encoding, false)
+    } else {
+        let image = prepared.prepared_main.take().ok_or_else(|| {
+            Error::Invalid("missing prepared image for uncached raster plan".to_owned())
+        })?;
+        let (handle, encoding) =
+            install_prepared_image(document, image, prepared.plan.width, prepared.plan.height);
+        result.stats.record_image_encoding(encoding);
+        let name = register_merge_image_resource(
+            xobjects,
+            suffix,
+            &mut result.added_resource_names,
+            handle,
+        );
+        if prepared.plan.kind == MergeKind::AlphaCrop
+            && let Some(source_crop) = prepared.source_crop_hint
+        {
+            result.alpha_crop_cache_entries.insert(
+                draw.target,
+                AlphaCropCacheEntry {
+                    image: handle,
+                    encoding,
+                    source_crop,
+                    fast_reuse: !prepared.background_cropped,
+                },
+            );
+        }
+        (name, encoding, true)
+    };
+
+    Ok(InstalledMergeImages {
+        name,
+        encoding,
+        image_created,
+        background,
+    })
+}
+
+/// Reserve every draw in a plan, or restore the exact previous reservation set.
+///
+/// An overlap discovered late in a plan must not poison later independent plans.
+/// Rollback avoids allocating a second per-plan set, including for large clusters.
+fn claim_plan_members(claimed: &mut HashSet<usize>, members: &[usize]) -> bool {
+    for (position, &member) in members.iter().enumerate() {
+        if !claimed.insert(member) {
+            for previous in &members[..position] {
+                claimed.remove(previous);
+            }
+            return false;
+        }
+    }
+    true
+}
+
 fn apply_plans(
     document: &mut EditDocument,
     context: ApplyPlansContext<'_>,
@@ -5571,109 +5681,45 @@ fn apply_plans(
     let mut result = ApplyPlansResult::default();
 
     for plan in plans {
-        if plan.members.iter().any(|index| !claimed.insert(*index)) {
+        // Overlap checks are cheap; avoid encoding a plan whose members are
+        // already owned by an earlier accepted plan.
+        if plan.members.iter().any(|index| claimed.contains(index)) {
             continue;
         }
         let first_draw = &input.draws[plan.first_member];
-        let preparation = prepare_merge_plan(
+        let Some(mut prepared) = prepare_merge_plan(
             plan,
             first_draw,
             config,
             flate_level,
             &result.alpha_crop_cache_entries,
             alpha_crop_cache,
-        )?;
-        if let Some(members) = preparation.release_claims {
-            for member in &members {
-                claimed.remove(member);
-            }
-        }
-        let Some(PreparedMergePlan {
-            plan,
-            relative,
-            source_crop_hint,
-            cached_crop,
-            prepared_background,
-            mut prepared_main,
-            transparent_cropped,
-            background_cropped,
-            removed_pixels,
-            mask_baked,
-        }) = preparation.ready
+        )?
         else {
+            // No claim is retained when geometry or encoded cost rejects a plan.
             continue;
         };
-
-        let plan_payload_bytes = prepared_main
-            .as_ref()
-            .map_or(0, PreparedImage::payload_bytes)
-            .saturating_add(
-                prepared_background
-                    .as_ref()
-                    .map_or(0, |(_, prepared)| prepared.payload_bytes()),
-            );
-        if matches!(
-            plan.kind,
-            MergeKind::PixelCluster | MergeKind::NativeFragment | MergeKind::Stripe
-        ) {
-            result.added_image_payload_bytes = result
-                .added_image_payload_bytes
-                .saturating_add(plan_payload_bytes);
-        } else {
-            result.has_non_fragment_plan = true;
+        if !claim_plan_members(&mut claimed, &prepared.plan.members) {
+            continue;
         }
 
-        result.stats.transparent_margins_cropped += usize::from(transparent_cropped);
-        result.stats.background_margins_cropped += usize::from(background_cropped);
-        result.stats.cropped_pixels_removed = result
-            .stats
-            .cropped_pixels_removed
-            .saturating_add(removed_pixels);
-
-        let background = if let Some((background_relative, prepared)) = prepared_background {
-            let (image, encoding) = install_prepared_image(document, prepared, 1, 1);
-            result.stats.record_image_encoding(encoding);
-            let name = unique_xobject_name(&xobjects, &mut suffix);
-            xobjects.insert(name.clone(), OwnedObject::Reference(image));
-            result.added_resource_names.insert(name.clone());
-            Some((background_relative, name))
-        } else {
-            None
-        };
-
-        let (name, encoding, image_created) = if let Some(cached) = cached_crop {
-            let name = unique_xobject_name(&xobjects, &mut suffix);
-            xobjects.insert(name.clone(), OwnedObject::Reference(cached.image));
-            result.added_resource_names.insert(name.clone());
-            (name, cached.encoding, false)
-        } else {
-            let Some(prepared) = prepared_main.take() else {
-                return Err(Error::Invalid(
-                    "missing prepared image for uncached raster plan".to_owned(),
-                ));
-            };
-            let (image, encoding) =
-                install_prepared_image(document, prepared, plan.width, plan.height);
-            result.stats.record_image_encoding(encoding);
-            let name = unique_xobject_name(&xobjects, &mut suffix);
-            xobjects.insert(name.clone(), OwnedObject::Reference(image));
-            result.added_resource_names.insert(name.clone());
-            if plan.kind == MergeKind::AlphaCrop
-                && let Some(source_crop) = source_crop_hint
-            {
-                result.alpha_crop_cache_entries.insert(
-                    first_draw.target,
-                    AlphaCropCacheEntry {
-                        image,
-                        encoding,
-                        source_crop,
-                        fast_reuse: !background_cropped,
-                    },
-                );
-            }
-            (name, encoding, true)
-        };
-        let replacement = emit_merge_image_paint(first_draw, relative, &name, background, encoding);
+        result.record_prepared_plan(&prepared);
+        let InstalledMergeImages {
+            name,
+            encoding,
+            image_created,
+            background,
+        } = install_prepared_merge_images(
+            document,
+            &mut prepared,
+            first_draw,
+            &mut xobjects,
+            &mut suffix,
+            &mut result,
+        )?;
+        let plan = &prepared.plan;
+        let replacement =
+            emit_merge_image_paint(first_draw, prepared.relative, &name, background, encoding);
         replacements.push((first_draw.range_start, first_draw.range_end, replacement));
         for &member in &plan.members {
             if member == plan.first_member {
@@ -5688,9 +5734,12 @@ fn apply_plans(
                 .insert(input.draws[member].resource_name.clone());
         }
         result.consumed_draws.extend(plan.members.iter().copied());
-        result
-            .stats
-            .record_accepted_plan(plan.kind, plan.members.len(), mask_baked, image_created);
+        result.stats.record_accepted_plan(
+            plan.kind,
+            plan.members.len(),
+            prepared.mask_baked,
+            image_created,
+        );
     }
     if replacements.is_empty() {
         return Ok((resources, result));
@@ -6647,6 +6696,93 @@ mod tests {
             fragmented_paint_threshold,
             ..RasterLayoutConfig::default()
         }
+    }
+
+    #[test]
+    fn failed_overlap_does_not_reserve_disjoint_draws() {
+        let mut claimed = HashSet::new();
+        assert!(claim_plan_members(&mut claimed, &[4]));
+        // The second plan overlaps only at its final member; its other
+        // members must remain available for subsequent independent plans.
+        assert!(!claim_plan_members(&mut claimed, &[1, 2, 4]));
+        assert_eq!(claimed, HashSet::from([4]));
+        assert!(claim_plan_members(&mut claimed, &[1, 3]));
+        assert!(claim_plan_members(&mut claimed, &[2]));
+        assert_eq!(claimed, HashSet::from([1, 2, 3, 4]));
+
+        // Duplicate members must not leave a partial reservation either.
+        assert!(!claim_plan_members(&mut claimed, &[5, 5]));
+        assert!(!claimed.contains(&5));
+    }
+
+    #[test]
+    fn rejected_raster_plan_allows_independent_fallback() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        // Both geometric and encoded-cost failures must leave later plans
+        // free to consume the same draws. Neither failure installs resources.
+        for reject_by_budget in [false, true] {
+            let mut pdf = ClassicPdfBuilder::new();
+            pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+            pdf.object(2, b"<< /Type /Pages /Kids [] /Count 0 >>")?;
+            let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+            let mut first = test_draw(3, 0.0);
+            if !reject_by_budget {
+                first.replace_ctm = Matrix::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            }
+            let mut second = test_draw(4, 1.0);
+            second.range_end = b"/Im4 Do".len();
+            let draws = [first, second];
+
+            let make_plan = |members: Vec<usize>, first_member: usize| MergePlan {
+                members,
+                first_member,
+                image: stripe_test_image(2, 2, vec![33, 66, 99, 132]),
+                width: 2,
+                height: 2,
+                data: vec![33, 66, 99, 132],
+                alpha: None,
+                source_color_budget: None,
+                source_payload_budget: None,
+                desired_ctm: draws[first_member].ctm,
+                background: None,
+                alpha_crop_hint: None,
+                kind: MergeKind::PixelCluster,
+            };
+            let mut first_plan = make_plan(vec![0, 1], 0);
+            if reject_by_budget {
+                first_plan.kind = MergeKind::Stripe;
+                first_plan.source_payload_budget = Some(1);
+            }
+            let fallback_plan = make_plan(vec![1], 1);
+            let config = RasterLayoutConfig {
+                enabled: true,
+                crop_background: false,
+                crop_transparent: false,
+                ..RasterLayoutConfig::default()
+            };
+            let (resources, applied) = apply_plans(
+                &mut document,
+                ApplyPlansContext {
+                    resources: OwnedDictionary::new(),
+                    input: RewriteInput {
+                        content: b"/Im4 Do",
+                        draws: &draws,
+                    },
+                    config: &config,
+                    flate_level: FlateLevel::PROCESSING,
+                    alpha_crop_cache: &HashMap::new(),
+                },
+                vec![first_plan, fallback_plan],
+            )?;
+
+            assert_eq!(applied.consumed_draws, HashSet::from([1]));
+            assert_eq!(applied.stats.pixel_clusters_reconstructed, 1);
+            assert_eq!(applied.added_resource_names.len(), 1);
+            assert!(applied.rewritten_content.is_some());
+            assert!(resources.contains_key(b"XObject".as_slice()));
+        }
+        Ok(())
     }
 
     #[test]
