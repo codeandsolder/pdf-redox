@@ -5250,16 +5250,12 @@ struct ApplyPlansResult {
 impl ApplyPlansResult {
     /// Account for an admitted candidate before writing its streams.
     fn record_prepared_plan(&mut self, prepared: &PreparedMergePlan) {
-        let payload = prepared
-            .prepared_main
-            .as_ref()
-            .map_or(0, PreparedImage::payload_bytes)
-            .saturating_add(
-                prepared
-                    .prepared_background
-                    .as_ref()
-                    .map_or(0, |(_, background)| background.payload_bytes()),
-            );
+        let payload = prepared.main.new_payload_bytes().saturating_add(
+            prepared
+                .prepared_background
+                .as_ref()
+                .map_or(0, |(_, background)| background.payload_bytes()),
+        );
         if matches!(
             prepared.plan.kind,
             MergeKind::PixelCluster | MergeKind::NativeFragment | MergeKind::Stripe
@@ -5325,13 +5321,28 @@ fn candidate_payload_fits_budget(
         .is_none_or(|source_payload| source_payload == 0 || candidate_payload < source_payload)
 }
 
+/// A merge's main raster is exactly one of an already installed image or a
+/// fully encoded candidate. It cannot be absent or simultaneously both.
+enum PreparedMainImage {
+    Cached(AlphaCropCacheEntry),
+    Encoded(PreparedImage),
+}
+
+impl PreparedMainImage {
+    fn new_payload_bytes(&self) -> usize {
+        match self {
+            Self::Cached(_) => 0,
+            Self::Encoded(image) => image.payload_bytes(),
+        }
+    }
+}
+
 struct PreparedMergePlan {
     plan: MergePlan,
     relative: Matrix,
     source_crop_hint: Option<PixelCrop>,
-    cached_crop: Option<AlphaCropCacheEntry>,
+    main: PreparedMainImage,
     prepared_background: Option<(Matrix, PreparedImage)>,
-    prepared_main: Option<PreparedImage>,
     transparent_cropped: bool,
     background_cropped: bool,
     removed_pixels: u64,
@@ -5342,13 +5353,15 @@ struct PreparedMergePlan {
 // before the resource graph or the claim set is mutated.
 fn prepared_merge_payload_fits(
     plan: &MergePlan,
-    prepared_main: Option<&PreparedImage>,
+    main: &PreparedMainImage,
     prepared_background: Option<&PreparedImage>,
-    uncached: bool,
 ) -> bool {
-    if plan.kind == MergeKind::ConstantColorMaskStencil
-        && let Some(prepared) = prepared_main
-    {
+    let PreparedMainImage::Encoded(prepared) = main else {
+        // Cached raster streams add no encoded payload and were already
+        // admitted in an earlier scope.
+        return true;
+    };
+    if plan.kind == MergeKind::ConstantColorMaskStencil {
         let source_payload = plan
             .image
             .encoded_color_bytes
@@ -5365,10 +5378,7 @@ fn prepared_merge_payload_fits(
         }
     }
 
-    if plan.kind == MergeKind::AlphaCrop
-        && uncached
-        && let Some(prepared) = prepared_main
-    {
+    if plan.kind == MergeKind::AlphaCrop {
         let source_payload = plan
             .image
             .encoded_color_bytes
@@ -5382,8 +5392,7 @@ fn prepared_merge_payload_fits(
     }
 
     if plan.kind == MergeKind::Stripe
-        && uncached
-        && let (Some(prepared), Some(source_payload)) = (prepared_main, plan.source_payload_budget)
+        && let Some(source_payload) = plan.source_payload_budget
     {
         let candidate_payload = prepared
             .payload_bytes()
@@ -5456,45 +5465,42 @@ fn prepare_merge_plan(
         None
     };
 
-    let prepared_main = if cached_crop.is_none() {
-        if plan.kind == MergeKind::ConstantColorMaskStencil {
-            let Some(alpha) = plan.alpha.as_deref() else {
-                return Ok(None);
-            };
-            let Some(prepared) = prepare_constant_color_mask_stencil(
-                &plan.image,
-                plan.width,
-                plan.height,
-                alpha,
-                flate_level,
-            )?
-            else {
-                return Ok(None);
-            };
-            Some(prepared)
-        } else {
-            Some(prepare_image(
-                &plan.image,
-                plan.width,
-                plan.height,
-                &plan.data,
-                plan.alpha.take(),
-                ImageEncodingContext {
-                    flate_level,
-                    exact_raster_rendering: config.exact_raster_rendering,
-                    source_color_budget: plan.source_color_budget,
-                },
-            )?)
-        }
+    let main = if let Some(cached) = cached_crop {
+        PreparedMainImage::Cached(cached)
+    } else if plan.kind == MergeKind::ConstantColorMaskStencil {
+        let Some(alpha) = plan.alpha.as_deref() else {
+            return Ok(None);
+        };
+        let Some(image) = prepare_constant_color_mask_stencil(
+            &plan.image,
+            plan.width,
+            plan.height,
+            alpha,
+            flate_level,
+        )?
+        else {
+            return Ok(None);
+        };
+        PreparedMainImage::Encoded(image)
     } else {
-        None
+        PreparedMainImage::Encoded(prepare_image(
+            &plan.image,
+            plan.width,
+            plan.height,
+            &plan.data,
+            plan.alpha.take(),
+            ImageEncodingContext {
+                flate_level,
+                exact_raster_rendering: config.exact_raster_rendering,
+                source_color_budget: plan.source_color_budget,
+            },
+        )?)
     };
 
     if !prepared_merge_payload_fits(
         &plan,
-        prepared_main.as_ref(),
+        &main,
         prepared_background.as_ref().map(|(_, prepared)| prepared),
-        cached_crop.is_none(),
     ) {
         return Ok(None);
     }
@@ -5503,9 +5509,8 @@ fn prepare_merge_plan(
         plan,
         relative,
         source_crop_hint,
-        cached_crop,
+        main,
         prepared_background,
-        prepared_main,
         transparent_cropped,
         background_cropped,
         removed_pixels,
@@ -5547,9 +5552,12 @@ fn emit_merge_image_paint(
     replacement
 }
 
-/// Handles created by the resource installation stage, including an optional
-/// reconstructed background paint.
-struct InstalledMergeImages {
+/// A fully installed merge keeps its plan and operator state together with
+/// the resource names, so the staged plan is consumed exactly once.
+struct InstalledMergePlan {
+    plan: MergePlan,
+    relative: Matrix,
+    mask_baked: bool,
     name: Vec<u8>,
     encoding: ImageEncodingStats,
     image_created: bool,
@@ -5570,21 +5578,25 @@ fn register_merge_image_resource(
 
 fn install_prepared_merge_images(
     document: &mut EditDocument,
-    prepared: &mut PreparedMergePlan,
+    prepared: PreparedMergePlan,
     draw: &RasterDraw,
     xobjects: &mut OwnedDictionary,
     suffix: &mut usize,
     result: &mut ApplyPlansResult,
-) -> Result<InstalledMergeImages> {
-    // Validate the main candidate before installing optional background
-    // resources; an incomplete plan must not leave an orphan background.
-    if prepared.cached_crop.is_none() && prepared.prepared_main.is_none() {
-        return Err(Error::Invalid(
-            "missing prepared image for uncached raster plan".to_owned(),
-        ));
-    }
+) -> InstalledMergePlan {
+    let PreparedMergePlan {
+        plan,
+        relative,
+        source_crop_hint,
+        main,
+        prepared_background,
+        background_cropped,
+        mask_baked,
+        ..
+    } = prepared;
 
-    let background = if let Some((relative, image)) = prepared.prepared_background.take() {
+    // Preserve the original install ordering: background first, main second.
+    let background = if let Some((relative, image)) = prepared_background {
         let (handle, encoding) = install_prepared_image(document, image, 1, 1);
         result.stats.record_image_encoding(encoding);
         let name = register_merge_image_resource(
@@ -5598,49 +5610,52 @@ fn install_prepared_merge_images(
         None
     };
 
-    let (name, encoding, image_created) = if let Some(cached) = prepared.cached_crop {
-        let name = register_merge_image_resource(
-            xobjects,
-            suffix,
-            &mut result.added_resource_names,
-            cached.image,
-        );
-        (name, cached.encoding, false)
-    } else {
-        let image = prepared.prepared_main.take().ok_or_else(|| {
-            Error::Invalid("missing prepared image for uncached raster plan".to_owned())
-        })?;
-        let (handle, encoding) =
-            install_prepared_image(document, image, prepared.plan.width, prepared.plan.height);
-        result.stats.record_image_encoding(encoding);
-        let name = register_merge_image_resource(
-            xobjects,
-            suffix,
-            &mut result.added_resource_names,
-            handle,
-        );
-        if prepared.plan.kind == MergeKind::AlphaCrop
-            && let Some(source_crop) = prepared.source_crop_hint
-        {
-            result.alpha_crop_cache_entries.insert(
-                draw.target,
-                AlphaCropCacheEntry {
-                    image: handle,
-                    encoding,
-                    source_crop,
-                    fast_reuse: !prepared.background_cropped,
-                },
+    let (name, encoding, image_created) = match main {
+        PreparedMainImage::Cached(cached) => {
+            let name = register_merge_image_resource(
+                xobjects,
+                suffix,
+                &mut result.added_resource_names,
+                cached.image,
             );
+            (name, cached.encoding, false)
         }
-        (name, encoding, true)
+        PreparedMainImage::Encoded(image) => {
+            let (handle, encoding) =
+                install_prepared_image(document, image, plan.width, plan.height);
+            result.stats.record_image_encoding(encoding);
+            let name = register_merge_image_resource(
+                xobjects,
+                suffix,
+                &mut result.added_resource_names,
+                handle,
+            );
+            if plan.kind == MergeKind::AlphaCrop
+                && let Some(source_crop) = source_crop_hint
+            {
+                result.alpha_crop_cache_entries.insert(
+                    draw.target,
+                    AlphaCropCacheEntry {
+                        image: handle,
+                        encoding,
+                        source_crop,
+                        fast_reuse: !background_cropped,
+                    },
+                );
+            }
+            (name, encoding, true)
+        }
     };
 
-    Ok(InstalledMergeImages {
+    InstalledMergePlan {
+        plan,
+        relative,
+        mask_baked,
         name,
         encoding,
         image_created,
         background,
-    })
+    }
 }
 
 /// Reserve every draw in a plan, or restore the exact previous reservation set.
@@ -5687,7 +5702,7 @@ fn apply_plans(
             continue;
         }
         let first_draw = &input.draws[plan.first_member];
-        let Some(mut prepared) = prepare_merge_plan(
+        let Some(prepared) = prepare_merge_plan(
             plan,
             first_draw,
             config,
@@ -5704,22 +5719,23 @@ fn apply_plans(
         }
 
         result.record_prepared_plan(&prepared);
-        let InstalledMergeImages {
+        let InstalledMergePlan {
+            plan,
+            relative,
+            mask_baked,
             name,
             encoding,
             image_created,
             background,
         } = install_prepared_merge_images(
             document,
-            &mut prepared,
+            prepared,
             first_draw,
             &mut xobjects,
             &mut suffix,
             &mut result,
-        )?;
-        let plan = &prepared.plan;
-        let replacement =
-            emit_merge_image_paint(first_draw, prepared.relative, &name, background, encoding);
+        );
+        let replacement = emit_merge_image_paint(first_draw, relative, &name, background, encoding);
         replacements.push((first_draw.range_start, first_draw.range_end, replacement));
         for &member in &plan.members {
             if member == plan.first_member {
@@ -5734,12 +5750,9 @@ fn apply_plans(
                 .insert(input.draws[member].resource_name.clone());
         }
         result.consumed_draws.extend(plan.members.iter().copied());
-        result.stats.record_accepted_plan(
-            plan.kind,
-            plan.members.len(),
-            prepared.mask_baked,
-            image_created,
-        );
+        result
+            .stats
+            .record_accepted_plan(plan.kind, plan.members.len(), mask_baked, image_created);
     }
     if replacements.is_empty() {
         return Ok((resources, result));
@@ -6713,6 +6726,128 @@ mod tests {
         // Duplicate members must not leave a partial reservation either.
         assert!(!claim_plan_members(&mut claimed, &[5, 5]));
         assert!(!claimed.contains(&5));
+    }
+
+    fn assert_single_image_reference(
+        resources: &OwnedDictionary,
+        image: ObjectHandle,
+    ) -> Result<()> {
+        let Some(OwnedObject::Dictionary(xobjects)) = resources.get(b"XObject".as_slice()) else {
+            return Err(Error::Invalid("expected XObject resources".to_owned()));
+        };
+        assert!(matches!(
+            xobjects.get(b"RL1".as_slice()),
+            Some(OwnedObject::Reference(handle)) if *handle == image
+        ));
+        assert_eq!(xobjects.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_alpha_crop_reuses_exact_stream_without_reencoding() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [] /Count 0 >>")?;
+        // A real source XObject is referenced by both draws. The first
+        // normalization creates a cropped image, the next reuses its object.
+        let source_color = (0u8..=255).cycle().take(600).collect::<Vec<_>>();
+        pdf.stream(
+            4,
+            b"/Type /XObject /Subtype /Image /Width 30 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &source_color,
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+
+        let mut draw = test_draw(4, 0.0);
+        draw.range_end = b"/Im4 Do".len();
+        let mut image = stripe_test_image(30, 20, source_color);
+        let mut alpha = vec![0u8; 30 * 20];
+        for y in 5..15usize {
+            for x in 5..25usize {
+                alpha[y * 30 + x] = 255;
+            }
+        }
+        image.alpha = Some(AlphaPlane {
+            data: alpha.into(),
+            width: 30,
+            height: 20,
+        });
+        let infos = HashMap::from([(draw.target, image)]);
+        let plans = || {
+            let mut plans = Vec::new();
+            append_alpha_crop_plans(
+                std::slice::from_ref(&draw),
+                &infos,
+                &HashSet::new(),
+                &mut HashMap::new(),
+                &mut plans,
+            );
+            plans
+        };
+        assert_eq!(plans().len(), 1);
+        let config = RasterLayoutConfig {
+            enabled: true,
+            crop_background: false,
+            crop_transparent: true,
+            ..RasterLayoutConfig::default()
+        };
+        let original = b"/Im4 Do";
+        let mut cache = HashMap::new();
+
+        let (first_resources, first) = apply_plans(
+            &mut document,
+            ApplyPlansContext {
+                resources: OwnedDictionary::new(),
+                input: RewriteInput {
+                    content: original,
+                    draws: std::slice::from_ref(&draw),
+                },
+                config: &config,
+                flate_level: FlateLevel::PROCESSING,
+                alpha_crop_cache: &cache,
+            },
+            plans(),
+        )?;
+        assert_eq!(first.consumed_draws, HashSet::from([0]));
+        assert!(first.has_non_fragment_plan);
+        assert_eq!(first.stats.transparent_margins_cropped, 1);
+        assert_eq!(first.stats.cropped_pixels_removed, 400);
+        let cached = first
+            .alpha_crop_cache_entries
+            .get(&draw.target)
+            .copied()
+            .ok_or_else(|| {
+                Error::Invalid("first alpha crop did not cache its encoded image".to_owned())
+            })?;
+        assert!(cached.fast_reuse);
+        cache.insert(draw.target, cached);
+
+        let (second_resources, second) = apply_plans(
+            &mut document,
+            ApplyPlansContext {
+                resources: OwnedDictionary::new(),
+                input: RewriteInput {
+                    content: original,
+                    draws: std::slice::from_ref(&draw),
+                },
+                config: &config,
+                flate_level: FlateLevel::PROCESSING,
+                alpha_crop_cache: &cache,
+            },
+            plans(),
+        )?;
+        assert_eq!(second.consumed_draws, HashSet::from([0]));
+        assert_eq!(second.rewritten_content, first.rewritten_content);
+        assert_eq!(second.stats.cropped_pixels_removed, 400);
+        assert_eq!(second.stats.binary_images_packed, 0);
+        assert_eq!(second.stats.binary_masks_packed, 0);
+        assert!(second.alpha_crop_cache_entries.is_empty());
+
+        assert_single_image_reference(&first_resources, cached.image)?;
+        assert_single_image_reference(&second_resources, cached.image)?;
+        Ok(())
     }
 
     #[test]
