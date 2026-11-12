@@ -13,7 +13,8 @@ use crate::{
     hidden_text::{HiddenTextSharedContext, PhysicalHiddenTextScanner, hidden_text_shared_context},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
-        cleanup_fragmented_inline_staging, externalize_fragmented_inline_target,
+        FragmentedInlineStaging, cleanup_fragmented_inline_staging,
+        externalize_fragmented_inline_target,
     },
     prune::prune_xobject_candidates_for_content,
     vector_compact::{
@@ -5766,6 +5767,186 @@ fn apply_plans(
     Ok((resources, result))
 }
 
+// All graph mutations from a candidate raster rewrite are speculative until the
+// inline-size gate and resource pruning succeed. The caller only sees committed
+// outcomes and is responsible for the outer scanner/cache observations.
+struct RasterTargetTransaction<'a> {
+    target: ContentTarget,
+    scanner: &'a RasterScanner,
+    staging: Option<&'a FragmentedInlineStaging>,
+    config: &'a RasterLayoutConfig,
+    flate_level: crate::FlateLevel,
+    normalize_content_for_budget: bool,
+    alpha_crop_cache: &'a HashMap<ObjectHandle, AlphaCropCacheEntry>,
+}
+
+struct RasterTargetTransactionInput {
+    resources: OwnedDictionary,
+    content: Vec<u8>,
+    plans: Vec<MergePlan>,
+    prior_prune_changed: bool,
+}
+
+enum RasterTargetCommit {
+    Accepted { removed_xobjects: usize },
+    InlineBudgetRejected,
+}
+
+struct RasterTargetTransactionResult {
+    target_changed: bool,
+    plan_changed: bool,
+    apply_plans_us: u64,
+    applied: ApplyPlansResult,
+    commit: RasterTargetCommit,
+}
+
+impl RasterTargetTransaction<'_> {
+    /// If speculative graph work errors, discard all of its new objects.
+    /// The successful/rejected path handles the inline budget rollback itself.
+    fn execute(
+        &self,
+        document: &mut EditDocument,
+        input: RasterTargetTransactionInput,
+    ) -> Result<RasterTargetTransactionResult> {
+        let checkpoint = document.new_object_checkpoint();
+        match self.try_execute(document, input, checkpoint) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                document.rollback_new_objects(checkpoint)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn rejected_inline_budget(
+        &self,
+        original_content: &[u8],
+        applied: &ApplyPlansResult,
+    ) -> Result<Option<InlineReconstructionBudget>> {
+        if applied.rewritten_content.is_none()
+            || applied.has_non_fragment_plan
+            || applied.consumed_draws.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(staging) = self.staging else {
+            return Ok(None);
+        };
+        if !applied.consumed_draws.iter().all(|index| {
+            self.scanner
+                .draws
+                .get(*index)
+                .is_some_and(|draw| staging.contains_resource_name(&draw.resource_name))
+        }) {
+            return Ok(None);
+        }
+        let Some(rewritten) = applied.rewritten_content.as_deref() else {
+            return Ok(None);
+        };
+        let (Some(fallback_content), Some(candidate_content)) = (
+            staging.restore_all_references(original_content),
+            staging.restore_all_references(rewritten),
+        ) else {
+            return Ok(None);
+        };
+        let budget = inline_reconstruction_budget(
+            &fallback_content,
+            &candidate_content,
+            applied.added_image_payload_bytes,
+            self.flate_level,
+            self.normalize_content_for_budget && matches!(self.target, ContentTarget::Page(_)),
+        )?;
+        Ok((!budget.fits()).then_some(budget))
+    }
+
+    fn try_execute(
+        &self,
+        document: &mut EditDocument,
+        input: RasterTargetTransactionInput,
+        checkpoint: crate::source::NewObjectCheckpoint,
+    ) -> Result<RasterTargetTransactionResult> {
+        let RasterTargetTransactionInput {
+            resources,
+            mut content,
+            plans,
+            prior_prune_changed,
+        } = input;
+        let resources_for_inline_rollback = self.staging.map(|_| resources.clone());
+        let started = Instant::now();
+        let (mut resources, mut applied) = apply_plans(
+            document,
+            ApplyPlansContext {
+                resources,
+                input: RewriteInput {
+                    content: &content,
+                    draws: &self.scanner.draws,
+                },
+                config: self.config,
+                flate_level: self.flate_level,
+                alpha_crop_cache: self.alpha_crop_cache,
+            },
+            plans,
+        )?;
+        let apply_plans_us = elapsed_micros_u64(started);
+        let plan_changed = applied.rewritten_content.is_some();
+
+        if let Some(budget) = self.rejected_inline_budget(&content, &applied)? {
+            if *DEBUG_RASTER {
+                eprintln!(
+                    "raster-inline payload rollback {:?}: candidate={} fallback={} image_payload={}",
+                    self.target,
+                    budget.candidate_payload,
+                    budget.fallback_payload,
+                    applied.added_image_payload_bytes
+                );
+            }
+            let rollback_resources = resources_for_inline_rollback.ok_or_else(|| {
+                Error::Invalid("missing pre-apply resources for staged inline rollback".to_owned())
+            })?;
+            // Reject only the speculative plan: a preceding visibility prune
+            // still needs its content/resources installed.
+            document.rollback_new_objects(checkpoint)?;
+            if prior_prune_changed {
+                install_target(document, self.target, rollback_resources, content)?;
+            }
+            return Ok(RasterTargetTransactionResult {
+                target_changed: prior_prune_changed,
+                plan_changed: false,
+                apply_plans_us,
+                applied: ApplyPlansResult::default(),
+                commit: RasterTargetCommit::InlineBudgetRejected,
+            });
+        }
+
+        let target_changed = prior_prune_changed || plan_changed;
+        if let Some(rewritten) = applied.rewritten_content.take() {
+            content = rewritten;
+        }
+        let removed_xobjects = if plan_changed && !applied.obsolete_resource_names.is_empty() {
+            let (updated, removed) = prune_xobject_candidates_for_content(
+                document,
+                resources,
+                &content,
+                &applied.obsolete_resource_names,
+            )?;
+            resources = updated;
+            removed
+        } else {
+            0
+        };
+        if target_changed {
+            install_target(document, self.target, resources, content)?;
+        }
+        Ok(RasterTargetTransactionResult {
+            target_changed,
+            plan_changed,
+            apply_plans_us,
+            applied,
+            commit: RasterTargetCommit::Accepted { removed_xobjects },
+        })
+    }
+}
+
 fn append_alpha_crop_plans(
     draws: &[RasterDraw],
     infos: &HashMap<ObjectHandle, SampleImage>,
@@ -6471,168 +6652,60 @@ pub fn normalize_raster_layout(
         let target_staging = inline_staging
             .iter()
             .find(|staging| staging.target() == inline_target);
-        let resources_before_apply = target_staging.map(|_| resources.clone());
-        let new_object_checkpoint = document.new_object_checkpoint();
-
-        let apply_plans_started = Instant::now();
-        let apply_result = apply_plans(
+        let transaction = RasterTargetTransaction {
+            target,
+            scanner: &scanner,
+            staging: target_staging,
+            config,
+            flate_level,
+            normalize_content_for_budget,
+            alpha_crop_cache: &alpha_crop_cache,
+        };
+        let result = transaction.execute(
             document,
-            ApplyPlansContext {
+            RasterTargetTransactionInput {
                 resources,
-                input: RewriteInput {
-                    content: &content,
-                    draws: &scanner.draws,
-                },
-                config,
-                flate_level,
-                alpha_crop_cache: &alpha_crop_cache,
+                content,
+                plans,
+                prior_prune_changed: target_changed,
             },
-            plans,
-        );
-        let apply_plans_us = elapsed_micros_u64(apply_plans_started);
-        stats.apply_plans_us = stats.apply_plans_us.saturating_add(apply_plans_us);
-        let (candidate_resources, mut applied) = match apply_result {
-            Ok(result) => result,
-            Err(error) => {
-                document.rollback_new_objects(new_object_checkpoint)?;
-                return Err(error);
-            }
-        };
-
-        let applied_changed = applied.rewritten_content.is_some();
-        let inline_budget_rejection = (|| -> Result<Option<InlineReconstructionBudget>> {
-            if !applied_changed
-                || applied.has_non_fragment_plan
-                || applied.consumed_draws.is_empty()
-            {
-                return Ok(None);
-            }
-            let Some(staging) = target_staging else {
-                return Ok(None);
-            };
-            if !applied.consumed_draws.iter().all(|index| {
-                scanner
-                    .draws
-                    .get(*index)
-                    .is_some_and(|draw| staging.contains_resource_name(&draw.resource_name))
-            }) {
-                return Ok(None);
-            }
-            let Some(rewritten) = applied.rewritten_content.as_deref() else {
-                return Ok(None);
-            };
-            let (Some(fallback_content), Some(candidate_content)) = (
-                staging.restore_all_references(&content),
-                staging.restore_all_references(rewritten),
-            ) else {
-                return Ok(None);
-            };
-            let budget = inline_reconstruction_budget(
-                &fallback_content,
-                &candidate_content,
-                applied.added_image_payload_bytes,
-                flate_level,
-                normalize_content_for_budget && matches!(target, ContentTarget::Page(_)),
-            )?;
-            Ok((!budget.fits()).then_some(budget))
-        })();
-        let inline_budget_rejection = match inline_budget_rejection {
-            Ok(rejection) => rejection,
-            Err(error) => {
-                document.rollback_new_objects(new_object_checkpoint)?;
-                return Err(error);
-            }
-        };
-
-        let rejected_apply = if let Some(budget) = inline_budget_rejection {
-            if *DEBUG_RASTER {
-                eprintln!(
-                    "raster-inline payload rollback {target:?}: candidate={} fallback={} image_payload={}",
-                    budget.candidate_payload,
-                    budget.fallback_payload,
-                    applied.added_image_payload_bytes
-                );
-            }
-            let Some(rollback_resources) = resources_before_apply else {
-                document.rollback_new_objects(new_object_checkpoint)?;
-                return Err(Error::Invalid(
-                    "missing pre-apply resources for staged inline rollback".to_owned(),
-                ));
-            };
-            document.rollback_new_objects(new_object_checkpoint)?;
-            stats.inline_reconstruction_payload_rejections = stats
-                .inline_reconstruction_payload_rejections
-                .saturating_add(1);
-            resources = rollback_resources;
-            applied = ApplyPlansResult::default();
-            true
-        } else {
-            resources = candidate_resources;
-            if let Some(rewritten) = applied.rewritten_content.take() {
-                content = rewritten;
-                target_changed = true;
-            }
-            false
-        };
-
-        let rewritten_xobject_entries_removed =
-            if !rejected_apply && applied_changed && !applied.obsolete_resource_names.is_empty() {
-                let pruned = prune_xobject_candidates_for_content(
-                    document,
-                    resources,
-                    &content,
-                    &applied.obsolete_resource_names,
-                );
-                let (updated_resources, removed) = match pruned {
-                    Ok(result) => result,
-                    Err(error) => {
-                        document.rollback_new_objects(new_object_checkpoint)?;
-                        return Err(error);
-                    }
-                };
-                resources = updated_resources;
-                removed
-            } else {
-                0
-            };
-
-        if target_changed {
-            if let Err(error) = install_target(document, target, resources, content) {
-                document.rollback_new_objects(new_object_checkpoint)?;
-                return Err(error);
-            }
+        )?;
+        stats.apply_plans_us = stats.apply_plans_us.saturating_add(result.apply_plans_us);
+        if result.target_changed {
             page_state.invalidate_vector(target);
-            if !rejected_apply && applied_changed {
-                // Plan application can remove or relocate raster paint barriers.
-                // Without a final rescan, the pre-apply vector skip proof no
-                // longer describes the installed content snapshot.
-                stats.invalidate_page_vector_scan(target);
-            }
+        }
+        if result.plan_changed {
+            // The original vector skip proof is no longer valid after raster
+            // plans move or remove paint barriers.
+            stats.invalidate_page_vector_scan(target);
         }
 
-        if !rejected_apply {
-            applied.stats.commit_to(&mut stats);
-            for (source, entry) in applied.alpha_crop_cache_entries.drain() {
-                alpha_crop_cache.insert(source, entry);
-            }
-            if rewritten_xobject_entries_removed != 0 {
+        let mut consumed = pruned_draws;
+        let mut added_resource_names = BTreeSet::new();
+        let mut applied = result.applied;
+        match result.commit {
+            RasterTargetCommit::Accepted { removed_xobjects } => {
+                applied.stats.commit_to(&mut stats);
+                alpha_crop_cache.extend(applied.alpha_crop_cache_entries.drain());
                 stats.rewritten_xobject_entries_removed = stats
                     .rewritten_xobject_entries_removed
-                    .saturating_add(rewritten_xobject_entries_removed);
+                    .saturating_add(removed_xobjects);
+                consumed.extend(applied.consumed_draws);
+                added_resource_names = applied.added_resource_names;
+            }
+            RasterTargetCommit::InlineBudgetRejected => {
+                stats.inline_reconstruction_payload_rejections = stats
+                    .inline_reconstruction_payload_rejections
+                    .saturating_add(1);
             }
         }
-
-        {
-            let mut consumed = pruned_draws.clone();
-            consumed.extend(applied.consumed_draws.iter().copied());
-            let mut usage = scanner.resource_usage_after_removing(&consumed);
-            usage
-                .by_type
-                .entry(b"XObject".to_vec())
-                .or_default()
-                .extend(applied.added_resource_names);
-            stats.record_resource_usage(target, usage);
-        }
+        let mut usage = scanner.resource_usage_after_removing(&consumed);
+        usage
+            .by_type
+            .entry(b"XObject".to_vec())
+            .or_default()
+            .extend(added_resource_names);
+        stats.record_resource_usage(target, usage);
     }
     let staging_cleanup_started = Instant::now();
     let staging_cleanup = cleanup_fragmented_inline_staging(document, &inline_staging)?;
@@ -7726,6 +7799,200 @@ mod tests {
             2
         );
         Ok(())
+    }
+
+    #[test]
+    fn raster_transaction_commits_rewrite_and_resource_pruning_together() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im5 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"/Im5 Do")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[10, 20, 30, 40],
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let content = page_content(&document, page)?;
+        let resources = page_resources(&document, page)?
+            .ok_or_else(|| Error::Invalid("test page missing resources".to_owned()))?;
+        let scanner = scan_target(&document, &resources, &content)?
+            .ok_or_else(|| Error::Invalid("test page not scannable".to_owned()))?;
+        assert_eq!(scanner.draws.len(), 1);
+        let plan = MergePlan {
+            members: vec![0],
+            first_member: 0,
+            image: stripe_test_image(2, 2, vec![10, 20, 30, 40]),
+            width: 2,
+            height: 2,
+            data: vec![10, 20, 30, 40],
+            alpha: None,
+            source_color_budget: None,
+            source_payload_budget: None,
+            desired_ctm: scanner.draws[0].ctm,
+            background: None,
+            alpha_crop_hint: None,
+            kind: MergeKind::PixelCluster,
+        };
+        let config = RasterLayoutConfig {
+            crop_background: false,
+            crop_transparent: false,
+            ..RasterLayoutConfig::default()
+        };
+        let transaction = RasterTargetTransaction {
+            target: ContentTarget::Page(page),
+            scanner: &scanner,
+            staging: None,
+            config: &config,
+            flate_level: FlateLevel::PROCESSING,
+            normalize_content_for_budget: true,
+            alpha_crop_cache: &HashMap::new(),
+        };
+        let outcome = transaction.execute(
+            &mut document,
+            RasterTargetTransactionInput {
+                resources,
+                content: content.clone(),
+                plans: vec![plan],
+                prior_prune_changed: false,
+            },
+        )?;
+        assert!(outcome.target_changed);
+        assert!(outcome.plan_changed);
+        assert_eq!(outcome.applied.consumed_draws, HashSet::from([0]));
+        assert_eq!(outcome.applied.stats.pixel_clusters_reconstructed, 1);
+        assert!(matches!(
+            outcome.commit,
+            RasterTargetCommit::Accepted {
+                removed_xobjects: 1
+            }
+        ));
+        let rewritten = page_content(&document, page)?;
+        assert_ne!(rewritten, content);
+        assert!(rewritten.windows(4).any(|bytes| bytes == b"/RL1"));
+        let new_resources = page_resources(&document, page)?
+            .ok_or_else(|| Error::Invalid("rewritten page missing resources".to_owned()))?;
+        let Some(OwnedObject::Dictionary(images)) = new_resources.get(b"XObject".as_slice()) else {
+            return Err(Error::Invalid("rewritten page missing XObjects".to_owned()));
+        };
+        assert!(images.contains_key(b"RL1".as_slice()));
+        assert!(!images.contains_key(b"Im5".as_slice()));
+        Ok(())
+    }
+
+    fn assert_inline_budget_rollback(prior_prune_changed: bool) -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << >> /Contents 4 0 R >>",
+        )?;
+        let mut original = b"q 1 0 0 1 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        original.push(0x7f);
+        original.extend_from_slice(b" EI Q");
+        pdf.stream(4, b"", &original)?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let externalized = externalize_fragmented_inline_target(
+            &mut document,
+            InlineContentTarget::Page(page),
+            1,
+        )?;
+        let staging = externalized.staging.ok_or_else(|| {
+            Error::Invalid("inline test fixture did not create staging".to_owned())
+        })?;
+        let content = page_content(&document, page)?;
+        let resources = page_resources(&document, page)?
+            .ok_or_else(|| Error::Invalid("inline test fixture has no resources".to_owned()))?;
+        let scanner = scan_target(&document, &resources, &content)?
+            .ok_or_else(|| Error::Invalid("inline test fixture was not scannable".to_owned()))?;
+        assert_eq!(scanner.draws.len(), 1);
+
+        // Encode a deliberately expensive reconstruction to exercise the
+        // compressed-payload rejection after a real image was installed.
+        let mut seed = 0xA75F_893Bu32;
+        let pixels = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let draw = &scanner.draws[0];
+        let plan = MergePlan {
+            members: vec![0],
+            first_member: 0,
+            image: stripe_test_image(64, 64, pixels.clone()),
+            width: 64,
+            height: 64,
+            data: pixels,
+            alpha: None,
+            source_color_budget: None,
+            source_payload_budget: None,
+            desired_ctm: draw.ctm,
+            background: None,
+            alpha_crop_hint: None,
+            kind: MergeKind::PixelCluster,
+        };
+        let config = RasterLayoutConfig {
+            crop_background: false,
+            crop_transparent: false,
+            ..RasterLayoutConfig::default()
+        };
+        let before_checkpoint = format!("{:?}", document.new_object_checkpoint());
+        let transaction = RasterTargetTransaction {
+            target: ContentTarget::Page(page),
+            scanner: &scanner,
+            staging: Some(&staging),
+            config: &config,
+            flate_level: FlateLevel::PROCESSING,
+            normalize_content_for_budget: true,
+            alpha_crop_cache: &HashMap::new(),
+        };
+        let outcome = transaction.execute(
+            &mut document,
+            RasterTargetTransactionInput {
+                resources,
+                content: content.clone(),
+                plans: vec![plan],
+                prior_prune_changed,
+            },
+        )?;
+        assert!(matches!(
+            outcome.commit,
+            RasterTargetCommit::InlineBudgetRejected
+        ));
+        assert_eq!(outcome.target_changed, prior_prune_changed);
+        assert!(!outcome.plan_changed);
+        assert!(outcome.applied.consumed_draws.is_empty());
+        assert!(outcome.applied.alpha_crop_cache_entries.is_empty());
+        assert_eq!(page_content(&document, page)?, content);
+        let after_checkpoint = format!("{:?}", document.new_object_checkpoint());
+        if prior_prune_changed {
+            // Rejecting speculative images still installs the already-pruned
+            // page content as one new stream object.
+            assert_ne!(after_checkpoint, before_checkpoint);
+        } else {
+            assert_eq!(after_checkpoint, before_checkpoint);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inline_transaction_rolls_back_images_without_losing_prune_state() -> Result<()> {
+        assert_inline_budget_rollback(false)?;
+        assert_inline_budget_rollback(true)
     }
 
     #[test]
