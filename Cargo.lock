@@ -418,6 +418,7 @@ dependencies = [
  "fax",
  "hayro-syntax",
  "libjpeg-turbo-rs",
+ "num-traits",
  "serde",
  "serde_json",
  "sha2",

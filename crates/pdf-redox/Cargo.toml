@@ -24,6 +24,7 @@ write-fonts.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 color_quant.workspace = true
+num-traits.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zlib-rs = { workspace = true, features = ["parallel"] }

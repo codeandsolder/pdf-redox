@@ -306,10 +306,6 @@ fn next_inline_name(resource_names: &mut BTreeSet<Vec<u8>>, suffix: &mut usize) 
     }
 }
 
-#[expect(
-    clippy::option_if_let_else,
-    reason = "the cache-miss branch atomically updates the generated name and staged image collections"
-)]
 fn rewrite_inline_images(
     document: &EditDocument,
     resources: &OwnedDictionary,
@@ -357,9 +353,7 @@ fn rewrite_inline_images(
             Vec::new()
         };
         output.extend_from_slice(&content[cursor..span.start]);
-        let name = if let Some(name) = local_names.get(&fingerprint) {
-            name.clone()
-        } else {
+        let name = local_names.get(&fingerprint).cloned().unwrap_or_else(|| {
             let name = next_inline_name(&mut resource_names, &mut suffix);
             local_names.insert(fingerprint, name.clone());
             images.push(DetachedInlineImage {
@@ -370,7 +364,7 @@ fn rewrite_inline_images(
                 original_inline,
             });
             name
-        };
+        });
         output.push(b'/');
         output.extend_from_slice(&name);
         output.extend_from_slice(b" Do\n");

@@ -6,6 +6,7 @@ use crate::{
         page_content, page_user_unit, resolved_name, resolved_number, resolved_number_array,
     },
 };
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_FORM_DEPTH: usize = 64;
@@ -31,17 +32,7 @@ impl ImagePlacement {
             if desired >= f64::from(pixels) {
                 return pixels;
             }
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
-            )]
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "desired is finite, positive, integral after ceil, and strictly below a u32 pixel bound"
-            )]
-            {
-                desired as u32
-            }
+            desired.to_u32().unwrap_or(pixels)
         }
 
         (
@@ -249,15 +240,7 @@ fn cow_image_dimensions(
     {
         return Ok(None);
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "finite positive image dimensions are range-checked against u32 before conversion"
-    )]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "finite positive image dimensions are range-checked against u32 before conversion"
-    )]
-    Ok(Some((width as u32, height as u32)))
+    Ok(width.to_u32().zip(height.to_u32()))
 }
 
 fn cow_subtype(
