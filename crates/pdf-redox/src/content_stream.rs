@@ -81,11 +81,10 @@ pub fn operand_number(object: &HayroObject<'_>, raw: &[u8]) -> Option<f64> {
 /// Apply sorted, non-overlapping byte-range replacements to a content stream.
 ///
 /// Returns `None` when any range is invalid or overlaps an earlier replacement.
-pub fn apply_replacements(
+pub fn apply_replacements_owned(
     input: &[u8],
-    replacements: &[(usize, usize, Vec<u8>)],
+    mut replacements: Vec<(usize, usize, Vec<u8>)>,
 ) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
     replacements.sort_unstable_by_key(|(start, _, _)| *start);
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0usize;
@@ -99,6 +98,14 @@ pub fn apply_replacements(
     }
     output.extend_from_slice(input.get(cursor..)?);
     Some(output)
+}
+
+/// Borrowed convenience variant; the owned form avoids cloning replacement payloads.
+pub fn apply_replacements(
+    input: &[u8],
+    replacements: &[(usize, usize, Vec<u8>)],
+) -> Option<Vec<u8>> {
+    apply_replacements_owned(input, replacements.to_vec())
 }
 
 /// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
@@ -143,6 +150,31 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_and_borrowed_replacements_agree_and_reject_overlaps() {
+        let input = b"abcdefghij";
+        let replacements = vec![(6, 8, b"Q".to_vec()), (1, 4, b"XX".to_vec())];
+        let expected = Some(b"aXXefQij".to_vec());
+        assert_eq!(apply_replacements(input, &replacements), expected);
+        assert_eq!(apply_replacements_owned(input, replacements), expected);
+
+        let overlap = vec![(4, 6, b"z".to_vec()), (1, 5, b"x".to_vec())];
+        assert_eq!(apply_replacements(input, &overlap), None);
+        assert_eq!(apply_replacements_owned(input, overlap), None);
+        assert_eq!(
+            apply_replacements_owned(input, vec![(7, 4, Vec::new())]),
+            None
+        );
+        assert_eq!(
+            apply_replacements_owned(input, vec![(0, 11, Vec::new())]),
+            None
+        );
+        assert_eq!(
+            apply_replacements_owned(input, Vec::new()),
+            Some(input.to_vec())
+        );
+    }
 
     #[test]
     fn content_normalization_is_idempotent_for_composite_operand_spacing() {

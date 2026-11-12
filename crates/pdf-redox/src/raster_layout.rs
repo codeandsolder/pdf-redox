@@ -3206,31 +3206,26 @@ fn prepare_constant_color_mask_stencil(
     }))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "image normalization combines coupled decode, crop, alpha, and encoded-cost safety gates"
-)]
-fn prepare_image(
+fn try_prepare_binary_alpha_stencil(
     info: &SampleImage,
-    width: u32,
-    height: u32,
+    dimensions: (u32, u32),
     data: &[u8],
-    alpha: Option<Vec<u8>>,
+    alpha: Option<&[u8]>,
     context: ImageEncodingContext,
-) -> Result<PreparedImage> {
+    encoded_8bit: &mut Option<Vec<u8>>,
+) -> Result<Option<PreparedImage>> {
+    let (width, height) = dimensions;
     let ImageEncodingContext {
         flate_level,
         exact_raster_rendering,
-        source_color_budget,
+        ..
     } = context;
-    let mut encoded_8bit = None;
     let mut encoding = ImageEncodingStats::default();
-
     // A constant Device* color behind strictly binary alpha is exactly a PDF
     // stencil image. In normal mode we also allow samples hidden by alpha=0
     // to differ: that can change only resampled antialiasing, and avoids an
     // otherwise redundant color plane. Exact mode keeps those samples.
-    if let Some(alpha) = alpha.as_deref()
+    if let Some(alpha) = alpha
         && let Some(stencil) = BilevelRaster::from_image_mask_alpha(alpha, width, height)
         && let Some((color, relaxed_stencil)) = constant_device_color(info, data)
             .map(|color| (color, false))
@@ -3257,7 +3252,7 @@ fn prepare_image(
         } else {
             let encoded = crate::stream_codec::encode_flate(data, flate_level)?;
             let cost = encoded.len().saturating_add(alpha_8bit_encoded.len());
-            encoded_8bit = Some(encoded);
+            *encoded_8bit = Some(encoded);
             cost
         };
         if stencil_cost < normal_cost {
@@ -3271,31 +3266,25 @@ fn prepare_image(
             }
             encoding.encoded_bytes_saved =
                 u64::try_from(normal_cost - stencil_cost).unwrap_or(u64::MAX);
-            return Ok(PreparedImage {
+            return Ok(Some(PreparedImage {
                 dictionary,
                 data: stencil_payload.data,
                 alpha: None,
                 encoding,
-            });
+            }));
         }
     }
 
-    let encoded_8bit = match encoded_8bit {
-        Some(encoded) => encoded,
-        None => crate::stream_codec::encode_flate(data, flate_level)?,
-    };
+    Ok(None)
+}
 
-    let mut dictionary = info.dictionary_template.clone();
-    dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec()));
-    dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec()));
-    dictionary.insert(b"Width".to_vec(), OwnedObject::Integer(i64::from(width)));
-    dictionary.insert(b"Height".to_vec(), OwnedObject::Integer(i64::from(height)));
-    dictionary.insert(
-        b"Filter".to_vec(),
-        OwnedObject::Name(b"FlateDecode".to_vec()),
-    );
-    dictionary.remove(b"DecodeParms".as_slice());
-
+fn encode_prepared_alpha(
+    alpha: Option<Vec<u8>>,
+    dimensions: (u32, u32),
+    flate_level: crate::FlateLevel,
+    encoding: &mut ImageEncodingStats,
+) -> Result<Option<PreparedAlpha>> {
+    let (width, height) = dimensions;
     let prepared_alpha = if let Some(alpha) = alpha {
         let alpha_8bit = crate::stream_codec::encode_flate(&alpha, flate_level)?;
         let (alpha_data, alpha_bpc, alpha_codec) =
@@ -3333,10 +3322,23 @@ fn prepare_image(
         None
     };
 
-    let binary_components = if info.components == 1 && is_device_gray(&dictionary) {
+    Ok(prepared_alpha)
+}
+
+fn encode_prepared_color(
+    info: &SampleImage,
+    dimensions: (u32, u32),
+    data: &[u8],
+    encoded_8bit: Vec<u8>,
+    dictionary: &mut OwnedDictionary,
+    flate_level: crate::FlateLevel,
+    encoding: &mut ImageEncodingStats,
+) -> Result<Vec<u8>> {
+    let (width, height) = dimensions;
+    let binary_components = if info.components == 1 && is_device_gray(dictionary) {
         Some(1)
     } else if info.components == 3
-        && is_device_rgb(&dictionary)
+        && is_device_rgb(dictionary)
         && !dictionary.contains_key(b"Decode".as_slice())
         && !dictionary.contains_key(b"D".as_slice())
     {
@@ -3347,14 +3349,14 @@ fn prepare_image(
     } else {
         None
     };
-    let mut encoded = if binary_components == Some(1) {
+    let encoded = if binary_components == Some(1) {
         if let Some(raster) = BilevelRaster::from_binary_gray_samples(data, width, height) {
             let encoded_1bit = raster.encode(flate_level)?;
             let encoded_cost =
                 estimated_bilevel_stream_cost(encoded_1bit.data.len(), encoded_1bit.codec);
             if encoded_cost < encoded_8bit.len() {
                 dictionary.insert(b"BitsPerComponent".to_vec(), OwnedObject::Integer(1));
-                set_bilevel_filter(&mut dictionary, width, height, encoded_1bit.codec);
+                set_bilevel_filter(dictionary, width, height, encoded_1bit.codec);
                 encoding.binary_packed = true;
                 match encoded_1bit.codec {
                     BilevelCodec::CcittGroup4 => {
@@ -3398,6 +3400,19 @@ fn prepare_image(
         encoded_8bit
     };
 
+    Ok(encoded)
+}
+
+fn prefer_reconstructed_jpeg(
+    info: &SampleImage,
+    dimensions: (u32, u32),
+    data: &[u8],
+    mut encoded: Vec<u8>,
+    dictionary: &mut OwnedDictionary,
+    encoding: &ImageEncodingStats,
+    source_color_budget: Option<usize>,
+) -> Result<Vec<u8>> {
+    let (width, height) = dimensions;
     // Reconstructed DCT/JPX-backed color should stay compact. Start at q85.
     // When a stripe plan knows the aggregate source color-stream budget, step
     // quality down only as far as needed to fit that budget. This keeps already
@@ -3441,6 +3456,74 @@ fn prepare_image(
             encoded = jpeg;
         }
     }
+
+    Ok(encoded)
+}
+
+fn prepare_image(
+    info: &SampleImage,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    alpha: Option<Vec<u8>>,
+    context: ImageEncodingContext,
+) -> Result<PreparedImage> {
+    let ImageEncodingContext {
+        flate_level,
+        source_color_budget,
+        ..
+    } = context;
+    let mut encoded_8bit = None;
+    let mut encoding = ImageEncodingStats::default();
+
+    if let Some(stencil) = try_prepare_binary_alpha_stencil(
+        info,
+        (width, height),
+        data,
+        alpha.as_deref(),
+        context,
+        &mut encoded_8bit,
+    )? {
+        return Ok(stencil);
+    }
+
+    let encoded_8bit = match encoded_8bit {
+        Some(encoded) => encoded,
+        None => crate::stream_codec::encode_flate(data, flate_level)?,
+    };
+
+    let mut dictionary = info.dictionary_template.clone();
+    dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec()));
+    dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec()));
+    dictionary.insert(b"Width".to_vec(), OwnedObject::Integer(i64::from(width)));
+    dictionary.insert(b"Height".to_vec(), OwnedObject::Integer(i64::from(height)));
+    dictionary.insert(
+        b"Filter".to_vec(),
+        OwnedObject::Name(b"FlateDecode".to_vec()),
+    );
+    dictionary.remove(b"DecodeParms".as_slice());
+
+    let prepared_alpha = encode_prepared_alpha(alpha, (width, height), flate_level, &mut encoding)?;
+
+    let encoded = encode_prepared_color(
+        info,
+        (width, height),
+        data,
+        encoded_8bit,
+        &mut dictionary,
+        flate_level,
+        &mut encoding,
+    )?;
+
+    let encoded = prefer_reconstructed_jpeg(
+        info,
+        (width, height),
+        data,
+        encoded,
+        &mut dictionary,
+        &encoding,
+        source_color_budget,
+    )?;
 
     Ok(PreparedImage {
         dictionary,
@@ -5084,6 +5167,41 @@ impl ApplyPlanStats {
             .saturating_add(encoding.encoded_bytes_saved);
     }
 
+    fn record_accepted_plan(
+        &mut self,
+        kind: MergeKind,
+        member_count: usize,
+        mask_baked: bool,
+        image_created: bool,
+    ) {
+        if kind == MergeKind::PixelCluster {
+            self.deferred_tile_paints_consumed = self
+                .deferred_tile_paints_consumed
+                .saturating_add(member_count);
+        }
+        match kind {
+            MergeKind::Stripe => {
+                self.stripe_groups_merged += 1;
+                self.stripe_paints_merged += member_count;
+            }
+            MergeKind::PixelCluster => {
+                self.pixel_clusters_reconstructed += 1;
+                self.pixel_paints_reconstructed += member_count;
+            }
+            MergeKind::NativeFragment => {
+                self.native_fragment_groups_reconstructed += 1;
+                self.native_fragment_paints_reconstructed += member_count;
+            }
+            MergeKind::ConstantColorMaskStencil => {
+                self.constant_color_mask_stencils_emitted += 1;
+            }
+            MergeKind::AlphaCrop => {}
+        }
+        if mask_baked && image_created {
+            self.masks_baked += 1;
+        }
+    }
+
     const fn commit_to(self, stats: &mut RasterLayoutStats) {
         stats.pixel_clusters_reconstructed += self.pixel_clusters_reconstructed;
         stats.pixel_paints_reconstructed += self.pixel_paints_reconstructed;
@@ -5177,9 +5295,259 @@ fn candidate_payload_fits_budget(
         .is_none_or(|source_payload| source_payload == 0 || candidate_payload < source_payload)
 }
 
+struct PreparedMergePlan {
+    plan: MergePlan,
+    relative: Matrix,
+    source_crop_hint: Option<PixelCrop>,
+    cached_crop: Option<AlphaCropCacheEntry>,
+    prepared_background: Option<(Matrix, PreparedImage)>,
+    prepared_main: Option<PreparedImage>,
+    transparent_cropped: bool,
+    background_cropped: bool,
+    removed_pixels: u64,
+    mask_baked: bool,
+}
+
+// Both rejections skip the candidate; only cost rejection releases its draw
+// reservations so another candidate can reuse them.
+struct PlanPreparation {
+    ready: Option<PreparedMergePlan>,
+    release_claims: Option<Vec<usize>>,
+}
+
+impl PlanPreparation {
+    const fn ineligible() -> Self {
+        Self {
+            ready: None,
+            release_claims: None,
+        }
+    }
+
+    const fn over_budget(members: Vec<usize>) -> Self {
+        Self {
+            ready: None,
+            release_claims: Some(members),
+        }
+    }
+
+    const fn ready(plan: PreparedMergePlan) -> Self {
+        Self {
+            ready: Some(plan),
+            release_claims: None,
+        }
+    }
+}
+
+fn prepared_merge_payload_fits(
+    plan: &MergePlan,
+    prepared_main: Option<&PreparedImage>,
+    prepared_background: Option<&PreparedImage>,
+    uncached: bool,
+) -> bool {
+    if plan.kind == MergeKind::ConstantColorMaskStencil
+        && let Some(prepared) = prepared_main
+    {
+        let source_payload = plan
+            .image
+            .encoded_color_bytes
+            .saturating_add(plan.image.encoded_mask_bytes);
+        let color_operator_bytes = prepared
+            .encoding
+            .stencil_color
+            .map_or(0, |color| color.content_operator().len());
+        let candidate_payload = prepared
+            .payload_bytes()
+            .saturating_add(color_operator_bytes);
+        if source_payload > 0 && candidate_payload >= source_payload {
+            return false;
+        }
+    }
+
+    if plan.kind == MergeKind::AlphaCrop
+        && uncached
+        && let Some(prepared) = prepared_main
+    {
+        let source_payload = plan
+            .image
+            .encoded_color_bytes
+            .saturating_add(plan.image.encoded_mask_bytes);
+        let candidate_payload = prepared
+            .payload_bytes()
+            .saturating_add(prepared_background.map_or(0, PreparedImage::payload_bytes));
+        if source_payload > 0 && candidate_payload >= source_payload {
+            return false;
+        }
+    }
+
+    if plan.kind == MergeKind::Stripe
+        && uncached
+        && let (Some(prepared), Some(source_payload)) = (prepared_main, plan.source_payload_budget)
+    {
+        let candidate_payload = prepared
+            .payload_bytes()
+            .saturating_add(prepared_background.map_or(0, PreparedImage::payload_bytes));
+        if !candidate_payload_fits_budget(Some(source_payload), candidate_payload) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn prepare_merge_plan(
+    mut plan: MergePlan,
+    first_draw: &RasterDraw,
+    config: &RasterLayoutConfig,
+    flate_level: crate::FlateLevel,
+    alpha_crop_cache_entries: &HashMap<ObjectHandle, AlphaCropCacheEntry>,
+    alpha_crop_cache: &HashMap<ObjectHandle, AlphaCropCacheEntry>,
+) -> Result<PlanPreparation> {
+    let source_crop_hint = plan.alpha_crop_hint;
+    let cached_crop = if plan.kind == MergeKind::AlphaCrop {
+        alpha_crop_cache_entries
+            .get(&first_draw.target)
+            .or_else(|| alpha_crop_cache.get(&first_draw.target))
+            .copied()
+    } else {
+        None
+    };
+    let crop_result = if plan.kind == MergeKind::ConstantColorMaskStencil {
+        Some((false, false, 0))
+    } else if let Some(cached) = cached_crop.filter(|cached| cached.fast_reuse) {
+        crop_plan_geometry_to(&mut plan, cached.source_crop)
+            .map(|removed_pixels| (true, false, removed_pixels))
+    } else {
+        crop_merge_plan(&mut plan, config)
+    };
+    let Some((transparent_cropped, background_cropped, removed_pixels)) = crop_result else {
+        return Ok(PlanPreparation::ineligible());
+    };
+    let Some(relative) = relative_matrix(first_draw.replace_ctm, plan.desired_ctm) else {
+        return Ok(PlanPreparation::ineligible());
+    };
+    let mask_baked = plan.image.alpha.is_some() || plan.alpha.is_some();
+
+    // Prepare all prospective streams before mutating the graph. This lets
+    // singleton alpha-crop plans compare real compressed payload cost with
+    // the current source image+mask and disappear cleanly when the crop
+    // would make the PDF larger.
+    let prepared_background = if let Some(background) = plan.background.take() {
+        let Some(background_relative) =
+            relative_matrix(first_draw.replace_ctm, background.desired_ctm)
+        else {
+            return Ok(PlanPreparation::ineligible());
+        };
+        let prepared = prepare_image(
+            &plan.image,
+            1,
+            1,
+            &background.data,
+            None,
+            ImageEncodingContext {
+                flate_level,
+                exact_raster_rendering: config.exact_raster_rendering,
+                source_color_budget: None,
+            },
+        )?;
+        Some((background_relative, prepared))
+    } else {
+        None
+    };
+
+    let prepared_main = if cached_crop.is_none() {
+        if plan.kind == MergeKind::ConstantColorMaskStencil {
+            let Some(alpha) = plan.alpha.as_deref() else {
+                return Ok(PlanPreparation::over_budget(plan.members));
+            };
+            let Some(prepared) = prepare_constant_color_mask_stencil(
+                &plan.image,
+                plan.width,
+                plan.height,
+                alpha,
+                flate_level,
+            )?
+            else {
+                return Ok(PlanPreparation::over_budget(plan.members));
+            };
+            Some(prepared)
+        } else {
+            Some(prepare_image(
+                &plan.image,
+                plan.width,
+                plan.height,
+                &plan.data,
+                plan.alpha.take(),
+                ImageEncodingContext {
+                    flate_level,
+                    exact_raster_rendering: config.exact_raster_rendering,
+                    source_color_budget: plan.source_color_budget,
+                },
+            )?)
+        }
+    } else {
+        None
+    };
+
+    if !prepared_merge_payload_fits(
+        &plan,
+        prepared_main.as_ref(),
+        prepared_background.as_ref().map(|(_, prepared)| prepared),
+        cached_crop.is_none(),
+    ) {
+        return Ok(PlanPreparation::over_budget(plan.members));
+    }
+
+    Ok(PlanPreparation::ready(PreparedMergePlan {
+        plan,
+        relative,
+        source_crop_hint,
+        cached_crop,
+        prepared_background,
+        prepared_main,
+        transparent_cropped,
+        background_cropped,
+        removed_pixels,
+        mask_baked,
+    }))
+}
+
+fn emit_merge_image_paint(
+    draw: &RasterDraw,
+    relative: Matrix,
+    name: &[u8],
+    background: Option<(Matrix, Vec<u8>)>,
+    encoding: ImageEncodingStats,
+) -> Vec<u8> {
+    let mut replacement = b"q ".to_vec();
+    if let Some(gs) = &draw.gs_name {
+        replacement.push(b'/');
+        replacement.extend_from_slice(gs.strip_prefix(b"/").unwrap_or(gs));
+        replacement.extend_from_slice(b" gs ");
+    }
+    if let Some(intent) = &draw.rendering_intent {
+        replacement.push(b'/');
+        replacement.extend_from_slice(intent.strip_prefix(b"/").unwrap_or(intent));
+        replacement.extend_from_slice(b" ri ");
+    }
+    if let Some((background_relative, background_name)) = background {
+        replacement
+            .extend_from_slice(format!("q {} cm /", background_relative.unparse()).as_bytes());
+        replacement.extend_from_slice(&background_name);
+        replacement.extend_from_slice(b" Do Q ");
+    }
+    replacement.extend_from_slice(b"q ");
+    if let Some(color) = encoding.stencil_color {
+        replacement.extend_from_slice(&color.content_operator());
+    }
+    replacement.extend_from_slice(format!("{} cm /", relative.unparse()).as_bytes());
+    replacement.extend_from_slice(name);
+    replacement.extend_from_slice(b" Do Q Q");
+    replacement
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "plan application must preserve rewrite ordering, resource edits, and accumulated statistics atomically"
+    reason = "plan application coordinates ordered graph resource insertion and draw rewrite accounting"
 )]
 fn apply_plans(
     document: &mut EditDocument,
@@ -5202,164 +5570,39 @@ fn apply_plans(
     let mut claimed = HashSet::new();
     let mut result = ApplyPlansResult::default();
 
-    for mut plan in plans {
+    for plan in plans {
         if plan.members.iter().any(|index| !claimed.insert(*index)) {
             continue;
         }
         let first_draw = &input.draws[plan.first_member];
-        let source_crop_hint = plan.alpha_crop_hint;
-        let cached_crop = if plan.kind == MergeKind::AlphaCrop {
-            result
-                .alpha_crop_cache_entries
-                .get(&first_draw.target)
-                .or_else(|| alpha_crop_cache.get(&first_draw.target))
-                .copied()
-        } else {
-            None
-        };
-        let crop_result = if plan.kind == MergeKind::ConstantColorMaskStencil {
-            Some((false, false, 0))
-        } else if let Some(cached) = cached_crop.filter(|cached| cached.fast_reuse) {
-            crop_plan_geometry_to(&mut plan, cached.source_crop)
-                .map(|removed_pixels| (true, false, removed_pixels))
-        } else {
-            crop_merge_plan(&mut plan, config)
-        };
-        let Some((transparent_cropped, background_cropped, removed_pixels)) = crop_result else {
+        let preparation = prepare_merge_plan(
+            plan,
+            first_draw,
+            config,
+            flate_level,
+            &result.alpha_crop_cache_entries,
+            alpha_crop_cache,
+        )?;
+        if let Some(members) = preparation.release_claims {
+            for member in &members {
+                claimed.remove(member);
+            }
+        }
+        let Some(PreparedMergePlan {
+            plan,
+            relative,
+            source_crop_hint,
+            cached_crop,
+            prepared_background,
+            mut prepared_main,
+            transparent_cropped,
+            background_cropped,
+            removed_pixels,
+            mask_baked,
+        }) = preparation.ready
+        else {
             continue;
         };
-        let Some(relative) = relative_matrix(first_draw.replace_ctm, plan.desired_ctm) else {
-            continue;
-        };
-        let mask_baked = plan.image.alpha.is_some() || plan.alpha.is_some();
-
-        // Prepare all prospective streams before mutating the graph. This lets
-        // singleton alpha-crop plans compare real compressed payload cost with
-        // the current source image+mask and disappear cleanly when the crop
-        // would make the PDF larger.
-        let prepared_background = if let Some(background) = plan.background.take() {
-            let Some(background_relative) =
-                relative_matrix(first_draw.replace_ctm, background.desired_ctm)
-            else {
-                continue;
-            };
-            let prepared = prepare_image(
-                &plan.image,
-                1,
-                1,
-                &background.data,
-                None,
-                ImageEncodingContext {
-                    flate_level,
-                    exact_raster_rendering: config.exact_raster_rendering,
-                    source_color_budget: None,
-                },
-            )?;
-            Some((background_relative, prepared))
-        } else {
-            None
-        };
-
-        let mut prepared_main = if cached_crop.is_none() {
-            if plan.kind == MergeKind::ConstantColorMaskStencil {
-                let Some(alpha) = plan.alpha.as_deref() else {
-                    for member in &plan.members {
-                        claimed.remove(member);
-                    }
-                    continue;
-                };
-                let Some(prepared) = prepare_constant_color_mask_stencil(
-                    &plan.image,
-                    plan.width,
-                    plan.height,
-                    alpha,
-                    flate_level,
-                )?
-                else {
-                    for member in &plan.members {
-                        claimed.remove(member);
-                    }
-                    continue;
-                };
-                Some(prepared)
-            } else {
-                Some(prepare_image(
-                    &plan.image,
-                    plan.width,
-                    plan.height,
-                    &plan.data,
-                    plan.alpha.take(),
-                    ImageEncodingContext {
-                        flate_level,
-                        exact_raster_rendering: config.exact_raster_rendering,
-                        source_color_budget: plan.source_color_budget,
-                    },
-                )?)
-            }
-        } else {
-            None
-        };
-
-        if plan.kind == MergeKind::ConstantColorMaskStencil
-            && let Some(prepared) = prepared_main.as_ref()
-        {
-            let source_payload = plan
-                .image
-                .encoded_color_bytes
-                .saturating_add(plan.image.encoded_mask_bytes);
-            let color_operator_bytes = prepared
-                .encoding
-                .stencil_color
-                .map_or(0, |color| color.content_operator().len());
-            let candidate_payload = prepared
-                .payload_bytes()
-                .saturating_add(color_operator_bytes);
-            if source_payload > 0 && candidate_payload >= source_payload {
-                for member in &plan.members {
-                    claimed.remove(member);
-                }
-                continue;
-            }
-        }
-
-        if plan.kind == MergeKind::AlphaCrop
-            && cached_crop.is_none()
-            && let Some(prepared) = prepared_main.as_ref()
-        {
-            let source_payload = plan
-                .image
-                .encoded_color_bytes
-                .saturating_add(plan.image.encoded_mask_bytes);
-            let candidate_payload = prepared.payload_bytes().saturating_add(
-                prepared_background
-                    .as_ref()
-                    .map_or(0, |(_, background)| background.payload_bytes()),
-            );
-            if source_payload > 0 && candidate_payload >= source_payload {
-                for member in &plan.members {
-                    claimed.remove(member);
-                }
-                continue;
-            }
-        }
-
-        if plan.kind == MergeKind::Stripe
-            && cached_crop.is_none()
-            && let (Some(prepared), Some(source_payload)) =
-                (prepared_main.as_ref(), plan.source_payload_budget)
-        {
-            let candidate_payload = prepared.payload_bytes().saturating_add(
-                prepared_background
-                    .as_ref()
-                    .map_or(0, |(_, background)| background.payload_bytes()),
-            );
-            if !candidate_payload_fits_budget(Some(source_payload), candidate_payload) {
-                for member in &plan.members {
-                    claimed.remove(member);
-                }
-                continue;
-            }
-        }
 
         let plan_payload_bytes = prepared_main
             .as_ref()
@@ -5430,30 +5673,7 @@ fn apply_plans(
             }
             (name, encoding, true)
         };
-        let mut replacement = b"q ".to_vec();
-        if let Some(gs) = &first_draw.gs_name {
-            replacement.push(b'/');
-            replacement.extend_from_slice(gs.strip_prefix(b"/").unwrap_or(gs));
-            replacement.extend_from_slice(b" gs ");
-        }
-        if let Some(intent) = &first_draw.rendering_intent {
-            replacement.push(b'/');
-            replacement.extend_from_slice(intent.strip_prefix(b"/").unwrap_or(intent));
-            replacement.extend_from_slice(b" ri ");
-        }
-        if let Some((background_relative, background_name)) = background {
-            replacement
-                .extend_from_slice(format!("q {} cm /", background_relative.unparse()).as_bytes());
-            replacement.extend_from_slice(&background_name);
-            replacement.extend_from_slice(b" Do Q ");
-        }
-        replacement.extend_from_slice(b"q ");
-        if let Some(color) = encoding.stencil_color {
-            replacement.extend_from_slice(&color.content_operator());
-        }
-        replacement.extend_from_slice(format!("{} cm /", relative.unparse()).as_bytes());
-        replacement.extend_from_slice(&name);
-        replacement.extend_from_slice(b" Do Q Q");
+        let replacement = emit_merge_image_paint(first_draw, relative, &name, background, encoding);
         replacements.push((first_draw.range_start, first_draw.range_end, replacement));
         for &member in &plan.members {
             if member == plan.first_member {
@@ -5468,51 +5688,17 @@ fn apply_plans(
                 .insert(input.draws[member].resource_name.clone());
         }
         result.consumed_draws.extend(plan.members.iter().copied());
-        if plan.kind == MergeKind::PixelCluster {
-            result.stats.deferred_tile_paints_consumed = result
-                .stats
-                .deferred_tile_paints_consumed
-                .saturating_add(plan.members.len());
-        }
-        match plan.kind {
-            MergeKind::Stripe => {
-                result.stats.stripe_groups_merged += 1;
-                result.stats.stripe_paints_merged += plan.members.len();
-            }
-            MergeKind::PixelCluster => {
-                result.stats.pixel_clusters_reconstructed += 1;
-                result.stats.pixel_paints_reconstructed += plan.members.len();
-            }
-            MergeKind::NativeFragment => {
-                result.stats.native_fragment_groups_reconstructed += 1;
-                result.stats.native_fragment_paints_reconstructed += plan.members.len();
-            }
-            MergeKind::ConstantColorMaskStencil => {
-                result.stats.constant_color_mask_stencils_emitted += 1;
-            }
-            MergeKind::AlphaCrop => {}
-        }
-        if mask_baked && image_created {
-            result.stats.masks_baked += 1;
-        }
+        result
+            .stats
+            .record_accepted_plan(plan.kind, plan.members.len(), mask_baked, image_created);
     }
     if replacements.is_empty() {
         return Ok((resources, result));
     }
-    replacements.sort_by_key(|(start, _, _)| *start);
-    let mut rewritten = Vec::with_capacity(input.content.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || end < start || end > input.content.len() {
-            return Err(Error::Invalid(
-                "overlapping/invalid raster-layout content replacement".to_owned(),
-            ));
-        }
-        rewritten.extend_from_slice(&input.content[cursor..start]);
-        rewritten.extend_from_slice(&replacement);
-        cursor = end;
-    }
-    rewritten.extend_from_slice(&input.content[cursor..]);
+    let rewritten = crate::content_stream::apply_replacements_owned(input.content, replacements)
+        .ok_or_else(|| {
+            Error::Invalid("overlapping/invalid raster-layout content replacement".to_owned())
+        })?;
     resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
     result.rewritten_content = Some(rewritten);
     Ok((resources, result))
