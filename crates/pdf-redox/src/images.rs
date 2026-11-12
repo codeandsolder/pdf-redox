@@ -14,6 +14,7 @@ use libjpeg_turbo_rs::{
     },
     read_coefficients,
 };
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const LOCAL_PALETTE_LAYER_OVERHEAD_BYTES: usize = 512;
@@ -322,14 +323,6 @@ fn image_binding_counts(
     Ok(counts)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "PDF dimensions are clamped to the complete u32 range before conversion"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "PDF dimensions are clamped to the nonnegative u32 range before conversion"
-)]
 fn dimension(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
@@ -341,7 +334,7 @@ fn dimension(
     if value.is_nan() {
         return Ok(Some(0));
     }
-    Ok(Some(value.clamp(0.0, f64::from(u32::MAX)) as u32))
+    Ok(value.clamp(0.0, f64::from(u32::MAX)).to_u32())
 }
 
 fn direct_resource_owner(object: &OwnedObject) -> bool {

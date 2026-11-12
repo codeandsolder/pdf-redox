@@ -211,16 +211,9 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
     let mut producer_counts = BTreeMap::new();
     let mut creator_counts = BTreeMap::new();
     let mut producer_stats = BTreeMap::new();
-    let mut filter_counts = BTreeMap::new();
+    let mut counters = CorpusCounters::default();
     let mut duplicate_stream_role_groups = BTreeMap::new();
     let mut duplicate_stream_role_wasted_bytes = BTreeMap::new();
-    let mut risk_counts = BTreeMap::new();
-    let mut documents_with_risk = BTreeMap::new();
-    let mut hidden_text_categories = BTreeMap::new();
-    let mut documents_with_hidden_text_category = BTreeMap::new();
-    let mut hidden_text_mechanisms = BTreeMap::new();
-    let mut documents_with_hidden_text_mechanism = BTreeMap::new();
-    let mut warning_counts = BTreeMap::new();
     let mut document_representation_counts = BTreeMap::new();
     let mut page_representation_unknown_reasons = BTreeMap::new();
     let mut summaries = Vec::new();
@@ -265,17 +258,7 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
             &mut duplicate_stream_role_groups,
             &mut duplicate_stream_role_wasted_bytes,
         );
-        accumulate_counts(
-            &analysis,
-            &mut filter_counts,
-            &mut risk_counts,
-            &mut documents_with_risk,
-            &mut hidden_text_categories,
-            &mut documents_with_hidden_text_category,
-            &mut hidden_text_mechanisms,
-            &mut documents_with_hidden_text_mechanism,
-            &mut warning_counts,
-        );
+        accumulate_counts(&analysis, &mut counters);
         summaries.push(CorpusFileSummary::from_analysis(root, path, &analysis));
     }
 
@@ -315,16 +298,16 @@ pub fn analyze_corpus(root: &Path, top: usize) -> Result<CorpusReport, Box<dyn s
         producer_counts,
         creator_counts,
         producer_stats,
-        filter_counts,
+        filter_counts: counters.filters,
         duplicate_stream_role_groups,
         duplicate_stream_role_wasted_bytes,
-        risk_counts,
-        documents_with_risk,
-        hidden_text_categories,
-        documents_with_hidden_text_category,
-        hidden_text_mechanisms,
-        documents_with_hidden_text_mechanism,
-        warning_counts,
+        risk_counts: counters.risks,
+        documents_with_risk: counters.risk_documents,
+        hidden_text_categories: counters.hidden_categories,
+        documents_with_hidden_text_category: counters.hidden_category_documents,
+        hidden_text_mechanisms: counters.hidden_mechanisms,
+        documents_with_hidden_text_mechanism: counters.hidden_mechanism_documents,
+        warning_counts: counters.warnings,
         document_representation_counts,
         page_representation_unknown_reasons,
         largest_files,
@@ -489,55 +472,61 @@ fn accumulate_stream_role_counts(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the accumulator updates one coherent set of corpus-wide counters in a single pass"
-)]
-fn accumulate_counts(
-    analysis: &PdfAnalysis,
-    filter_counts: &mut BTreeMap<String, u64>,
-    risk_counts: &mut BTreeMap<RiskKind, u64>,
-    documents_with_risk: &mut BTreeMap<RiskKind, u64>,
-    hidden_text_categories: &mut BTreeMap<HiddenTextCategory, u64>,
-    documents_with_hidden_text_category: &mut BTreeMap<HiddenTextCategory, u64>,
-    hidden_text_mechanisms: &mut BTreeMap<HiddenTextMechanism, u64>,
-    documents_with_hidden_text_mechanism: &mut BTreeMap<HiddenTextMechanism, u64>,
-    warning_counts: &mut BTreeMap<String, u64>,
-) {
+#[derive(Default)]
+struct CorpusCounters {
+    filters: BTreeMap<String, u64>,
+    risks: BTreeMap<RiskKind, u64>,
+    risk_documents: BTreeMap<RiskKind, u64>,
+    hidden_categories: BTreeMap<HiddenTextCategory, u64>,
+    hidden_category_documents: BTreeMap<HiddenTextCategory, u64>,
+    hidden_mechanisms: BTreeMap<HiddenTextMechanism, u64>,
+    hidden_mechanism_documents: BTreeMap<HiddenTextMechanism, u64>,
+    warnings: BTreeMap<String, u64>,
+}
+
+fn accumulate_counts(analysis: &PdfAnalysis, counts: &mut CorpusCounters) {
     for (filter, count) in &analysis.filter_counts {
-        *filter_counts.entry(filter.clone()).or_default() += *count as u64;
+        *counts.filters.entry(filter.clone()).or_default() += *count as u64;
     }
 
     let mut seen_risks = BTreeSet::new();
     for risk in &analysis.risks {
-        *risk_counts.entry(risk.kind.clone()).or_default() += risk.count as u64;
+        *counts.risks.entry(risk.kind.clone()).or_default() += risk.count as u64;
         seen_risks.insert(risk.kind.clone());
     }
     for risk in seen_risks {
-        *documents_with_risk.entry(risk).or_default() += 1;
+        *counts.risk_documents.entry(risk).or_default() += 1;
     }
 
     let mut seen_categories = BTreeSet::new();
     let mut seen_mechanisms = BTreeSet::new();
     for finding in &analysis.hidden_text {
-        *hidden_text_categories.entry(finding.category).or_default() += 1;
-        *hidden_text_mechanisms.entry(finding.mechanism).or_default() += 1;
+        *counts
+            .hidden_categories
+            .entry(finding.category)
+            .or_default() += 1;
+        *counts
+            .hidden_mechanisms
+            .entry(finding.mechanism)
+            .or_default() += 1;
         seen_categories.insert(finding.category);
         seen_mechanisms.insert(finding.mechanism);
     }
     for category in seen_categories {
-        *documents_with_hidden_text_category
+        *counts
+            .hidden_category_documents
             .entry(category)
             .or_default() += 1;
     }
     for mechanism in seen_mechanisms {
-        *documents_with_hidden_text_mechanism
+        *counts
+            .hidden_mechanism_documents
             .entry(mechanism)
             .or_default() += 1;
     }
 
     for warning in &analysis.warnings {
-        *warning_counts.entry(warning.clone()).or_default() += 1;
+        *counts.warnings.entry(warning.clone()).or_default() += 1;
     }
 }
 

@@ -3,6 +3,7 @@ use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, Result,
     content::{PageRewriteResult, page_content, replace_page_content, resolved_dictionary},
 };
+use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,17 +160,15 @@ impl<'a> PageScanner<'a> {
         Some(values)
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the rounded value is clamped to the full i32 range immediately before conversion"
-    )]
     fn quantized(value: f64, scale: f64) -> i32 {
         if !value.is_finite() {
             return 0;
         }
         (value * scale)
             .round()
-            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+            .to_i32()
+            .unwrap_or_default()
     }
 
     fn linear(matrix: Matrix) -> [i32; 4] {

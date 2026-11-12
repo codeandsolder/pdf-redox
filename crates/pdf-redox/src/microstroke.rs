@@ -8,6 +8,7 @@ use crate::{
         replace_page_content, resolved_dictionary,
     },
 };
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MIN_MICROSTROKE_RUN: usize = 500;
@@ -590,16 +591,12 @@ fn grouped_runs(input: &[u8], blocks: &[MicroStrokeBlock]) -> Vec<MicroStrokeRun
     runs
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "accepted pitches are bounded to 0.04..=0.25, so the scaled key is always 400..=2500"
-)]
 fn quantized_pitch_key(value: f64) -> Option<i32> {
     let value = value.abs();
     if !value.is_finite() || !(MIN_PITCH..=MAX_PITCH).contains(&value) {
         return None;
     }
-    Some((value * 10_000.0).round() as i32)
+    (value * 10_000.0).round().to_i32()
 }
 
 fn infer_pitch(lines: &[LineSegment]) -> Option<f64> {
@@ -685,19 +682,11 @@ const fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
         && saved.saturating_mul(100) >= before.saturating_mul(MIN_RUN_SAVINGS_PERCENT)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the value is finite, nonnegative, integral-valued by construction, and bounded by the 16384-pixel raster limit"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the value is explicitly checked to be nonnegative before conversion"
-)]
 fn bounded_raster_index(value: f64) -> Option<usize> {
     if !value.is_finite() || !(0.0..=16_384.0).contains(&value) {
         return None;
     }
-    Some(value as usize)
+    value.to_usize()
 }
 
 #[expect(

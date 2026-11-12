@@ -51,30 +51,26 @@ fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the repeated entries_removed suffix makes each public resource-pruning counter self-describing"
-)]
 pub struct ResourcePruneStats {
     pub entries_removed: usize,
-    pub font_entries_removed: usize,
-    pub xobject_entries_removed: usize,
-    pub ext_gstate_entries_removed: usize,
-    pub pattern_entries_removed: usize,
-    pub properties_entries_removed: usize,
-    pub shading_entries_removed: usize,
+    pub fonts: usize,
+    pub xobjects: usize,
+    pub ext_gstates: usize,
+    pub patterns: usize,
+    pub properties: usize,
+    pub shadings: usize,
 }
 
 impl ResourcePruneStats {
     const fn record_category(&mut self, category: &[u8], count: usize) {
         self.entries_removed = self.entries_removed.saturating_add(count);
         let slot = match category {
-            b"Font" => &mut self.font_entries_removed,
-            b"XObject" => &mut self.xobject_entries_removed,
-            b"ExtGState" => &mut self.ext_gstate_entries_removed,
-            b"Pattern" => &mut self.pattern_entries_removed,
-            b"Properties" => &mut self.properties_entries_removed,
-            b"Shading" => &mut self.shading_entries_removed,
+            b"Font" => &mut self.fonts,
+            b"XObject" => &mut self.xobjects,
+            b"ExtGState" => &mut self.ext_gstates,
+            b"Pattern" => &mut self.patterns,
+            b"Properties" => &mut self.properties,
+            b"Shading" => &mut self.shadings,
             _ => return,
         };
         *slot = slot.saturating_add(count);
@@ -82,24 +78,12 @@ impl ResourcePruneStats {
 
     const fn merge(&mut self, other: Self) {
         self.entries_removed = self.entries_removed.saturating_add(other.entries_removed);
-        self.font_entries_removed = self
-            .font_entries_removed
-            .saturating_add(other.font_entries_removed);
-        self.xobject_entries_removed = self
-            .xobject_entries_removed
-            .saturating_add(other.xobject_entries_removed);
-        self.ext_gstate_entries_removed = self
-            .ext_gstate_entries_removed
-            .saturating_add(other.ext_gstate_entries_removed);
-        self.pattern_entries_removed = self
-            .pattern_entries_removed
-            .saturating_add(other.pattern_entries_removed);
-        self.properties_entries_removed = self
-            .properties_entries_removed
-            .saturating_add(other.properties_entries_removed);
-        self.shading_entries_removed = self
-            .shading_entries_removed
-            .saturating_add(other.shading_entries_removed);
+        self.fonts = self.fonts.saturating_add(other.fonts);
+        self.xobjects = self.xobjects.saturating_add(other.xobjects);
+        self.ext_gstates = self.ext_gstates.saturating_add(other.ext_gstates);
+        self.patterns = self.patterns.saturating_add(other.patterns);
+        self.properties = self.properties.saturating_add(other.properties);
+        self.shadings = self.shadings.saturating_add(other.shadings);
     }
 }
 

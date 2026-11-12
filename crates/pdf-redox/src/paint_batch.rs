@@ -5,6 +5,7 @@ use crate::{
         replace_page_content, resolved_dictionary,
     },
 };
+use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 use std::{
     borrow::Cow,
@@ -1243,11 +1244,7 @@ fn structural_grid_coordinate(value: f64) -> Option<i64> {
     if (scaled - rounded).abs() > 1.0e-6 || rounded.abs() > 9_007_199_254_740_991.0 {
         return None;
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "value is finite, integral, and restricted to f64 exact-integer range above"
-    )]
-    let coordinate = rounded as i64;
+    let coordinate = rounded.to_i64()?;
     Some(coordinate)
 }
 
@@ -1277,11 +1274,7 @@ impl StrokeGraphicsState {
         if !scaled.is_finite() || scaled < 0.0 || scaled > 9_007_199_254_740_990.0 {
             return None;
         }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "finite nonnegative value is bounded below f64 exact-integer limit above"
-        )]
-        let rounded_up = scaled.ceil() as i64;
+        let rounded_up = scaled.ceil().to_i64()?;
         rounded_up.checked_add(1)
     }
 }

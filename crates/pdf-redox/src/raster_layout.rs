@@ -21,6 +21,7 @@ use crate::{
         merge_rect_fill_pair, rect_contains_rect,
     },
 };
+use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::{
@@ -1467,52 +1468,28 @@ fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Opti
     }))
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the rounded value is explicitly checked against the full u32 range before conversion"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the rounded value is explicitly checked to be nonnegative before conversion"
-)]
 fn rounded_nonnegative_u32(value: f64) -> Option<u32> {
     let value = value.round();
     if !value.is_finite() || !(0.0..=f64::from(u32::MAX)).contains(&value) {
         return None;
     }
-    Some(value as u32)
+    value.to_u32()
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the rounded value is explicitly checked against the full u32 range before conversion"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the rounded value is explicitly required to be positive before conversion"
-)]
 fn rounded_positive_u32(value: f64) -> Option<u32> {
     let value = value.round();
     if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
         return None;
     }
-    Some(value as u32)
+    value.to_u32()
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the rounded value is explicitly checked against the full u8 range before conversion"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the rounded value is explicitly checked to be nonnegative before conversion"
-)]
 fn rounded_u8(value: f64) -> Option<u8> {
     let value = value.round();
     if !value.is_finite() || !(0.0..=f64::from(u8::MAX)).contains(&value) {
         return None;
     }
-    Some(value as u8)
+    value.to_u8()
 }
 
 #[expect(
