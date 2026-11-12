@@ -2106,38 +2106,10 @@ fn encoded_stream_payload_len(
     Ok(Some(data.bytes(document.source())?.len()))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "mask validation requires a sequence of tightly coupled semantic and pixel-safety gates"
-)]
-fn simple_binary_soft_mask_candidate(
+fn is_simple_binary_gray_soft_mask(
     document: &EditDocument,
-    handle: ObjectHandle,
+    mask_dictionary: &OwnedDictionary,
 ) -> Result<bool> {
-    const SAFE_PARENT_KEYS: &[&[u8]] = &[
-        b"Type",
-        b"Subtype",
-        b"Width",
-        b"W",
-        b"Height",
-        b"H",
-        b"BitsPerComponent",
-        b"BPC",
-        b"ColorSpace",
-        b"CS",
-        b"Filter",
-        b"F",
-        b"DecodeParms",
-        b"DP",
-        b"Decode",
-        b"D",
-        b"Interpolate",
-        b"I",
-        b"Length",
-        b"SMask",
-        b"SMaskInData",
-        b"Name",
-    ];
     const SAFE_MASK_KEYS: &[&[u8]] = &[
         b"Type",
         b"Subtype",
@@ -2160,29 +2132,6 @@ fn simple_binary_soft_mask_candidate(
         b"Length",
         b"Name",
     ];
-    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
-    else {
-        return Ok(false);
-    };
-    if dictionary
-        .keys()
-        .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
-        || dictionary.contains_key(b"Mask".as_slice())
-        || resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
-            .is_some_and(|value| value != 0.0)
-    {
-        return Ok(false);
-    }
-    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Stream {
-        dictionary: mask_dictionary,
-        ..
-    }) = document.resolve_owned_value(smask)?
-    else {
-        return Ok(false);
-    };
     if mask_dictionary
         .keys()
         .any(|key| !SAFE_MASK_KEYS.contains(&key.as_slice()))
@@ -2223,6 +2172,60 @@ fn simple_binary_soft_mask_candidate(
         document.resolve_owned_value(color_space)?,
         Some(OwnedObject::Name(name)) if matches!(name.as_slice(), b"DeviceGray" | b"G")
     ))
+}
+
+fn simple_binary_soft_mask_candidate(
+    document: &EditDocument,
+    handle: ObjectHandle,
+) -> Result<bool> {
+    const SAFE_PARENT_KEYS: &[&[u8]] = &[
+        b"Type",
+        b"Subtype",
+        b"Width",
+        b"W",
+        b"Height",
+        b"H",
+        b"BitsPerComponent",
+        b"BPC",
+        b"ColorSpace",
+        b"CS",
+        b"Filter",
+        b"F",
+        b"DecodeParms",
+        b"DP",
+        b"Decode",
+        b"D",
+        b"Interpolate",
+        b"I",
+        b"Length",
+        b"SMask",
+        b"SMaskInData",
+        b"Name",
+    ];
+    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
+    else {
+        return Ok(false);
+    };
+    if dictionary
+        .keys()
+        .any(|key| !SAFE_PARENT_KEYS.contains(&key.as_slice()))
+        || dictionary.contains_key(b"Mask".as_slice())
+        || resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
+            .is_some_and(|value| value != 0.0)
+    {
+        return Ok(false);
+    }
+    let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
+        return Ok(false);
+    };
+    let Some(OwnedObject::Stream {
+        dictionary: mask_dictionary,
+        ..
+    }) = document.resolve_owned_value(smask)?
+    else {
+        return Ok(false);
+    };
+    is_simple_binary_gray_soft_mask(document, &mask_dictionary)
 }
 
 #[expect(
@@ -2808,10 +2811,95 @@ fn elapsed_micros_u64(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "visibility classification and coverage accounting are one ordered conservative pruning pass"
-)]
+fn occluded_raster_paint_indices(
+    scanner: &RasterScanner,
+    states: &HashMap<Vec<u8>, ImagePaintState>,
+    visibility: &HashMap<ObjectHandle, Option<SampleImage>>,
+    transparent: &HashSet<usize>,
+    scope: Option<Rect>,
+) -> HashSet<usize> {
+    let mut occluded = HashSet::new();
+    let mut opaque_coverage = Vec::<OpaqueCover>::new();
+    for paint in scanner.coverage_paints.iter().rev().copied() {
+        match paint {
+            CoveragePaint::RectFill(fill_index) => {
+                let fill = &scanner.rect_fills[fill_index];
+                if fill.clip_complex {
+                    continue;
+                }
+                let state = fill
+                    .gs_name
+                    .as_ref()
+                    .and_then(|name| states.get(name))
+                    .copied()
+                    .unwrap_or_default();
+                if state.alpha < ALPHA_OPAQUE || !state.normal_blend {
+                    continue;
+                }
+                let cover = fill
+                    .clip
+                    .map_or(Some(fill.rect), |clip| fill.rect.intersection(clip))
+                    .filter(|rect| {
+                        fill.clip_polygon
+                            .as_deref()
+                            .is_none_or(|polygon| convex_polygon_contains_rect(polygon, *rect))
+                    })
+                    .and_then(|rect| intersect_scope(rect, scope));
+                if let Some(cover) = cover {
+                    opaque_coverage.push(OpaqueCover {
+                        rect: cover,
+                        clip_polygon: fill.clip_polygon.clone(),
+                    });
+                }
+            }
+            CoveragePaint::Image(index) => {
+                if transparent.contains(&index) {
+                    continue;
+                }
+                let draw = &scanner.draws[index];
+                let visible_rect = match axis_aligned_candidate_rect(draw) {
+                    CandidateRect::Unsupported => continue,
+                    CandidateRect::Invisible => {
+                        occluded.insert(index);
+                        continue;
+                    }
+                    CandidateRect::Visible(rect) => rect,
+                };
+                let Some(visible_rect) = intersect_scope(visible_rect, scope) else {
+                    occluded.insert(index);
+                    continue;
+                };
+                if target_covered_by_opaque_union(
+                    visible_rect,
+                    draw.clip_polygon.as_deref(),
+                    &opaque_coverage,
+                    1.0e-6,
+                ) {
+                    occluded.insert(index);
+                }
+
+                let state = draw_paint_state(draw, states);
+                if state.alpha < ALPHA_OPAQUE || !state.normal_blend {
+                    continue;
+                }
+                let Some(image) = visibility.get(&draw.target).and_then(Option::as_ref) else {
+                    continue;
+                };
+                if image_fully_opaque(image)
+                    && let Some(cover_rect) = axis_aligned_opaque_cover_rect(draw)
+                    && let Some(cover_rect) = intersect_scope(cover_rect, scope)
+                {
+                    opaque_coverage.push(OpaqueCover {
+                        rect: cover_rect,
+                        clip_polygon: draw.clip_polygon.clone(),
+                    });
+                }
+            }
+        }
+    }
+    occluded
+}
+
 fn prune_hidden_raster_paints(
     document: &EditDocument,
     resources: &OwnedDictionary,
@@ -2873,87 +2961,11 @@ fn prune_hidden_raster_paints(
         }
     }
 
-    let mut occluded = HashSet::new();
-    let mut opaque_coverage = Vec::<OpaqueCover>::new();
-    if prune_occluded {
-        for paint in scanner.coverage_paints.iter().rev().copied() {
-            match paint {
-                CoveragePaint::RectFill(fill_index) => {
-                    let fill = &scanner.rect_fills[fill_index];
-                    if fill.clip_complex {
-                        continue;
-                    }
-                    let state = fill
-                        .gs_name
-                        .as_ref()
-                        .and_then(|name| states.get(name))
-                        .copied()
-                        .unwrap_or_default();
-                    if state.alpha < ALPHA_OPAQUE || !state.normal_blend {
-                        continue;
-                    }
-                    let cover = fill
-                        .clip
-                        .map_or(Some(fill.rect), |clip| fill.rect.intersection(clip))
-                        .filter(|rect| {
-                            fill.clip_polygon
-                                .as_deref()
-                                .is_none_or(|polygon| convex_polygon_contains_rect(polygon, *rect))
-                        })
-                        .and_then(|rect| intersect_scope(rect, scope));
-                    if let Some(cover) = cover {
-                        opaque_coverage.push(OpaqueCover {
-                            rect: cover,
-                            clip_polygon: fill.clip_polygon.clone(),
-                        });
-                    }
-                }
-                CoveragePaint::Image(index) => {
-                    if transparent.contains(&index) {
-                        continue;
-                    }
-                    let draw = &scanner.draws[index];
-                    let visible_rect = match axis_aligned_candidate_rect(draw) {
-                        CandidateRect::Unsupported => continue,
-                        CandidateRect::Invisible => {
-                            occluded.insert(index);
-                            continue;
-                        }
-                        CandidateRect::Visible(rect) => rect,
-                    };
-                    let Some(visible_rect) = intersect_scope(visible_rect, scope) else {
-                        occluded.insert(index);
-                        continue;
-                    };
-                    if target_covered_by_opaque_union(
-                        visible_rect,
-                        draw.clip_polygon.as_deref(),
-                        &opaque_coverage,
-                        1.0e-6,
-                    ) {
-                        occluded.insert(index);
-                    }
-
-                    let state = draw_paint_state(draw, &states);
-                    if state.alpha < ALPHA_OPAQUE || !state.normal_blend {
-                        continue;
-                    }
-                    let Some(image) = visibility.get(&draw.target).and_then(Option::as_ref) else {
-                        continue;
-                    };
-                    if image_fully_opaque(image)
-                        && let Some(cover_rect) = axis_aligned_opaque_cover_rect(draw)
-                        && let Some(cover_rect) = intersect_scope(cover_rect, scope)
-                    {
-                        opaque_coverage.push(OpaqueCover {
-                            rect: cover_rect,
-                            clip_polygon: draw.clip_polygon.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let occluded = if prune_occluded {
+        occluded_raster_paint_indices(scanner, &states, &visibility, &transparent, scope)
+    } else {
+        HashSet::new()
+    };
 
     stats.hidden_coverage_us = stats
         .hidden_coverage_us

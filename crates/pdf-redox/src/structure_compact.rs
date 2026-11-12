@@ -329,43 +329,90 @@ fn page_tree_node_count(document: &EditDocument, root: ObjectHandle) -> Result<O
     Ok(Some(seen.len()))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "page-tree rebuilding is one recursive structural transaction with shared parent and count invariants"
-)]
+const fn page_tree_required_nodes(mut leaves: usize) -> usize {
+    let mut nodes = 1usize;
+    while leaves > PAGE_TREE_FANOUT {
+        leaves = leaves.div_ceil(PAGE_TREE_FANOUT);
+        nodes = nodes.saturating_add(leaves);
+    }
+    nodes
+}
+
+#[derive(Clone, Copy)]
+struct PageTreeChild {
+    handle: ObjectHandle,
+    pages: usize,
+}
+
+fn set_page_tree_parent(
+    document: &mut EditDocument,
+    child: ObjectHandle,
+    parent: ObjectHandle,
+) -> Result<()> {
+    let Some(dictionary) = document.edit_handle(child)?.as_dictionary_mut() else {
+        return Err(Error::Invalid(
+            "page-tree child is not a dictionary".to_owned(),
+        ));
+    };
+    dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(parent));
+    Ok(())
+}
+
+fn rebuild_compact_page_tree_levels(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+    root: ObjectHandle,
+) -> Result<Vec<PageTreeChild>> {
+    let mut level = pages
+        .iter()
+        .copied()
+        .map(|handle| PageTreeChild { handle, pages: 1 })
+        .collect::<Vec<_>>();
+
+    while level.len() > PAGE_TREE_FANOUT {
+        let mut next = Vec::with_capacity(level.len().div_ceil(PAGE_TREE_FANOUT));
+        for chunk in level.chunks(PAGE_TREE_FANOUT) {
+            let count = chunk.iter().map(|child| child.pages).sum::<usize>();
+            let node = ObjectHandle::New(
+                document.add_object(OwnedObject::Dictionary(BTreeMap::from([
+                    (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+                    (
+                        b"Kids".to_vec(),
+                        OwnedObject::Array(
+                            chunk
+                                .iter()
+                                .map(|child| OwnedObject::Reference(child.handle))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        b"Count".to_vec(),
+                        OwnedObject::Integer(i64::try_from(count).unwrap_or(i64::MAX)),
+                    ),
+                ]))),
+            );
+            for child in chunk {
+                set_page_tree_parent(document, child.handle, node)?;
+            }
+            next.push(PageTreeChild {
+                handle: node,
+                pages: count,
+            });
+        }
+        level = next;
+    }
+
+    for child in &level {
+        set_page_tree_parent(document, child.handle, root)?;
+    }
+
+    Ok(level)
+}
+
 fn compact_page_tree(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
 ) -> Result<()> {
-    const fn required_nodes(mut leaves: usize) -> usize {
-        let mut nodes = 1usize;
-        while leaves > PAGE_TREE_FANOUT {
-            leaves = leaves.div_ceil(PAGE_TREE_FANOUT);
-            nodes = nodes.saturating_add(leaves);
-        }
-        nodes
-    }
-
-    #[derive(Clone, Copy)]
-    struct Child {
-        handle: ObjectHandle,
-        pages: usize,
-    }
-
-    fn set_parent(
-        document: &mut EditDocument,
-        child: ObjectHandle,
-        parent: ObjectHandle,
-    ) -> Result<()> {
-        let Some(dictionary) = document.edit_handle(child)?.as_dictionary_mut() else {
-            return Err(Error::Invalid(
-                "page-tree child is not a dictionary".to_owned(),
-            ));
-        };
-        dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(parent));
-        Ok(())
-    }
-
     let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = current_dictionary(document, catalog_handle)? else {
         return Ok(());
@@ -384,7 +431,7 @@ fn compact_page_tree(
         return Ok(());
     }
 
-    let after_nodes = required_nodes(pages.len());
+    let after_nodes = page_tree_required_nodes(pages.len());
     stats.page_tree_nodes_after = after_nodes;
     if after_nodes >= before_nodes {
         return Ok(());
@@ -415,48 +462,7 @@ fn compact_page_tree(
         }
     }
 
-    let mut level = pages
-        .iter()
-        .copied()
-        .map(|handle| Child { handle, pages: 1 })
-        .collect::<Vec<_>>();
-
-    while level.len() > PAGE_TREE_FANOUT {
-        let mut next = Vec::with_capacity(level.len().div_ceil(PAGE_TREE_FANOUT));
-        for chunk in level.chunks(PAGE_TREE_FANOUT) {
-            let count = chunk.iter().map(|child| child.pages).sum::<usize>();
-            let node = ObjectHandle::New(
-                document.add_object(OwnedObject::Dictionary(BTreeMap::from([
-                    (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
-                    (
-                        b"Kids".to_vec(),
-                        OwnedObject::Array(
-                            chunk
-                                .iter()
-                                .map(|child| OwnedObject::Reference(child.handle))
-                                .collect(),
-                        ),
-                    ),
-                    (
-                        b"Count".to_vec(),
-                        OwnedObject::Integer(i64::try_from(count).unwrap_or(i64::MAX)),
-                    ),
-                ]))),
-            );
-            for child in chunk {
-                set_parent(document, child.handle, node)?;
-            }
-            next.push(Child {
-                handle: node,
-                pages: count,
-            });
-        }
-        level = next;
-    }
-
-    for child in &level {
-        set_parent(document, child.handle, root)?;
-    }
+    let level = rebuild_compact_page_tree_levels(document, &pages, root)?;
 
     let Some(root_dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
         return Ok(());

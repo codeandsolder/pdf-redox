@@ -894,10 +894,6 @@ impl<'a> PageScanner<'a> {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "hidden-text classification combines related accumulated parser state and confidence gates in one terminal decision"
-    )]
     fn finish(self) -> PageScan {
         let page_area = self.crop.area();
         let page_images: Vec<Rect> = self
@@ -954,59 +950,14 @@ impl<'a> PageScanner<'a> {
                     .iter()
                     .any(|image| image.coverage_of(bounds) >= COVERAGE_THRESHOLD)
             });
-            let (category, suggested_action, confidence) = if text.actual_text.is_some() {
-                (
-                    HiddenTextCategory::Accessibility,
-                    HiddenTextAction::Keep,
-                    0.9,
-                )
-            } else if mechanism == HiddenTextMechanism::OptionalContentHidden {
-                (
-                    HiddenTextCategory::HiddenLayer,
-                    HiddenTextAction::Keep,
-                    0.95,
-                )
-            } else if mechanism == HiddenTextMechanism::OutsideCropBox {
-                (
-                    HiddenTextCategory::OutsidePage,
-                    HiddenTextAction::Keep,
-                    0.95,
-                )
-            } else if matches!(
+            let (category, suggested_action, confidence) = classify_hidden_text(
+                &text,
                 mechanism,
-                HiddenTextMechanism::RenderingModeInvisible
-                    | HiddenTextMechanism::ZeroOpacity
-                    | HiddenTextMechanism::CoveredByImage
-            ) && has_page_image
-                && explicit_invisible_count >= 3
-            {
-                (HiddenTextCategory::OcrOverlay, HiddenTextAction::Keep, 0.92)
-            } else if let Some(PaintEvent {
-                kind: PaintKind::FillRect { dark: true },
-                bounds,
-                ..
-            }) = covering_paint
-            {
-                if page_area > 0.0 && bounds.area() / page_area <= 0.4 {
-                    (
-                        HiddenTextCategory::LikelyRedactionLeak,
-                        HiddenTextAction::Remove,
-                        0.94,
-                    )
-                } else {
-                    (
-                        HiddenTextCategory::OtherInvisible,
-                        HiddenTextAction::Keep,
-                        0.65,
-                    )
-                }
-            } else {
-                (
-                    HiddenTextCategory::OtherInvisible,
-                    HiddenTextAction::Keep,
-                    0.7,
-                )
-            };
+                covering_paint,
+                has_page_image,
+                explicit_invisible_count,
+                page_area,
+            );
             let display_text = text
                 .actual_text
                 .clone()
@@ -1030,6 +981,69 @@ impl<'a> PageScanner<'a> {
             });
         }
         PageScan { findings }
+    }
+}
+
+fn classify_hidden_text(
+    text: &TextEvent,
+    mechanism: HiddenTextMechanism,
+    covering_paint: Option<PaintEvent>,
+    has_page_image: bool,
+    explicit_invisible_count: usize,
+    page_area: f64,
+) -> (HiddenTextCategory, HiddenTextAction, f32) {
+    if text.actual_text.is_some() {
+        (
+            HiddenTextCategory::Accessibility,
+            HiddenTextAction::Keep,
+            0.9,
+        )
+    } else if mechanism == HiddenTextMechanism::OptionalContentHidden {
+        (
+            HiddenTextCategory::HiddenLayer,
+            HiddenTextAction::Keep,
+            0.95,
+        )
+    } else if mechanism == HiddenTextMechanism::OutsideCropBox {
+        (
+            HiddenTextCategory::OutsidePage,
+            HiddenTextAction::Keep,
+            0.95,
+        )
+    } else if matches!(
+        mechanism,
+        HiddenTextMechanism::RenderingModeInvisible
+            | HiddenTextMechanism::ZeroOpacity
+            | HiddenTextMechanism::CoveredByImage
+    ) && has_page_image
+        && explicit_invisible_count >= 3
+    {
+        (HiddenTextCategory::OcrOverlay, HiddenTextAction::Keep, 0.92)
+    } else if let Some(PaintEvent {
+        kind: PaintKind::FillRect { dark: true },
+        bounds,
+        ..
+    }) = covering_paint
+    {
+        if page_area > 0.0 && bounds.area() / page_area <= 0.4 {
+            (
+                HiddenTextCategory::LikelyRedactionLeak,
+                HiddenTextAction::Remove,
+                0.94,
+            )
+        } else {
+            (
+                HiddenTextCategory::OtherInvisible,
+                HiddenTextAction::Keep,
+                0.65,
+            )
+        }
+    } else {
+        (
+            HiddenTextCategory::OtherInvisible,
+            HiddenTextAction::Keep,
+            0.7,
+        )
     }
 }
 
