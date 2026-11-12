@@ -1452,6 +1452,134 @@ fn load_scanned_target(
     })))
 }
 
+/// Loads the scan used by all downstream plan and inventory decisions. Inline
+/// externalization is allowed to mutate the target, so its scan must be
+/// discarded and reloaded before another stage uses operator offsets.
+struct RasterTargetScanStage<'a> {
+    target: ContentTarget,
+    config: &'a RasterLayoutConfig,
+    hidden_context: Option<&'a HiddenTextSharedContext>,
+    page_numbers: &'a BTreeMap<ObjectHandle, usize>,
+}
+
+impl RasterTargetScanStage<'_> {
+    fn load(
+        &self,
+        document: &mut EditDocument,
+        page_state: &mut RasterPageState<'_>,
+        stats: &mut RasterLayoutStats,
+        inline_staging: &mut Vec<FragmentedInlineStaging>,
+    ) -> Result<Option<ScannedTarget>> {
+        let target = self.target;
+        let scan_started = Instant::now();
+        let scanned = load_scanned_target(
+            document,
+            target,
+            self.hidden_context,
+            self.page_numbers,
+            page_state,
+        )?;
+        stats.target_scan_us = stats
+            .target_scan_us
+            .saturating_add(elapsed_micros_u64(scan_started));
+        let mut scanned = match scanned {
+            TargetLoadResult::MissingResources => {
+                // A resource-less Form borrows its caller's resource scope;
+                // none of its scan-derived inventories may claim completeness.
+                stats.invalidate_target_scan(target);
+                return Ok(None);
+            }
+            TargetLoadResult::Incomplete { content_len } => {
+                stats.invalidate_target_scan(target);
+                if *DEBUG_RASTER {
+                    eprintln!("raster-target {target:?}: scanner incomplete content={content_len}");
+                }
+                return Ok(None);
+            }
+            TargetLoadResult::Complete(scanned) => *scanned,
+        };
+
+        if scanned.scanner.inline_occurrences > 0 {
+            if scanned.scanner.inline_occurrences < self.config.fragmented_paint_threshold {
+                stats.record_unmodified_target(target, &scanned.scanner);
+                return Ok(None);
+            }
+            let inline_started = Instant::now();
+            let inline_target = match target {
+                ContentTarget::Page(page) => InlineContentTarget::Page(page),
+                ContentTarget::Form(form) => InlineContentTarget::Form(form),
+            };
+            let inline = externalize_fragmented_inline_target(
+                document,
+                inline_target,
+                self.config.fragmented_paint_threshold,
+            )?;
+            stats.inline_externalize_us = stats
+                .inline_externalize_us
+                .saturating_add(elapsed_micros_u64(inline_started));
+            stats.inline.scopes_rewritten = stats
+                .inline
+                .scopes_rewritten
+                .saturating_add(inline.stats.scopes_rewritten);
+            stats.inline.occurrences_externalized = stats
+                .inline
+                .occurrences_externalized
+                .saturating_add(inline.stats.occurrences_externalized);
+            stats.inline.xobjects_created = stats
+                .inline
+                .xobjects_created
+                .saturating_add(inline.stats.xobjects_created);
+            stats.inline.xobject_references_reused = stats
+                .inline
+                .xobject_references_reused
+                .saturating_add(inline.stats.xobject_references_reused);
+            if let Some(staging) = inline.staging {
+                inline_staging.push(staging);
+            }
+            if inline.stats.scopes_rewritten == 0 {
+                stats.record_unmodified_target(target, &scanned.scanner);
+                return Ok(None);
+            }
+
+            // Every offset and page-vector observation from the original
+            // content is stale once the inline operator bytes were rewritten.
+            page_state.invalidate_vector(target);
+            let rescan_started = Instant::now();
+            let rescanned = load_scanned_target(
+                document,
+                target,
+                self.hidden_context,
+                self.page_numbers,
+                page_state,
+            )?;
+            scanned = match rescanned {
+                TargetLoadResult::MissingResources | TargetLoadResult::Incomplete { .. } => {
+                    stats.invalidate_target_scan(target);
+                    return Ok(None);
+                }
+                TargetLoadResult::Complete(scanned) => *scanned,
+            };
+            stats.target_scan_us = stats
+                .target_scan_us
+                .saturating_add(elapsed_micros_u64(rescan_started));
+            if scanned.scanner.inline_occurrences != 0 {
+                stats.record_unmodified_target(target, &scanned.scanner);
+                return Ok(None);
+            }
+        }
+
+        stats.record_target_scan(target, &scanned.scanner);
+        if matches!(target, ContentTarget::Page(_)) && *DEBUG_VECTOR {
+            eprintln!(
+                "vector-proof target={target:?} rect_fills={} candidate={}",
+                scanned.scanner.rect_fills.len(),
+                scanned.scanner.vector_merge_candidate
+            );
+        }
+        Ok(Some(scanned))
+    }
+}
+
 fn page_visible_rect(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
     let Some(values) = page_box_numbers_matching(document, page, |values| {
         values.into_iter().all(f64::is_finite)
@@ -6289,6 +6417,177 @@ fn build_merge_plans_for_scanner(
     Ok(plans)
 }
 
+/// Visibility inventory and candidate discovery share the same decoded-image
+/// cache and scanner offsets. Their result carries both the pending prune and
+/// the plans, so the coordinator cannot accidentally use a plan with a
+/// different initial visibility snapshot.
+struct RasterTargetPlanStage<'a> {
+    target: ContentTarget,
+    config: &'a RasterLayoutConfig,
+    scanner: &'a RasterScanner,
+    resources: &'a OwnedDictionary,
+    content: &'a [u8],
+}
+
+struct RasterPlanShared<'a, 'b> {
+    page_state: &'a mut RasterPageState<'b>,
+    image_cache: &'a mut RasterImageDecodeCache,
+    alpha_crop_bounds_cache: &'a mut HashMap<ObjectHandle, Option<PixelCrop>>,
+    stats: &'a mut RasterLayoutStats,
+}
+
+struct RasterTargetPlans {
+    pending_pruned_content: Option<Vec<u8>>,
+    pruned_draws: HashSet<usize>,
+    predecoded_images: Option<HashMap<ObjectHandle, Option<SampleImage>>>,
+    plans: Vec<MergePlan>,
+    user_unit: f64,
+}
+
+/// A post-prune scan reads exact rewritten bytes, not the old draw offsets.
+/// Physical hidden-text results were gathered from the original snapshot.
+#[derive(Clone, Copy)]
+struct PrunedTargetSnapshot<'a> {
+    target: ContentTarget,
+    config: &'a RasterLayoutConfig,
+    resources: &'a OwnedDictionary,
+    content: &'a [u8],
+}
+
+impl RasterTargetPlans {
+    fn rebuild_after_prune(
+        &mut self,
+        document: &EditDocument,
+        snapshot: PrunedTargetSnapshot<'_>,
+        shared: &mut RasterPlanShared<'_, '_>,
+    ) -> Result<Option<RasterScanner>> {
+        let PrunedTargetSnapshot {
+            target,
+            config,
+            resources,
+            content,
+        } = snapshot;
+        let rescan_started = Instant::now();
+        let rescanned = scan_target(document, resources, content)?;
+        shared.stats.target_scan_us = shared
+            .stats
+            .target_scan_us
+            .saturating_add(elapsed_micros_u64(rescan_started));
+        let Some(scanner) = rescanned else {
+            shared.stats.invalidate_target_scan(target);
+            return Ok(None);
+        };
+        shared.stats.record_page_vector_candidate(target, &scanner);
+        // The original indices refer to the pre-prune scanner. Never apply
+        // them to a freshly rescanned content stream.
+        self.pruned_draws.clear();
+        self.plans = build_merge_plans_for_scanner(
+            document,
+            MergePlanContext {
+                target,
+                scanner: &scanner,
+                initial_used: &self.pruned_draws,
+                predecoded_images: self.predecoded_images.as_ref(),
+                config,
+                user_unit: self.user_unit,
+            },
+            shared.image_cache,
+            shared.alpha_crop_bounds_cache,
+            shared.stats,
+        )?;
+        Ok(Some(scanner))
+    }
+}
+
+impl RasterTargetPlanStage<'_> {
+    fn prepare(
+        &self,
+        document: &EditDocument,
+        shared: &mut RasterPlanShared<'_, '_>,
+    ) -> Result<RasterTargetPlans> {
+        let Self {
+            target,
+            config,
+            scanner,
+            resources,
+            content,
+        } = *self;
+        let mut pending_pruned_content = None;
+        let mut pruned_draws = HashSet::new();
+        let mut predecoded_images = None;
+        if config.prune_hidden_paints {
+            let hidden_prune_started = Instant::now();
+            let scope = match target {
+                ContentTarget::Page(page) => shared.page_state.visible_rect(document, page)?,
+                ContentTarget::Form(_) => None,
+            };
+            let HiddenRasterPruneResult {
+                rewritten,
+                transparent,
+                occluded,
+                removed,
+                visibility,
+            } = prune_hidden_raster_paints(
+                document,
+                resources,
+                content,
+                scanner,
+                HiddenRasterPruneContext {
+                    scope,
+                    prune_occluded: config.prune_occluded_raster_paints,
+                    image_cache: shared.image_cache,
+                    stats: shared.stats,
+                },
+            )?;
+            predecoded_images = Some(visibility);
+            shared.stats.hidden_prune_us = shared
+                .stats
+                .hidden_prune_us
+                .saturating_add(elapsed_micros_u64(hidden_prune_started));
+            if transparent != 0 || occluded != 0 {
+                shared.stats.transparent_paints_pruned += transparent;
+                shared.stats.occluded_raster_paints_pruned += occluded;
+                pending_pruned_content = Some(rewritten);
+                pruned_draws = removed;
+            }
+        }
+        if *DEBUG_RASTER && !scanner.draws.is_empty() {
+            eprintln!(
+                "raster-target {target:?}: content={} image_draws={}",
+                content.len(),
+                scanner.draws.len()
+            );
+        }
+        let user_unit = match target {
+            ContentTarget::Page(page) => {
+                shared.page_state.user_unit(document, page)?.unwrap_or(1.0)
+            }
+            ContentTarget::Form(_) => 1.0,
+        };
+        let plans = build_merge_plans_for_scanner(
+            document,
+            MergePlanContext {
+                target,
+                scanner,
+                initial_used: &pruned_draws,
+                predecoded_images: predecoded_images.as_ref(),
+                config,
+                user_unit,
+            },
+            shared.image_cache,
+            shared.alpha_crop_bounds_cache,
+            shared.stats,
+        )?;
+        Ok(RasterTargetPlans {
+            pending_pruned_content,
+            pruned_draws,
+            predecoded_images,
+            plans,
+            user_unit,
+        })
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the raster normalization pipeline intentionally coordinates scan ordering, caches, rewrite plans, and statistics in one pass"
@@ -6363,204 +6662,47 @@ pub fn normalize_raster_layout(
         .collect::<BTreeMap<_, _>>();
 
     for target in collect_targets(document, pages)? {
-        let scan_started = Instant::now();
-        let scanned = load_scanned_target(
-            document,
+        let scan_stage = RasterTargetScanStage {
             target,
-            hidden_context.as_ref(),
-            &page_numbers,
-            &mut page_state,
-        )?;
-        let ScannedTarget {
-            mut resources,
+            config,
+            hidden_context: hidden_context.as_ref(),
+            page_numbers: &page_numbers,
+        };
+        let Some(ScannedTarget {
+            resources,
             mut content,
             mut scanner,
             hidden_ranges: mut shared_hidden_ranges,
-        } = match scanned {
-            TargetLoadResult::MissingResources => {
-                // A resource-less Form borrows its caller's resource scope. More
-                // generally, without a target scan none of the scan-derived
-                // inventories can claim completeness for this target.
-                stats.invalidate_target_scan(target);
-                stats.target_scan_us = stats
-                    .target_scan_us
-                    .saturating_add(elapsed_micros_u64(scan_started));
-                continue;
-            }
-            TargetLoadResult::Incomplete { content_len } => {
-                stats.invalidate_target_scan(target);
-                stats.target_scan_us = stats
-                    .target_scan_us
-                    .saturating_add(elapsed_micros_u64(scan_started));
-                if *DEBUG_RASTER {
-                    eprintln!("raster-target {target:?}: scanner incomplete content={content_len}");
-                }
-                continue;
-            }
-            TargetLoadResult::Complete(scanned) => *scanned,
+        }) = scan_stage.load(document, &mut page_state, &mut stats, &mut inline_staging)?
+        else {
+            continue;
         };
-        stats.target_scan_us = stats
-            .target_scan_us
-            .saturating_add(elapsed_micros_u64(scan_started));
 
-        if scanner.inline_occurrences > 0 {
-            if scanner.inline_occurrences < config.fragmented_paint_threshold {
-                stats.record_unmodified_target(target, &scanner);
-                continue;
-            }
-            let inline_started = Instant::now();
-            let inline_target = match target {
-                ContentTarget::Page(page) => InlineContentTarget::Page(page),
-                ContentTarget::Form(form) => InlineContentTarget::Form(form),
-            };
-            let inline = externalize_fragmented_inline_target(
-                document,
-                inline_target,
-                config.fragmented_paint_threshold,
-            )?;
-            stats.inline_externalize_us = stats
-                .inline_externalize_us
-                .saturating_add(elapsed_micros_u64(inline_started));
-            stats.inline.scopes_rewritten = stats
-                .inline
-                .scopes_rewritten
-                .saturating_add(inline.stats.scopes_rewritten);
-            stats.inline.occurrences_externalized = stats
-                .inline
-                .occurrences_externalized
-                .saturating_add(inline.stats.occurrences_externalized);
-            stats.inline.xobjects_created = stats
-                .inline
-                .xobjects_created
-                .saturating_add(inline.stats.xobjects_created);
-            stats.inline.xobject_references_reused = stats
-                .inline
-                .xobject_references_reused
-                .saturating_add(inline.stats.xobject_references_reused);
-            if let Some(staging) = inline.staging {
-                inline_staging.push(staging);
-            }
-            if inline.stats.scopes_rewritten == 0 {
-                stats.record_unmodified_target(target, &scanner);
-                continue;
-            }
-
-            page_state.invalidate_vector(target);
-            let rescan_started = Instant::now();
-            let rescanned = load_scanned_target(
-                document,
-                target,
-                hidden_context.as_ref(),
-                &page_numbers,
-                &mut page_state,
-            )?;
-            let ScannedTarget {
-                resources: rescanned_resources,
-                content: rescanned_content,
-                scanner: rescanned_scanner,
-                hidden_ranges: rescanned_hidden_ranges,
-            } = match rescanned {
-                TargetLoadResult::MissingResources | TargetLoadResult::Incomplete { .. } => {
-                    stats.invalidate_target_scan(target);
-                    continue;
-                }
-                TargetLoadResult::Complete(scanned) => *scanned,
-            };
-            stats.target_scan_us = stats
-                .target_scan_us
-                .saturating_add(elapsed_micros_u64(rescan_started));
-            resources = rescanned_resources;
-            content = rescanned_content;
-            scanner = rescanned_scanner;
-            shared_hidden_ranges = rescanned_hidden_ranges;
-            if scanner.inline_occurrences != 0 {
-                stats.record_unmodified_target(target, &scanner);
-                continue;
-            }
-        }
-
-        stats.record_target_scan(target, &scanner);
-        if matches!(target, ContentTarget::Page(_)) && *DEBUG_VECTOR {
-            eprintln!(
-                "vector-proof target={target:?} rect_fills={} candidate={}",
-                scanner.rect_fills.len(),
-                scanner.vector_merge_candidate
-            );
-        }
-
-        let mut pending_pruned_content = None;
-        let mut pruned_draws = HashSet::new();
-        let mut predecoded_images = None;
-        if config.prune_hidden_paints {
-            let hidden_prune_started = Instant::now();
-            let scope = match target {
-                ContentTarget::Page(page) => page_state.visible_rect(document, page)?,
-                ContentTarget::Form(_) => None,
-            };
-            let HiddenRasterPruneResult {
-                rewritten,
-                transparent,
-                occluded,
-                removed,
-                visibility,
-            } = prune_hidden_raster_paints(
-                document,
-                &resources,
-                &content,
-                &scanner,
-                HiddenRasterPruneContext {
-                    scope,
-                    prune_occluded: config.prune_occluded_raster_paints,
-                    image_cache: &mut image_cache,
-                    stats: &mut stats,
-                },
-            )?;
-            predecoded_images = Some(visibility);
-            stats.hidden_prune_us = stats
-                .hidden_prune_us
-                .saturating_add(elapsed_micros_u64(hidden_prune_started));
-            if transparent != 0 || occluded != 0 {
-                stats.transparent_paints_pruned += transparent;
-                stats.occluded_raster_paints_pruned += occluded;
-                pending_pruned_content = Some(rewritten);
-                pruned_draws = removed;
-            }
-        }
-        if *DEBUG_RASTER && !scanner.draws.is_empty() {
-            eprintln!(
-                "raster-target {target:?}: content={} image_draws={}",
-                content.len(),
-                scanner.draws.len()
-            );
-        }
-
-        let user_unit = match target {
-            ContentTarget::Page(page) => page_state.user_unit(document, page)?.unwrap_or(1.0),
-            ContentTarget::Form(_) => 1.0,
+        let plan_stage = RasterTargetPlanStage {
+            target,
+            config,
+            scanner: &scanner,
+            resources: &resources,
+            content: &content,
         };
-        let mut plans = build_merge_plans_for_scanner(
+        let mut prepared = plan_stage.prepare(
             document,
-            MergePlanContext {
-                target,
-                scanner: &scanner,
-                initial_used: &pruned_draws,
-                predecoded_images: predecoded_images.as_ref(),
-                config,
-                user_unit,
+            &mut RasterPlanShared {
+                page_state: &mut page_state,
+                image_cache: &mut image_cache,
+                alpha_crop_bounds_cache: &mut alpha_crop_bounds_cache,
+                stats: &mut stats,
             },
-            &mut image_cache,
-            &mut alpha_crop_bounds_cache,
-            &mut stats,
         )?;
 
-        if plans.is_empty() {
+        if prepared.plans.is_empty() {
             stats.record_resource_usage(
                 target,
-                scanner.resource_usage_after_removing(&pruned_draws),
+                scanner.resource_usage_after_removing(&prepared.pruned_draws),
             );
         }
 
-        if !plans.is_empty()
+        if !prepared.plans.is_empty()
             && scanner.text_paints > 0
             && let ContentTarget::Page(page) = target
         {
@@ -6571,15 +6713,16 @@ pub fn normalize_raster_layout(
             // may change operator bytes, but with no pending prune rewrite it
             // does not invalidate an empty removal set, so do not rescan the
             // entire page later just because raster plans were applied.
-            if pending_pruned_content.is_none()
+            if prepared.pending_pruned_content.is_none()
                 && shared_hidden_ranges.as_ref().is_some_and(Vec::is_empty)
             {
                 stats.page_hidden_text_shared_complete.insert(page);
             }
         }
 
-        if plans.is_empty() {
-            let mut removal_ranges = pruned_draws
+        if prepared.plans.is_empty() {
+            let mut removal_ranges = prepared
+                .pruned_draws
                 .iter()
                 .map(|&index| {
                     let draw = &scanner.draws[index];
@@ -6605,45 +6748,40 @@ pub fn normalize_raster_layout(
         }
 
         let mut target_changed = false;
-        if let Some(rewritten) = pending_pruned_content {
+        if let Some(rewritten) = prepared.pending_pruned_content.take() {
             page_state.invalidate_vector(target);
             content = rewritten;
             target_changed = true;
 
-            // Mixed prune+reconstruction scopes are uncommon. Preserve the previous
-            // conservative behavior there: rescan the post-prune bytes and build
-            // plans against their exact new operator/range layout. The rewrite does
-            // not need to be installed first because raster scanning consumes the
-            // explicit content/resources snapshot. Hidden-text results from the
-            // original token offsets are deliberately discarded.
-            let rescan_started = Instant::now();
-            let rescanned = scan_target(document, &resources, &content)?;
-            stats.target_scan_us = stats
-                .target_scan_us
-                .saturating_add(elapsed_micros_u64(rescan_started));
+            // Mixed prune+reconstruction scopes rebuild plans against the
+            // post-prune byte snapshot. No install is needed before scanning.
+            let rescanned = prepared.rebuild_after_prune(
+                document,
+                PrunedTargetSnapshot {
+                    target,
+                    config,
+                    resources: &resources,
+                    content: &content,
+                },
+                &mut RasterPlanShared {
+                    page_state: &mut page_state,
+                    image_cache: &mut image_cache,
+                    alpha_crop_bounds_cache: &mut alpha_crop_bounds_cache,
+                    stats: &mut stats,
+                },
+            )?;
             let Some(rescanned) = rescanned else {
-                stats.invalidate_target_scan(target);
                 install_target(document, target, resources, content)?;
                 continue;
             };
             scanner = rescanned;
-            stats.record_page_vector_candidate(target, &scanner);
-            pruned_draws.clear();
-            plans = build_merge_plans_for_scanner(
-                document,
-                MergePlanContext {
-                    target,
-                    scanner: &scanner,
-                    initial_used: &HashSet::new(),
-                    predecoded_images: predecoded_images.as_ref(),
-                    config,
-                    user_unit,
-                },
-                &mut image_cache,
-                &mut alpha_crop_bounds_cache,
-                &mut stats,
-            )?;
         }
+
+        let RasterTargetPlans {
+            pruned_draws,
+            plans,
+            ..
+        } = prepared;
 
         let inline_target = match target {
             ContentTarget::Page(page) => InlineContentTarget::Page(page),
@@ -7583,6 +7721,81 @@ mod tests {
         assert!(candidate_payload_fits_budget(Some(1_000), 999));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_000));
         assert!(!candidate_payload_fits_budget(Some(1_000), 1_001));
+    }
+
+    #[test]
+    fn prune_replan_discards_stale_draw_indices_and_rescans_exact_bytes() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im5 5 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q /Im5 Do /Im5 Do Q")?;
+        pdf.stream(
+            5,
+            b"/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[11, 22, 33, 44],
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ContentTarget::Page(ObjectHandle::Existing(ObjectId::new(3, 0)));
+        let resources = target_resources(&document, page)?
+            .ok_or_else(|| Error::Invalid("test page missing XObject resources".to_owned()))?;
+        let old_content = target_content(&document, page)?;
+        let old_scanner = scan_target(&document, &resources, &old_content)?
+            .ok_or_else(|| Error::Invalid("test page failed to scan".to_owned()))?;
+        assert_eq!(old_scanner.draws.len(), 2);
+        let pruned_content = b"/Im5 Do";
+        let mut prepared = RasterTargetPlans {
+            pending_pruned_content: None,
+            pruned_draws: HashSet::from([0]),
+            predecoded_images: None,
+            plans: Vec::new(),
+            user_unit: 1.0,
+        };
+        let config = RasterLayoutConfig {
+            enabled: true,
+            crop_transparent: false,
+            crop_background: false,
+            merge_stripes: false,
+            reconstruct_pixel_clusters: false,
+            stripe_min_paints: 100,
+            pixel_cluster_min_paints: 100,
+            ..RasterLayoutConfig::default()
+        };
+        let mut page_state = RasterPageState::new(None);
+        let mut image_cache = RasterImageDecodeCache::default();
+        let mut alpha_crop_bounds_cache = HashMap::new();
+        let mut stats = RasterLayoutStats::default();
+        let rescanned = prepared
+            .rebuild_after_prune(
+                &document,
+                PrunedTargetSnapshot {
+                    target: page,
+                    config: &config,
+                    resources: &resources,
+                    content: pruned_content,
+                },
+                &mut RasterPlanShared {
+                    page_state: &mut page_state,
+                    image_cache: &mut image_cache,
+                    alpha_crop_bounds_cache: &mut alpha_crop_bounds_cache,
+                    stats: &mut stats,
+                },
+            )?
+            .ok_or_else(|| Error::Invalid("pruned content failed to scan".to_owned()))?;
+        assert_eq!(rescanned.draws.len(), 1);
+        assert_eq!(rescanned.draws[0].range_start, 0);
+        assert_eq!(rescanned.draws[0].range_end, pruned_content.len());
+        assert!(prepared.pruned_draws.is_empty());
+        assert!(prepared.plans.is_empty());
+        // The rebuilt scan's snapshot is now authoritative; no pre-prune
+        // member index may be carried into the new admission.
+        assert_eq!(stats.page_rect_fill_paints_seen, 0);
+        Ok(())
     }
 
     #[test]
