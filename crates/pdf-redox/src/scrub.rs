@@ -195,34 +195,11 @@ fn scrub_owned_cos_privacy_dictionary(
     }
 }
 
-/// Apply COS-level privacy cleanup directly to the Hayro/COW graph without
-/// materializing unaffected source objects.
-///
-/// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
-/// `/LastModified`. `BestEffort` can additionally remove thumbnails and form
-/// values, active content, attachment roots, signature values, and JPEG metadata.
-#[expect(
-    clippy::too_many_lines,
-    reason = "privacy scrubbing applies an ordered set of related catalog, trailer, stream, and object-graph transformations"
-)]
-pub fn scrub_edit_document_cos_privacy(
+fn scrub_reachable_cos_privacy(
     document: &mut EditDocument,
     cfg: &PrivacyConfig,
-) -> Result<ScrubStats> {
-    let mut stats = ScrubStats::default();
-    if cfg.level == PrivacyLevel::None {
-        return Ok(stats);
-    }
-
-    for (key, label) in [
-        (b"Info".as_slice(), "info-dictionary"),
-        (b"ID".as_slice(), "document-id"),
-    ] {
-        if document.trailer_mut().remove(key).is_some() {
-            stats.bump(label);
-        }
-    }
-
+    stats: &mut ScrubStats,
+) -> Result<()> {
     // Walk the post-trailer-removal output graph once. For untouched source
     // objects, inspect privacy keys and collect outgoing references from the
     // same Hayro parse. Only the sparse set of dictionaries that actually need
@@ -302,18 +279,47 @@ pub fn scrub_edit_document_cos_privacy(
         match handle {
             CowObjectHandle::Existing(id) => {
                 if let Some(dictionary) = document.edit_object(id)?.as_dictionary_mut() {
-                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, stats);
                 }
             }
             CowObjectHandle::New(id) => {
                 if let Ok(object) = document.edit_added_object(id)
                     && let Some(dictionary) = object.as_dictionary_mut()
                 {
-                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, &mut stats);
+                    scrub_owned_cos_privacy_dictionary(dictionary, cfg, active_content, stats);
                 }
             }
         }
     }
+
+    Ok(())
+}
+
+/// Apply COS-level privacy cleanup directly to the Hayro/COW graph without
+/// materializing unaffected source objects.
+///
+/// Metadata cleanup removes `/Info`, `/ID`, `/Metadata`, `/PieceInfo`, and
+/// `/LastModified`. `BestEffort` can additionally remove thumbnails and form
+/// values, active content, attachment roots, signature values, and JPEG metadata.
+pub fn scrub_edit_document_cos_privacy(
+    document: &mut EditDocument,
+    cfg: &PrivacyConfig,
+) -> Result<ScrubStats> {
+    let mut stats = ScrubStats::default();
+    if cfg.level == PrivacyLevel::None {
+        return Ok(stats);
+    }
+
+    for (key, label) in [
+        (b"Info".as_slice(), "info-dictionary"),
+        (b"ID".as_slice(), "document-id"),
+    ] {
+        if document.trailer_mut().remove(key).is_some() {
+            stats.bump(label);
+        }
+    }
+
+    scrub_reachable_cos_privacy(document, cfg, &mut stats)?;
 
     if cfg.level == PrivacyLevel::BestEffort && cfg.remove_active_content {
         scrub_catalog_javascript_name_tree(document, &mut stats)?;

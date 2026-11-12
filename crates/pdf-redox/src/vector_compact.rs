@@ -3281,10 +3281,101 @@ fn close_processing_exact_factoring(
     Ok(total)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "vector compaction coordinates scan, factoring, rewrite, and statistics stages over shared document state"
-)]
+fn finish_processing_vector_compaction(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+    flate_level: crate::FlateLevel,
+    pre_scanned_processing: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
+    mut path_coordinate_plans: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
+    mut vector_rewritten_pages: BTreeSet<ObjectHandle>,
+    flate_reuse_cache: &mut FlateReuseCache,
+) -> Result<VectorCompactionStats> {
+    let mut total = VectorCompactionStats::default();
+    for page in &vector_rewritten_pages {
+        path_coordinate_plans.remove(page);
+    }
+    let (factored, factored_pages) =
+        factor_processing_structural_forms(document, flate_level, pages, pre_scanned_processing)?;
+    for page in &factored_pages {
+        path_coordinate_plans.remove(page);
+    }
+    vector_rewritten_pages.extend(factored_pages.iter().copied());
+    let mut late_rewritten_pages = factored_pages;
+    total.absorb(factored);
+
+    let path_coordinates = canonicalize_page_path_coordinates(
+        document,
+        flate_level,
+        pages,
+        path_coordinate_plans,
+        &vector_rewritten_pages,
+        flate_reuse_cache,
+    )?;
+    vector_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
+    late_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
+    let path_coordinate_stats = path_coordinates.stats;
+    total.pages_compacted += path_coordinate_stats.pages_compacted;
+    total.decoded_bytes_removed += path_coordinate_stats.decoded_bytes_removed;
+    total.estimated_flate_bytes_saved += path_coordinate_stats.estimated_flate_bytes_saved;
+    total.path_coordinates_canonicalized += path_coordinate_stats.path_coordinates_canonicalized;
+    total.path_coordinate_pages_rewritten += path_coordinate_stats.path_coordinate_pages_rewritten;
+    total.path_coordinate_decoded_bytes_removed +=
+        path_coordinate_stats.path_coordinate_decoded_bytes_removed;
+    total.path_coordinate_estimated_flate_bytes_saved +=
+        path_coordinate_stats.path_coordinate_estimated_flate_bytes_saved;
+
+    // Processing-only coordinate/factoring rewrites can make exact rectangle
+    // adjacency visible only after the initial fill scan. Close that local
+    // dependency here instead of requiring another whole optimizer pass.
+    let fill_tail = compact_processing_fill_tail(document, flate_level, &late_rewritten_pages)?;
+    total.absorb(fill_tail);
+    // The earlier lossless factor passes had already run before bounded-error
+    // coordinate rewriting and the fill tail. Close only the exact stages
+    // that those mutations may expose, without rounding any path twice.
+    if !late_rewritten_pages.is_empty() {
+        let closure = close_processing_exact_factoring(document, flate_level, pages)?;
+        total.absorb(closure);
+    }
+    Ok(total)
+}
+
+fn write_compacted_vector_page(
+    document: &mut EditDocument,
+    page: ObjectHandle,
+    decoded: &[u8],
+    compacted: Vec<u8>,
+    flate_level: crate::FlateLevel,
+    goal: OptimizationGoal,
+    flate_reuse_cache: &mut FlateReuseCache,
+) -> Result<Option<usize>> {
+    let before_flate = crate::stream_codec::flate_encoded_len(decoded, flate_level)?;
+    let after_encoded = if goal == OptimizationGoal::Size {
+        Some(crate::stream_codec::encode_flate(&compacted, flate_level)?)
+    } else {
+        None
+    };
+    let after_flate = match &after_encoded {
+        Some(encoded) => encoded.len(),
+        None => crate::stream_codec::flate_encoded_len(&compacted, flate_level)?,
+    };
+    if goal == OptimizationGoal::Size && after_flate >= before_flate {
+        return Ok(None);
+    }
+    if let Some(after_encoded) = after_encoded {
+        let decoded_sha256 = Sha256::digest(&compacted).into();
+        let replacement = replace_page_content_with_handle(document, page, compacted)?;
+        flate_reuse_cache.insert_with_digest(
+            replacement,
+            flate_level,
+            decoded_sha256,
+            after_encoded,
+        );
+    } else {
+        replace_page_content(document, page, compacted)?;
+    }
+    Ok(Some(before_flate.saturating_sub(after_flate)))
+}
+
 pub fn compact_vector_paths_with_flate_cache(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
@@ -3358,91 +3449,36 @@ pub fn compact_vector_paths_with_flate_cache(
             }
             continue;
         }
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_encoded = if goal == OptimizationGoal::Size {
-            Some(crate::stream_codec::encode_flate(&compacted, flate_level)?)
-        } else {
-            None
-        };
-        let after_flate = match &after_encoded {
-            Some(encoded) => encoded.len(),
-            None => crate::stream_codec::flate_encoded_len(&compacted, flate_level)?,
-        };
-        if goal == OptimizationGoal::Size && after_flate >= before_flate {
+        let Some(saved_bytes) = write_compacted_vector_page(
+            document,
+            page,
+            &decoded,
+            compacted,
+            flate_level,
+            goal,
+            flate_reuse_cache,
+        )?
+        else {
             continue;
-        }
-        if let Some(after_encoded) = after_encoded {
-            let decoded_sha256 = Sha256::digest(&compacted).into();
-            let replacement = replace_page_content_with_handle(document, page, compacted)?;
-            flate_reuse_cache.insert_with_digest(
-                replacement,
-                flate_level,
-                decoded_sha256,
-                after_encoded,
-            );
-        } else {
-            replace_page_content(document, page, compacted)?;
-        }
+        };
         vector_rewritten_pages.insert(page);
         total.pages_compacted += 1;
         total.fill_groups_batched += stats.fill_groups_batched;
         total.covered_fills_pruned += stats.covered_fills_pruned;
         total.fill_paints_eliminated += stats.fill_paints_eliminated;
         total.decoded_bytes_removed += stats.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += before_flate.saturating_sub(after_flate);
+        total.estimated_flate_bytes_saved += saved_bytes;
     }
     if goal == OptimizationGoal::Processing {
-        for page in &vector_rewritten_pages {
-            path_coordinate_plans.remove(page);
-        }
-        let (factored, factored_pages) = factor_processing_structural_forms(
+        total.absorb(finish_processing_vector_compaction(
             document,
-            flate_level,
             pages,
+            flate_level,
             pre_scanned_processing,
-        )?;
-        for page in &factored_pages {
-            path_coordinate_plans.remove(page);
-        }
-        vector_rewritten_pages.extend(factored_pages.iter().copied());
-        let mut late_rewritten_pages = factored_pages;
-        total.absorb(factored);
-
-        let path_coordinates = canonicalize_page_path_coordinates(
-            document,
-            flate_level,
-            pages,
             path_coordinate_plans,
-            &vector_rewritten_pages,
+            vector_rewritten_pages,
             flate_reuse_cache,
-        )?;
-        vector_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
-        late_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
-        let path_coordinate_stats = path_coordinates.stats;
-        total.pages_compacted += path_coordinate_stats.pages_compacted;
-        total.decoded_bytes_removed += path_coordinate_stats.decoded_bytes_removed;
-        total.estimated_flate_bytes_saved += path_coordinate_stats.estimated_flate_bytes_saved;
-        total.path_coordinates_canonicalized +=
-            path_coordinate_stats.path_coordinates_canonicalized;
-        total.path_coordinate_pages_rewritten +=
-            path_coordinate_stats.path_coordinate_pages_rewritten;
-        total.path_coordinate_decoded_bytes_removed +=
-            path_coordinate_stats.path_coordinate_decoded_bytes_removed;
-        total.path_coordinate_estimated_flate_bytes_saved +=
-            path_coordinate_stats.path_coordinate_estimated_flate_bytes_saved;
-
-        // Processing-only coordinate/factoring rewrites can make exact rectangle
-        // adjacency visible only after the initial fill scan. Close that local
-        // dependency here instead of requiring another whole optimizer pass.
-        let fill_tail = compact_processing_fill_tail(document, flate_level, &late_rewritten_pages)?;
-        total.absorb(fill_tail);
-        // The earlier lossless factor passes had already run before bounded-error
-        // coordinate rewriting and the fill tail. Close only the exact stages
-        // that those mutations may expose, without rounding any path twice.
-        if !late_rewritten_pages.is_empty() {
-            let closure = close_processing_exact_factoring(document, flate_level, pages)?;
-            total.absorb(closure);
-        }
+        )?);
     }
     Ok(total)
 }
