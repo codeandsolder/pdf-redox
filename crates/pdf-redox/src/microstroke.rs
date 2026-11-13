@@ -12,8 +12,6 @@ use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MIN_MICROSTROKE_RUN: usize = 500;
-const MIN_RUN_SAVINGS_BYTES: usize = 1024;
-const MIN_RUN_SAVINGS_PERCENT: usize = 20;
 const MIN_PITCH: f64 = 0.04;
 const MAX_PITCH: f64 = 0.25;
 const MAX_RASTER_DIMENSION: usize = 16_384;
@@ -673,15 +671,7 @@ fn raster_sample_pitch(state: StrokeState, geometry_pitch: f64, user_unit: f64) 
     (pitch.is_finite() && pitch > 0.0).then_some(pitch)
 }
 
-const fn worthwhile_raster_savings(before: usize, after: usize) -> bool {
-    if after >= before {
-        return false;
-    }
-    let saved = before - after;
-    saved >= MIN_RUN_SAVINGS_BYTES
-        && saved.saturating_mul(100) >= before.saturating_mul(MIN_RUN_SAVINGS_PERCENT)
-}
-
+// Preserve main's checked numeric conversion without extra cast-lint exceptions.
 fn bounded_raster_index(value: f64) -> Option<usize> {
     if !value.is_finite() || !(0.0..=16_384.0).contains(&value) {
         return None;
@@ -689,16 +679,26 @@ fn bounded_raster_index(value: f64) -> Option<usize> {
     value.to_usize()
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "geometry bounds, cap semantics, and raster safety gates form one cohesive scan-conversion operation"
-)]
+#[cfg(test)]
 fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<RasterizedRun> {
-    if !run.state.raster_safe() || !pitch.is_finite() || pitch <= 0.0 {
-        return None;
-    }
-    let sample_pitch = raster_sample_pitch(run.state, pitch, user_unit)?;
-    if run.state.width / sample_pitch < MIN_STROKE_RASTER_PIXELS {
+    rasterize_run_at_pitch(run, pitch, pitch, user_unit)
+}
+
+#[derive(Clone, Copy)]
+struct MicroStrokeGeometry {
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+}
+
+/// This eligibility proof and source-space bounding box are independent of
+/// the output grid. Compute them only once when trying multiple resolutions.
+fn analyze_microstroke_run(
+    run: &MicroStrokeRun,
+    geometry_pitch: f64,
+) -> Option<MicroStrokeGeometry> {
+    if !run.state.raster_safe() || !geometry_pitch.is_finite() || geometry_pitch <= 0.0 {
         return None;
     }
     let mut xmin = f64::INFINITY;
@@ -727,13 +727,11 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
         let (_, previous_end) = pair[0];
         let (next_start, _) = pair[1];
         let gap = (previous_end.0 - next_start.0).hypot(previous_end.1 - next_start.1);
-        if gap <= pitch * 0.05 {
+        if gap <= geometry_pitch * 0.05 {
             forward_connected = forward_connected.saturating_add(1);
         }
     }
-    // A nearly continuous chain is much more likely to be useful raw vector data
-    // (for example a sampled graph trace) than scan-converted/plotter soup.
-    // Preserve it even in the explicitly lossy micro-vector rasterizer.
+    // Preserve nearly continuous sampled graph traces as original vectors.
     if run.lines.len() > 1
         && forward_connected.saturating_mul(100)
             >= run.lines.len().saturating_sub(1).saturating_mul(90)
@@ -743,15 +741,58 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
     if short.saturating_mul(100) < run.lines.len().saturating_mul(65) {
         return None;
     }
-    lengths.sort_by(f64::total_cmp);
-    if lengths
-        .get(lengths.len() / 2)
-        .copied()
-        .unwrap_or(f64::INFINITY)
-        > 1.5
-    {
+    // An empty run has no median. Keep the same ineligible outcome as the
+    // original sorted-median path rather than calling selection out of bounds.
+    if lengths.is_empty() {
         return None;
     }
+    // Selection is O(n), unlike sorting all lengths merely to find a median.
+    let midpoint = lengths.len() / 2;
+    let (_, median, _) = lengths.select_nth_unstable_by(midpoint, f64::total_cmp);
+    if *median > 1.5 {
+        return None;
+    }
+    Some(MicroStrokeGeometry {
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+    })
+}
+
+#[cfg(test)]
+fn rasterize_run_at_pitch(
+    run: &MicroStrokeRun,
+    geometry_pitch: f64,
+    requested_sample_pitch: f64,
+    user_unit: f64,
+) -> Option<RasterizedRun> {
+    let geometry = analyze_microstroke_run(run, geometry_pitch)?;
+    rasterize_run_on_grid(run, geometry, requested_sample_pitch, user_unit)
+}
+
+/// Render an already eligible geometry on one bounded grid. Source eligibility
+/// never depends on the requested image sampling pitch.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded raster dimensions, cap geometry and source-stroke coverage are one cohesive raster operation"
+)]
+fn rasterize_run_on_grid(
+    run: &MicroStrokeRun,
+    geometry: MicroStrokeGeometry,
+    requested_sample_pitch: f64,
+    user_unit: f64,
+) -> Option<RasterizedRun> {
+    let sample_pitch = raster_sample_pitch(run.state, requested_sample_pitch, user_unit)?;
+    if run.state.width / sample_pitch < MIN_STROKE_RASTER_PIXELS {
+        return None;
+    }
+    let MicroStrokeGeometry {
+        mut xmin,
+        mut ymin,
+        mut xmax,
+        mut ymax,
+    } = geometry;
 
     let pad = run.state.width.mul_add(0.5, sample_pitch);
     xmin -= pad;
@@ -807,6 +848,12 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
                 .min(f64::from(height_u32 - 1)),
         )?;
 
+        // At a coarse grid, a short *butt-capped* mark can fall entirely
+        // between pixel centres even when stroke width spans >=1.5 pixels.
+        // Require that every source segment has geometric raster coverage.
+        // This tests the segment's own footprint, not the final mask (which
+        // might already contain paint from a different segment).
+        let mut has_coverage = false;
         for y in min_y..=max_y {
             let py = f64::from(u32::try_from(y).ok()?) + 0.5;
             for x in min_x..=max_x {
@@ -846,9 +893,13 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
                     _ => false,
                 };
                 if paints {
+                    has_coverage = true;
                     mask.paint(x, y);
                 }
             }
+        }
+        if !has_coverage {
+            return None;
         }
     }
 
@@ -859,6 +910,24 @@ fn rasterize_run(run: &MicroStrokeRun, pitch: f64, user_unit: f64) -> Option<Ras
         height_user: f64::from(height_u32) / scale,
         mask,
     })
+}
+
+/// The highest-utility grid is not necessarily the densest possible one:
+/// closely spaced microstrokes can be represented as a compact raster at
+/// print-scale resolution instead of preserving pathological subpixel marks.
+fn coarser_microstroke_sample_pitch(
+    state: StrokeState,
+    natural_pitch: f64,
+    user_unit: f64,
+) -> Option<f64> {
+    let base = raster_sample_pitch(state, natural_pitch, user_unit)?;
+    let page_scale = max_linear_scale(state.ctm)? * user_unit;
+    let max_quality_pitch = MAX_PAGE_RASTER_PITCH_PT / page_scale;
+    // Stay visibly wider than a single sample; tiny lines must not disappear
+    // simply because the selected grid became too coarse.
+    let max_coverage_pitch = (state.width / MIN_STROKE_RASTER_PIXELS) * 0.98;
+    let alternative = max_quality_pitch.min(max_coverage_pitch);
+    (alternative.is_finite() && alternative >= base * 1.05).then_some(alternative)
 }
 
 fn image_payload(
@@ -952,6 +1021,7 @@ struct Candidate {
     data: Vec<u8>,
     codec: BilevelCodec,
     strokes: usize,
+    estimated_encoded_gain: usize,
 }
 
 #[expect(
@@ -961,8 +1031,9 @@ struct Candidate {
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
-    flate_level: crate::FlateLevel,
+    goal: crate::OptimizationGoal,
 ) -> Result<MicrostrokeRasterStats> {
+    let flate_level = goal.flate_level();
     let mut stats = MicrostrokeRasterStats::default();
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {
@@ -1001,61 +1072,102 @@ pub fn rasterize_pathological_microstrokes(
             let Some(pitch) = infer_pitch(&run.lines) else {
                 continue;
             };
-            let Some(raster) = rasterize_run(&run, pitch, user_unit) else {
+            let Some(geometry) = analyze_microstroke_run(&run, pitch) else {
                 continue;
             };
-            let payload = image_payload(&raster, flate_level)?;
             let name = next_image_name(&mut name_index, &mut occupied);
-            let replacement = replacement_bytes(&name, &run, &raster);
+            let mut chosen: Option<(BilevelImagePayload, Vec<u8>, usize)> = None;
+            for sample_pitch in std::iter::once(pitch).chain(coarser_microstroke_sample_pitch(
+                run.state, pitch, user_unit,
+            )) {
+                // Oversized natural masks must not preclude a valid compact grid.
+                let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch, user_unit)
+                else {
+                    continue;
+                };
+                let payload = image_payload(&raster, flate_level)?;
+                let replacement = replacement_bytes(&name, &run, &raster);
+                let cost = payload
+                    .data
+                    .len()
+                    .saturating_add(replacement.len())
+                    .saturating_add(192);
+                if chosen
+                    .as_ref()
+                    .is_none_or(|(_, _, selected_cost)| cost < *selected_cost)
+                {
+                    chosen = Some((payload, replacement, cost));
+                }
+            }
+            let Some((chosen_payload, chosen_replacement, chosen_cost)) = chosen else {
+                continue;
+            };
             let local_before =
                 crate::stream_codec::flate_encoded_len(&decoded[run.start..run.end], flate_level)?;
-            let local_after = payload
-                .data
-                .len()
-                .saturating_add(replacement.len())
-                .saturating_add(192);
-            if !worthwhile_raster_savings(local_before, local_after) {
+            if chosen_cost >= local_before {
+                // More paints have no value if the available raster encoding
+                // already costs more than the original repeated vector run.
                 continue;
             }
             candidates.push(Candidate {
                 start: run.start,
                 end: run.end,
                 name,
-                replacement,
-                dictionary: payload.dictionary,
-                data: payload.data,
-                codec: payload.codec,
+                replacement: chosen_replacement,
+                dictionary: chosen_payload.dictionary,
+                data: chosen_payload.data,
+                codec: chosen_payload.codec,
                 strokes: run.lines.len(),
+                estimated_encoded_gain: local_before.saturating_sub(chosen_cost),
             });
         }
         if candidates.is_empty() {
             continue;
         }
 
-        let replacements = candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    candidate.start,
-                    candidate.end,
-                    candidate.replacement.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let Some(rewritten) = crate::content_stream::apply_replacements(&decoded, &replacements)
-        else {
+        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let Some((rewritten, after)) = (loop {
+            if candidates.is_empty() {
+                break None;
+            }
+            let replacements = candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.start,
+                        candidate.end,
+                        candidate.replacement.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let Some(rewritten) =
+                crate::content_stream::apply_replacements(&decoded, &replacements)
+            else {
+                break None;
+            };
+            let image_cost = candidates
+                .iter()
+                .map(|candidate| candidate.data.len().saturating_add(192))
+                .sum::<usize>();
+            let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
+                .saturating_add(image_cost);
+            if after < before {
+                break Some((rewritten, after));
+            }
+            // Whole-page Flate has contextual effects not reflected in each
+            // isolated run estimate. If the full rewrite grows the PDF, drop
+            // the least effective candidate and retry until it really shrinks.
+            let Some((worst, _)) = candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, candidate)| candidate.estimated_encoded_gain)
+            else {
+                break None;
+            };
+            candidates.remove(worst);
+        }) else {
             continue;
         };
-        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let image_cost = candidates
-            .iter()
-            .map(|candidate| candidate.data.len().saturating_add(192))
-            .sum::<usize>();
-        let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
-            .saturating_add(image_cost);
-        if after >= before {
-            continue;
-        }
 
         let mut installed = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
@@ -1163,12 +1275,95 @@ mod tests {
     }
 
     #[test]
-    fn lossy_rasterization_requires_material_encoded_savings() {
-        assert!(!worthwhile_raster_savings(100_000, 98_000));
-        assert!(worthwhile_raster_savings(100_000, 79_000));
-        assert!(!worthwhile_raster_savings(4_000, 3_100));
-        assert!(worthwhile_raster_savings(4_000, 2_900));
-        assert!(!worthwhile_raster_savings(1_000, 0));
+    fn coarser_grid_represents_run_when_natural_mask_exceeds_dimensions() -> Result<()> {
+        let run = MicroStrokeRun {
+            start: 0,
+            end: 0,
+            state: StrokeState {
+                width: 0.24,
+                cap: 1,
+                ..StrokeState::default()
+            },
+            lines: (0..600_u32)
+                .map(|index| {
+                    let x = f64::from(index % 100) * 8.0;
+                    let y = f64::from(index / 100) * 8.0;
+                    ((x, y), (x + 0.04, y))
+                })
+                .collect(),
+        };
+        assert!(rasterize_run(&run, 0.04, 1.0).is_none());
+        let pitch = coarser_microstroke_sample_pitch(run.state, 0.04, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing compact pitch".to_owned()))?;
+        let raster = rasterize_run_at_pitch(&run, 0.04, pitch, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("compact grid still too large".to_owned()))?;
+        assert!(raster.mask.packed().iter().any(|byte| *byte != 0xff));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_microstroke_run_has_no_eligible_geometry() {
+        let run = MicroStrokeRun {
+            start: 0,
+            end: 0,
+            state: StrokeState::default(),
+            lines: Vec::new(),
+        };
+        assert!(analyze_microstroke_run(&run, 0.12).is_none());
+        assert!(rasterize_run(&run, 0.12, 1.0).is_none());
+    }
+
+    #[test]
+    fn coarse_grid_rejects_butt_strokes_lost_between_pixel_centres() -> Result<()> {
+        let run = MicroStrokeRun {
+            start: 0,
+            end: 0,
+            state: StrokeState {
+                width: 0.24,
+                cap: 0,
+                ..StrokeState::default()
+            },
+            // A 0.04 pt butt-capped mark at this phase lands on natural
+            // raster centres, but has no pixel centres inside its axial
+            // projection on the 450-DPI quality grid.
+            lines: vec![((0.0, 0.0), (0.04, 0.0)); MIN_MICROSTROKE_RUN],
+        };
+        let natural = rasterize_run(&run, 0.08, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("natural mark was lost".to_owned()))?;
+        assert!(natural.mask.packed().iter().any(|&byte| byte != 0xff));
+        let coarse_pitch = coarser_microstroke_sample_pitch(run.state, 0.08, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing quality grid".to_owned()))?;
+        assert!(rasterize_run_at_pitch(&run, 0.08, coarse_pitch, 1.0).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn processing_grid_can_reduce_pathological_microstroke_resolution() -> Result<()> {
+        let run = MicroStrokeRun {
+            start: 0,
+            end: 0,
+            state: StrokeState {
+                width: 0.24,
+                cap: 1,
+                ..StrokeState::default()
+            },
+            lines: (0..600_u32)
+                .map(|index| {
+                    let x = f64::from(index % 100) * 0.16;
+                    let y = f64::from(index / 100) * 0.16;
+                    ((x, y), (x + 0.08, y))
+                })
+                .collect(),
+        };
+        let natural = rasterize_run(&run, 0.08, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing natural raster".to_owned()))?;
+        let coarser_pitch = coarser_microstroke_sample_pitch(run.state, 0.08, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing coarser pitch".to_owned()))?;
+        let coarser = rasterize_run_at_pitch(&run, 0.08, coarser_pitch, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing coarser raster".to_owned()))?;
+        assert!(coarser.mask.packed().len() < natural.mask.packed().len());
+        assert!(coarser.mask.packed().iter().any(|byte| *byte != 0xff));
+        Ok(())
     }
 
     #[test]
