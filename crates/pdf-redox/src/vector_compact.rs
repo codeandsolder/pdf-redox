@@ -1464,9 +1464,12 @@ fn apply_span_replacements(
     Some(output)
 }
 
+type ProcessingFactorBlocks = BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>;
+
 struct PathFactoringOutcome {
     stats: VectorCompactionStats,
     cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
+    reusable_blocks: ProcessingFactorBlocks,
     rewritten_pages: BTreeSet<ObjectHandle>,
 }
 
@@ -1572,12 +1575,13 @@ fn factor_repeated_path_forms(
             eprintln!("path-forms cached-proof=skip");
         }
         let cached_transformed = pre_scanned
-            .into_iter()
-            .map(|(page, (_, transformed))| (page, transformed))
+            .iter()
+            .map(|(&page, (_, transformed))| (page, transformed.clone()))
             .collect();
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             cached_transformed,
+            reusable_blocks: pre_scanned,
             rewritten_pages: BTreeSet::new(),
         });
     }
@@ -1638,6 +1642,13 @@ fn factor_repeated_path_forms(
         .map(|(key, _)| key)
         .collect::<HashSet<_>>();
 
+    // Source offsets and semantic keys may be reused in the following
+    // iteration only if the page content is not changed in this iteration.
+    let reusable_blocks: ProcessingFactorBlocks = page_data
+        .iter()
+        .zip(&page_blocks)
+        .map(|(page, blocks)| (page.page, blocks.clone()))
+        .collect();
     for (page_index, (path_blocks, transformed_blocks)) in page_blocks.into_iter().enumerate() {
         let page = page_data[page_index].page;
         for block in path_blocks {
@@ -1679,6 +1690,7 @@ fn factor_repeated_path_forms(
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             cached_transformed,
+            reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
     }
@@ -1708,6 +1720,7 @@ fn factor_repeated_path_forms(
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             cached_transformed,
+            reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
     }
@@ -1735,6 +1748,7 @@ fn factor_repeated_path_forms(
             return Ok(PathFactoringOutcome {
                 stats: VectorCompactionStats::default(),
                 cached_transformed,
+                reusable_blocks,
                 rewritten_pages: BTreeSet::new(),
             });
         };
@@ -1766,6 +1780,7 @@ fn factor_repeated_path_forms(
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             cached_transformed,
+            reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
     }
@@ -1783,6 +1798,7 @@ fn factor_repeated_path_forms(
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             cached_transformed,
+            reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
     }
@@ -1857,6 +1873,7 @@ fn factor_repeated_path_forms(
             ..VectorCompactionStats::default()
         },
         cached_transformed,
+        reusable_blocks,
         rewritten_pages: rewritten_page_handles,
     })
 }
@@ -3224,11 +3241,16 @@ fn factor_processing_structural_forms(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
-    pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
-) -> Result<(VectorCompactionStats, BTreeSet<ObjectHandle>)> {
+    pre_scanned: ProcessingFactorBlocks,
+) -> Result<(
+    VectorCompactionStats,
+    BTreeSet<ObjectHandle>,
+    ProcessingFactorBlocks,
+)> {
     let PathFactoringOutcome {
         stats: path_stats,
         cached_transformed,
+        mut reusable_blocks,
         rewritten_pages: path_rewritten,
     } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages)?;
     let transformed = factor_repeated_transformed_blocks(
@@ -3242,11 +3264,16 @@ fn factor_processing_structural_forms(
     let mut rewritten = path_rewritten;
     rewritten.extend(transformed.generated_page_xobjects.keys().copied());
     rewritten.extend(shared.generated_page_xobjects.keys().copied());
+    // A rewritten stream invalidates its source offsets and block semantics.
+    // All unchanged pages remain candidates for cross-page matches.
+    for page in &rewritten {
+        reusable_blocks.remove(page);
+    }
     let mut stats = VectorCompactionStats::default();
     stats.absorb(path_stats);
     stats.absorb(transformed);
     stats.absorb(shared);
-    Ok((stats, rewritten))
+    Ok((stats, rewritten, reusable_blocks))
 }
 
 // Every accepted Form factor replaces a page span containing native operators
@@ -3263,9 +3290,10 @@ fn close_processing_exact_factoring(
     pages: &[ObjectHandle],
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
+    let mut pre_scanned = ProcessingFactorBlocks::new();
     loop {
-        let (forms, rewritten) =
-            factor_processing_structural_forms(document, flate_level, pages, BTreeMap::new())?;
+        let (forms, rewritten, reusable_blocks) =
+            factor_processing_structural_forms(document, flate_level, pages, pre_scanned)?;
         let changed = forms.path_forms_created != 0
             || forms.transformed_forms_created != 0
             || forms.shared_run_forms_created != 0;
@@ -3275,6 +3303,9 @@ fn close_processing_exact_factoring(
         // A page rewritten by any Form pass must be scanned using its new
         // content and resources; do not recycle pre-mutation raster/path proofs.
         let fills = compact_processing_fill_tail(document, flate_level, &rewritten)?;
+        // Fill cleanup rewrites only pages already present in rewritten;
+        // every retained metadata entry is still tied to identical bytes.
+        pre_scanned = reusable_blocks;
         total.absorb(forms);
         total.absorb(fills);
     }
@@ -3294,7 +3325,7 @@ fn finish_processing_vector_compaction(
     for page in &vector_rewritten_pages {
         path_coordinate_plans.remove(page);
     }
-    let (factored, factored_pages) =
+    let (factored, factored_pages, _) =
         factor_processing_structural_forms(document, flate_level, pages, pre_scanned_processing)?;
     for page in &factored_pages {
         path_coordinate_plans.remove(page);
@@ -3522,6 +3553,116 @@ mod tests {
                 .collect(),
             path_coordinate_plan: None,
         }
+    }
+
+    #[test]
+    fn exact_closure_reuses_only_unchanged_page_blocks() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        // Pages 3 and 4 share a long transform-independent paint body.
+        // Page 5 is intentionally different and is never rewritten. Compare
+        // caching with a fresh full document scan after an accepted rewrite.
+        let mut shared = Vec::new();
+        let mut distinct = Vec::new();
+        for index in 0..360 {
+            let x = index * 13 + 17;
+            let y = index * 19 + 29;
+            shared.extend_from_slice(
+                format!("{x} {y} {} {} re f ", index % 37 + 3, index % 23 + 5).as_bytes(),
+            );
+            distinct.extend_from_slice(
+                format!(
+                    "{} {} {} {} re f ",
+                    x + 7,
+                    y + 9,
+                    index % 31 + 4,
+                    index % 17 + 8
+                )
+                .as_bytes(),
+            );
+        }
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")?;
+        for (page, content) in [(3, 6), (4, 7), (5, 8)] {
+            pdf.object(
+                page,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9000 9000] /Resources << >> /Contents {content} 0 R >>"
+                )
+                .as_bytes(),
+            )?;
+        }
+        let mut first = b"q 1 0 0 1 0 0 cm ".to_vec();
+        first.extend_from_slice(&shared);
+        first.extend_from_slice(b"Q");
+        let mut second = b"q 2 0 0 2 20 30 cm ".to_vec();
+        second.extend_from_slice(&shared);
+        second.extend_from_slice(b"Q");
+        let mut third = b"q 1 0 0 1 100 200 cm ".to_vec();
+        third.extend_from_slice(&distinct);
+        third.extend_from_slice(b"Q");
+        pdf.stream(6, b"", &first)?;
+        pdf.stream(7, b"", &second)?;
+        pdf.stream(8, b"", &third)?;
+        let bytes = pdf.finish(1)?;
+        let mut warm = EditDocument::from_bytes(bytes.clone())?;
+        let mut cold = EditDocument::from_bytes(bytes)?;
+        let pages = [3, 4, 5].map(|number| ObjectHandle::Existing(ObjectId::new(number, 0)));
+
+        let (warm_first, changed, reusable) = factor_processing_structural_forms(
+            &mut warm,
+            FlateLevel::PROCESSING,
+            &pages,
+            ProcessingFactorBlocks::new(),
+        )?;
+        let (cold_first, cold_changed, _) = factor_processing_structural_forms(
+            &mut cold,
+            FlateLevel::PROCESSING,
+            &pages,
+            ProcessingFactorBlocks::new(),
+        )?;
+        assert_eq!(warm_first, cold_first);
+        assert_eq!(changed, cold_changed);
+        assert!(warm_first.transformed_forms_created > 0);
+        assert!(changed.contains(&pages[0]) && changed.contains(&pages[1]));
+        assert!(!changed.contains(&pages[2]));
+        assert!(reusable.contains_key(&pages[2]));
+        assert!(!reusable.contains_key(&pages[0]));
+        assert!(!reusable.contains_key(&pages[1]));
+
+        let (warm_second, warm_changed, _) = factor_processing_structural_forms(
+            &mut warm,
+            FlateLevel::PROCESSING,
+            &pages,
+            reusable,
+        )?;
+        let (cold_second, cold_changed, _) = factor_processing_structural_forms(
+            &mut cold,
+            FlateLevel::PROCESSING,
+            &pages,
+            ProcessingFactorBlocks::new(),
+        )?;
+        assert_eq!(warm_second, cold_second);
+        assert_eq!(warm_changed, cold_changed);
+        for page in pages {
+            let content = |document: &EditDocument| -> Result<Vec<u8>> {
+                let Some(object) = document.current_owned_object(page)? else {
+                    return Err(crate::Error::Invalid("missing page".to_owned()));
+                };
+                let Some(dictionary) = object.as_dictionary() else {
+                    return Err(crate::Error::Invalid("page lacks dictionary".to_owned()));
+                };
+                let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+                    return Err(crate::Error::Invalid("page lacks contents".to_owned()));
+                };
+                let mut decoded = Vec::new();
+                decoded_content_value(document, contents, &mut decoded)?;
+                Ok(decoded)
+            };
+            assert_eq!(content(&warm)?, content(&cold)?);
+        }
+        Ok(())
     }
 
     #[test]
