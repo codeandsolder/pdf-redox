@@ -1445,24 +1445,63 @@ fn path_form_dictionary(bounds: Rect) -> OwnedDictionary {
     dictionary
 }
 
-fn apply_span_replacements(
+fn apply_sorted_span_replacements<'a>(
     input: &[u8],
-    replacements: &[(usize, usize, Vec<u8>)],
+    replacements: impl IntoIterator<Item = (usize, usize, Option<&'a [u8]>)>,
 ) -> Option<Vec<u8>> {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
     let mut output = Vec::with_capacity(input.len());
     let mut cursor = 0usize;
     for (start, end, replacement) in replacements {
         if start < cursor || end > input.len() || start > end {
             return None;
         }
-        output.extend_from_slice(&input[cursor..start]);
-        output.extend_from_slice(&replacement);
+        output.extend_from_slice(input.get(cursor..start)?);
+        output.extend_from_slice(replacement?);
         cursor = end;
     }
-    output.extend_from_slice(&input[cursor..]);
+    output.extend_from_slice(input.get(cursor..)?);
     Some(output)
+}
+
+fn apply_span_replacements_owned<B: AsRef<[u8]>>(
+    input: &[u8],
+    mut replacements: Vec<(usize, usize, B)>,
+) -> Option<Vec<u8>> {
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    apply_sorted_span_replacements(
+        input,
+        replacements
+            .iter()
+            .map(|(start, end, bytes)| (*start, *end, Some(bytes.as_ref()))),
+    )
+}
+
+fn apply_span_replacements_from_arena(
+    input: &[u8],
+    mut replacements: Vec<CoordinateReplacement>,
+    bytes: &[u8],
+) -> Option<Vec<u8>> {
+    replacements.sort_unstable_by_key(|replacement| replacement.start);
+    apply_sorted_span_replacements(
+        input,
+        replacements.iter().map(|replacement| {
+            (
+                replacement.start,
+                replacement.end,
+                replacement
+                    .byte_start
+                    .checked_add(replacement.byte_length)
+                    .and_then(|end| bytes.get(replacement.byte_start..end)),
+            )
+        }),
+    )
+}
+
+fn apply_span_replacements(
+    input: &[u8],
+    replacements: &[(usize, usize, Vec<u8>)],
+) -> Option<Vec<u8>> {
+    apply_span_replacements_owned(input, replacements.to_vec())
 }
 
 type ProcessingFactorBlocks = BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>;
@@ -2848,12 +2887,20 @@ struct PathCoordinatePlan {
     coordinates_canonicalized: usize,
 }
 
+struct CoordinateReplacement {
+    start: usize,
+    end: usize,
+    byte_start: usize,
+    byte_length: usize,
+}
+
 struct PathCoordinateScanner {
     operands: Vec<PathCoordinateOperand>,
     ctm: Option<Matrix>,
     state_stack: Vec<Option<Matrix>>,
     user_unit: f64,
-    replacements: Vec<(usize, usize, Vec<u8>)>,
+    replacements: Vec<CoordinateReplacement>,
+    replacement_bytes: Vec<u8>,
     coordinates_canonicalized: usize,
 }
 
@@ -2865,6 +2912,7 @@ impl PathCoordinateScanner {
             state_stack: Vec::new(),
             user_unit,
             replacements: Vec::new(),
+            replacement_bytes: Vec::new(),
             coordinates_canonicalized: 0,
         }
     }
@@ -2880,10 +2928,10 @@ impl PathCoordinateScanner {
         Some(scaled.round() / PATH_COORDINATE_SCALE)
     }
 
-    fn rounded_coordinate_bytes(value: f64) -> Option<Vec<u8>> {
+    fn rounded_coordinate_bytes(value: f64) -> Option<SmallVec<[u8; 32]>> {
         let rounded = Self::rounded_coordinate(value)?;
         if rounded == 0.0 {
-            return Some(vec![b'0']);
+            return Some(SmallVec::from_slice(b"0"));
         }
 
         // A cent-valued f64 is unambiguous when its representable spacing
@@ -2925,7 +2973,7 @@ impl PathCoordinateScanner {
                 cursor -= 1;
                 bytes[cursor] = b'-';
             }
-            return Some(bytes[cursor..].to_vec());
+            return Some(SmallVec::from_slice(&bytes[cursor..]));
         }
 
         let mut out = format!("{rounded:.2}");
@@ -2938,7 +2986,7 @@ impl PathCoordinateScanner {
         if out == "-0" {
             "0".clone_into(&mut out);
         }
-        Some(out.into_bytes())
+        Some(SmallVec::from_slice(out.as_bytes()))
     }
 
     fn point_error(&self, old: (f64, f64), new: (f64, f64)) -> Option<f64> {
@@ -3025,7 +3073,9 @@ impl PathCoordinateScanner {
             return;
         }
 
-        let mut pending = Vec::new();
+        // A path operator has at most six coordinate operands. Keep its
+        // atomic replacement transaction inline until all spans validate.
+        let mut pending = SmallVec::<[(usize, usize, SmallVec<[u8; 32]>); 6]>::new();
         for (operand, &rounded) in self.operands.iter().zip(&new) {
             if rounded.to_bits() == operand.value.unwrap_or_default().to_bits() {
                 continue;
@@ -3044,7 +3094,16 @@ impl PathCoordinateScanner {
         }
         self.coordinates_canonicalized =
             self.coordinates_canonicalized.saturating_add(pending.len());
-        self.replacements.extend(pending);
+        for (start, end, bytes) in pending {
+            let byte_start = self.replacement_bytes.len();
+            self.replacement_bytes.extend_from_slice(&bytes);
+            self.replacements.push(CoordinateReplacement {
+                start,
+                end,
+                byte_start,
+                byte_length: bytes.len(),
+            });
+        }
     }
 
     fn concat_ctm(&mut self) {
@@ -3116,7 +3175,11 @@ impl PathCoordinateScanner {
             return None;
         }
         Some(PathCoordinatePlan {
-            canonicalized: apply_span_replacements(input, &self.replacements)?,
+            canonicalized: apply_span_replacements_from_arena(
+                input,
+                self.replacements,
+                &self.replacement_bytes,
+            )?,
             coordinates_canonicalized: self.coordinates_canonicalized,
         })
     }
@@ -4217,6 +4280,93 @@ mod tests {
     }
 
     #[test]
+    fn owned_span_replacements_preserve_source_order_and_reject_overlaps() {
+        // Owned small buffers and the longstanding borrowed Vec path must
+        // produce byte-identical content, including out-of-order spans.
+        let input = b"ABCDEF0123456789";
+        let borrowed = vec![
+            (6, 10, b"xy".to_vec()),
+            (1, 3, b"z".to_vec()),
+            (14, 16, b"Q".to_vec()),
+        ];
+        let owned = borrowed
+            .iter()
+            .map(|(start, end, bytes)| (*start, *end, SmallVec::<[u8; 32]>::from_slice(bytes)))
+            .collect::<Vec<_>>();
+        let borrowed_output = apply_span_replacements(input, &borrowed);
+        let owned_output = apply_span_replacements_owned(input, owned);
+        assert_eq!(borrowed_output, owned_output);
+        assert_eq!(owned_output.as_deref(), Some(b"AzDEFxy4567Q".as_slice()));
+
+        let overlapping = vec![
+            (1, 4, SmallVec::<[u8; 32]>::from_slice(b"x")),
+            (3, 5, SmallVec::<[u8; 32]>::from_slice(b"y")),
+        ];
+        assert!(apply_span_replacements_owned(input, overlapping).is_none());
+        let invalid_end = vec![(14, 17, SmallVec::<[u8; 32]>::from_slice(b"x"))];
+        assert!(apply_span_replacements_owned(input, invalid_end).is_none());
+        // Coordinate assembler references a single contiguous arena instead
+        // of owning separate payloads or cloning them at page finalization.
+        let arena = b"xyzQ".to_vec();
+        let indexed = vec![
+            CoordinateReplacement {
+                start: 14,
+                end: 16,
+                byte_start: 3,
+                byte_length: 1,
+            },
+            CoordinateReplacement {
+                start: 1,
+                end: 3,
+                byte_start: 2,
+                byte_length: 1,
+            },
+            CoordinateReplacement {
+                start: 6,
+                end: 10,
+                byte_start: 0,
+                byte_length: 2,
+            },
+        ];
+        assert_eq!(
+            apply_span_replacements_from_arena(input, indexed, &arena),
+            borrowed_output
+        );
+        let invalid_index = vec![CoordinateReplacement {
+            start: 1,
+            end: 3,
+            byte_start: usize::MAX,
+            byte_length: 2,
+        }];
+        assert!(apply_span_replacements_from_arena(input, invalid_index, &arena).is_none());
+        let overlapping = vec![
+            CoordinateReplacement {
+                start: 1,
+                end: 4,
+                byte_start: 0,
+                byte_length: 1,
+            },
+            CoordinateReplacement {
+                start: 2,
+                end: 5,
+                byte_start: 1,
+                byte_length: 1,
+            },
+        ];
+        assert!(apply_span_replacements_from_arena(input, overlapping, &arena).is_none());
+
+        // Extremely long replacements remain supported by SmallVec's heap
+        // storage, without truncating the f64 formatter's unusual magnitudes.
+        let long = vec![b'5'; 512];
+        let owned = vec![(4, 6, SmallVec::<[u8; 32]>::from_slice(&long))];
+        let result = apply_span_replacements_owned(input, owned);
+        assert_eq!(
+            result.as_ref().map(Vec::len),
+            Some(input.len() - 2 + long.len())
+        );
+    }
+
+    #[test]
     fn decimal_coordinate_encoder_matches_original_float_formatter() {
         // This is deliberately independent of the integer-cent encoder.
         // It also checks values outside its exact representability domain.
@@ -4270,7 +4420,7 @@ mod tests {
         ];
         for value in edges {
             assert_eq!(
-                PathCoordinateScanner::rounded_coordinate_bytes(value),
+                PathCoordinateScanner::rounded_coordinate_bytes(value).map(|b| b.to_vec()),
                 reference(value),
                 "edge {value:?}"
             );
@@ -4287,7 +4437,7 @@ mod tests {
                 ] {
                     let sample = f64::from_bits(bits);
                     assert_eq!(
-                        PathCoordinateScanner::rounded_coordinate_bytes(sample),
+                        PathCoordinateScanner::rounded_coordinate_bytes(sample).map(|b| b.to_vec()),
                         reference(sample),
                         "boundary {sample:?}"
                     );
@@ -4303,7 +4453,7 @@ mod tests {
             state ^= state << 17;
             let sample = f64::from_bits(state);
             assert_eq!(
-                PathCoordinateScanner::rounded_coordinate_bytes(sample),
+                PathCoordinateScanner::rounded_coordinate_bytes(sample).map(|b| b.to_vec()),
                 reference(sample),
                 "f64 bits 0x{state:016x}"
             );
