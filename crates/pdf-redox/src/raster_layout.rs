@@ -274,6 +274,60 @@ struct ResourceUsage {
     by_type: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
 }
 
+// This inventory is derived from the same scanner snapshot that generated
+// the rewrite plans. A no-plan prune can remove draws, while a committed
+// reconstruction also installs new XObject names.
+struct RasterResourceInventory<'a> {
+    target: ContentTarget,
+    scanner: &'a RasterScanner,
+}
+
+impl RasterResourceInventory<'_> {
+    fn record_pruned(self, removed_draws: &HashSet<usize>, stats: &mut RasterLayoutStats) {
+        stats.record_resource_usage(
+            self.target,
+            self.scanner.resource_usage_after_removing(removed_draws),
+        );
+    }
+
+    fn record_planned(self, edits: PlannedRasterResourceEdits, stats: &mut RasterLayoutStats) {
+        let mut usage = self
+            .scanner
+            .resource_usage_after_removing(&edits.removed_draws);
+        // The planned path retains its explicit XObject entry even when there
+        // were no surviving names; the no-plan path does not invent one.
+        usage
+            .by_type
+            .entry(b"XObject".to_vec())
+            .or_default()
+            .extend(edits.added_xobjects);
+        stats.record_resource_usage(self.target, usage);
+    }
+}
+
+/// Only an admitted plan can add resource names. Keeping this separate from
+/// no-plan inventory makes it impossible to commit a candidate's resource
+/// names to the no-plan path by accident.
+struct PlannedRasterResourceEdits {
+    removed_draws: HashSet<usize>,
+    added_xobjects: BTreeSet<Vec<u8>>,
+}
+
+impl PlannedRasterResourceEdits {
+    const fn new(removed_draws: HashSet<usize>) -> Self {
+        Self {
+            removed_draws,
+            added_xobjects: BTreeSet::new(),
+        }
+    }
+
+    fn include_accepted(&mut self, applied: &mut ApplyPlansResult) {
+        self.removed_draws.extend(applied.consumed_draws.drain());
+        self.added_xobjects
+            .append(&mut applied.added_resource_names);
+    }
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -6588,6 +6642,99 @@ impl RasterTargetPlanStage<'_> {
     }
 }
 
+// When reconstruction finds no plan, visibility pruning and shared physical
+// hidden-text pruning still form one atomic content rewrite. Their ranges
+// refer to the same scanner snapshot and must be removed together.
+struct RasterNoPlanTarget<'a> {
+    target: ContentTarget,
+    scanner: &'a RasterScanner,
+    resources: OwnedDictionary,
+    content: Vec<u8>,
+    pruned_draws: HashSet<usize>,
+    shared_hidden_ranges: Option<Vec<(usize, usize)>>,
+}
+
+impl RasterNoPlanTarget<'_> {
+    fn finish(
+        self,
+        document: &mut EditDocument,
+        page_state: &mut RasterPageState<'_>,
+        stats: &mut RasterLayoutStats,
+    ) -> Result<()> {
+        let Self {
+            target,
+            scanner,
+            resources,
+            content,
+            pruned_draws,
+            shared_hidden_ranges,
+        } = self;
+        let mut removal_ranges = pruned_draws
+            .iter()
+            .map(|&index| {
+                let draw = &scanner.draws[index];
+                (draw.range_start, draw.range_end)
+            })
+            .collect::<Vec<_>>();
+        // The inventory counts all operators observed in the original scan,
+        // but subtracts only consumed image draws. Hidden-text removals keep
+        // conservative resource usage (including referenced fonts) exactly as
+        // in the original scanner-backed inventory.
+        RasterResourceInventory { target, scanner }.record_pruned(&pruned_draws, stats);
+        if let Some(hidden_ranges) = shared_hidden_ranges {
+            stats.shared_hidden_text_paints_pruned = stats
+                .shared_hidden_text_paints_pruned
+                .saturating_add(hidden_ranges.len());
+            removal_ranges.extend(hidden_ranges);
+            if let ContentTarget::Page(page) = target {
+                stats.page_hidden_text_shared_complete.insert(page);
+            }
+        }
+        if !removal_ranges.is_empty() {
+            page_state.invalidate_vector(target);
+            stats.invalidate_page_vector_scan(target);
+            let rewritten = remove_content_ranges(&content, removal_ranges)?;
+            install_target(document, target, resources, rewritten)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reconcile the final inventories only after speculative inline `XObject`s
+/// have either been consumed by reconstruction or restored to original bytes.
+fn reconcile_fragmented_inline_inventory(
+    document: &mut EditDocument,
+    inline_staging: &[FragmentedInlineStaging],
+    page_state: &mut RasterPageState<'_>,
+    stats: &mut RasterLayoutStats,
+) -> Result<()> {
+    let started = Instant::now();
+    let cleanup = cleanup_fragmented_inline_staging(document, inline_staging)?;
+    stats.staging_xobject_entries_removed = cleanup.xobject_entries_removed;
+    stats.inline_occurrences_remaining = stats
+        .inline_occurrences_remaining
+        .saturating_add(cleanup.occurrences_restored);
+    if !cleanup.restored_targets.is_empty() {
+        // The inventory observed staged Do references. Restored BI images can
+        // refer to resource aliases in their own dictionaries, so the typed
+        // inventory no longer describes the final content.
+        stats.resource_inventory_complete = false;
+    }
+    for target in cleanup.restored_targets {
+        if let InlineContentTarget::Page(page) = target {
+            page_state.invalidate_page_vector(page);
+            stats.page_vector_inventory_complete = false;
+            // Physical hidden-text coverage models Do paint operators but
+            // not inline image bodies. Restored pages require a fresh scan.
+            stats.page_physical_hidden_text_candidate = true;
+            stats.page_hidden_text_candidates.insert(page);
+            stats.page_hidden_text_shared_complete.remove(&page);
+        }
+    }
+    stats.staging_cleanup_us = elapsed_micros_u64(started);
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the raster normalization pipeline intentionally coordinates scan ordering, caches, rewrite plans, and statistics in one pass"
@@ -6672,7 +6819,7 @@ pub fn normalize_raster_layout(
             resources,
             mut content,
             mut scanner,
-            hidden_ranges: mut shared_hidden_ranges,
+            hidden_ranges: shared_hidden_ranges,
         }) = scan_stage.load(document, &mut page_state, &mut stats, &mut inline_staging)?
         else {
             continue;
@@ -6695,13 +6842,6 @@ pub fn normalize_raster_layout(
             },
         )?;
 
-        if prepared.plans.is_empty() {
-            stats.record_resource_usage(
-                target,
-                scanner.resource_usage_after_removing(&prepared.pruned_draws),
-            );
-        }
-
         if !prepared.plans.is_empty()
             && scanner.text_paints > 0
             && let ContentTarget::Page(page) = target
@@ -6711,8 +6851,7 @@ pub fn normalize_raster_layout(
             // A completed shared hidden-text scan with no prunable ranges is
             // already a complete proof for this page. Raster reconstruction
             // may change operator bytes, but with no pending prune rewrite it
-            // does not invalidate an empty removal set, so do not rescan the
-            // entire page later just because raster plans were applied.
+            // does not invalidate an empty removal set.
             if prepared.pending_pruned_content.is_none()
                 && shared_hidden_ranges.as_ref().is_some_and(Vec::is_empty)
             {
@@ -6721,29 +6860,15 @@ pub fn normalize_raster_layout(
         }
 
         if prepared.plans.is_empty() {
-            let mut removal_ranges = prepared
-                .pruned_draws
-                .iter()
-                .map(|&index| {
-                    let draw = &scanner.draws[index];
-                    (draw.range_start, draw.range_end)
-                })
-                .collect::<Vec<_>>();
-            if let Some(hidden_ranges) = shared_hidden_ranges.take() {
-                stats.shared_hidden_text_paints_pruned = stats
-                    .shared_hidden_text_paints_pruned
-                    .saturating_add(hidden_ranges.len());
-                removal_ranges.extend(hidden_ranges);
-                if let ContentTarget::Page(page) = target {
-                    stats.page_hidden_text_shared_complete.insert(page);
-                }
+            RasterNoPlanTarget {
+                target,
+                scanner: &scanner,
+                resources,
+                content,
+                pruned_draws: prepared.pruned_draws,
+                shared_hidden_ranges,
             }
-            if !removal_ranges.is_empty() {
-                page_state.invalidate_vector(target);
-                stats.invalidate_page_vector_scan(target);
-                let rewritten = remove_content_ranges(&content, removal_ranges)?;
-                install_target(document, target, resources, rewritten)?;
-            }
+            .finish(document, &mut page_state, &mut stats)?;
             continue;
         }
 
@@ -6818,8 +6943,7 @@ pub fn normalize_raster_layout(
             stats.invalidate_page_vector_scan(target);
         }
 
-        let mut consumed = pruned_draws;
-        let mut added_resource_names = BTreeSet::new();
+        let mut resource_edits = PlannedRasterResourceEdits::new(pruned_draws);
         let mut applied = result.applied;
         match result.commit {
             RasterTargetCommit::Accepted { removed_xobjects } => {
@@ -6828,8 +6952,7 @@ pub fn normalize_raster_layout(
                 stats.rewritten_xobject_entries_removed = stats
                     .rewritten_xobject_entries_removed
                     .saturating_add(removed_xobjects);
-                consumed.extend(applied.consumed_draws);
-                added_resource_names = applied.added_resource_names;
+                resource_edits.include_accepted(&mut applied);
             }
             RasterTargetCommit::InlineBudgetRejected => {
                 stats.inline_reconstruction_payload_rejections = stats
@@ -6837,40 +6960,13 @@ pub fn normalize_raster_layout(
                     .saturating_add(1);
             }
         }
-        let mut usage = scanner.resource_usage_after_removing(&consumed);
-        usage
-            .by_type
-            .entry(b"XObject".to_vec())
-            .or_default()
-            .extend(added_resource_names);
-        stats.record_resource_usage(target, usage);
-    }
-    let staging_cleanup_started = Instant::now();
-    let staging_cleanup = cleanup_fragmented_inline_staging(document, &inline_staging)?;
-    stats.staging_xobject_entries_removed = staging_cleanup.xobject_entries_removed;
-    stats.inline_occurrences_remaining = stats
-        .inline_occurrences_remaining
-        .saturating_add(staging_cleanup.occurrences_restored);
-    if !staging_cleanup.restored_targets.is_empty() {
-        // The shared resource scan observes temporary `Do` operands, while an
-        // original inline image can carry named resource aliases in its own
-        // dictionary. Restoring `BI ... EI` therefore invalidates the typed
-        // page/Form resource inventory even though the rendered image is the same.
-        stats.resource_inventory_complete = false;
-    }
-    for target in staging_cleanup.restored_targets {
-        if let InlineContentTarget::Page(page) = target {
-            page_state.invalidate_page_vector(page);
-            stats.page_vector_inventory_complete = false;
-            // The physical hidden-text scanner models Image XObject `Do` coverage
-            // but intentionally ignores inline `BI` bodies. Force the final page
-            // through the canonical scanner after restoring its original bytes.
-            stats.page_physical_hidden_text_candidate = true;
-            stats.page_hidden_text_candidates.insert(page);
-            stats.page_hidden_text_shared_complete.remove(&page);
+        RasterResourceInventory {
+            target,
+            scanner: &scanner,
         }
+        .record_planned(resource_edits, &mut stats);
     }
-    stats.staging_cleanup_us = elapsed_micros_u64(staging_cleanup_started);
+    reconcile_fragmented_inline_inventory(document, &inline_staging, &mut page_state, &mut stats)?;
     if *DEBUG_RASTER {
         eprintln!(
             "raster image decode cache: hits={} misses={} entries={} decoded_bytes={} clears={}",
@@ -7795,6 +7891,149 @@ mod tests {
         // The rebuilt scan's snapshot is now authoritative; no pre-prune
         // member index may be carried into the new admission.
         assert_eq!(stats.page_rect_fill_paints_seen, 0);
+        Ok(())
+    }
+
+    fn no_plan_inventory_fixture() -> Result<(
+        EditDocument,
+        ContentTarget,
+        OwnedDictionary,
+        Vec<u8>,
+        RasterScanner,
+    )> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Im1 5 0 R /Im2 6 0 R >> /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q /Im1 Do Q BT /F1 12 Tf (x) Tj ET q /Im2 Do Q")?;
+        for (id, gray) in [(5, 11), (6, 22)] {
+            pdf.stream(
+                id,
+                b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+                &[gray],
+            )?;
+        }
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let target = ContentTarget::Page(ObjectHandle::Existing(ObjectId::new(3, 0)));
+        let content = target_content(&document, target)?;
+        let resources = target_resources(&document, target)?
+            .ok_or_else(|| Error::Invalid("fixture missing page resources".to_owned()))?;
+        let scanner = scan_target(&document, &resources, &content)?
+            .ok_or_else(|| Error::Invalid("fixture scanner incomplete".to_owned()))?;
+        assert_eq!(scanner.draws.len(), 2);
+        Ok((document, target, resources, content, scanner))
+    }
+
+    #[test]
+    fn no_plan_prune_combines_raster_and_hidden_text_ranges_and_inventory() -> Result<()> {
+        let (mut document, target, resources, content, scanner) = no_plan_inventory_fixture()?;
+        let start = content
+            .windows(3)
+            .position(|bytes| bytes == b"BT ")
+            .ok_or_else(|| Error::Invalid("fixture missing BT".to_owned()))?;
+        let end = content
+            .windows(2)
+            .position(|bytes| bytes == b"ET")
+            .ok_or_else(|| Error::Invalid("fixture missing ET".to_owned()))?
+            + 2;
+        let mut stats = RasterLayoutStats {
+            page_vector_inventory_complete: true,
+            resource_inventory_complete: true,
+            ..RasterLayoutStats::default()
+        };
+        let mut page_state = RasterPageState::new(None);
+        RasterNoPlanTarget {
+            target,
+            scanner: &scanner,
+            resources,
+            content,
+            pruned_draws: HashSet::from([0]),
+            shared_hidden_ranges: Some(vec![(start, end)]),
+        }
+        .finish(&mut document, &mut page_state, &mut stats)?;
+
+        let page = match target {
+            ContentTarget::Page(page) => page,
+            ContentTarget::Form(_) => unreachable!(),
+        };
+        let rewritten = page_content(&document, page)?;
+        assert!(!rewritten.windows(b"/Im1 Do".len()).any(|w| w == b"/Im1 Do"));
+        assert!(!rewritten.windows(2).any(|w| w == b"BT"));
+        assert!(rewritten.windows(b"/Im2 Do".len()).any(|w| w == b"/Im2 Do"));
+        assert_eq!(stats.shared_hidden_text_paints_pruned, 1);
+        assert!(stats.page_hidden_text_shared_complete.contains(&page));
+        assert!(!stats.page_vector_inventory_complete);
+        assert!(stats.resource_inventory_complete);
+        let inventory = stats
+            .page_resource_names_by_type
+            .get(&page)
+            .ok_or_else(|| Error::Invalid("missing no-plan inventory".to_owned()))?;
+        assert_eq!(
+            inventory.get(b"XObject".as_slice()),
+            Some(&BTreeSet::from([b"Im2".to_vec()]))
+        );
+        // The original scanner's hidden-text font entry remains a
+        // conservative usage claim even though its paint range was removed.
+        assert_eq!(
+            inventory.get(b"Font".as_slice()),
+            Some(&BTreeSet::from([b"F1".to_vec()]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_inventory_records_only_survivors_and_new_xobjects() -> Result<()> {
+        let (_, target, _, _, scanner) = no_plan_inventory_fixture()?;
+        let page = match target {
+            ContentTarget::Page(page) => page,
+            ContentTarget::Form(_) => unreachable!(),
+        };
+
+        // A rejected candidate has no installed new XObjects and only the
+        // original visibility-pruned draw is removed from the inventory.
+        let mut rejected_stats = RasterLayoutStats::default();
+        RasterResourceInventory {
+            target,
+            scanner: &scanner,
+        }
+        .record_planned(
+            PlannedRasterResourceEdits::new(HashSet::from([0])),
+            &mut rejected_stats,
+        );
+        assert_eq!(
+            rejected_stats.page_resource_names_by_type[&page][b"XObject".as_slice()],
+            BTreeSet::from([b"Im2".to_vec()])
+        );
+
+        let mut accepted_stats = RasterLayoutStats::default();
+        let mut edits = PlannedRasterResourceEdits::new(HashSet::from([0]));
+        let mut applied = ApplyPlansResult {
+            consumed_draws: HashSet::from([1]),
+            added_resource_names: BTreeSet::from([b"RL1".to_vec()]),
+            ..ApplyPlansResult::default()
+        };
+        edits.include_accepted(&mut applied);
+        assert!(applied.consumed_draws.is_empty());
+        assert!(applied.added_resource_names.is_empty());
+        RasterResourceInventory {
+            target,
+            scanner: &scanner,
+        }
+        .record_planned(edits, &mut accepted_stats);
+        let inventory = &accepted_stats.page_resource_names_by_type[&page];
+        assert_eq!(
+            inventory[b"XObject".as_slice()],
+            BTreeSet::from([b"RL1".to_vec()])
+        );
+        assert_eq!(
+            inventory[b"Font".as_slice()],
+            BTreeSet::from([b"F1".to_vec()])
+        );
         Ok(())
     }
 
