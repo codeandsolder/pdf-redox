@@ -10,6 +10,7 @@ use crate::{
     content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
     flate::FlateReuseCache,
 };
+use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::{
@@ -2881,6 +2882,52 @@ impl PathCoordinateScanner {
 
     fn rounded_coordinate_bytes(value: f64) -> Option<Vec<u8>> {
         let rounded = Self::rounded_coordinate(value)?;
+        if rounded == 0.0 {
+            return Some(vec![b'0']);
+        }
+
+        // A cent-valued f64 is unambiguous when its representable spacing
+        // is smaller than half a cent and converting the integer cent count
+        // back to f64 reconstructs the exact rounded value. Outside that
+        // domain, retain Rust's full-precision fixed-decimal formatter.
+        let scaled = rounded * PATH_COORDINATE_SCALE;
+        let cents = scaled.round();
+        let half_cent = 0.5 / PATH_COORDINATE_SCALE;
+        if (f64::EPSILON * rounded.abs()) < half_cent
+            && cents.abs() < 9_007_199_254_740_992.0
+            && (cents / PATH_COORDINATE_SCALE).to_bits() == rounded.to_bits()
+            && let Some(cents) = cents.to_i64()
+        {
+            let mut bytes = [0_u8; 32];
+            let mut cursor = bytes.len();
+            let unsigned = cents.unsigned_abs();
+            let fraction = unsigned % 100;
+            if fraction > 0 {
+                if !fraction.is_multiple_of(10) {
+                    cursor -= 1;
+                    bytes[cursor] = b'0' + (fraction % 10) as u8;
+                }
+                cursor -= 1;
+                bytes[cursor] = b'0' + (fraction / 10) as u8;
+                cursor -= 1;
+                bytes[cursor] = b'.';
+            }
+            let mut whole = unsigned / 100;
+            loop {
+                cursor -= 1;
+                bytes[cursor] = b'0' + (whole % 10) as u8;
+                whole /= 10;
+                if whole == 0 {
+                    break;
+                }
+            }
+            if cents < 0 {
+                cursor -= 1;
+                bytes[cursor] = b'-';
+            }
+            return Some(bytes[cursor..].to_vec());
+        }
+
         let mut out = format!("{rounded:.2}");
         while out.contains('.') && out.ends_with('0') {
             out.pop();
@@ -4167,6 +4214,100 @@ mod tests {
         assert_eq!(after_stats.fill_paints_eliminated, 1);
         assert!(String::from_utf8_lossy(&after).contains("0 0 20 10 re f"));
         Ok(())
+    }
+
+    #[test]
+    fn decimal_coordinate_encoder_matches_original_float_formatter() {
+        // This is deliberately independent of the integer-cent encoder.
+        // It also checks values outside its exact representability domain.
+        let reference = |value| {
+            let rounded = PathCoordinateScanner::rounded_coordinate(value)?;
+            let mut text = format!("{rounded:.2}");
+            while text.contains('.') && text.ends_with('0') {
+                text.pop();
+            }
+            if text.ends_with('.') {
+                text.pop();
+            }
+            if text == "-0" {
+                text = "0".to_owned();
+            }
+            Some(text.into_bytes())
+        };
+        let edges = [
+            0.0,
+            -0.0,
+            f64::EPSILON,
+            -f64::EPSILON,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::MIN,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            0.005,
+            -0.005,
+            0.015,
+            -0.015,
+            0.105,
+            -0.105,
+            0.995,
+            -0.995,
+            1.005,
+            -1.005,
+            10.235,
+            -10.235,
+            999.995,
+            -999.995,
+            1.0e6,
+            -1.0e6,
+            1.0e12,
+            -1.0e12,
+            1.0e16,
+            -1.0e16,
+        ];
+        for value in edges {
+            assert_eq!(
+                PathCoordinateScanner::rounded_coordinate_bytes(value),
+                reference(value),
+                "edge {value:?}"
+            );
+        }
+
+        // Neighboring floats around decimal ties and cent boundaries.
+        for cents in -1000_i64..=1000 {
+            for offset in [-0.005, 0.0, 0.005] {
+                let value = cents.to_f64().unwrap_or_default() / PATH_COORDINATE_SCALE + offset;
+                for bits in [
+                    value.to_bits().wrapping_sub(1),
+                    value.to_bits(),
+                    value.to_bits().wrapping_add(1),
+                ] {
+                    let sample = f64::from_bits(bits);
+                    assert_eq!(
+                        PathCoordinateScanner::rounded_coordinate_bytes(sample),
+                        reference(sample),
+                        "boundary {sample:?}"
+                    );
+                }
+            }
+        }
+        // Deterministic full-range f64-bit sampling includes subnormals,
+        // large exponents, negatives, and values near the fast-path boundary.
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        for _ in 0..180_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let sample = f64::from_bits(state);
+            assert_eq!(
+                PathCoordinateScanner::rounded_coordinate_bytes(sample),
+                reference(sample),
+                "f64 bits 0x{state:016x}"
+            );
+        }
     }
 
     #[test]
