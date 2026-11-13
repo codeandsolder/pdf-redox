@@ -1014,9 +1014,18 @@ impl RasterScanner {
             self.barrier();
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        let operator = &instruction.operator[..];
+        // A vector-only page has no image paint candidates, so its raster
+        // scanner tracks resource names, paint proof and q/Q balance without
+        // interpreting geometric operands. Keep the ordinary image-aware
+        // scanner's exact operand path unchanged.
+        let needs_operands =
+            !self.analysis_only_no_images || Self::resource_type_for_operator(operator).is_some();
+        if needs_operands {
+            self.operands = instruction_operands(input, instruction);
+        }
         let span = instruction.operator_span();
-        self.operator(&instruction.operator[..], span.start, span.len());
+        self.operator(operator, span.start, span.len());
         self.operands.clear();
     }
 
@@ -8017,6 +8026,76 @@ mod tests {
             .ok_or_else(|| Error::Invalid("fixture scanner incomplete".to_owned()))?;
         assert_eq!(scanner.draws.len(), 2);
         Ok((document, target, resources, content, scanner))
+    }
+
+    #[test]
+    fn raster_operand_fast_path_preserves_full_scan_semantics() -> Result<()> {
+        // Compare the optimized dispatcher with an independent reference
+        // that parses every operand, including operands whose value is
+        // irrelevant to raster scanning. Exercise both image-aware and
+        // resource-only scan modes.
+        let pdf_content = br"q /CS0 cs /G0 gs /F0 9 Tf /P0 scn /P1 SCN /M0 BDC /M1 DP /S0 sh
+            1 0 0 1 3 4 cm 0 0 6 7 re f
+            0 0 m 6 0 l 6 7 l 0 7 l h f
+            1 2 3 4 5 6 c 0 0 0 rg 5 w [1 3] 0 d
+            BT /F0 12 Tf (some text) Tj [(abc) 100 (def)] TJ ET
+            /Im Do Q";
+        let image = ObjectHandle::Existing(ObjectId::new(70, 0));
+        for analysis_only_no_images in [false, true] {
+            let resources = BTreeMap::from([(b"Im".to_vec(), image)]);
+            let image_names = if analysis_only_no_images {
+                HashSet::new()
+            } else {
+                HashSet::from([b"Im".to_vec()])
+            };
+            let mut fast = RasterScanner::new(resources.clone(), image_names.clone());
+            let mut reference = RasterScanner::new(resources, image_names);
+            fast.analysis_only_no_images = analysis_only_no_images;
+            reference.analysis_only_no_images = analysis_only_no_images;
+            let fast_incomplete = fast.scan(pdf_content)?;
+            let reference_incomplete =
+                crate::content_stream::visit_instructions(pdf_content, |instruction| {
+                    if &instruction.operator[..] == b"BI" {
+                        reference.inline_occurrences =
+                            reference.inline_occurrences.saturating_add(1);
+                        reference.mark_other_paint();
+                        reference.barrier();
+                    } else {
+                        reference.operands = instruction_operands(pdf_content, instruction);
+                        let span = instruction.operator_span();
+                        reference.operator(&instruction.operator[..], span.start, span.len());
+                        reference.operands.clear();
+                    }
+                    Ok(())
+                })?;
+            reference.finish_scan();
+            assert_eq!(fast_incomplete, reference_incomplete);
+            assert_eq!(fast.complete, reference.complete);
+            assert_eq!(fast.inline_occurrences, reference.inline_occurrences);
+            assert_eq!(fast.text_paints, reference.text_paints);
+            assert_eq!(fast.text_with_ext_gstate, reference.text_with_ext_gstate);
+            assert_eq!(
+                fast.vector_merge_candidate,
+                reference.vector_merge_candidate
+            );
+            assert_eq!(
+                fast.resource_counts_by_type,
+                reference.resource_counts_by_type
+            );
+            assert_eq!(
+                format!("{:?}", fast.draws),
+                format!("{:?}", reference.draws)
+            );
+            assert_eq!(
+                format!("{:?}", fast.rect_fills),
+                format!("{:?}", reference.rect_fills)
+            );
+            assert_eq!(
+                format!("{:?}", fast.coverage_paints),
+                format!("{:?}", reference.coverage_paints)
+            );
+        }
+        Ok(())
     }
 
     #[test]
