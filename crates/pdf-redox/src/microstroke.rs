@@ -16,7 +16,9 @@ const MIN_PITCH: f64 = 0.04;
 const MAX_PITCH: f64 = 0.25;
 const MAX_RASTER_DIMENSION: usize = 16_384;
 const MAX_RASTER_PIXELS: usize = 100_000_000;
-const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 450.0;
+// Preserve individual marks, not the source renderer's subpixel antialiasing.
+// 300 DPI is the practical upper sampling requirement for pathological marks.
+const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 300.0;
 const MIN_STROKE_RASTER_PIXELS: f64 = 1.5;
 
 /// Internal-facing statistics from the pathological-microstroke rasterization pass.
@@ -1261,17 +1263,45 @@ mod tests {
             ..StrokeState::default()
         };
         let pitch = raster_sample_pitch(scaled, 0.1, 1.0).unwrap_or(f64::NAN);
-        assert!((pitch - 0.04).abs() < 1.0e-12);
+        assert!((pitch - 0.06).abs() < 1.0e-12);
 
         let rotated_scaled = StrokeState {
             ctm: Matrix::new(0.0, 2.0, -2.0, 0.0, 0.0, 0.0),
             ..StrokeState::default()
         };
         let pitch = raster_sample_pitch(rotated_scaled, 0.1, 1.0).unwrap_or(f64::NAN);
-        assert!((pitch - 0.08).abs() < 1.0e-12);
+        assert!((pitch - 0.1).abs() < 1.0e-12);
 
         let pitch = raster_sample_pitch(identity, 0.1, 2.0).unwrap_or(f64::NAN);
-        assert!((pitch - 0.08).abs() < 1.0e-12);
+        assert!((pitch - 0.1).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn print_scale_microstroke_grid_preserves_every_mark() -> Result<()> {
+        let state = StrokeState {
+            width: 0.45,
+            cap: 1,
+            ..StrokeState::default()
+        };
+        let pitch = coarser_microstroke_sample_pitch(state, 0.08, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing print-scale pitch".to_owned()))?;
+        assert!((pitch - 72.0 / 300.0).abs() < 1.0e-12);
+        let run = MicroStrokeRun {
+            start: 0,
+            end: 0,
+            state,
+            lines: (0..600_u32)
+                .map(|index| {
+                    let x = f64::from(index % 30) * 0.46;
+                    let y = f64::from(index / 30) * 0.46;
+                    ((x, y), (x + 0.08, y))
+                })
+                .collect(),
+        };
+        let raster = rasterize_run_at_pitch(&run, 0.08, pitch, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("a print-scale mark lost coverage".to_owned()))?;
+        assert!(raster.mask.packed().iter().any(|&byte| byte != 0xff));
+        Ok(())
     }
 
     #[test]
@@ -1325,7 +1355,7 @@ mod tests {
             },
             // A 0.04 pt butt-capped mark at this phase lands on natural
             // raster centres, but has no pixel centres inside its axial
-            // projection on the 450-DPI quality grid.
+            // projection on the width-constrained fine sampling grid.
             lines: vec![((0.0, 0.0), (0.04, 0.0)); MIN_MICROSTROKE_RUN],
         };
         let natural = rasterize_run(&run, 0.08, 1.0)
