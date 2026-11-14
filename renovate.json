@@ -1,6 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>codeandsolder/ci-workflows:renovate-fleet"
+    "config:recommended",
+    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+  ],
+  "ignorePaths": [
+    "third_party/hayro-syntax/**"
   ]
 }
