@@ -569,6 +569,9 @@ impl OptimizationRunStats {
                 .estimated_flate_bytes_saved,
             polyline_simplification_pages_rewritten: self.polyline_simplification.pages_rewritten,
             polyline_simplification_vertices_removed: self.polyline_simplification.vertices_removed,
+            polyline_simplification_cubics_simplified: self
+                .polyline_simplification
+                .cubics_simplified,
             polyline_simplification_decoded_bytes_removed: self
                 .polyline_simplification
                 .decoded_bytes_removed,

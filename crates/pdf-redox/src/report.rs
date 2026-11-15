@@ -679,6 +679,9 @@ pub struct OptimizationReport {
     /// Number of line vertices removed within the bounded page-space deviation.
     #[serde(default)]
     pub polyline_simplification_vertices_removed: usize,
+    /// Number of filled-path cubics replaced with line segments within the page-space envelope.
+    #[serde(default)]
+    pub polyline_simplification_cubics_simplified: usize,
     /// Decoded page-content bytes removed by bounded polyline simplification.
     #[serde(default)]
     pub polyline_simplification_decoded_bytes_removed: usize,
