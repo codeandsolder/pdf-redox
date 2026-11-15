@@ -17,6 +17,7 @@ struct ShapeOp {
 struct Shape {
     start: usize,
     end: usize,
+    page_index: usize,
     prefix: Vec<u8>,
     paint: Vec<u8>,
     ops: Vec<ShapeOp>,
@@ -180,6 +181,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, outer: [f64; 6]) -> Opti
         Shape {
             start: q.start,
             end: restore.end,
+            page_index: 0,
             prefix: input.get(q.start..cm.end)?.to_vec(),
             paint: paint.operator.clone(),
             ops,
@@ -369,12 +371,26 @@ fn replacement(font: &[u8], code: usize, shape: &Shape) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub(super) fn factor(
-    doc: &mut EditDocument,
+const MIN_OCR_USEFUL_OCCURRENCES: usize = 64;
+
+struct PageContents {
+    page: ObjectHandle,
+    decoded: Vec<u8>,
+}
+
+struct CurvedPlan {
+    plans: Vec<GlyphFontPlan>,
+    font_pages: Vec<BTreeSet<usize>>,
+    edits: Vec<Vec<(usize, usize, Vec<u8>)>>,
+    replacements: usize,
+}
+
+fn collect_sources(
+    doc: &EditDocument,
     pages: &[ObjectHandle],
-    flate_level: crate::FlateLevel,
-) -> Result<OutlinedGlyphFactorStats> {
-    let mut stats = OutlinedGlyphFactorStats::default();
+) -> Result<(Vec<PageContents>, Vec<Shape>)> {
+    let mut sources = Vec::<PageContents>::new();
+    let mut shapes = Vec::<Shape>::new();
     for &page in pages {
         let Some(obj) = doc.current_owned_object(page)? else {
             continue;
@@ -387,91 +403,182 @@ pub(super) fn factor(
         };
         let mut decoded = Vec::new();
         decoded_content_value(doc, contents, &mut decoded)?;
-        if decoded.len() < MIN_PAGE_CONTENT_BYTES {
-            continue;
-        }
-        let Some(shapes) = collect(&decoded) else {
+        let Some(found) = collect(&decoded) else {
             continue;
         };
-        let mut groups = group(&shapes);
-        if groups.is_empty() {
+        if found.is_empty() {
             continue;
         }
-        groups.sort_unstable_by_key(|g| {
-            std::cmp::Reverse(
-                g.members
-                    .iter()
-                    .map(|&i| shapes[i].end - shapes[i].start)
-                    .sum::<usize>(),
-            )
-        });
-        let resources = effective_page_resources(doc, page)?;
-        let mut occupied = resolved_dictionary(doc, resources.get(b"Font".as_slice()))?
-            .map_or_default(|fonts| fonts.keys().cloned().collect::<BTreeSet<_>>());
-        let mut plans = Vec::<GlyphFontPlan>::new();
-        let mut edits = Vec::new();
-        let mut count = 0;
-        for (font_index, chunk) in groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT).enumerate() {
-            let name = outlined_glyph_font_name(font_index, &mut occupied);
-            let mut entries = Vec::new();
-            for g in chunk {
-                let code = entries.len() + 1;
-                let mut replacements = Vec::new();
-                for &i in &g.members {
-                    let Some(bytes) = replacement(&name, code, &shapes[i]) else {
-                        replacements.clear();
-                        break;
-                    };
-                    replacements.push((shapes[i].start, shapes[i].end, bytes));
-                }
-                if replacements.is_empty() {
-                    continue;
-                }
-                count += replacements.len();
-                edits.extend(replacements);
-                entries.push(GlyphShapePlan {
-                    canonical: GlyphComponent {
-                        start: 0,
-                        end: 0,
-                        origin_x: 0,
-                        origin_y: 0,
-                        width: 100,
-                        height: 100,
-                        source_paints: 1,
-                        signature: Vec::new(),
-                    },
-                    occurrences: Vec::new(),
-                    charproc: g.charproc(&shapes),
-                });
-            }
-            if !entries.is_empty() {
-                plans.push(GlyphFontPlan {
-                    name,
-                    shapes: entries,
-                });
-            }
+        let page_index = sources.len();
+        for mut shape in found {
+            shape.page_index = page_index;
+            shapes.push(shape);
         }
-        let Some(rewritten) = crate::content_stream::apply_replacements(&decoded, &edits) else {
-            continue;
-        };
-        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after = outlined_glyph_estimated_after_flate(&rewritten, &plans, flate_level)?;
-        if before <= after || before - after < MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS {
-            continue;
-        }
-        for plan in &plans {
-            let font = outlined_glyph_font_dictionary(doc, plan);
-            install_page_resource(doc, page, b"Font", plan.name.clone(), font)?;
-        }
-        replace_page_content(doc, page, rewritten.clone())?;
-        stats.pages_rewritten += 1;
-        stats.fonts_created += plans.len();
-        stats.glyphs_created += plans.iter().map(|p| p.shapes.len()).sum::<usize>();
-        stats.occurrences_replaced += count;
-        stats.source_paints_replaced += count;
-        stats.decoded_bytes_removed += decoded.len().saturating_sub(rewritten.len());
-        stats.estimated_flate_bytes_saved += before - after;
+        sources.push(PageContents { page, decoded });
     }
+    Ok((sources, shapes))
+}
+
+fn prepare_plans(
+    doc: &EditDocument,
+    sources: &[PageContents],
+    shapes: &[Shape],
+    groups: &[Group],
+) -> Result<CurvedPlan> {
+    // Avoid colliding with any existing page-local font resource, including
+    // Type3 fonts installed by the earlier, exact polyline factorer.
+    let mut occupied = BTreeSet::new();
+    for source in sources {
+        let resources = effective_page_resources(doc, source.page)?;
+        if let Some(fonts) = resolved_dictionary(doc, resources.get(b"Font".as_slice()))? {
+            occupied.extend(fonts.keys().cloned());
+        }
+    }
+
+    let mut edits = vec![Vec::<(usize, usize, Vec<u8>)>::new(); sources.len()];
+    let mut plans = Vec::<GlyphFontPlan>::new();
+    let mut font_pages = Vec::<BTreeSet<usize>>::new();
+    let mut replacements = 0_usize;
+    for (font_index, chunk) in groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT).enumerate() {
+        let name = outlined_glyph_font_name(font_index, &mut occupied);
+        let mut entries = Vec::new();
+        let mut users = BTreeSet::new();
+        for candidate in chunk {
+            let code = entries.len() + 1;
+            let mut planned = Vec::new();
+            for &i in &candidate.members {
+                let appearance = &shapes[i];
+                let Some(data) = replacement(&name, code, appearance) else {
+                    planned.clear();
+                    break;
+                };
+                planned.push((
+                    appearance.page_index,
+                    appearance.start,
+                    appearance.end,
+                    data,
+                ));
+            }
+            if planned.is_empty() {
+                continue;
+            }
+            for (page_index, start, end, data) in planned {
+                edits[page_index].push((start, end, data));
+                users.insert(page_index);
+                replacements += 1;
+            }
+            entries.push(GlyphShapePlan {
+                canonical: GlyphComponent {
+                    start: 0,
+                    end: 0,
+                    origin_x: 0,
+                    origin_y: 0,
+                    width: 100,
+                    height: 100,
+                    source_paints: 1,
+                    signature: Vec::new(),
+                },
+                occurrences: Vec::new(),
+                charproc: candidate.charproc(shapes),
+            });
+        }
+        if !entries.is_empty() {
+            plans.push(GlyphFontPlan {
+                name,
+                shapes: entries,
+            });
+            font_pages.push(users);
+        }
+    }
+    Ok(CurvedPlan {
+        plans,
+        font_pages,
+        edits,
+        replacements,
+    })
+}
+
+/// Share filled glyphs across the whole document. OCR can label each
+/// canonical once even when appearances span different pages.
+pub(super) fn factor(
+    doc: &mut EditDocument,
+    pages: &[ObjectHandle],
+    flate_level: crate::FlateLevel,
+) -> Result<OutlinedGlyphFactorStats> {
+    let (sources, shapes) = collect_sources(doc, pages)?;
+    let mut stats = OutlinedGlyphFactorStats::default();
+    if shapes.is_empty() {
+        return Ok(stats);
+    }
+    let mut groups = group(&shapes);
+    groups.sort_unstable_by_key(|g| {
+        std::cmp::Reverse(
+            g.members
+                .iter()
+                .map(|&i| shapes[i].end - shapes[i].start)
+                .sum::<usize>(),
+        )
+    });
+    if groups.is_empty() {
+        return Ok(stats);
+    }
+
+    let CurvedPlan {
+        plans,
+        font_pages,
+        edits,
+        replacements,
+    } = prepare_plans(doc, &sources, &shapes, &groups)?;
+    if replacements == 0 {
+        return Ok(stats);
+    }
+    // Compare realistic per-page compressed streams, counting shared font
+    // objects once, rather than pretending all page content is one stream.
+    let mut rewritten = Vec::new();
+    let (mut before, mut after) = (0_usize, 0_usize);
+    let mut affected_pages = 0_usize;
+    for (source, page_edits) in sources.iter().zip(&edits) {
+        if page_edits.is_empty() {
+            rewritten.push(None);
+            continue;
+        }
+        let Some(content) = crate::content_stream::apply_replacements(&source.decoded, page_edits)
+        else {
+            return Ok(stats);
+        };
+        before += crate::stream_codec::flate_encoded_len(&source.decoded, flate_level)?;
+        after += crate::stream_codec::flate_encoded_len(&content, flate_level)?;
+        rewritten.push(Some(content));
+        affected_pages += 1;
+    }
+    let fonts_overhead = outlined_glyph_estimated_after_flate(b"", &plans, flate_level)?
+        .saturating_sub(crate::stream_codec::flate_encoded_len(b"", flate_level)?);
+    after = after.saturating_add(fonts_overhead);
+
+    // Processing values OCR-ready reusable outlines, not only compressed size.
+    // Cap the extra storage cost rather than outright requiring a Flate win.
+    if replacements < MIN_OCR_USEFUL_OCCURRENCES || after > before.saturating_add(before / 20) {
+        return Ok(stats);
+    }
+
+    for (plan, users) in plans.iter().zip(&font_pages) {
+        let font = outlined_glyph_font_dictionary(doc, plan);
+        for &index in users {
+            install_page_resource(doc, sources[index].page, b"Font", plan.name.clone(), font)?;
+        }
+    }
+    for (source, content) in sources.iter().zip(rewritten) {
+        if let Some(content) = content {
+            stats.decoded_bytes_removed += source.decoded.len().saturating_sub(content.len());
+            replace_page_content(doc, source.page, content)?;
+        }
+    }
+    stats.pages_rewritten = affected_pages;
+    stats.fonts_created = plans.len();
+    stats.glyphs_created = plans.iter().map(|p| p.shapes.len()).sum();
+    stats.occurrences_replaced = replacements;
+    stats.source_paints_replaced = replacements;
+    stats.estimated_flate_bytes_saved = before.saturating_sub(after);
     Ok(stats)
 }
 
