@@ -17,8 +17,9 @@ const MAX_PITCH: f64 = 0.25;
 const MAX_RASTER_DIMENSION: usize = 16_384;
 const MAX_RASTER_PIXELS: usize = 100_000_000;
 // Preserve individual marks, not the source renderer's subpixel antialiasing.
-// 300 DPI is the practical upper sampling requirement for pathological marks.
-const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 300.0;
+// Consider a compact 200-DPI grid only when every source mark remains covered;
+// the former 300-DPI grid remains an encoded-cost candidate.
+const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 200.0;
 const MIN_STROKE_RASTER_PIXELS: f64 = 1.5;
 
 /// Internal-facing statistics from the pathological-microstroke rasterization pass.
@@ -923,13 +924,24 @@ fn coarser_microstroke_sample_pitch(
     user_unit: f64,
 ) -> Option<f64> {
     let base = raster_sample_pitch(state, natural_pitch, user_unit)?;
+    let alternative = microstroke_page_grid_pitch(state, user_unit, MAX_PAGE_RASTER_PITCH_PT)?;
+    (alternative >= base * 1.05).then_some(alternative)
+}
+
+fn microstroke_page_grid_pitch(
+    state: StrokeState,
+    user_unit: f64,
+    page_pitch_limit_pt: f64,
+) -> Option<f64> {
     let page_scale = max_linear_scale(state.ctm)? * user_unit;
-    let max_quality_pitch = MAX_PAGE_RASTER_PITCH_PT / page_scale;
-    // Stay visibly wider than a single sample; tiny lines must not disappear
-    // simply because the selected grid became too coarse.
-    let max_coverage_pitch = (state.width / MIN_STROKE_RASTER_PIXELS) * 0.98;
-    let alternative = max_quality_pitch.min(max_coverage_pitch);
-    (alternative.is_finite() && alternative >= base * 1.05).then_some(alternative)
+    if !page_scale.is_finite() || page_scale <= 0.0 {
+        return None;
+    }
+    let quality_pitch = page_pitch_limit_pt / page_scale;
+    // Preserve >=1.5-pixel stroke width even at the coarser print grid.
+    let coverage_pitch = (state.width / MIN_STROKE_RASTER_PIXELS) * 0.98;
+    let pitch = quality_pitch.min(coverage_pitch);
+    (pitch.is_finite() && pitch > 0.0).then_some(pitch)
 }
 
 fn image_payload(
@@ -1079,9 +1091,14 @@ pub fn rasterize_pathological_microstrokes(
             };
             let name = next_image_name(&mut name_index, &mut occupied);
             let mut chosen: Option<(BilevelImagePayload, Vec<u8>, usize)> = None;
-            for sample_pitch in std::iter::once(pitch).chain(coarser_microstroke_sample_pitch(
-                run.state, pitch, user_unit,
-            )) {
+            // Coarser grids are not guaranteed to be cheaper or even eligible.
+            // Keep the 300-DPI fallback when offering more compact masks.
+            // Offer the former 300-DPI grid even if source pitch is coarser.
+            let finer = microstroke_page_grid_pitch(run.state, user_unit, 72.0 / 300.0)
+                .filter(|candidate| (*candidate - pitch).abs() > pitch * 1.0e-12);
+            let coarser = coarser_microstroke_sample_pitch(run.state, pitch, user_unit)
+                .filter(|sample_pitch| Some(*sample_pitch) != finer);
+            for sample_pitch in std::iter::once(pitch).chain(finer).chain(coarser) {
                 // Oversized natural masks must not preclude a valid compact grid.
                 let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch, user_unit)
                 else {
@@ -1263,7 +1280,7 @@ mod tests {
             ..StrokeState::default()
         };
         let pitch = raster_sample_pitch(scaled, 0.1, 1.0).unwrap_or(f64::NAN);
-        assert!((pitch - 0.06).abs() < 1.0e-12);
+        assert!((pitch - 0.09).abs() < 1.0e-12);
 
         let rotated_scaled = StrokeState {
             ctm: Matrix::new(0.0, 2.0, -2.0, 0.0, 0.0, 0.0),
@@ -1277,15 +1294,37 @@ mod tests {
     }
 
     #[test]
+    fn original_finer_grid_remains_eligible_when_source_pitch_is_coarser() {
+        let state = StrokeState {
+            width: 0.65,
+            ..StrokeState::default()
+        };
+        let source_pitch = 0.25;
+        assert_eq!(raster_sample_pitch(state, source_pitch, 1.0), Some(0.25));
+        let previous_grid = microstroke_page_grid_pitch(state, 1.0, 72.0 / 300.0);
+        assert_eq!(previous_grid, Some(72.0 / 300.0));
+        assert!(previous_grid.is_some_and(|pitch| pitch < source_pitch));
+    }
+
+    #[test]
     fn print_scale_microstroke_grid_preserves_every_mark() -> Result<()> {
         let state = StrokeState {
             width: 0.45,
             cap: 1,
             ..StrokeState::default()
         };
+        let finer = microstroke_page_grid_pitch(state, 1.0, 72.0 / 300.0)
+            .ok_or_else(|| crate::Error::Invalid("missing 300-DPI fallback pitch".to_owned()))?;
+        assert!((finer - 72.0 / 300.0).abs() < 1.0e-12);
         let pitch = coarser_microstroke_sample_pitch(state, 0.08, 1.0)
             .ok_or_else(|| crate::Error::Invalid("missing print-scale pitch".to_owned()))?;
-        assert!((pitch - 72.0 / 300.0).abs() < 1.0e-12);
+        assert!(
+            (0.45 / MIN_STROKE_RASTER_PIXELS)
+                .mul_add(-0.98, pitch)
+                .abs()
+                < 1.0e-12
+        );
+        assert!(pitch > finer);
         let run = MicroStrokeRun {
             start: 0,
             end: 0,
