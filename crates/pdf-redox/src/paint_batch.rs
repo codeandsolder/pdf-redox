@@ -1616,6 +1616,8 @@ struct GlyphComponent {
     height: i64,
     source_paints: usize,
     signature: Vec<u8>,
+    scale: i64,
+    charproc_source: Option<Vec<u8>>,
 }
 
 fn outlined_glyph_component_signature(
@@ -1725,6 +1727,8 @@ fn outlined_glyph_components_for_run(run: &[GlyphTransaction]) -> Vec<GlyphCompo
             height: bounds.height(),
             source_paints: indices.len(),
             signature: outlined_glyph_component_signature(run, &indices, bounds),
+            scale: 100,
+            charproc_source: None,
         });
     }
     components
@@ -1776,17 +1780,21 @@ struct GlyphFontPlan {
     shapes: Vec<GlyphShapePlan>,
 }
 
-fn structural_pdf_number(value: i64) -> String {
+fn scaled_pdf_number(value: i64, scale: i64) -> String {
+    let scale = i128::from(scale);
     let negative = value < 0;
     let magnitude = i128::from(value).abs();
-    let whole = magnitude / 100;
-    let fraction = magnitude % 100;
+    let whole = magnitude / scale;
+    let fraction = magnitude % scale;
     let body = if fraction == 0 {
         whole.to_string()
-    } else if fraction % 10 == 0 {
-        format!("{whole}.{}", fraction / 10)
     } else {
-        format!("{whole}.{fraction:02}")
+        let digits = if scale == 1_000 { 3 } else { 2 };
+        let mut decimal = format!("{fraction:0digits$}");
+        while decimal.ends_with('0') {
+            decimal.pop();
+        }
+        format!("{whole}.{decimal}")
     };
     if negative && magnitude != 0 {
         format!("-{body}")
@@ -1795,16 +1803,24 @@ fn structural_pdf_number(value: i64) -> String {
     }
 }
 
+fn structural_pdf_number(value: i64) -> String {
+    scaled_pdf_number(value, 100)
+}
+
 fn outlined_glyph_charproc(input: &[u8], component: &GlyphComponent) -> Option<Vec<u8>> {
     let x = component.origin_x.checked_neg()?;
     let y = component.origin_y.checked_neg()?;
     let mut output = Vec::new();
     output.extend_from_slice(b"0 0 d0\n1 0 0 1 ");
-    output.extend_from_slice(structural_pdf_number(x).as_bytes());
+    output.extend_from_slice(scaled_pdf_number(x, component.scale).as_bytes());
     output.push(b' ');
-    output.extend_from_slice(structural_pdf_number(y).as_bytes());
+    output.extend_from_slice(scaled_pdf_number(y, component.scale).as_bytes());
     output.extend_from_slice(b" cm\n");
-    output.extend_from_slice(input.get(component.start..component.end)?);
+    if let Some(body) = &component.charproc_source {
+        output.extend_from_slice(body);
+    } else {
+        output.extend_from_slice(input.get(component.start..component.end)?);
+    }
     output.push(b'\n');
     Some(output)
 }
@@ -1822,9 +1838,9 @@ fn outlined_glyph_placement(
     output.extend_from_slice(b"BT /");
     output.extend_from_slice(font_name);
     output.extend_from_slice(b" 1 Tf 1 0 0 1 ");
-    output.extend_from_slice(structural_pdf_number(component.origin_x).as_bytes());
+    output.extend_from_slice(scaled_pdf_number(component.origin_x, component.scale).as_bytes());
     output.push(b' ');
-    output.extend_from_slice(structural_pdf_number(component.origin_y).as_bytes());
+    output.extend_from_slice(scaled_pdf_number(component.origin_y, component.scale).as_bytes());
     output.extend_from_slice(b" Tm <");
     output.extend_from_slice(format!("{code:02X}").as_bytes());
     output.extend_from_slice(b"> Tj ET\n");
@@ -2108,6 +2124,542 @@ pub fn factor_repeated_stroke_forms(
     })
 }
 
+// A single fill can paint an entire line of outlined glyphs. Split its
+// disjoint, compound contours into translated shapes before passing them to
+// the existing Type3 font planner; never separate overlapping fill regions.
+const COMPOUND_GLYPH_GRID: f64 = 1_000.0;
+const MAX_COMPOUND_GLYPH_EXTENT: i64 = 16_000;
+
+#[derive(Clone, Debug)]
+struct CompoundOutlineOp {
+    operator: Vec<u8>,
+    coordinates: SmallVec<[i64; 6]>,
+}
+
+#[derive(Clone, Debug)]
+struct CompoundContour {
+    start: usize,
+    end: usize,
+    bounds: GridBounds,
+    ops: Vec<CompoundOutlineOp>,
+}
+
+#[derive(Clone, Debug)]
+struct CompoundShape {
+    contours: Vec<CompoundContour>,
+    canonical: GlyphComponent,
+}
+
+#[derive(Debug)]
+struct CompoundFill {
+    start: usize,
+    end: usize,
+    paint: Vec<u8>,
+    shapes: Vec<CompoundShape>,
+}
+
+fn compound_grid(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let scaled = value * COMPOUND_GLYPH_GRID;
+    if !scaled.is_finite() || scaled.abs() > 9_007_199_254_740_991.0 {
+        return None;
+    }
+    let rounded = scaled.round();
+    ((scaled - rounded).abs() < 1.0e-6)
+        .then(|| rounded.to_i64())
+        .flatten()
+}
+
+fn compound_outline_op(event: &Event) -> Option<(CompoundOutlineOp, GridBounds)> {
+    let op = event.operator.as_slice();
+    let count = match op {
+        b"m" | b"l" => 2,
+        b"v" | b"y" | b"re" => 4,
+        b"c" => 6,
+        b"h" => 0,
+        _ => return None,
+    };
+    if !event.all_operands_numeric || event.numbers.len() != count {
+        return None;
+    }
+    let coords = event
+        .numbers
+        .iter()
+        .copied()
+        .map(compound_grid)
+        .collect::<Option<SmallVec<[i64; 6]>>>()?;
+    let (first_x, first_y) = match op {
+        b"h" => (0, 0),
+        _ => (*coords.first()?, *coords.get(1)?),
+    };
+    let mut bounds = GridBounds::from_point(first_x, first_y);
+    if op == b"re" {
+        bounds.include(GridBounds::from_point(
+            first_x.checked_add(*coords.get(2)?)?,
+            first_y.checked_add(*coords.get(3)?)?,
+        ));
+    } else {
+        for pair in coords.as_slice().as_chunks::<2>().0 {
+            bounds.include(GridBounds::from_point(pair[0], pair[1]));
+        }
+    }
+    Some((
+        CompoundOutlineOp {
+            operator: event.operator.clone(),
+            coordinates: coords,
+        },
+        bounds,
+    ))
+}
+
+// For these paths we retain the original lexical operands in CharProcs.
+// Normalized coordinates are used only to discover translated duplicates.
+fn compound_shape_signature(
+    contours: &[CompoundContour],
+    bounds: GridBounds,
+    paint: &[u8],
+) -> Option<Vec<u8>> {
+    let mut signature = b"PdfRedoxCompoundFill1".to_vec();
+    signature.extend_from_slice(if paint == b"f*" { b"f*" } else { b"f" });
+    for contour in contours {
+        signature.push(0xff);
+        for op in &contour.ops {
+            signature.push(u8::try_from(op.operator.len()).ok()?);
+            signature.extend_from_slice(&op.operator);
+            for (idx, &coordinate) in op.coordinates.iter().enumerate() {
+                let translated = if op.operator == b"re" && idx >= 2 {
+                    coordinate
+                } else if idx % 2 == 0 {
+                    coordinate.checked_sub(bounds.x0)?
+                } else {
+                    coordinate.checked_sub(bounds.y0)?
+                };
+                signature.extend_from_slice(&translated.to_be_bytes());
+            }
+        }
+    }
+    Some(signature)
+}
+
+fn compound_fill_shapes(
+    contours: &[CompoundContour],
+    paint: &[u8],
+    input: &[u8],
+) -> Option<Vec<CompoundShape>> {
+    if contours.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut union = GlyphUnionFind::new(contours.len());
+    // Sweep by x coordinate, examining only geometrically intersecting
+    // intervals. This also joins inner contours and holes with their outers.
+    let mut indices = (0..contours.len()).collect::<Vec<_>>();
+    indices.sort_unstable_by_key(|&index| contours[index].bounds.x0);
+    for (pos, &left) in indices.iter().enumerate() {
+        let left_bounds = contours[left].bounds;
+        for &right in &indices[pos + 1..] {
+            if contours[right].bounds.x0 > left_bounds.x1 {
+                break;
+            }
+            if left_bounds.touches(contours[right].bounds) {
+                union.union(left, right);
+            }
+        }
+    }
+    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..contours.len() {
+        grouped.entry(union.find(index)).or_default().push(index);
+    }
+    let mut shapes = Vec::with_capacity(grouped.len());
+    for mut indices in grouped.into_values() {
+        indices.sort_unstable();
+        let first = *indices.first()?;
+        let mut bounds = contours[first].bounds;
+        for &index in &indices[1..] {
+            bounds.include(contours[index].bounds);
+        }
+        // Oversized or overflowed groups must stay in the original path.
+        let width = bounds.x1.checked_sub(bounds.x0)?;
+        let height = bounds.y1.checked_sub(bounds.y0)?;
+        let members = indices
+            .into_iter()
+            .map(|idx| contours[idx].clone())
+            .collect::<Vec<_>>();
+        let signature = if width <= MAX_COMPOUND_GLYPH_EXTENT && height <= MAX_COMPOUND_GLYPH_EXTENT
+        {
+            compound_shape_signature(&members, bounds, paint)?
+        } else {
+            // Large shapes are never entered into the cross-page font pool.
+            Vec::new()
+        };
+        let mut body = Vec::new();
+        for contour in &members {
+            body.extend_from_slice(input.get(contour.start..contour.end)?);
+            body.push(b'\n');
+        }
+        body.extend_from_slice(paint);
+        body.push(b'\n');
+        shapes.push(CompoundShape {
+            contours: members,
+            canonical: GlyphComponent {
+                start: 0,
+                end: 0,
+                origin_x: bounds.x0,
+                origin_y: bounds.y0,
+                width,
+                height,
+                source_paints: 0,
+                signature,
+                scale: 1_000,
+                charproc_source: Some(body),
+            },
+        });
+    }
+    Some(shapes)
+}
+
+fn compound_filled_paths(input: &[u8]) -> Option<Vec<CompoundFill>> {
+    let events = events_for(input, "compound outlined glyph factoring")?;
+    let mut paths = Vec::new();
+    let mut contours = Vec::<CompoundContour>::new();
+    let mut active = None::<CompoundContour>;
+    let mut path_start = None::<usize>;
+    let mut poisoned = false;
+
+    for event in &events {
+        let operator = event.operator.as_slice();
+        match operator {
+            b"m" | b"re" => {
+                if let Some(contour) = active.take() {
+                    contours.push(contour);
+                }
+                if !poisoned {
+                    if let Some((op, bounds)) = compound_outline_op(event) {
+                        path_start.get_or_insert(event.start);
+                        active = Some(CompoundContour {
+                            start: event.start,
+                            end: event.end,
+                            bounds,
+                            ops: vec![op],
+                        });
+                    } else {
+                        poisoned = true;
+                    }
+                }
+            }
+            b"l" | b"c" | b"v" | b"y" | b"h" if path_start.is_some() => {
+                if !poisoned {
+                    if let (Some(contour), Some((op, bounds))) =
+                        (active.as_mut(), compound_outline_op(event))
+                    {
+                        if operator != b"h" {
+                            contour.bounds.include(bounds);
+                        }
+                        contour.end = event.end;
+                        contour.ops.push(op);
+                    } else {
+                        poisoned = true;
+                    }
+                }
+            }
+            b"f" | b"F" | b"f*" => {
+                if let Some(contour) = active.take() {
+                    contours.push(contour);
+                }
+                if !poisoned && let Some(start) = path_start {
+                    let paint = if operator == b"F" {
+                        b"f".as_slice()
+                    } else {
+                        operator
+                    };
+                    let shapes = compound_fill_shapes(&contours, paint, input)?;
+                    if shapes.len() > 1 {
+                        paths.push(CompoundFill {
+                            start,
+                            end: event.end,
+                            paint: paint.to_vec(),
+                            shapes,
+                        });
+                    }
+                }
+                contours.clear();
+                path_start = None;
+                poisoned = false;
+            }
+            b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*" | b"n" => {
+                active = None;
+                contours.clear();
+                path_start = None;
+                poisoned = false;
+            }
+            _ if path_start.is_some() => {
+                // Graphics state, clipping, unknown operators, inline images,
+                // or interleaved content would invalidate the fill equivalence.
+                poisoned = true;
+            }
+            _ => {}
+        }
+    }
+    Some(paths)
+}
+
+#[derive(Debug)]
+struct CompoundPage {
+    page: ObjectHandle,
+    input: Vec<u8>,
+    paths: Vec<CompoundFill>,
+}
+
+fn compound_font_plans(
+    document: &EditDocument,
+    pages: &[CompoundPage],
+) -> Result<Vec<GlyphFontPlan>> {
+    let mut groups = BTreeMap::<Vec<u8>, Vec<GlyphComponent>>::new();
+    for page in pages {
+        for path in &page.paths {
+            for shape in &path.shapes {
+                if !shape.canonical.signature.is_empty() {
+                    groups
+                        .entry(shape.canonical.signature.clone())
+                        .or_default()
+                        .push(shape.canonical.clone());
+                }
+            }
+        }
+    }
+    let mut repeated = groups
+        .into_values()
+        .filter(|group| group.len() >= MIN_OUTLINED_GLYPH_OCCURRENCES)
+        .collect::<Vec<_>>();
+    if repeated.is_empty() {
+        return Ok(Vec::new());
+    }
+    repeated.sort_unstable_by_key(|group| {
+        std::cmp::Reverse(
+            group
+                .iter()
+                .map(|x| x.charproc_source.as_ref().map_or(0, Vec::len))
+                .sum::<usize>(),
+        )
+    });
+    // Select one font namespace that does not collide on any affected page.
+    let mut occupied = BTreeSet::<Vec<u8>>::new();
+    for page in pages {
+        let resources = effective_page_resources(document, page.page)?;
+        if let Some(fonts) = resolved_dictionary(document, resources.get(b"Font".as_slice()))? {
+            occupied.extend(fonts.keys().cloned());
+        }
+    }
+    let mut plans = Vec::new();
+    for (font_index, chunk) in repeated.chunks(MAX_TYPE3_GLYPHS_PER_FONT).enumerate() {
+        let mut shapes = Vec::with_capacity(chunk.len());
+        for occurrences in chunk {
+            let Some(canonical) = occurrences.first().cloned() else {
+                continue;
+            };
+            let Some(charproc) = outlined_glyph_charproc(&[], &canonical) else {
+                continue;
+            };
+            shapes.push(GlyphShapePlan {
+                canonical,
+                occurrences: occurrences.clone(),
+                charproc,
+            });
+        }
+        if !shapes.is_empty() {
+            plans.push(GlyphFontPlan {
+                name: outlined_glyph_font_name(font_index, &mut occupied),
+                shapes,
+            });
+        }
+    }
+    Ok(plans)
+}
+
+struct CompoundRewrites {
+    replacements: Vec<(usize, usize, Vec<u8>)>,
+    occurrences: usize,
+    fonts: BTreeSet<Vec<u8>>,
+}
+
+fn compound_glyph_replacements(
+    paths: &[CompoundFill],
+    plans: &[GlyphFontPlan],
+    input: &[u8],
+) -> Option<CompoundRewrites> {
+    let mut codes = BTreeMap::<Vec<u8>, (&[u8], usize)>::new();
+    for plan in plans {
+        for (index, shape) in plan.shapes.iter().enumerate() {
+            codes.insert(shape.canonical.signature.clone(), (&plan.name, index + 1));
+        }
+    }
+    let mut replacements = Vec::new();
+    let mut occurrences_replaced = 0usize;
+    let mut used_fonts = BTreeSet::<Vec<u8>>::new();
+    for path in paths {
+        let mut original = Vec::new();
+        let mut text = Vec::new();
+        for shape in &path.shapes {
+            if let Some(&(font, code)) = codes.get(&shape.canonical.signature) {
+                used_fonts.insert(font.to_vec());
+                // Type3 glyph codes don't identify Unicode yet. ActualText is
+                // empty to preserve the original extracted-text behavior.
+                // Text state is not reset by BT: explicitly isolate it from
+                // arbitrary text state inherited from preceding real text.
+                text.extend_from_slice(b"q BT 0 Tr 100 Tz 0 Ts 0 Tc 0 Tw ");
+                text.extend_from_slice(
+                    outlined_glyph_placement(font, code, &shape.canonical)?.strip_prefix(b"BT ")?,
+                );
+                text.extend_from_slice(b"Q\n");
+                occurrences_replaced = occurrences_replaced.saturating_add(1);
+            } else {
+                for contour in &shape.contours {
+                    original.extend_from_slice(input.get(contour.start..contour.end)?);
+                    original.push(b'\n');
+                }
+            }
+        }
+        if !text.is_empty() {
+            if !original.is_empty() {
+                original.extend_from_slice(&path.paint);
+                original.push(b'\n');
+            }
+            original.extend_from_slice(b"/Span << /ActualText () >> BDC\n");
+            original.extend_from_slice(&text);
+            original.extend_from_slice(b"EMC\n");
+            replacements.push((path.start, path.end, original));
+        }
+    }
+    Some(CompoundRewrites {
+        replacements,
+        occurrences: occurrences_replaced,
+        fonts: used_fonts,
+    })
+}
+
+fn compound_fonts_estimated_cost(
+    plans: &[GlyphFontPlan],
+    flate_level: crate::FlateLevel,
+) -> Result<usize> {
+    let mut total = 0usize;
+    for plan in plans {
+        for shape in &plan.shapes {
+            total = total.saturating_add(crate::stream_codec::flate_encoded_len(
+                &shape.charproc,
+                flate_level,
+            )?);
+        }
+        total = total.saturating_add(plan.shapes.len().saturating_mul(384));
+        total = total.saturating_add(1_024);
+    }
+    Ok(total)
+}
+
+fn factor_compound_filled_glyphs(
+    document: &mut EditDocument,
+    page_handles: &[ObjectHandle],
+    flate_level: crate::FlateLevel,
+) -> Result<OutlinedGlyphFactorStats> {
+    let mut stats = OutlinedGlyphFactorStats::default();
+    let mut pages = Vec::<CompoundPage>::new();
+    for &page in page_handles {
+        let Some(object) = document.current_owned_object(page)? else {
+            continue;
+        };
+        let Some(dictionary) = object.as_dictionary() else {
+            continue;
+        };
+        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+            continue;
+        };
+        let mut input = Vec::new();
+        decoded_content_value(document, contents, &mut input)?;
+        if input.len() < MIN_PAGE_CONTENT_BYTES {
+            continue;
+        }
+        let Some(paths) = compound_filled_paths(&input) else {
+            continue;
+        };
+        if paths.is_empty() {
+            continue;
+        }
+        pages.push(CompoundPage { page, input, paths });
+    }
+    if pages.is_empty() {
+        return Ok(stats);
+    }
+    let plans = compound_font_plans(document, &pages)?;
+    if plans.is_empty() {
+        return Ok(stats);
+    }
+
+    let mut updates = Vec::<(ObjectHandle, Vec<u8>, BTreeSet<Vec<u8>>)>::new();
+    let mut before = 0usize;
+    let mut after = 0usize;
+    for page in &pages {
+        let Some(rewrites) = compound_glyph_replacements(&page.paths, &plans, &page.input) else {
+            continue;
+        };
+        let CompoundRewrites {
+            replacements,
+            occurrences,
+            fonts,
+        } = rewrites;
+        if replacements.is_empty() {
+            continue;
+        }
+        let Some(rewritten) = crate::content_stream::apply_replacements(&page.input, &replacements)
+        else {
+            continue;
+        };
+        before = before.saturating_add(crate::stream_codec::flate_encoded_len(
+            &page.input,
+            flate_level,
+        )?);
+        after = after.saturating_add(crate::stream_codec::flate_encoded_len(
+            &rewritten,
+            flate_level,
+        )?);
+        after = after.saturating_add(fonts.len().saturating_mul(72));
+        stats.pages_rewritten += 1;
+        stats.occurrences_replaced += occurrences;
+        stats.source_paints_replaced += replacements.len();
+        stats.decoded_bytes_removed += page.input.len().saturating_sub(rewritten.len());
+        updates.push((page.page, rewritten, fonts));
+    }
+    if updates.is_empty() {
+        return Ok(OutlinedGlyphFactorStats::default());
+    }
+
+    let glyphs = plans.iter().map(|p| p.shapes.len()).sum::<usize>();
+    // The font object/encoding and CharProc stream costs must accompany the
+    // shared page content when comparing the candidate against production.
+    after = after.saturating_add(compound_fonts_estimated_cost(&plans, flate_level)?);
+    if before <= after || before - after < MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS {
+        return Ok(OutlinedGlyphFactorStats::default());
+    }
+
+    let mut font_refs = BTreeMap::<Vec<u8>, ObjectHandle>::new();
+    for plan in &plans {
+        let font = outlined_glyph_font_dictionary(document, plan);
+        font_refs.insert(plan.name.clone(), font);
+    }
+    for (page, rewritten, used_fonts) in updates {
+        for name in used_fonts {
+            let Some(&font) = font_refs.get(&name) else {
+                continue;
+            };
+            install_page_resource(document, page, b"Font", name, font)?;
+        }
+        replace_page_content(document, page, rewritten)?;
+    }
+    stats.fonts_created = plans.len();
+    stats.glyphs_created = glyphs;
+    stats.estimated_flate_bytes_saved = before - after;
+    Ok(stats)
+}
+
 fn outlined_glyph_shape_weight(input: &[u8], occurrences: &[GlyphComponent]) -> usize {
     occurrences
         .iter()
@@ -2237,8 +2789,8 @@ fn outlined_glyph_font_dictionary(
     let mut charprocs = OwnedDictionary::new();
     let mut differences = vec![OwnedObject::Integer(1)];
     let mut widths = Vec::with_capacity(plan.shapes.len());
-    let mut max_width = 0i64;
-    let mut max_height = 0i64;
+    let mut max_width = 0.0_f64;
+    let mut max_height = 0.0_f64;
 
     for (index, shape) in plan.shapes.iter().enumerate() {
         let code = index.saturating_add(1);
@@ -2250,8 +2802,11 @@ fn outlined_glyph_font_dictionary(
         charprocs.insert(glyph_name.clone(), OwnedObject::Reference(stream));
         differences.push(OwnedObject::Name(glyph_name));
         widths.push(OwnedObject::Integer(0));
-        max_width = max_width.max(shape.canonical.width);
-        max_height = max_height.max(shape.canonical.height);
+        let scale = f64::from(i32::try_from(shape.canonical.scale).unwrap_or(i32::MAX));
+        max_width = max_width
+            .max(f64::from(i32::try_from(shape.canonical.width).unwrap_or(i32::MAX)) / scale);
+        max_height = max_height
+            .max(f64::from(i32::try_from(shape.canonical.height).unwrap_or(i32::MAX)) / scale);
     }
 
     let mut encoding = OwnedDictionary::new();
@@ -2266,14 +2821,8 @@ fn outlined_glyph_font_dictionary(
         OwnedObject::Array(vec![
             OwnedObject::Real(-1.0),
             OwnedObject::Real(-1.0),
-            OwnedObject::Real(
-                f64::from(i32::try_from(max_width).unwrap_or(i32::MAX)) / STRUCTURAL_GRID_SCALE
-                    + 1.0,
-            ),
-            OwnedObject::Real(
-                f64::from(i32::try_from(max_height).unwrap_or(i32::MAX)) / STRUCTURAL_GRID_SCALE
-                    + 1.0,
-            ),
+            OwnedObject::Real(max_width + 1.0),
+            OwnedObject::Real(max_height + 1.0),
         ]),
     );
     dictionary.insert(
@@ -2367,6 +2916,26 @@ pub fn factor_outlined_glyphs(
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
+    let additional = factor_compound_filled_glyphs(document, pages, flate_level)?;
+    stats.pages_rewritten = stats
+        .pages_rewritten
+        .saturating_add(additional.pages_rewritten);
+    stats.fonts_created = stats.fonts_created.saturating_add(additional.fonts_created);
+    stats.glyphs_created = stats
+        .glyphs_created
+        .saturating_add(additional.glyphs_created);
+    stats.occurrences_replaced = stats
+        .occurrences_replaced
+        .saturating_add(additional.occurrences_replaced);
+    stats.source_paints_replaced = stats
+        .source_paints_replaced
+        .saturating_add(additional.source_paints_replaced);
+    stats.decoded_bytes_removed = stats
+        .decoded_bytes_removed
+        .saturating_add(additional.decoded_bytes_removed);
+    stats.estimated_flate_bytes_saved = stats
+        .estimated_flate_bytes_saved
+        .saturating_add(additional.estimated_flate_bytes_saved);
     Ok(stats)
 }
 
@@ -2654,6 +3223,54 @@ mod tests {
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].source_paints, 1);
         assert_eq!(components[0].origin_x, 1000);
+    }
+
+    #[test]
+    fn compound_cubic_outlines_are_recognized_as_repeated_type3_glyphs() {
+        let input = b"q 0 0 m 1 2 2 2 3 0 c 3 -1 l h 6 0 m 7 2 8 2 9 0 c 9 -1 l h f Q";
+        let paths = some!(compound_filled_paths(input), "compound parse");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].shapes.len(), 2);
+        let left = &paths[0].shapes[0].canonical;
+        let right = &paths[0].shapes[1].canonical;
+        assert_eq!(left.signature, right.signature);
+        assert_eq!(left.scale, 1_000);
+        assert_eq!(
+            left.charproc_source.as_deref().unwrap_or_default(),
+            b"0 0 m 1 2 2 2 3 0 c 3 -1 l h\nf\n"
+        );
+        let charproc = some!(outlined_glyph_charproc(input, left), "charproc");
+        assert!(charproc.ends_with(b"0 0 m 1 2 2 2 3 0 c 3 -1 l h\nf\n\n"));
+    }
+
+    #[test]
+    fn compound_filled_contours_keep_nested_holes_together() {
+        let input = b"0 0 m 6 0 l 6 6 l 0 6 l h 2 2 m 4 2 l 4 4 l 2 4 l h 10 0 m 16 0 l 16 6 l 10 6 l h 12 2 m 14 2 l 14 4 l 12 4 l h f";
+        let paths = some!(compound_filled_paths(input), "compound parse");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].shapes.len(), 2);
+        assert!(
+            paths[0]
+                .shapes
+                .iter()
+                .all(|shape| shape.contours.len() == 2)
+        );
+        assert_eq!(
+            paths[0].shapes[0].canonical.signature,
+            paths[0].shapes[1].canonical.signature
+        );
+    }
+
+    #[test]
+    fn compound_fill_rejects_graphics_state_and_clipping_inside_paths() {
+        for content in [
+            b"0 0 m 1 1 l W 2 2 m 3 3 l f".as_slice(),
+            b"0 0 m 1 1 l q Q 2 2 m 3 3 l f",
+            b"0 0 m 1 1 l 1 0 0 rg 2 2 m 3 3 l f",
+        ] {
+            let paths = some!(compound_filled_paths(content), "compound parse");
+            assert!(paths.is_empty());
+        }
     }
 
     #[test]
