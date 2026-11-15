@@ -145,6 +145,9 @@ impl<'a> Scanner<'a> {
             return false;
         }
         let denom = len * len;
+        if !denom.is_finite() {
+            return false;
+        }
         let project =
             |point: (f64, f64)| (point.1 - start.1).mul_add(dy, (point.0 - start.0) * dx) / denom;
         let first_t = project(first);
@@ -656,6 +659,16 @@ mod tests {
             assert_eq!(replacements, Vec::<Replacement>::new());
         }
         Ok(())
+    }
+
+    #[test]
+    fn enormous_page_coordinates_cannot_bypass_projection_bounds() {
+        assert!(!Scanner::near_linear_cubic(
+            (0.0, 0.0),
+            (1.2e308, 0.0),
+            (1.3e308, 0.0),
+            (1.0e308, 0.0),
+        ));
     }
 
     #[test]
