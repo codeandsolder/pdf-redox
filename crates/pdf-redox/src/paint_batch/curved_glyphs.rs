@@ -10,6 +10,8 @@ const MAX_ERROR_PT: f64 = 0.02;
 struct ShapeOp {
     token: Vec<u8>,
     args: Vec<f64>,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -17,6 +19,8 @@ struct Shape {
     start: usize,
     end: usize,
     page_index: usize,
+    fill_index: usize,
+    raw_subpaths: Vec<(usize, Vec<u8>)>,
     paint: Vec<u8>,
     ops: Vec<ShapeOp>,
     skeleton: Vec<u8>,
@@ -24,6 +28,7 @@ struct Shape {
     dimensions: Vec<f64>,
     bounds: [f64; 4],
     page_space_factor: f64,
+    min_page_scale: f64,
 }
 
 const fn arity(op: &[u8]) -> Option<usize> {
@@ -146,6 +151,8 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
         ops.push(ShapeOp {
             token: e.operator.clone(),
             args,
+            start: e.start,
+            end: e.end,
         });
         cursor += 1;
     }
@@ -168,6 +175,16 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
     let page_space_factor = (combined[0].abs() + combined[2].abs())
         .max(combined[1].abs() + combined[3].abs())
         .max(1.0);
+    // Lower bound on the minimum singular value (|det| / Frobenius).
+    // Combined with the separation gap, this ensures independently painted
+    // components cannot touch under any affine orientation.
+    let [xx, yx, xy, yy, _, _] = combined;
+    let linear_norm = xx.hypot(yx).hypot(xy).hypot(yy);
+    let min_page_scale = if linear_norm > 0. {
+        xx.mul_add(yy, -yx * xy).abs() / linear_norm
+    } else {
+        0.
+    };
     if !page_space_factor.is_finite() || normalized.iter().any(|n| !n.is_finite()) {
         return None;
     }
@@ -176,6 +193,8 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
             start: first.start,
             end: paint.end,
             page_index: 0,
+            fill_index: 0,
+            raw_subpaths: Vec::new(),
             paint: paint.operator.clone(),
             ops,
             skeleton,
@@ -183,17 +202,188 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
             dimensions,
             bounds,
             page_space_factor,
+            min_page_scale,
         },
         cursor + 1,
     ))
 }
 
-fn collect(input: &[u8]) -> Option<Vec<Shape>> {
+/// A paint transaction remains a single replacement span, even when its
+/// disjoint contour components are shared as separate Type3 glyphs.
+#[derive(Clone, Debug)]
+struct CompoundFill {
+    start: usize,
+    end: usize,
+    page_index: usize,
+    components: Vec<usize>,
+    paint: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct Subpath {
+    ops: Vec<ShapeOp>,
+    bounds: [f64; 4],
+}
+
+fn path_bounds(ops: &[ShapeOp]) -> Option<[f64; 4]> {
+    let mut bbox = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for op in ops {
+        if op.token == b"re" {
+            let [x, y, w, h]: [f64; 4] = op.args.as_slice().try_into().ok()?;
+            for (a, b) in [(x, y), (x + w, y + h)] {
+                bbox[0] = bbox[0].min(a);
+                bbox[1] = bbox[1].min(b);
+                bbox[2] = bbox[2].max(a);
+                bbox[3] = bbox[3].max(b);
+            }
+        } else {
+            for [x, y] in op.args.as_chunks::<2>().0 {
+                bbox[0] = bbox[0].min(*x);
+                bbox[1] = bbox[1].min(*y);
+                bbox[2] = bbox[2].max(*x);
+                bbox[3] = bbox[3].max(*y);
+            }
+        }
+    }
+    bbox.iter().all(|v| v.is_finite()).then_some(bbox)
+}
+
+/// A small ink separation margin in page coordinates reduces opportunities
+/// for antialias fringes to overlap after decomposing one original fill.
+const COMPONENT_SEPARATION_PT: f64 = 0.15;
+
+const fn root(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn independent_components(input: &[u8], original: &Shape) -> Option<Vec<Shape>> {
+    // A singular or near-singular CTM cannot guarantee disjointness after
+    // rasterization; leave its complete original fill untouched.
+    let mut parts = Vec::<Subpath>::new();
+    for op in &original.ops {
+        if op.token == b"m" || op.token == b"re" {
+            parts.push(Subpath {
+                ops: Vec::new(),
+                bounds: [0.; 4],
+            });
+        }
+        parts.last_mut()?.ops.push(op.clone());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    for p in &mut parts {
+        p.bounds = path_bounds(&p.ops)?;
+    }
+
+    if !original.min_page_scale.is_finite() || original.min_page_scale < 1e-8 {
+        return None;
+    }
+    // The margin in local coordinates is deliberately larger when a page
+    // transform strongly compresses the shape along any direction.
+    let gap = COMPONENT_SEPARATION_PT / original.min_page_scale;
+    let n = parts.len();
+    let mut parent = (0..n).collect::<Vec<_>>();
+    let mut order = (0..n).collect::<Vec<_>>();
+    order.sort_unstable_by(|&a, &b| parts[a].bounds[0].total_cmp(&parts[b].bounds[0]));
+    // Sorted x sweep avoids comparing the whole path's thousands of contours.
+    for i in 0..n {
+        let a = order[i];
+        let bx = parts[a].bounds;
+        for &b in &order[i + 1..] {
+            let by = parts[b].bounds;
+            if by[0] - bx[2] > gap {
+                break;
+            }
+            if by[1] - bx[3] > gap || bx[1] - by[3] > gap {
+                continue;
+            }
+            let x = root(&mut parent, a);
+            let y = root(&mut parent, b);
+            if x != y {
+                parent[y] = x;
+            }
+        }
+    }
+    let mut bins = BTreeMap::<usize, Vec<usize>>::new();
+    for i in 0..n {
+        bins.entry(root(&mut parent, i)).or_default().push(i);
+    }
+    let mut result = Vec::with_capacity(bins.len());
+    for indexes in bins.into_values() {
+        let mut ops = Vec::new();
+        let mut raw_subpaths = Vec::new();
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for i in indexes {
+            let part = &parts[i];
+            bounds[0] = bounds[0].min(part.bounds[0]);
+            bounds[1] = bounds[1].min(part.bounds[1]);
+            bounds[2] = bounds[2].max(part.bounds[2]);
+            bounds[3] = bounds[3].max(part.bounds[3]);
+            let first = part.ops.first()?.start;
+            let last = part.ops.last()?.end;
+            raw_subpaths.push((first, input.get(first..last)?.to_vec()));
+            ops.extend(part.ops.iter().cloned());
+        }
+        let mut skeleton = Vec::new();
+        for op in &ops {
+            skeleton.push(u8::try_from(op.args.len()).ok()?);
+            skeleton.extend_from_slice(&op.token);
+            skeleton.push(0);
+        }
+        skeleton.extend_from_slice(&original.paint);
+        let width = bounds[2] - bounds[0];
+        let height = bounds[3] - bounds[1];
+        let (normalized, dimensions) = if width > 0. && height > 0. {
+            normalize_control_points(&ops, bounds, width, height)
+        } else {
+            // Empty-ink or degenerate components are kept as residual source
+            // but cannot be pooled into a nonzero-dimensional glyph.
+            (Vec::new(), Vec::new())
+        };
+        // Do not clone the entire parent paint for every child component:
+        // a DEFOND fill can contain hundreds of subpaths and thousands of
+        // Bézier control points.
+        result.push(Shape {
+            start: original.start,
+            end: original.end,
+            page_index: original.page_index,
+            fill_index: original.fill_index,
+            raw_subpaths,
+            paint: original.paint.clone(),
+            ops,
+            skeleton,
+            normalized,
+            dimensions,
+            bounds,
+            page_space_factor: original.page_space_factor,
+            min_page_scale: original.min_page_scale,
+        });
+    }
+    Some(result)
+}
+
+fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
     let events = events_for(input, "filled curve outlines")?;
-    let mut shapes = Vec::new();
     let (mut cursor, mut text, mut path_open) = (0, false, false);
-    let mut ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-    let mut ctm_stack = Vec::new();
+    let mut ctm = [1., 0., 0., 1., 0., 0.];
+    let mut stack = Vec::new();
+    let mut shapes = Vec::new();
+    let mut fills = Vec::new();
     while cursor < events.len() {
         let e = &events[cursor];
         if e.operator == b"BT" {
@@ -205,15 +395,29 @@ fn collect(input: &[u8]) -> Option<Vec<Shape>> {
         if !text
             && !path_open
             && matches!(e.operator.as_slice(), b"m" | b"re")
-            && let Some((shape, next)) = read_shape(input, &events, cursor, ctm)
+            && let Some((composite, next)) = read_shape(input, &events, cursor, ctm)
+            && let Some(parts) = independent_components(input, &composite)
         {
-            shapes.push(shape);
+            let index = fills.len();
+            let mut component_indices = Vec::new();
+            for mut part in parts {
+                part.fill_index = index;
+                component_indices.push(shapes.len());
+                shapes.push(part);
+            }
+            fills.push(CompoundFill {
+                start: composite.start,
+                end: composite.end,
+                page_index: 0,
+                components: component_indices,
+                paint: composite.paint,
+            });
             cursor = next;
             continue;
         }
         match e.operator.as_slice() {
-            b"q" => ctm_stack.push(ctm),
-            b"Q" => ctm = ctm_stack.pop()?,
+            b"q" => stack.push(ctm),
+            b"Q" => ctm = stack.pop()?,
             b"cm" => ctm = compose_matrix(ctm, matrix_from_event(e)?),
             _ => {}
         }
@@ -228,7 +432,12 @@ fn collect(input: &[u8]) -> Option<Vec<Shape>> {
         }
         cursor += 1;
     }
-    Some(shapes)
+    Some((shapes, fills))
+}
+
+#[cfg(test)]
+fn collect(input: &[u8]) -> Option<Vec<Shape>> {
+    Some(collect_compound(input)?.0)
 }
 
 #[derive(Debug)]
@@ -318,7 +527,12 @@ impl Group {
 fn group(shapes: &[Shape]) -> Vec<Group> {
     let mut candidates = BTreeMap::<Vec<u8>, Vec<usize>>::new();
     for (i, item) in shapes.iter().enumerate() {
-        candidates.entry(item.skeleton.clone()).or_default().push(i);
+        if !item.normalized.is_empty()
+            && !item.ops.is_empty()
+            && item.normalized.iter().all(|v| v.is_finite())
+        {
+            candidates.entry(item.skeleton.clone()).or_default().push(i);
+        }
     }
     let mut output = Vec::new();
     for members in candidates.into_values() {
@@ -377,14 +591,16 @@ struct CurvedPlan {
     font_pages: Vec<BTreeSet<usize>>,
     edits: Vec<Vec<(usize, usize, Vec<u8>)>>,
     replacements: usize,
+    paint_ops_replaced: usize,
 }
 
 fn collect_sources(
     doc: &EditDocument,
     pages: &[ObjectHandle],
-) -> Result<(Vec<PageContents>, Vec<Shape>)> {
+) -> Result<(Vec<PageContents>, Vec<Shape>, Vec<CompoundFill>)> {
     let mut sources = Vec::<PageContents>::new();
     let mut shapes = Vec::<Shape>::new();
+    let mut fills = Vec::<CompoundFill>::new();
     for &page in pages {
         let Some(obj) = doc.current_owned_object(page)? else {
             continue;
@@ -397,20 +613,78 @@ fn collect_sources(
         };
         let mut decoded = Vec::new();
         decoded_content_value(doc, contents, &mut decoded)?;
-        let Some(found) = collect(&decoded) else {
+        let Some((found, found_fills)) = collect_compound(&decoded) else {
             continue;
         };
         if found.is_empty() {
             continue;
         }
         let page_index = sources.len();
+        let component_offset = shapes.len();
+        let fill_offset = fills.len();
         for mut shape in found {
             shape.page_index = page_index;
+            shape.fill_index += fill_offset;
             shapes.push(shape);
+        }
+        for mut fill in found_fills {
+            fill.page_index = page_index;
+            for idx in &mut fill.components {
+                *idx += component_offset;
+            }
+            fills.push(fill);
         }
         sources.push(PageContents { page, decoded });
     }
-    Ok((sources, shapes))
+    Ok((sources, shapes, fills))
+}
+
+fn rewrite_compound_fill(
+    fill: &CompoundFill,
+    shapes: &[Shape],
+    chosen: &[Option<(Vec<u8>, usize)>],
+) -> Option<(Vec<u8>, usize)> {
+    let selected = fill
+        .components
+        .iter()
+        .filter(|&&i| chosen[i].is_some())
+        .count();
+    if selected == 0 {
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut kept = Vec::<(usize, &[u8])>::new();
+    for &i in &fill.components {
+        if chosen[i].is_none() {
+            kept.extend(
+                shapes[i]
+                    .raw_subpaths
+                    .iter()
+                    .map(|(order, data)| (*order, data.as_slice())),
+            );
+        }
+    }
+    // All unresolved components are painted *once*, using the original
+    // winding/even-odd fill operator and unchanged coordinates.
+    if !kept.is_empty() {
+        kept.sort_unstable_by_key(|(offset, _)| *offset);
+        for (_, raw) in kept {
+            output.extend_from_slice(raw);
+            output.push(b'\n');
+        }
+        output.extend_from_slice(&fill.paint);
+        output.push(b'\n');
+    }
+    // Components moved to Type3 have AABBs separated from all residual
+    // components, so the original source operation's simultaneous fill
+    // cannot contribute compositing interactions between them.
+    for &i in &fill.components {
+        if let Some((name, code)) = &chosen[i] {
+            let bytes = replacement(name, *code, &shapes[i])?;
+            output.extend_from_slice(&bytes);
+        }
+    }
+    Some((output, selected))
 }
 
 fn prepare_plans(
@@ -418,6 +692,7 @@ fn prepare_plans(
     sources: &[PageContents],
     shapes: &[Shape],
     groups: &[Group],
+    fills: &[CompoundFill],
 ) -> Result<CurvedPlan> {
     // Avoid colliding with any existing page-local font resource, including
     // Type3 fonts installed by the earlier, exact polyline factorer.
@@ -432,34 +707,19 @@ fn prepare_plans(
     let mut edits = vec![Vec::<(usize, usize, Vec<u8>)>::new(); sources.len()];
     let mut plans = Vec::<GlyphFontPlan>::new();
     let mut font_pages = Vec::<BTreeSet<usize>>::new();
-    let mut replacements = 0_usize;
+    let mut chosen = vec![None::<(Vec<u8>, usize)>; shapes.len()];
     for (font_index, chunk) in groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT).enumerate() {
         let name = outlined_glyph_font_name(font_index, &mut occupied);
         let mut entries = Vec::new();
         let mut users = BTreeSet::new();
         for candidate in chunk {
             let code = entries.len() + 1;
-            let mut planned = Vec::new();
-            for &i in &candidate.members {
-                let appearance = &shapes[i];
-                let Some(data) = replacement(&name, code, appearance) else {
-                    planned.clear();
-                    break;
-                };
-                planned.push((
-                    appearance.page_index,
-                    appearance.start,
-                    appearance.end,
-                    data,
-                ));
-            }
-            if planned.is_empty() {
+            if u8::try_from(code).is_err() {
                 continue;
             }
-            for (page_index, start, end, data) in planned {
-                edits[page_index].push((start, end, data));
-                users.insert(page_index);
-                replacements += 1;
+            for &i in &candidate.members {
+                chosen[i] = Some((name.clone(), code));
+                users.insert(shapes[i].page_index);
             }
             entries.push(GlyphShapePlan {
                 canonical: GlyphComponent {
@@ -484,11 +744,23 @@ fn prepare_plans(
             font_pages.push(users);
         }
     }
+
+    let mut replacements = 0_usize;
+    let mut paint_ops_replaced = 0_usize;
+    for fill in fills {
+        if let Some((output, selected)) = rewrite_compound_fill(fill, shapes, &chosen) {
+            paint_ops_replaced += 1;
+            replacements += selected;
+            edits[fill.page_index].push((fill.start, fill.end, output));
+        }
+    }
+
     Ok(CurvedPlan {
         plans,
         font_pages,
         edits,
         replacements,
+        paint_ops_replaced,
     })
 }
 
@@ -499,7 +771,7 @@ pub(super) fn factor(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<OutlinedGlyphFactorStats> {
-    let (sources, shapes) = collect_sources(doc, pages)?;
+    let (sources, shapes, fills) = collect_sources(doc, pages)?;
     let mut stats = OutlinedGlyphFactorStats::default();
     if shapes.is_empty() {
         return Ok(stats);
@@ -522,7 +794,8 @@ pub(super) fn factor(
         font_pages,
         edits,
         replacements,
-    } = prepare_plans(doc, &sources, &shapes, &groups)?;
+        paint_ops_replaced,
+    } = prepare_plans(doc, &sources, &shapes, &groups, &fills)?;
     if replacements == 0 {
         return Ok(stats);
     }
@@ -571,7 +844,7 @@ pub(super) fn factor(
     stats.fonts_created = plans.len();
     stats.glyphs_created = plans.iter().map(|p| p.shapes.len()).sum();
     stats.occurrences_replaced = replacements;
-    stats.source_paints_replaced = replacements;
+    stats.source_paints_replaced = paint_ops_replaced;
     stats.estimated_flate_bytes_saved = before.saturating_sub(after);
     Ok(stats)
 }
@@ -668,7 +941,7 @@ mod tests {
         let input = std::fs::read(&path)?;
         let doc = EditDocument::from_bytes(input)?;
         let pages = doc.page_handles()?;
-        let (sources, shapes) = collect_sources(&doc, &pages)?;
+        let (sources, shapes, _fills) = collect_sources(&doc, &pages)?;
         let groups = group(&shapes);
         let all_members: usize = groups.iter().map(|g| g.members.len()).sum();
         let unique_pages: BTreeSet<_> = shapes.iter().map(|s| s.page_index).collect();
@@ -712,6 +985,118 @@ mod tests {
             operators.iter().rev().take(12).collect::<Vec<_>>()
         );
         Ok(())
+    }
+
+    #[test]
+    fn compound_fill_keeps_nested_holes_and_unrelated_contours_separate() {
+        // A rectangle with a nested even-odd hole must stay together, while
+        // separated rectangles can each become an independent component.
+        let stream = b"q \
+            0 0 4 4 re 1 1 2 2 re \
+            10 0 4 4 re \
+            20 0 4 4 re f* Q";
+        let (parts, fills) = collect_compound(stream).expect("compound fill");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts.iter().map(|p| p.ops.len()).collect::<Vec<_>>(),
+            [2, 1, 1]
+        );
+        assert_eq!(parts[0].bounds, [0., 0., 4., 4.]);
+        assert_eq!(parts[0].paint, b"f*");
+        assert_eq!(parts[0].raw_subpaths.len(), 2);
+        assert_eq!(fills[0].components, vec![0, 1, 2]);
+        assert_eq!(
+            fills[0].start,
+            stream.iter().position(|&b| b == b'0').expect("start")
+        );
+    }
+
+    #[test]
+    fn compound_fill_preserves_residual_paths_with_one_atomic_rewrite() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        let mut content = Vec::new();
+        for i in 0..4 {
+            let origin = i * 10;
+            content.extend_from_slice(
+                format!(
+                    "q 1 0 0 1 {origin} {origin} cm \
+                  0 0 4 4 re 1 1 2 2 re \
+                  10 0 3 4 re \
+                  20 0 m 25 0 l 20 {} l 20 {} l h f* Q\n",
+                    3 + i,
+                    1 + i
+                )
+                .as_bytes(),
+            );
+        }
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3,b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", &content)?;
+        let doc = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = doc.page_handles()?;
+        let (sources, parts, fills) = collect_sources(&doc, &pages)?;
+        assert_eq!(fills.len(), 4);
+        assert_eq!(parts.len(), 12);
+        // The two-rectangle even-odd glyph + the separate rectangular
+        // glyph are repeated. The distinct triangle stays original.
+        let groups = group(&parts);
+        assert_eq!(groups.len(), 2);
+        let plan = prepare_plans(&doc, &sources, &parts, &groups, &fills)?;
+        assert_eq!(plan.replacements, 8);
+        assert_eq!(plan.paint_ops_replaced, 4);
+        assert_eq!(
+            plan.edits[0].len(),
+            4,
+            "one edit per original compound fill"
+        );
+        let rewritten =
+            crate::content_stream::apply_replacements(&sources[0].decoded, &plan.edits[0])
+                .expect("nonoverlapping edits");
+        assert_eq!(
+            rewritten
+                .windows(b"/ActualText ()".len())
+                .filter(|w| *w == b"/ActualText ()")
+                .count(),
+            8
+        );
+        assert_eq!(
+            rewritten
+                .windows(b" f*\n".len())
+                .filter(|w| *w == b" f*\n")
+                .count(),
+            0
+        );
+        assert_eq!(
+            rewritten
+                .windows(b"\nf*\n".len())
+                .filter(|w| *w == b"\nf*\n")
+                .count(),
+            4
+        );
+        // The unmatched triangle's original coordinates survive exactly.
+        assert!(
+            rewritten
+                .windows(b"20 6 l 20 4 l h".len())
+                .any(|w| w == b"20 6 l 20 4 l h")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nearly_touching_or_singular_compound_paths_are_not_split() {
+        let touching = collect(b"0 0 2 2 re 2 0 2 2 re 2 1 2 1 re f").expect("touching fill");
+        assert_eq!(touching.len(), 1);
+        let separated = collect(b"0 0 2 2 re 2.3 0 2 2 re 2.3 1 2 1 re f").expect("separated fill");
+        assert_eq!(separated.len(), 2);
+        let singular = collect(b"q 1 0 0 0 0 0 cm 0 0 2 2 re 10 0 2 2 re 20 0 2 2 re f Q")
+            .expect("singular graphics state");
+        assert!(
+            singular.is_empty(),
+            "cannot prove separated ink under singular CTM"
+        );
     }
 
     #[test]
