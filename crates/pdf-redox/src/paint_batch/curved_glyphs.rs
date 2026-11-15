@@ -1,11 +1,10 @@
-//! Shared Type3 shapes for isolated, filled, Bézier or line outlines.
+//! Shared Type3 shapes for painted Bézier and line outlines in any graphics scope.
 //! Discovery is approximate, but canonical membership is checked across
 //! every occurrence using the same local-point coordinate bound.
 use super::*;
 
 const SEED_EPS: f64 = 0.012;
 const MAX_ERROR_PT: f64 = 0.02;
-const MAX_EXTENT: f64 = 16.0;
 
 #[derive(Clone, Debug)]
 struct ShapeOp {
@@ -18,7 +17,6 @@ struct Shape {
     start: usize,
     end: usize,
     page_index: usize,
-    prefix: Vec<u8>,
     paint: Vec<u8>,
     ops: Vec<ShapeOp>,
     skeleton: Vec<u8>,
@@ -97,16 +95,12 @@ fn normalize_control_points(
     (normalized, dimensions)
 }
 
-fn read_shape(input: &[u8], events: &[Event], i: usize, outer: [f64; 6]) -> Option<(Shape, usize)> {
-    let q = events.get(i)?;
-    let cm = events.get(i + 1)?;
-    if q.operator != b"q"
-        || q.operand_count != 0
-        || cm.operator != b"cm"
-        || !cm.all_operands_numeric
-        || cm.operand_count != 6
-        || !adjacent(input, q, cm)
-    {
+fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option<(Shape, usize)> {
+    // Only an unpainted path followed by a filling operator is replaced.
+    // Its surrounding graphics state (including any cm, q/Q, clipping and
+    // optional-content scopes) stays in the original content stream.
+    let first = events.get(i)?;
+    if !matches!(first.operator.as_slice(), b"m" | b"re") {
         return None;
     }
     let mut ops = Vec::new();
@@ -117,29 +111,34 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, outer: [f64; 6]) -> Opti
         f64::NEG_INFINITY,
         f64::NEG_INFINITY,
     ];
-    let mut cursor = i + 2;
+    let mut cursor = i;
     while let Some(e) = events.get(cursor) {
         let Some(need) = arity(&e.operator) else {
             break;
         };
         if !e.all_operands_numeric
             || e.operand_count != need
-            || !adjacent(input, events.get(cursor - 1)?, e)
+            || (cursor > i && !adjacent(input, events.get(cursor - 1)?, e))
         {
             return None;
         }
         let args = e.numbers.iter().copied().collect::<Vec<_>>();
-        for v in args.as_chunks::<2>().0 {
-            bounds[0] = bounds[0].min(v[0]);
-            bounds[1] = bounds[1].min(v[1]);
-            bounds[2] = bounds[2].max(v[0]);
-            bounds[3] = bounds[3].max(v[1]);
-        }
         if e.operator == b"re" {
-            bounds[0] = bounds[0].min(args[0] + args[2]);
-            bounds[1] = bounds[1].min(args[1] + args[3]);
-            bounds[2] = bounds[2].max(args[0] + args[2]);
-            bounds[3] = bounds[3].max(args[1] + args[3]);
+            // PDF 're' operands are x, y, WIDTH, HEIGHT. Width and height
+            // are not independent x/y control points.
+            for (x, y) in [(args[0], args[1]), (args[0] + args[2], args[1] + args[3])] {
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x);
+                bounds[3] = bounds[3].max(y);
+            }
+        } else {
+            for [x, y] in args.as_chunks::<2>().0 {
+                bounds[0] = bounds[0].min(*x);
+                bounds[1] = bounds[1].min(*y);
+                bounds[2] = bounds[2].max(*x);
+                bounds[3] = bounds[3].max(*y);
+            }
         }
         skeleton.push(u8::try_from(need).ok()?);
         skeleton.extend_from_slice(&e.operator);
@@ -151,38 +150,32 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, outer: [f64; 6]) -> Opti
         cursor += 1;
     }
     let paint = events.get(cursor)?;
-    let restore = events.get(cursor + 1)?;
-    if ops.len() < 8
-        || !matches!(ops.first()?.token.as_slice(), b"m" | b"re")
+    if ops.len() < 3
         || !matches!(paint.operator.as_slice(), b"f" | b"F" | b"f*")
         || paint.operand_count != 0
-        || restore.operator != b"Q"
-        || restore.operand_count != 0
         || !adjacent(input, events.get(cursor - 1)?, paint)
-        || !adjacent(input, paint, restore)
     {
         return None;
     }
     let width = bounds[2] - bounds[0];
     let height = bounds[3] - bounds[1];
-    if !(width > 1.5 && height > 2.0 && width <= MAX_EXTENT && height <= MAX_EXTENT) {
+    if !(width > 0.0 && height > 0.0 && width.is_finite() && height.is_finite()) {
         return None;
     }
     let (normalized, dimensions) = normalize_control_points(&ops, bounds, width, height);
     skeleton.extend_from_slice(&paint.operator);
-    let combined = compose_matrix(outer, matrix_from_event(cm)?);
+    let combined = ctm;
     let page_space_factor = (combined[0].abs() + combined[2].abs())
         .max(combined[1].abs() + combined[3].abs())
         .max(1.0);
-    if !page_space_factor.is_finite() {
+    if !page_space_factor.is_finite() || normalized.iter().any(|n| !n.is_finite()) {
         return None;
     }
     Some((
         Shape {
-            start: q.start,
-            end: restore.end,
+            start: first.start,
+            end: paint.end,
             page_index: 0,
-            prefix: input.get(q.start..cm.end)?.to_vec(),
             paint: paint.operator.clone(),
             ops,
             skeleton,
@@ -191,7 +184,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, outer: [f64; 6]) -> Opti
             bounds,
             page_space_factor,
         },
-        cursor + 2,
+        cursor + 1,
     ))
 }
 
@@ -211,7 +204,7 @@ fn collect(input: &[u8]) -> Option<Vec<Shape>> {
         }
         if !text
             && !path_open
-            && e.operator == b"q"
+            && matches!(e.operator.as_slice(), b"m" | b"re")
             && let Some((shape, next)) = read_shape(input, &events, cursor, ctm)
         {
             shapes.push(shape);
@@ -349,9 +342,10 @@ fn replacement(font: &[u8], code: usize, shape: &Shape) -> Option<Vec<u8>> {
     if code == 0 {
         return None;
     }
-    let mut out = shape.prefix.clone();
-    // Explicitly set text parameters: the q/Q pair restores the caller state.
-    out.extend_from_slice(b"\n/Span << /ActualText () >> BDC\nBT 0 Tr 0 Ts 0 Tc 0 Tw 100 Tz /");
+    // Replace only the original path and fill operator. The surrounding
+    // clipping, current colors, CTM, transparency and marked-content stay.
+    // q/Q here ensure the new BT/ET state cannot escape its painting site.
+    let mut out = b"q\n/Span << /ActualText () >> BDC\nBT 0 Tr 0 Ts 0 Tc 0 Tw 100 Tz /".to_vec();
     out.extend_from_slice(font);
     out.extend_from_slice(b" 1 Tf ");
     for v in [
@@ -600,6 +594,7 @@ mod tests {
         let text = replacement(b"Test", 1, &samples[1]).expect("placement");
         assert!(text.windows(4).any(|x| x == b"BT 0"));
         assert!(text.ends_with(b"ET\nEMC\nQ\n"));
+        assert!(text.starts_with(b"q\n/Span"));
         assert!(
             text.windows(b"/ActualText ()".len())
                 .any(|w| w == b"/ActualText ()")
@@ -615,6 +610,110 @@ mod tests {
         bytes.extend(b"q 1 0 0 1 0 0 cm 0 0 m 3 0 l 3 4 l 0 4 l 1 3 l 2 2 l 2 1 l 0 1 l 0.5 g f Q");
         assert_eq!(collect(&bytes).expect("parse").len(), 2);
     }
+
+    #[test]
+    fn recognizes_fills_inside_existing_graphics_and_marked_content_scopes() {
+        let data = b"/OC /Glyphs BDC q 2 0 0 1 0 0 cm /GS1 gs \
+          9 9 2 3 re 9 9 m 11 12 l f \
+          13 9 2 3 re 13 9 m 15 12 l f Q EMC";
+        let found = collect(data).expect("source content");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].bounds, [9.0, 9.0, 11.0, 12.0]);
+        assert_eq!(found[1].bounds, [13.0, 9.0, 15.0, 12.0]);
+        assert_eq!(found[0].page_space_factor, 2.0);
+        let groups = group(&found);
+        assert_eq!(groups.len(), 1);
+        let rendered = replacement(b"Test", 1, &found[1]).expect("glyph rendering");
+        assert!(rendered.starts_with(b"q\n/Span"));
+        assert!(!rendered.windows(5).any(|part| part == b" cm\n"));
+        assert!(rendered.ends_with(b"EMC\nQ\n"));
+    }
+
+    #[test]
+    fn preserves_clipping_and_excludes_incomplete_paths() {
+        let data = b"q 0 0 100 100 re W n \
+            1 1 m 2 1 l 2 2 l f \
+            3 3 m 4 3 l 4 4 l W n \
+            7 7 m 8 7 l 8 8 l f Q";
+        let found = collect(data).expect("source content");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].bounds, [1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(found[1].bounds, [7.0, 7.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn nested_transforms_constrain_canonical_error_in_page_space() {
+        let a = b"q 20 0 0 20 1 2 cm \
+            0 0 m 4 0 l 4 4 l 0 4 l 0 0 l f Q";
+        let b = b"q 1 0 0 1 1 2 cm \
+            0 0 m 4 0 l 4 4 l 0.04 4 l 0 0 l f Q";
+        let found_a = collect(a).expect("source a");
+        let found_b = collect(b).expect("source b");
+        assert_eq!(found_a[0].page_space_factor, 20.0);
+        let mut both = found_a;
+        both.extend(found_b);
+        // Dimensions differ; a single canonical would violate the 0.02pt
+        // transformed error budget on the 20x-scaled member.
+        assert!(group(&both).is_empty());
+    }
+
+    /// Optional corpus probe: `PDF_REDOX_CORPUS_PDF=/path/to/file.pdf`.
+    /// Deliberately ignored in CI because no fixture PDF is checked in.
+    #[test]
+    #[ignore = "requires an external source PDF supplied via an environment variable"]
+    fn corpus_outline_coverage_diagnostic() -> Result<()> {
+        let Ok(path) = std::env::var("PDF_REDOX_CORPUS_PDF") else {
+            return Ok(());
+        };
+        let input = std::fs::read(&path)?;
+        let doc = EditDocument::from_bytes(input)?;
+        let pages = doc.page_handles()?;
+        let (sources, shapes) = collect_sources(&doc, &pages)?;
+        let groups = group(&shapes);
+        let all_members: usize = groups.iter().map(|g| g.members.len()).sum();
+        let unique_pages: BTreeSet<_> = shapes.iter().map(|s| s.page_index).collect();
+        eprintln!(
+            "CORPUS_OUTLINE_PROBE pdf={path} pages={} content_pages={} shapes={} \
+             groups={} grouped_occurrences={} candidate_pages={}",
+            pages.len(),
+            sources.len(),
+            shapes.len(),
+            groups.len(),
+            all_members,
+            unique_pages.len()
+        );
+        let mut operators = BTreeMap::<usize, usize>::new();
+        let mut sizes = BTreeMap::<usize, usize>::new();
+        for shape in &shapes {
+            *operators.entry(shape.ops.len()).or_default() += 1;
+            let dim = (shape.bounds[2] - shape.bounds[0]).max(shape.bounds[3] - shape.bounds[1]);
+            let bin = if dim < 2.0 {
+                0
+            } else if dim < 8.0 {
+                1
+            } else if dim < 16.0 {
+                2
+            } else if dim < 64.0 {
+                3
+            } else {
+                4
+            };
+            *sizes.entry(bin).or_default() += 1;
+        }
+        let shortest: usize = operators
+            .iter()
+            .filter(|(n, _)| **n < 8)
+            .map(|(_, v)| v)
+            .sum();
+        eprintln!(
+            "CORPUS_OUTLINE_PROBE short_ops={} size_bins={} most_common_ops={:?}",
+            shortest,
+            format_args!("{sizes:?}"),
+            operators.iter().rev().take(12).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
     #[test]
     fn emits_real_type3_fonts_from_repeated_curved_paths() -> Result<()> {
         use crate::test_support::ClassicPdfBuilder;
