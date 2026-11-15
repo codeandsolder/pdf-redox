@@ -3144,8 +3144,11 @@ impl PathCoordinateScanner {
         input: &[u8],
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
     ) {
-        if &instruction.operator[..] == b"BI" {
-            self.operands.clear();
+        let operator = &instruction.operator[..];
+        if !matches!(operator, b"cm" | b"m" | b"l" | b"c" | b"v" | b"y" | b"re") {
+            // Only CTM changes and path geometry consume operands. Still
+            // process q/Q so the graphics-state stack stays authoritative.
+            self.process_operator(input, operator);
             return;
         }
         self.operands.clear();
@@ -4491,6 +4494,21 @@ mod tests {
         let cached = Some((plan.canonicalized, plan.coordinates_canonicalized));
 
         assert_eq!(cached, standalone);
+    }
+
+    #[test]
+    fn path_coordinate_canonicalization_skips_unrelated_operators_without_losing_state()
+    -> crate::Result<()> {
+        let input = b"1 0 0 rg q 99 w 100 0 0 100 0 0 cm 1.004 2 m S Q BT /F1 12 Tf (keep 1.009) Tj ET 5.003 6.003 m S";
+        let (output, count) = canonicalize_path_coordinates(input, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing outer path rewrite".to_owned()))?;
+        assert_eq!(count, 2);
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("1 0 0 rg q 99 w"));
+        assert!(output.contains("1.004 2 m S Q"));
+        assert!(output.contains("BT /F1 12 Tf (keep 1.009) Tj ET"));
+        assert!(output.contains("5 6 m S"));
+        Ok(())
     }
 
     #[test]
