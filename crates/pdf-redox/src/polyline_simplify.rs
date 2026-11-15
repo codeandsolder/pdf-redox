@@ -16,7 +16,8 @@ use crate::{
 };
 
 pub const MAX_POLYLINE_PAGE_ERROR_PT: f64 = 0.005;
-const MAX_CUBIC_CHORD_PAGE_ERROR_PT: f64 = 0.05;
+const MAX_CUBIC_CHORD_PAGE_ERROR_PT: f64 = 0.20;
+const MAX_CUBIC_CHORD_RELATIVE_ERROR: f64 = 0.10;
 const MIN_CUBIC_CHORD_LENGTH_PT: f64 = 0.5;
 const MIN_RUN_POINTS: usize = 8;
 const MIN_FLATE_SAVINGS_BYTES: usize = 1024;
@@ -155,9 +156,13 @@ impl<'a> Scanner<'a> {
         if !(0.0..=1.0).contains(&first_t) || !(first_t..=1.0).contains(&second_t) {
             return false;
         }
+        // Keep the point-space limit subpixel while also protecting short
+        // segments: the allowed lateral deviation cannot exceed one tenth
+        // of the chord, regardless of the output scale.
+        let max_error = MAX_CUBIC_CHORD_PAGE_ERROR_PT.min(MAX_CUBIC_CHORD_RELATIVE_ERROR * len);
         [first, second].into_iter().all(|point| {
             let cross = (point.0 - start.0).mul_add(dy, -(point.1 - start.1) * dx);
-            cross.is_finite() && cross.abs() <= MAX_CUBIC_CHORD_PAGE_ERROR_PT * len
+            cross.is_finite() && cross.abs() <= max_error * len
         })
     }
 
@@ -640,7 +645,7 @@ mod tests {
         let invalid = [
             b"0 0 m 4 0 1 0 3 0 c f".as_slice(),
             b"0 0 m 1 0 2 0 0.1 0 c f",
-            b"0 0 m 1 0.2 2 0.2 3 0 c f",
+            b"0 0 m 1 0.31 2 0.31 3 0 c f",
             b"0 0 m 1 0.01 2 0.01 3 0 c W n",
             b"0 0 m 1 0.01 2 0.01 3 0 c q Q f",
         ];
@@ -659,6 +664,34 @@ mod tests {
             assert_eq!(replacements, Vec::<Replacement>::new());
         }
         Ok(())
+    }
+
+    #[test]
+    fn cubic_envelope_expands_only_for_sufficiently_long_chords() {
+        assert!(Scanner::near_linear_cubic(
+            (0.0, 0.0),
+            (0.6, 0.08),
+            (1.4, 0.08),
+            (2.0, 0.0),
+        ));
+        assert!(!Scanner::near_linear_cubic(
+            (0.0, 0.0),
+            (0.2, 0.07),
+            (0.4, 0.07),
+            (0.6, 0.0),
+        ));
+        assert!(Scanner::near_linear_cubic(
+            (0.0, 0.0),
+            (0.6, 0.15),
+            (1.4, 0.15),
+            (2.0, 0.0),
+        ));
+        assert!(!Scanner::near_linear_cubic(
+            (0.0, 0.0),
+            (0.6, 0.22),
+            (1.4, 0.22),
+            (2.0, 0.0),
+        ));
     }
 
     #[test]
