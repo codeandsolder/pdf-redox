@@ -2,6 +2,8 @@
 //! Discovery is approximate, but canonical membership is checked across
 //! every occurrence using the same local-point coordinate bound.
 use super::*;
+use crate::glyph_catalog::{GlyphCatalog, GlyphOccurrence, GlyphTemplate};
+use sha2::{Digest as _, Sha256};
 
 const SEED_EPS: f64 = 0.012;
 const MAX_ERROR_PT: f64 = 0.02;
@@ -29,6 +31,7 @@ struct Shape {
     bounds: [f64; 4],
     page_space_factor: f64,
     min_page_scale: f64,
+    effective_ctm: [f64; 6],
 }
 
 const fn arity(op: &[u8]) -> Option<usize> {
@@ -203,6 +206,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
             bounds,
             page_space_factor,
             min_page_scale,
+            effective_ctm: combined,
         },
         cursor + 1,
     ))
@@ -372,6 +376,7 @@ fn independent_components(input: &[u8], original: &Shape) -> Option<Vec<Shape>> 
             bounds,
             page_space_factor: original.page_space_factor,
             min_page_scale: original.min_page_scale,
+            effective_ctm: original.effective_ctm,
         });
     }
     Some(result)
@@ -583,6 +588,7 @@ const MIN_OCR_USEFUL_OCCURRENCES: usize = 64;
 
 struct PageContents {
     page: ObjectHandle,
+    page_number: usize,
     decoded: Vec<u8>,
 }
 
@@ -601,7 +607,7 @@ fn collect_sources(
     let mut sources = Vec::<PageContents>::new();
     let mut shapes = Vec::<Shape>::new();
     let mut fills = Vec::<CompoundFill>::new();
-    for &page in pages {
+    for (actual_page_index, &page) in pages.iter().enumerate() {
         let Some(obj) = doc.current_owned_object(page)? else {
             continue;
         };
@@ -634,7 +640,11 @@ fn collect_sources(
             }
             fills.push(fill);
         }
-        sources.push(PageContents { page, decoded });
+        sources.push(PageContents {
+            page,
+            page_number: actual_page_index + 1,
+            decoded,
+        });
     }
     Ok((sources, shapes, fills))
 }
@@ -764,12 +774,167 @@ fn prepare_plans(
     })
 }
 
+const fn transformed_corner(matrix: [f64; 6], x: f64, y: f64) -> [f64; 2] {
+    [
+        matrix[0].mul_add(x, matrix[2].mul_add(y, matrix[4])),
+        matrix[1].mul_add(x, matrix[3].mul_add(y, matrix[5])),
+    ]
+}
+
+fn candidate_svg_path(group: &Group, shapes: &[Shape]) -> String {
+    use std::fmt::Write as _;
+    let canonical = group
+        .low
+        .iter()
+        .zip(&group.high)
+        .map(|(lo, hi)| f64::midpoint(*lo, *hi))
+        .collect::<Vec<_>>();
+    let mut path = String::new();
+    let mut current = [0.0, 0.0];
+    let mut subpath_start = current;
+    let mut pos = 0_usize;
+    for op in &shapes[group.seed].ops {
+        let values = &canonical[pos..pos + op.args.len()];
+        pos += op.args.len();
+        match op.token.as_slice() {
+            b"m" => {
+                let _ = write!(&mut path, "M{} {} ", pdf_num(values[0]), pdf_num(values[1]));
+                current = [values[0], values[1]];
+                subpath_start = current;
+            }
+            b"l" => {
+                let _ = write!(&mut path, "L{} {} ", pdf_num(values[0]), pdf_num(values[1]));
+                current = [values[0], values[1]];
+            }
+            b"c" => {
+                let _ = write!(
+                    &mut path,
+                    "C{} {} {} {} {} {} ",
+                    pdf_num(values[0]),
+                    pdf_num(values[1]),
+                    pdf_num(values[2]),
+                    pdf_num(values[3]),
+                    pdf_num(values[4]),
+                    pdf_num(values[5])
+                );
+                current = [values[4], values[5]];
+            }
+            b"v" => {
+                let _ = write!(
+                    &mut path,
+                    "C{} {} {} {} {} {} ",
+                    pdf_num(current[0]),
+                    pdf_num(current[1]),
+                    pdf_num(values[0]),
+                    pdf_num(values[1]),
+                    pdf_num(values[2]),
+                    pdf_num(values[3])
+                );
+                current = [values[2], values[3]];
+            }
+            b"y" => {
+                let _ = write!(
+                    &mut path,
+                    "C{} {} {} {} {} {} ",
+                    pdf_num(values[0]),
+                    pdf_num(values[1]),
+                    pdf_num(values[2]),
+                    pdf_num(values[3]),
+                    pdf_num(values[2]),
+                    pdf_num(values[3])
+                );
+                current = [values[2], values[3]];
+            }
+            b"re" => {
+                let [x, y, w, h] = values else {
+                    return String::new();
+                };
+                let (x, y, w, h) = (*x, *y, *w, *h);
+                let _ = write!(
+                    &mut path,
+                    "M{} {} L{} {} L{} {} L{} {} Z ",
+                    pdf_num(x),
+                    pdf_num(y),
+                    pdf_num(x + w),
+                    pdf_num(y),
+                    pdf_num(x + w),
+                    pdf_num(y + h),
+                    pdf_num(x),
+                    pdf_num(y + h)
+                );
+                current = [x, y];
+                subpath_start = current;
+            }
+            b"h" => {
+                path.push_str("Z ");
+                current = subpath_start;
+            }
+            _ => unreachable!("candidate ops already validated"),
+        }
+    }
+    path.trim_end().to_owned()
+}
+
+fn collect_catalog(
+    catalog: &mut GlyphCatalog,
+    groups: &[Group],
+    plans: &[GlyphFontPlan],
+    shapes: &[Shape],
+    sources: &[PageContents],
+) {
+    use std::fmt::Write as _;
+    catalog.schema_version = 1;
+    for (plan, chunk) in plans.iter().zip(groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT)) {
+        for (index, (entry, group)) in plan.shapes.iter().zip(chunk).enumerate() {
+            let digest = Sha256::digest(&entry.charproc);
+            let mut id = String::with_capacity(64);
+            for byte in &digest {
+                let _ = write!(&mut id, "{byte:02x}");
+            }
+            let Ok(code) = u8::try_from(index + 1) else {
+                continue;
+            };
+            let mut occurrences = Vec::with_capacity(group.members.len());
+            for &member in &group.members {
+                let shape = &shapes[member];
+                let [x0, y0, x1, y1] = shape.bounds;
+                occurrences.push(GlyphOccurrence {
+                    page: sources[shape.page_index].page_number,
+                    local_bbox: shape.bounds,
+                    ctm: shape.effective_ctm,
+                    page_quad: [
+                        transformed_corner(shape.effective_ctm, x0, y0),
+                        transformed_corner(shape.effective_ctm, x1, y0),
+                        transformed_corner(shape.effective_ctm, x1, y1),
+                        transformed_corner(shape.effective_ctm, x0, y1),
+                    ],
+                });
+            }
+            catalog.glyphs.push(GlyphTemplate {
+                id,
+                font_resource: String::from_utf8_lossy(&plan.name).into_owned(),
+                code,
+                charproc: String::from_utf8_lossy(&entry.charproc).into_owned(),
+                svg_path: candidate_svg_path(group, shapes),
+                fill_rule: if shapes[group.seed].paint == b"f*" {
+                    "evenodd"
+                } else {
+                    "nonzero"
+                }
+                .to_owned(),
+                occurrences,
+            });
+        }
+    }
+}
+
 /// Share filled glyphs across the whole document. OCR can label each
 /// canonical once even when appearances span different pages.
 pub(super) fn factor(
     doc: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    catalog: Option<&mut GlyphCatalog>,
 ) -> Result<OutlinedGlyphFactorStats> {
     let (sources, shapes, fills) = collect_sources(doc, pages)?;
     let mut stats = OutlinedGlyphFactorStats::default();
@@ -846,6 +1011,9 @@ pub(super) fn factor(
     stats.occurrences_replaced = replacements;
     stats.source_paints_replaced = paint_ops_replaced;
     stats.estimated_flate_bytes_saved = before.saturating_sub(after);
+    if let Some(catalog) = catalog {
+        collect_catalog(catalog, &groups, &plans, &shapes, &sources);
+    }
     Ok(stats)
 }
 
@@ -1100,6 +1268,65 @@ mod tests {
     }
 
     #[test]
+    fn export_svg_encodes_pdf_curve_shorthands_correctly() {
+        let data = b"0 0 m 1 1 2 2 v 2 4 3 3 y 4 4 l h \
+            6 6 2 3 re f*";
+        let shapes = collect(data).expect("parse");
+        assert_eq!(shapes.len(), 2);
+        let g = Group::first(0, &shapes[0]);
+        let path = candidate_svg_path(&g, &shapes);
+        assert!(path.contains('C'), "{path}");
+        assert!(path.contains('Z'), "{path}");
+        assert_eq!(path.matches('M').count(), 1, "{path}");
+        let rectangle = Group::first(1, &shapes[1]);
+        let rectangle_path = candidate_svg_path(&rectangle, &shapes);
+        assert!(rectangle_path.starts_with('M'));
+        assert!(rectangle_path.ends_with('Z'));
+        let proc = g.charproc(&shapes);
+        assert!(proc.ends_with(b"f*\n"));
+    }
+
+    #[test]
+    fn captures_actual_one_based_page_indices_when_empty_pages_are_skipped() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        pdf.object(3,b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 5 0 R >>")?;
+        pdf.object(4,b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 6 0 R >>")?;
+        pdf.stream(5, b"", b"")?;
+        let repeated = b"q 3 0 0 4 7 8 cm 1 1 m 3 1 l 3 5 l 1 5 l h f Q \
+            q 3 0 0 4 7 8 cm 5 1 m 7 1 l 7 5 l 5 5 l h f Q";
+        pdf.stream(6, b"", repeated)?;
+        let doc = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = doc.page_handles()?;
+        let (sources, shapes, _fills) = collect_sources(&doc, &pages)?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].page_number, 2);
+        assert_eq!(shapes.len(), 2);
+        let groups = group(&shapes);
+        assert_eq!(groups.len(), 1);
+        let mut catalog = GlyphCatalog::default();
+        let plans = prepare_plans(
+            &doc,
+            &sources,
+            &shapes,
+            &groups,
+            &collect_sources(&doc, &pages)?.2,
+        )?;
+        collect_catalog(&mut catalog, &groups, &plans.plans, &shapes, &sources);
+        assert_eq!(catalog.glyphs.len(), 1);
+        assert_eq!(catalog.glyphs[0].occurrences.len(), 2);
+        assert!(catalog.glyphs[0].occurrences.iter().all(|o| o.page == 2));
+        assert_eq!(
+            catalog.glyphs[0].occurrences[0].ctm,
+            [3., 0., 0., 4., 7., 8.]
+        );
+        assert!(catalog.glyphs[0].occurrences[0].page_quad[0][0] > 7.);
+        Ok(())
+    }
+
+    #[test]
     fn emits_real_type3_fonts_from_repeated_curved_paths() -> Result<()> {
         use crate::test_support::ClassicPdfBuilder;
         let mut content = Vec::new();
@@ -1136,8 +1363,33 @@ mod tests {
         pdf.stream(4, b"", &content)?;
         let mut doc = EditDocument::from_bytes(pdf.finish(1)?)?;
         let pages = doc.page_handles()?;
-        let stats = factor(&mut doc, &pages, crate::FlateLevel::PROCESSING)?;
+        let mut catalog = GlyphCatalog::default();
+        let stats = factor(
+            &mut doc,
+            &pages,
+            crate::FlateLevel::PROCESSING,
+            Some(&mut catalog),
+        )?;
         assert_eq!(stats.pages_rewritten, 1, "{stats:?}");
+        assert_eq!(catalog.schema_version, 1);
+        assert_eq!(catalog.glyphs.len(), stats.glyphs_created);
+        assert_eq!(
+            catalog
+                .glyphs
+                .iter()
+                .map(|g| g.occurrences.len())
+                .sum::<usize>(),
+            stats.occurrences_replaced
+        );
+        assert!(catalog.glyphs.iter().all(|g| g.id.len() == 64));
+        assert!(
+            catalog
+                .glyphs
+                .iter()
+                .all(|g| g.occurrences.iter().all(|o| o.page == 1))
+        );
+        assert!(catalog.glyphs.iter().any(|g| g.svg_path.starts_with('M')));
+
         assert!(stats.fonts_created >= 1);
         assert!(stats.occurrences_replaced >= 4000, "{stats:?}");
         let object = doc.current_owned_object(pages[0])?.expect("page");

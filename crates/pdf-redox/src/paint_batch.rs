@@ -2376,9 +2376,10 @@ pub fn factor_outlined_glyphs(
     doc: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    catalog: Option<&mut crate::GlyphCatalog>,
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = factor_polyline_outlined_glyphs(doc, pages, flate_level)?;
-    let curves = curved_glyphs::factor(doc, pages, flate_level)?;
+    let curves = curved_glyphs::factor(doc, pages, flate_level, catalog)?;
     stats.pages_rewritten += curves.pages_rewritten;
     stats.fonts_created += curves.fonts_created;
     stats.glyphs_created += curves.glyphs_created;

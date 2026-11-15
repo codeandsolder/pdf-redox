@@ -1,5 +1,5 @@
 use crate::{
-    Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
+    Config, EditDocument, GlyphCatalog, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::analyze_document_for_optimization,
     content::{PageRewriteResult, normalize_page_contents},
     dedup::{
@@ -299,6 +299,33 @@ pub fn analyze_microstroke_rasterization(
 /// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
 /// an optimization pass fails, or the rewritten document cannot be serialized.
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
+    optimize_pdf_impl(input, cfg, None)
+}
+
+/// Optimize a PDF and return the document-wide catalog of Type3 outline
+/// components actually created by the Processing goal.
+///
+/// The catalog stores reusable geometry candidates and page placements, not
+/// Unicode predictions: one visual component is not necessarily one character.
+/// All ordinary optimization results remain identical when collection is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the PDF or optimization configuration is invalid.
+pub fn optimize_pdf_with_glyph_catalog(
+    input: &[u8],
+    cfg: &Config,
+) -> Result<(Vec<u8>, OptimizationReport, GlyphCatalog)> {
+    let mut catalog = GlyphCatalog::default();
+    let (output, report) = optimize_pdf_impl(input, cfg, Some(&mut catalog))?;
+    Ok((output, report, catalog))
+}
+
+fn optimize_pdf_impl(
+    input: &[u8],
+    cfg: &Config,
+    catalog: Option<&mut GlyphCatalog>,
+) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
     let mut timings = BTreeMap::new();
     let document = timed(&mut timings, "document-open", || {
@@ -313,6 +340,7 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         analysis.report,
         Some(&analysis.ext_gstate_dictionary_handles),
         timings,
+        catalog,
     )
 }
 
@@ -335,7 +363,7 @@ pub fn optimize_pdf_with_analysis(
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings)
+    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings, None)
 }
 
 fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
@@ -403,6 +431,7 @@ fn optimize_pdf_with_document(
     before: PdfAnalysis,
     ext_gstate_dictionary_handles: Option<&[crate::ObjectHandle]>,
     mut timings: BTreeMap<String, f64>,
+    catalog: Option<&mut GlyphCatalog>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
     let preservation_fast_path = preservation_uses_fast_path(&cfg.preservation);
@@ -866,7 +895,7 @@ fn optimize_pdf_with_document(
 
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(&mut document, &stable_pages, flate_level)
+            factor_outlined_glyphs(&mut document, &stable_pages, flate_level, catalog)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
