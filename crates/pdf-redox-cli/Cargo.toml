@@ -15,6 +15,11 @@ name = "pdf-redox"
 path = "src/main.rs"
 doc = false
 
+[[bin]]
+name = "pdf-redox-glyph-labels"
+path = "src/glyph_labels.rs"
+doc = false
+
 [dependencies]
 pdf-redox = { path = "../pdf-redox" }
 clap.workspace = true

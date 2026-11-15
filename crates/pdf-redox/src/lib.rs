@@ -18,6 +18,7 @@ mod font_bitmap;
 mod font_subset;
 pub(crate) mod geometry;
 mod glyph_catalog;
+mod glyph_labels;
 pub(crate) mod hidden_text;
 mod icc_alternate;
 pub(crate) mod images;
@@ -57,7 +58,10 @@ pub use config::{
     PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
 };
 pub use error::{Error, Result, SourceLoadError};
-pub use glyph_catalog::{GlyphCatalog, GlyphOccurrence, GlyphTemplate};
+pub use glyph_catalog::{
+    GlyphCatalog, GlyphLabelOverride, GlyphLabelReport, GlyphLabels, GlyphOccurrence, GlyphTemplate,
+};
+pub use glyph_labels::apply_glyph_labels;
 pub use microstroke::MicrostrokeRasterStats;
 pub use optimize::{
     analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis,

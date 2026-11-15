@@ -883,7 +883,7 @@ fn collect_catalog(
     sources: &[PageContents],
 ) {
     use std::fmt::Write as _;
-    catalog.schema_version = 1;
+    catalog.schema_version = 2;
     for (plan, chunk) in plans.iter().zip(groups.chunks(MAX_TYPE3_GLYPHS_PER_FONT)) {
         for (index, (entry, group)) in plan.shapes.iter().zip(chunk).enumerate() {
             let digest = Sha256::digest(&entry.charproc);
@@ -895,11 +895,17 @@ fn collect_catalog(
                 continue;
             };
             let mut occurrences = Vec::with_capacity(group.members.len());
+            let mut ordinals = BTreeMap::<usize, usize>::new();
             for &member in &group.members {
                 let shape = &shapes[member];
+                let page = sources[shape.page_index].page_number;
+                let ordinal = ordinals.entry(page).or_insert(0);
+                let index_on_page = *ordinal;
+                *ordinal += 1;
                 let [x0, y0, x1, y1] = shape.bounds;
                 occurrences.push(GlyphOccurrence {
-                    page: sources[shape.page_index].page_number,
+                    page,
+                    index_on_page,
                     local_bbox: shape.bounds,
                     ctm: shape.effective_ctm,
                     page_quad: [
@@ -1371,7 +1377,7 @@ mod tests {
             Some(&mut catalog),
         )?;
         assert_eq!(stats.pages_rewritten, 1, "{stats:?}");
-        assert_eq!(catalog.schema_version, 1);
+        assert_eq!(catalog.schema_version, 2);
         assert_eq!(catalog.glyphs.len(), stats.glyphs_created);
         assert_eq!(
             catalog
