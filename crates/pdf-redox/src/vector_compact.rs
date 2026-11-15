@@ -7,7 +7,7 @@ use crate::{
         page_box_numbers_matching, page_user_unit, replace_page_content,
         replace_page_content_with_handle, resolved_dictionary,
     },
-    content_stream::{InstructionOperand as Operand, instruction_operands, operand_numbers},
+    content_stream::{InstructionOperand as Operand, instruction_operands_into, operand_numbers},
     flate::FlateReuseCache,
 };
 use num_traits::ToPrimitive;
@@ -359,7 +359,7 @@ impl FillScanner {
             self.barrier();
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        instruction_operands_into(input, instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }
@@ -1177,7 +1177,7 @@ impl TransformedBlockScanner {
             self.operands.clear();
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        instruction_operands_into(input, instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }
@@ -1205,7 +1205,7 @@ fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
         if &instruction.operator[..] == b"BI" {
             scanner.unsupported_operator_state(false);
         } else {
-            let operands = instruction_operands(input, instruction);
+            let operands = crate::content_stream::instruction_operands(input, instruction);
             let span = instruction.operator_span();
             scanner.process_operator_with_operands(
                 &instruction.operator[..],
@@ -1262,7 +1262,7 @@ impl ProcessingFactorScanner {
             self.inline_image();
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        instruction_operands_into(input, instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }

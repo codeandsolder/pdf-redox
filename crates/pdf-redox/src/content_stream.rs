@@ -31,15 +31,26 @@ pub fn instruction_operands(
     input: &[u8],
     instruction: &hayro_syntax::content::Instruction<'_, '_>,
 ) -> Vec<InstructionOperand> {
-    instruction
-        .operands()
-        .zip(instruction.operand_spans())
-        .map(|(object, span)| InstructionOperand {
+    let mut operands = Vec::new();
+    instruction_operands_into(input, instruction, &mut operands);
+    operands
+}
+
+/// Parse the same operand facets into an existing buffer, retaining capacity
+/// across instructions in long-running page scanners.
+pub fn instruction_operands_into(
+    input: &[u8],
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    operands: &mut Vec<InstructionOperand>,
+) {
+    operands.clear();
+    operands.extend(instruction.operands().zip(instruction.operand_spans()).map(
+        |(object, span)| InstructionOperand {
             number: operand_number(object, input.get(span.clone()).unwrap_or_default()),
             name: operand_name(object).map(ToOwned::to_owned),
             offset: span.start,
-        })
-        .collect()
+        },
+    ));
 }
 
 /// Return all operands as numbers, or `None` when any operand is non-numeric.
@@ -150,6 +161,30 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reusable_operand_buffer_matches_owned_parsing_and_reuses_capacity() -> Result<()> {
+        let input = b"/F1 12 Tf 5.123 8 m 1 0 0 rg q Q 10 20 l (literal text) Tj";
+        let mut reused = Vec::with_capacity(16);
+        let initial_pointer = reused.as_ptr();
+        let mut instructions = 0;
+        let incomplete = visit_instructions(input, |instruction| {
+            let owned = instruction_operands(input, instruction);
+            instruction_operands_into(input, instruction, &mut reused);
+            assert_eq!(reused.len(), owned.len());
+            for (actual, expected) in reused.iter().zip(&owned) {
+                assert_eq!(actual.number, expected.number);
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.offset, expected.offset);
+            }
+            assert_eq!(reused.as_ptr(), initial_pointer);
+            instructions += 1;
+            Ok(())
+        })?;
+        assert!(!incomplete);
+        assert_eq!(instructions, 7);
+        Ok(())
+    }
 
     #[test]
     fn owned_and_borrowed_replacements_agree_and_reject_overlaps() {
