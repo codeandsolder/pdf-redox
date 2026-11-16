@@ -281,6 +281,31 @@ pub fn replace_page_content(
     replace_page_content_with_handle(document, page, bytes).map(|_| ())
 }
 
+/// Replace page contents with a new Flate-encoded stream instead of leaving
+/// entire page commands uncompressed after semantic-only transformations.
+pub fn replace_page_content_flate(
+    document: &mut EditDocument,
+    page: ObjectHandle,
+    decoded: &[u8],
+    level: crate::FlateLevel,
+) -> Result<()> {
+    let encoded = crate::stream_codec::encode_flate(decoded, level)?;
+    let mut dictionary = OwnedDictionary::new();
+    dictionary.insert(
+        b"Filter".to_vec(),
+        OwnedObject::Name(b"FlateDecode".to_vec()),
+    );
+    let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+        dictionary,
+        data: StreamData::Owned(encoded),
+    }));
+    let object = document.edit_handle(page)?;
+    if let Some(dict) = object.as_dictionary_mut() {
+        dict.insert(b"Contents".to_vec(), OwnedObject::Reference(stream));
+    }
+    Ok(())
+}
+
 pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandle]) -> Result<()> {
     for &page in pages {
         let Some(object) = document.current_owned_object(page)? else {

@@ -26,6 +26,7 @@ mod inline_images;
 mod jpeg;
 mod jpeg_optimize;
 mod microstroke;
+mod ocr_overlay;
 mod optimize;
 mod page_representation;
 mod paint_batch;
@@ -63,6 +64,9 @@ pub use glyph_catalog::{
 };
 pub use glyph_labels::apply_glyph_labels;
 pub use microstroke::MicrostrokeRasterStats;
+pub use ocr_overlay::{
+    OcrDocument, OcrLine, OcrOverlayOptions, OcrOverlayReport, OcrPage, apply_ocr_overlay,
+};
 pub use optimize::{
     analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis,
     optimize_pdf_with_glyph_catalog,

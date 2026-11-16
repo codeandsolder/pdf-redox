@@ -16,6 +16,11 @@ path = "src/main.rs"
 doc = false
 
 [[bin]]
+name = "pdf-redox-ocr-overlay"
+path = "src/ocr_overlay.rs"
+doc = false
+
+[[bin]]
 name = "pdf-redox-glyph-labels"
 path = "src/glyph_labels.rs"
 doc = false
