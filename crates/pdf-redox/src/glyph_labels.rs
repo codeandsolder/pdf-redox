@@ -4,7 +4,7 @@
 use crate::{
     EditDocument, Error, GlyphCatalog, GlyphLabelReport, GlyphLabels, Result,
     content::{decoded_content_value, replace_page_content},
-    glyph_catalog::sha256_hex,
+    digest::sha256_hex,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

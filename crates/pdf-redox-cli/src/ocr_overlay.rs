@@ -1,23 +1,20 @@
 //! Apply externally supplied OCR line text without changing vector paint.
 use clap::Parser;
-use pdf_redox::{GlyphCatalog, OcrDocument, OcrOverlayOptions, apply_ocr_overlay};
+use pdf_redox::{OcrDocument, OcrOverlayOptions, apply_ocr_overlay};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "pdf-redox-ocr-overlay")]
 struct Args {
-    /// Input optimized PDF (not the original source).
+    /// Input PDF, original or optimized. Must match the OCR draft's SHA-256.
     input: PathBuf,
-    /// Matching schema-v2 vector glyph catalog.
-    #[arg(long)]
-    catalog: PathBuf,
     /// JSON OCR line detections with page-space quads and confidence.
     #[arg(long)]
     ocr: PathBuf,
     /// Resulting vector PDF with an invisible OCR text layer.
     #[arg(short, long)]
     output: PathBuf,
-    /// Include unreviewed OCR predictions that meet confidence and vector-coverage gates.
+    /// Allow unreviewed OCR predictions meeting confidence and native-text exclusion checks.
     #[arg(long)]
     apply_unreviewed: bool,
     /// Lower confidence bound applied to unreviewed predictions.
@@ -27,11 +24,9 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let input = std::fs::read(&args.input)?;
-    let catalog: GlyphCatalog = serde_json::from_slice(&std::fs::read(&args.catalog)?)?;
     let draft: OcrDocument = serde_json::from_slice(&std::fs::read(&args.ocr)?)?;
     let (output, report) = apply_ocr_overlay(
         &input,
-        &catalog,
         &draft,
         OcrOverlayOptions {
             apply_unreviewed: args.apply_unreviewed,

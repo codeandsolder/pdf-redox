@@ -318,7 +318,7 @@ pub fn optimize_pdf_with_glyph_catalog(
 ) -> Result<(Vec<u8>, OptimizationReport, GlyphCatalog)> {
     let mut catalog = GlyphCatalog::default();
     let (output, report) = optimize_pdf_impl(input, cfg, Some(&mut catalog))?;
-    catalog.optimized_pdf_sha256 = crate::glyph_catalog::sha256_hex(&output);
+    catalog.optimized_pdf_sha256 = crate::digest::sha256_hex(&output);
     Ok((output, report, catalog))
 }
 

@@ -9,6 +9,7 @@ mod config;
 mod content;
 pub(crate) mod content_stream;
 mod dedup;
+mod digest;
 mod direct_object;
 mod error;
 mod ext_gstate;

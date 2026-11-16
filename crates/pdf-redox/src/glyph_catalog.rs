@@ -4,7 +4,6 @@
 //! combining marks, i-dots, and complex glyphs may occupy multiple components.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 /// Exportable glyph-candidate dictionary from an actual Processing rewrite.
@@ -97,15 +96,4 @@ pub struct GlyphLabelReport {
     pub labeled_occurrences: usize,
     /// Number of pages with at least one newly inserted semantic label.
     pub rewritten_pages: usize,
-}
-
-/// Lowercase SHA-256 of exact bytes, used to tie semantic edits to a PDF.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(bytes);
-    let mut text = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut text, "{byte:02x}");
-    }
-    text
 }

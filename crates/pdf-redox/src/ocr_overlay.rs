@@ -2,11 +2,11 @@
 //! PDF text scopes. The original vector pages are not rasterized.
 
 use crate::{
-    EditDocument, Error, GlyphCatalog, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{
         decoded_content_value, effective_page_resources, install_page_resource, resolved_dictionary,
     },
-    glyph_catalog::sha256_hex,
+    digest::sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,15 +15,14 @@ use std::{
 };
 
 const OCR_CONFIDENCE_DEFAULT: f64 = 0.97;
-const MIN_COMPONENT_HITS: usize = 2;
 
 /// Machine-readable OCR line predictions bound to one optimized PDF.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrDocument {
     /// Version of the OCR draft JSON schema.
     pub schema_version: u32,
-    /// SHA-256 of the exact input optimized PDF.
-    pub optimized_pdf_sha256: String,
+    /// SHA-256 of the exact PDF to annotate, whether optimized or original.
+    pub pdf_sha256: String,
     /// Provenance identifier of the OCR detection and recognition model.
     pub model: String,
     /// Page-specific OCR predictions.
@@ -67,12 +66,12 @@ pub struct OcrOverlayReport {
     pub accepted_lines: usize,
     /// Unreviewed predictions below the configured confidence.
     pub skipped_low_confidence: usize,
-    /// Detections lacking source outlined components.
-    pub skipped_without_vector_coverage: usize,
     /// Unreviewed predictions intentionally excluded by default.
     pub skipped_unreviewed: usize,
     /// Lines overlapping existing searchable PDF words (including mixed lines).
     pub skipped_native_text_overlap: usize,
+    /// Overlapping OCR detections suppressed after higher-confidence selections.
+    pub skipped_duplicate_lines: usize,
     /// Pages receiving a text overlay.
     pub pages_rewritten: usize,
     /// Unicode scalar values inserted in accepted lines.
@@ -124,44 +123,6 @@ fn valid_box(quad: &[[f64; 2]; 4]) -> bool {
     let long = v[0].hypot(v[1]);
     let high = h[0].hypot(h[1]);
     long > 0.25 && high > 0.25 && signed_area(quad) > 0.0625
-}
-
-fn ink_centers(catalog: &GlyphCatalog) -> BTreeMap<usize, Vec<[f64; 2]>> {
-    let mut out = BTreeMap::<usize, Vec<[f64; 2]>>::new();
-    for template in &catalog.glyphs {
-        for occ in &template.occurrences {
-            let quad = &occ.page_quad;
-            out.entry(occ.page).or_default().push([
-                quad.iter().map(|p| p[0]).sum::<f64>() / 4.,
-                quad.iter().map(|p| p[1]).sum::<f64>() / 4.,
-            ]);
-        }
-    }
-    out
-}
-
-/// Count reusable outlined components in a detected OCR line, independent
-/// of skew and page rotation. This rejects most already-native PDF text.
-fn coverage(quad: &[[f64; 2]; 4], centers: &[[f64; 2]]) -> usize {
-    let origin = quad[0];
-    let ux = [quad[1][0] - origin[0], quad[1][1] - origin[1]];
-    let uy = [quad[3][0] - origin[0], quad[3][1] - origin[1]];
-    let det = ux[0].mul_add(uy[1], -ux[1] * uy[0]);
-    if det.abs() < 1e-8 {
-        return 0;
-    }
-    let h = uy[0].hypot(uy[1]);
-    let padding = 0.5 / h + 0.25;
-    centers
-        .iter()
-        .filter(|p| {
-            let x = p[0] - origin[0];
-            let y = p[1] - origin[1];
-            let along = x.mul_add(uy[1], -y * uy[0]) / det;
-            let across = ux[0].mul_add(y, -ux[1] * x) / det;
-            (-0.01..=1.01).contains(&along) && (-padding..=1.0 + padding).contains(&across)
-        })
-        .count()
 }
 
 fn actual_text_hex(value: &str) -> String {
@@ -258,19 +219,12 @@ fn native_intersection(a: &[[f64; 2]; 4], b: &[[f64; 2]; 4]) -> bool {
     true
 }
 
-fn validate(
-    ocr: &OcrDocument,
-    catalog: &GlyphCatalog,
-    pages: usize,
-    options: OcrOverlayOptions,
-) -> Result<()> {
-    if ocr.schema_version != 2 || catalog.schema_version != 2 {
-        return Err(invalid("unsupported OCR draft or glyph catalog schema"));
+fn validate(ocr: &OcrDocument, pages: usize, options: OcrOverlayOptions) -> Result<()> {
+    if ocr.schema_version != 3 {
+        return Err(invalid("unsupported OCR detection draft schema"));
     }
-    if ocr.optimized_pdf_sha256 != catalog.optimized_pdf_sha256 || ocr.model.trim().is_empty() {
-        return Err(invalid(
-            "OCR data does not match the exact glyph catalog or has no model identifier",
-        ));
+    if ocr.model.trim().is_empty() {
+        return Err(invalid("OCR model provenance must not be empty"));
     }
     if !(0.0..=1.0).contains(&options.min_confidence) {
         return Err(invalid("OCR confidence threshold is outside [0,1]"));
@@ -304,9 +258,11 @@ fn validate(
 
 /// Add OCR text lines to the exact optimized PDF without altering its painting.
 ///
-/// Only accepted lines overlapping at least two existing reusable vector
-/// components are included. Predictions not explicitly reviewed require an
-/// opt-in and confidence threshold.
+/// Recognition is independent of vector grouping, PDF font types and image
+/// compression. OCR text regions can describe ungrouped outlines, images, or
+/// one-off labels. All lines are subject to the native-searchable-text overlap
+/// check; unreviewed model predictions additionally need explicit opt-in
+/// and a confidence threshold.
 ///
 /// # Errors
 ///
@@ -317,19 +273,15 @@ fn validate(
 )]
 pub fn apply_ocr_overlay(
     input: &[u8],
-    catalog: &GlyphCatalog,
     ocr: &OcrDocument,
     options: OcrOverlayOptions,
 ) -> Result<(Vec<u8>, OcrOverlayReport)> {
-    if sha256_hex(input) != catalog.optimized_pdf_sha256 {
-        return Err(invalid(
-            "OCR catalog does not belong to this exact optimized PDF",
-        ));
+    if sha256_hex(input) != ocr.pdf_sha256 {
+        return Err(invalid("OCR draft belongs to a different PDF"));
     }
     let mut doc = EditDocument::from_bytes(input.to_vec())?;
     let handles = doc.page_handles()?;
-    validate(ocr, catalog, handles.len(), options)?;
-    let centers = ink_centers(catalog);
+    validate(ocr, handles.len(), options)?;
     let mut report = OcrOverlayReport::default();
     let mut accepted = BTreeMap::<usize, Vec<&OcrLine>>::new();
     for page in &ocr.pages {
@@ -349,14 +301,6 @@ pub fn apply_ocr_overlay(
                 report.skipped_low_confidence += 1;
                 continue;
             }
-            let found = coverage(
-                &line.quad,
-                centers.get(&page.page).map_or(&[], Vec::as_slice),
-            );
-            if found < MIN_COMPONENT_HITS {
-                report.skipped_without_vector_coverage += 1;
-                continue;
-            }
             if page
                 .native_text_regions
                 .iter()
@@ -366,6 +310,7 @@ pub fn apply_ocr_overlay(
                 continue;
             }
             if selected.iter().any(|x| overlap(&x.quad, &line.quad) > 0.60) {
+                report.skipped_duplicate_lines += 1;
                 continue;
             }
             selected.push(line);
@@ -462,10 +407,7 @@ mod tests {
 
     #[test]
     fn applies_only_non_native_lines_on_multiple_pages() -> Result<()> {
-        use crate::{
-            GlyphOccurrence, GlyphTemplate, content::page_content, glyph_catalog::sha256_hex,
-            test_support::ClassicPdfBuilder,
-        };
+        use crate::{content::page_content, digest::sha256_hex, test_support::ClassicPdfBuilder};
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
@@ -476,36 +418,12 @@ mod tests {
             );
             pdf.object(page, body.as_bytes())?;
         }
+        // Neither page has fonts, images or reusable glyphs. The OCR document
+        // is independently authenticated by its source-PDF hash.
         let ink = b"q 0 0 5 8 re 20 0 5 8 re f Q";
         pdf.stream(5, b"", ink)?;
         pdf.stream(6, b"", ink)?;
         let input = pdf.finish(1)?;
-        let mut catalog = GlyphCatalog {
-            optimized_pdf_sha256: sha256_hex(&input),
-            ..GlyphCatalog::default()
-        };
-        catalog.glyphs.push(GlyphTemplate {
-            id: "template-1".to_owned(),
-            font_resource: "test-font".to_owned(),
-            code: 1,
-            charproc: "f".to_owned(),
-            svg_path: "M0 0".to_owned(),
-            fill_rule: "nonzero".to_owned(),
-            occurrences: (1..=2)
-                .flat_map(|page| {
-                    [0., 20.]
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(i, x)| GlyphOccurrence {
-                            page,
-                            index_on_page: i,
-                            local_bbox: [x, 0., x + 5., 8.],
-                            ctm: [1., 0., 0., 1., 0., 0.],
-                            page_quad: [[x, 0.], [x + 5., 0.], [x + 5., 8.], [x, 8.]],
-                        })
-                })
-                .collect(),
-        });
         let same_line = OcrLine {
             text: "你好 ABC".to_owned(),
             confidence: 0.98,
@@ -513,8 +431,8 @@ mod tests {
             reviewed: false,
         };
         let mut ocr = OcrDocument {
-            schema_version: 2,
-            optimized_pdf_sha256: catalog.optimized_pdf_sha256.clone(),
+            schema_version: 3,
+            pdf_sha256: sha256_hex(&input),
             model: "test model".to_owned(),
             pages: vec![
                 OcrPage {
@@ -529,14 +447,14 @@ mod tests {
                 },
             ],
         };
-        let defaults = apply_ocr_overlay(&input, &catalog, &ocr, OcrOverlayOptions::default())?;
+        let defaults = apply_ocr_overlay(&input, &ocr, OcrOverlayOptions::default())?;
         assert_eq!(defaults.0, input);
         assert_eq!(defaults.1.skipped_unreviewed, 2);
         let options = OcrOverlayOptions {
             apply_unreviewed: true,
             min_confidence: 0.95,
         };
-        let (annotated, stats) = apply_ocr_overlay(&input, &catalog, &ocr, options)?;
+        let (annotated, stats) = apply_ocr_overlay(&input, &ocr, options)?;
         assert_eq!(stats.accepted_lines, 1);
         assert_eq!(stats.skipped_native_text_overlap, 1);
         assert_eq!(stats.pages_rewritten, 1);
@@ -551,8 +469,8 @@ mod tests {
                 .any(|part| part == b"/ActualText <FEFF")
         );
         assert!(changed.ends_with(ink));
-        ocr.optimized_pdf_sha256 = "wrong digest".to_owned();
-        assert!(apply_ocr_overlay(&input, &catalog, &ocr, options).is_err());
+        ocr.pdf_sha256 = "wrong digest".to_owned();
+        assert!(apply_ocr_overlay(&input, &ocr, options).is_err());
         Ok(())
     }
 
@@ -571,10 +489,9 @@ mod tests {
     }
 
     #[test]
-    fn rotated_geometry_coverage_and_utf16_be() {
+    fn rotated_geometry_and_utf16_be() {
         let b = [[0., 0.], [0., 100.], [-10., 100.], [-10., 0.]];
         assert!(valid_box(&b));
-        assert_eq!(coverage(&b, &[[-5., 20.], [-5., 80.], [10., 30.]]), 2);
         assert_eq!(actual_text_hex("中A"), "<FEFF4E2D0041>");
         let mut s = String::new();
         render_invisible_line(
