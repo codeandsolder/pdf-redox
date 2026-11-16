@@ -37,6 +37,10 @@ pub struct OcrPage {
     pub page: usize,
     /// Predictions on this page, with individual review and confidence status.
     pub lines: Vec<OcrLine>,
+    /// Existing native searchable words, in PDF user-space BL/BR/TR/TL
+    /// quads. Lines overlapping these words are excluded to avoid
+    /// duplicating existing text, including on mixed native/vector pages.
+    pub native_text_regions: Vec<[[f64; 2]; 4]>,
 }
 
 /// One OCR-detected line with text and its original vector-page placement.
@@ -67,6 +71,8 @@ pub struct OcrOverlayReport {
     pub skipped_without_vector_coverage: usize,
     /// Unreviewed predictions intentionally excluded by default.
     pub skipped_unreviewed: usize,
+    /// Lines overlapping existing searchable PDF words (including mixed lines).
+    pub skipped_native_text_overlap: usize,
     /// Pages receiving a text overlay.
     pub pages_rewritten: usize,
     /// Unicode scalar values inserted in accepted lines.
@@ -211,13 +217,54 @@ fn overlap(a: &[[f64; 2]; 4], b: &[[f64; 2]; 4]) -> f64 {
     }
 }
 
+/// Decide whether two source-space convex quadrilaterals overlap by a
+/// meaningful amount, regardless of PDF rotation or line skew.
+fn native_intersection(a: &[[f64; 2]; 4], b: &[[f64; 2]; 4]) -> bool {
+    // Cheap broadphase for typical horizontal layouts.
+    for axis in 0..2 {
+        let a_min = a.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+        let a_max = a.iter().map(|p| p[axis]).fold(f64::NEG_INFINITY, f64::max);
+        let b_min = b.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+        let b_max = b.iter().map(|p| p[axis]).fold(f64::NEG_INFINITY, f64::max);
+        if a_max.min(b_max) - a_min.max(b_min) <= 0.2 {
+            return false;
+        }
+    }
+    // Separating-axis theorem. All OCR and text quads are convex.
+    for polygon in [a, b] {
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            let dx = polygon[j][0] - polygon[i][0];
+            let dy = polygon[j][1] - polygon[i][1];
+            let length = dx.hypot(dy);
+            if length <= 1e-12 {
+                return false;
+            }
+            let normal = [-dy / length, dx / length];
+            let extremes = |poly: &[[f64; 2]; 4]| -> (f64, f64) {
+                poly.iter()
+                    .map(|p| p[0].mul_add(normal[0], p[1] * normal[1]))
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+                        (lo.min(value), hi.max(value))
+                    })
+            };
+            let (a0, a1) = extremes(a);
+            let (b0, b1) = extremes(b);
+            if a1.min(b1) - a0.max(b0) <= 0.2 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn validate(
     ocr: &OcrDocument,
     catalog: &GlyphCatalog,
     pages: usize,
     options: OcrOverlayOptions,
 ) -> Result<()> {
-    if ocr.schema_version != 1 || catalog.schema_version != 2 {
+    if ocr.schema_version != 2 || catalog.schema_version != 2 {
         return Err(invalid("unsupported OCR draft or glyph catalog schema"));
     }
     if ocr.optimized_pdf_sha256 != catalog.optimized_pdf_sha256 || ocr.model.trim().is_empty() {
@@ -232,6 +279,12 @@ fn validate(
     for page in &ocr.pages {
         if page.page == 0 || page.page > pages || !seen.insert(page.page) {
             return Err(invalid("unknown or duplicate OCR page number"));
+        }
+        if page.native_text_regions.iter().any(|quad| !valid_box(quad)) {
+            return Err(invalid(format!(
+                "invalid native PDF word geometry on page {}",
+                page.page
+            )));
         }
         for line in &page.lines {
             if !valid_box(&line.quad)
@@ -302,6 +355,14 @@ pub fn apply_ocr_overlay(
             );
             if found < MIN_COMPONENT_HITS {
                 report.skipped_without_vector_coverage += 1;
+                continue;
+            }
+            if page
+                .native_text_regions
+                .iter()
+                .any(|native| native_intersection(&line.quad, native))
+            {
+                report.skipped_native_text_overlap += 1;
                 continue;
             }
             if selected.iter().any(|x| overlap(&x.quad, &line.quad) > 0.60) {
@@ -398,6 +459,117 @@ pub fn apply_ocr_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applies_only_non_native_lines_on_multiple_pages() -> Result<()> {
+        use crate::{
+            GlyphOccurrence, GlyphTemplate, content::page_content, glyph_catalog::sha256_hex,
+            test_support::ClassicPdfBuilder,
+        };
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        for page in 3..=4 {
+            let body = format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents {} 0 R >>",
+                page + 2
+            );
+            pdf.object(page, body.as_bytes())?;
+        }
+        let ink = b"q 0 0 5 8 re 20 0 5 8 re f Q";
+        pdf.stream(5, b"", ink)?;
+        pdf.stream(6, b"", ink)?;
+        let input = pdf.finish(1)?;
+        let mut catalog = GlyphCatalog {
+            optimized_pdf_sha256: sha256_hex(&input),
+            ..GlyphCatalog::default()
+        };
+        catalog.glyphs.push(GlyphTemplate {
+            id: "template-1".to_owned(),
+            font_resource: "test-font".to_owned(),
+            code: 1,
+            charproc: "f".to_owned(),
+            svg_path: "M0 0".to_owned(),
+            fill_rule: "nonzero".to_owned(),
+            occurrences: (1..=2)
+                .flat_map(|page| {
+                    [0., 20.]
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(i, x)| GlyphOccurrence {
+                            page,
+                            index_on_page: i,
+                            local_bbox: [x, 0., x + 5., 8.],
+                            ctm: [1., 0., 0., 1., 0., 0.],
+                            page_quad: [[x, 0.], [x + 5., 0.], [x + 5., 8.], [x, 8.]],
+                        })
+                })
+                .collect(),
+        });
+        let same_line = OcrLine {
+            text: "你好 ABC".to_owned(),
+            confidence: 0.98,
+            quad: [[0., 0.], [35., 0.], [35., 10.], [0., 10.]],
+            reviewed: false,
+        };
+        let mut ocr = OcrDocument {
+            schema_version: 2,
+            optimized_pdf_sha256: catalog.optimized_pdf_sha256.clone(),
+            model: "test model".to_owned(),
+            pages: vec![
+                OcrPage {
+                    page: 1,
+                    lines: vec![same_line.clone()],
+                    native_text_regions: vec![[[8., 1.], [18., 1.], [18., 9.], [8., 9.]]],
+                },
+                OcrPage {
+                    page: 2,
+                    lines: vec![same_line],
+                    native_text_regions: Vec::new(),
+                },
+            ],
+        };
+        let defaults = apply_ocr_overlay(&input, &catalog, &ocr, OcrOverlayOptions::default())?;
+        assert_eq!(defaults.0, input);
+        assert_eq!(defaults.1.skipped_unreviewed, 2);
+        let options = OcrOverlayOptions {
+            apply_unreviewed: true,
+            min_confidence: 0.95,
+        };
+        let (annotated, stats) = apply_ocr_overlay(&input, &catalog, &ocr, options)?;
+        assert_eq!(stats.accepted_lines, 1);
+        assert_eq!(stats.skipped_native_text_overlap, 1);
+        assert_eq!(stats.pages_rewritten, 1);
+        assert_eq!(stats.searchable_characters, 6);
+        let output = EditDocument::from_bytes(annotated)?;
+        let pages = output.page_handles()?;
+        assert_eq!(page_content(&output, pages[0])?, ink);
+        let changed = page_content(&output, pages[1])?;
+        assert!(
+            changed
+                .windows(b"/ActualText <FEFF".len())
+                .any(|part| part == b"/ActualText <FEFF")
+        );
+        assert!(changed.ends_with(ink));
+        ocr.optimized_pdf_sha256 = "wrong digest".to_owned();
+        assert!(apply_ocr_overlay(&input, &catalog, &ocr, options).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_text_overlap_rejects_mixed_lines_but_not_nearby_columns() {
+        let line = [[40., 100.], [210., 100.], [210., 115.], [40., 115.]];
+        let native = [[110., 101.], [140., 101.], [140., 113.], [110., 113.]];
+        let adjacent = [[216., 101.], [290., 101.], [290., 113.], [216., 113.]];
+        let touching = [[210., 101.], [215., 101.], [215., 113.], [210., 113.]];
+        assert!(native_intersection(&line, &native));
+        assert!(!native_intersection(&line, &adjacent));
+        assert!(!native_intersection(&line, &touching));
+        let rotated = [[80., 80.], [80., 180.], [65., 180.], [65., 80.]];
+        let native_rotated = [[65., 125.], [80., 125.], [80., 145.], [65., 145.]];
+        assert!(native_intersection(&rotated, &native_rotated));
+    }
+
     #[test]
     fn rotated_geometry_coverage_and_utf16_be() {
         let b = [[0., 0.], [0., 100.], [-10., 100.], [-10., 0.]];
