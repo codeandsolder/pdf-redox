@@ -3,7 +3,7 @@
 
 use crate::{
     EditDocument, Error, GlyphCatalog, GlyphLabelReport, GlyphLabels, Result,
-    content::{decoded_content_value, replace_page_content},
+    content::{decoded_content_value, replace_page_content_flate},
     digest::sha256_hex,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -361,7 +361,12 @@ pub fn apply_glyph_labels(
         if let Some(rewritten) =
             amend_page(&decoded, page_index + 1, &context, &mut seen, &mut report)?
         {
-            replace_page_content(&mut doc, handle, rewritten)?;
+            replace_page_content_flate(
+                &mut doc,
+                handle,
+                &rewritten,
+                crate::FlateLevel::PROCESSING,
+            )?;
             report.rewritten_pages += 1;
         }
     }
