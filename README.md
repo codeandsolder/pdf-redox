@@ -20,7 +20,7 @@ Hayro is the source parser and codec layer. Source bytes stay immutable and lazi
 - `pdf-redox-cli`: native CLI
 - `pdf-redox-wasm`: WASM bindings
 - `web/`: static no-framework site
-- `ocr/`: PDF-structure-aware OCR companion (uv/RapidOCR), with native-resolution Image XObject recognition, painter-verified mixed-page text, and a Rust invisible-text importer. See [OCR workflow](ocr/README.md).
+- [pdf-redox-ocr](https://github.com/codeandsolder/pdf-redox-ocr): independently versioned Python/RapidOCR inference companion, using native Image XObject pixels, painted-page visibility proofs, and the Rust invisible-text importer provided by this repository.
 
 ## Status
 
