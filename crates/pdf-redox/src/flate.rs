@@ -18,6 +18,26 @@ const ADAPTIVE_FLATE_MIN_DECODED_BYTES: usize = 1024 * 1024;
 const ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT: usize = 10;
 const MAX_REUSED_FLATE_BYTES: usize = 64 * 1024 * 1024;
 
+// Keep independent stream compression parallel without retaining every decoded
+// payload and its worst-case compressed buffer for the entire PDF at once.
+// A single stream larger than the limit is processed alone.
+#[derive(Clone, Copy)]
+struct FlateBatchLimits {
+    max_input_bytes: usize,
+    max_streams: usize,
+}
+
+impl FlateBatchLimits {
+    const DEFAULT: Self = Self {
+        max_input_bytes: 32 * 1024 * 1024,
+        max_streams: 64,
+    };
+
+    const fn full(self, count: usize, input_bytes: usize) -> bool {
+        count >= self.max_streams || input_bytes >= self.max_input_bytes
+    }
+}
+
 #[derive(Debug)]
 struct FlateReuseEntry {
     level: crate::FlateLevel,
@@ -125,60 +145,58 @@ struct UnfilteredFlateCandidate {
     encoded: Option<AdaptiveFlateEncoding>,
 }
 
-fn collect_unfiltered_candidates(
+fn collect_unfiltered_candidate(
     document: &mut crate::EditDocument,
+    handle: ObjectHandle,
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
-) -> Result<Vec<UnfilteredFlateCandidate>> {
-    let mut candidates = Vec::new();
-    for handle in document.reachable_streams()? {
-        let Some(crate::OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(handle)?
-        else {
-            continue;
-        };
-        // External /F streams do not have their authoritative payload in the
-        // inline stream bytes. Never compress their fallback or strip filters.
-        if crate::stream_codec::has_external_file_stream_entries(&dictionary) {
-            continue;
-        }
-        let raw = data.bytes(document.source())?.into_owned();
-        let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
-            !matches!(
-                document.resolve_owned_value(value),
-                Ok(Some(crate::OwnedObject::Null) | None)
-            )
-        });
-        if raw.is_empty() {
-            if has_filter {
-                let object = document.edit_handle(handle)?;
-                if let crate::OwnedObject::Stream { dictionary, data } = object {
-                    dictionary.remove(b"Filter".as_slice());
-                    dictionary.remove(b"DecodeParms".as_slice());
-                    dictionary.remove(b"Length".as_slice());
-                    *data = crate::StreamData::Owned(Vec::new());
-                }
-            }
-            continue;
-        }
-        if has_filter {
-            continue;
-        }
-
-        let encoded = if level == crate::FlateLevel::SIZE {
-            reuse_cache
-                .take_matching(handle, level, &raw)
-                .map(AdaptiveFlateEncoding::baseline)
-        } else {
-            None
-        };
-        candidates.push(UnfilteredFlateCandidate {
-            handle,
-            raw,
-            encoded,
-        });
+) -> Result<Option<UnfilteredFlateCandidate>> {
+    let Some(crate::OwnedObject::Stream { dictionary, data }) =
+        document.current_owned_object(handle)?
+    else {
+        return Ok(None);
+    };
+    // External /F streams do not have their authoritative payload in the
+    // inline stream bytes. Never compress their fallback or strip filters.
+    if crate::stream_codec::has_external_file_stream_entries(&dictionary) {
+        return Ok(None);
     }
-    Ok(candidates)
+    let raw = data.bytes(document.source())?;
+    let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
+        !matches!(
+            document.resolve_owned_value(value),
+            Ok(Some(crate::OwnedObject::Null) | None)
+        )
+    });
+    if raw.is_empty() {
+        if has_filter {
+            let object = document.edit_handle(handle)?;
+            if let crate::OwnedObject::Stream { dictionary, data } = object {
+                dictionary.remove(b"Filter".as_slice());
+                dictionary.remove(b"DecodeParms".as_slice());
+                dictionary.remove(b"Length".as_slice());
+                *data = crate::StreamData::Owned(Vec::new());
+            }
+        }
+        return Ok(None);
+    }
+    if has_filter {
+        return Ok(None);
+    }
+
+    let raw = raw.into_owned();
+    let encoded = if level == crate::FlateLevel::SIZE {
+        reuse_cache
+            .take_matching(handle, level, &raw)
+            .map(AdaptiveFlateEncoding::baseline)
+    } else {
+        None
+    };
+    Ok(Some(UnfilteredFlateCandidate {
+        handle,
+        raw,
+        encoded,
+    }))
 }
 
 fn batch_missing_baselines(
@@ -255,62 +273,40 @@ fn is_safe_lone_flate(
     Ok(true)
 }
 
-pub fn optimize_flate_streams_with_cache(
+struct FilteredFlateCandidate {
+    handle: ObjectHandle,
+    raw_len: usize,
+    decoded: Vec<u8>,
+    encoded: Option<AdaptiveFlateEncoding>,
+}
+
+fn flush_filtered_batch(
     document: &mut crate::EditDocument,
+    candidates: &mut Vec<FilteredFlateCandidate>,
     level: crate::FlateLevel,
-    reuse_cache: &mut FlateReuseCache,
     batcher: &FlateBatchEncoder,
-) -> Result<FlateOptimizationStats> {
-    struct Candidate {
-        handle: ObjectHandle,
-        raw_len: usize,
-        decoded: Vec<u8>,
-        encoded: Option<AdaptiveFlateEncoding>,
+    stats: &mut FlateOptimizationStats,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
     }
-
-    let mut candidates = Vec::new();
-    for handle in document.reachable_streams()? {
-        let Some(crate::OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(handle)?
-        else {
-            continue;
-        };
-        if !is_safe_lone_flate(document, &dictionary)? {
-            continue;
-        }
-        let raw_len = data.bytes(document.source())?.len();
-        let Ok(decoded) = document.decoded_stream_data(handle) else {
-            continue;
-        };
-        let encoded = reuse_cache
-            .take_matching(handle, level, &decoded)
-            .map(AdaptiveFlateEncoding::baseline);
-        candidates.push(Candidate {
-            handle,
-            raw_len,
-            decoded,
-            encoded,
-        });
-    }
-
-    let batch_indices = candidates
+    let indices = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
         .collect::<Vec<_>>();
-    let batch_outputs = {
-        let inputs = batch_indices
+    let outputs = {
+        let inputs = indices
             .iter()
             .map(|&index| candidates[index].decoded.as_slice())
             .collect::<Vec<_>>();
         batcher.encode_many(&inputs, level)?
     };
-    for (index, bytes) in batch_indices.into_iter().zip(batch_outputs) {
+    for (index, bytes) in indices.into_iter().zip(outputs) {
         candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
     }
 
-    let mut stats = FlateOptimizationStats::default();
-    for candidate in candidates {
+    for candidate in candidates.drain(..) {
         let Some(encoded) = candidate.encoded else {
             continue;
         };
@@ -339,23 +335,80 @@ pub fn optimize_flate_streams_with_cache(
             stats.estimated_savings_bytes = stats.estimated_savings_bytes.saturating_add(saving);
         }
     }
+    Ok(())
+}
+
+fn optimize_flate_streams_bounded(
+    document: &mut crate::EditDocument,
+    level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
+    batcher: &FlateBatchEncoder,
+    limits: FlateBatchLimits,
+) -> Result<FlateOptimizationStats> {
+    let mut candidates = Vec::new();
+    let mut staged_bytes = 0_usize;
+    let mut stats = FlateOptimizationStats::default();
+    for handle in document.reachable_streams()? {
+        let Some(crate::OwnedObject::Stream { dictionary, data }) =
+            document.current_owned_object(handle)?
+        else {
+            continue;
+        };
+        if !is_safe_lone_flate(document, &dictionary)? {
+            continue;
+        }
+        let raw_len = data.bytes(document.source())?.len();
+        let Ok(decoded) = document.decoded_stream_data(handle) else {
+            continue;
+        };
+        let encoded = reuse_cache
+            .take_matching(handle, level, &decoded)
+            .map(AdaptiveFlateEncoding::baseline);
+        staged_bytes = staged_bytes.saturating_add(decoded.len());
+        candidates.push(FilteredFlateCandidate {
+            handle,
+            raw_len,
+            decoded,
+            encoded,
+        });
+        if limits.full(candidates.len(), staged_bytes) {
+            flush_filtered_batch(document, &mut candidates, level, batcher, &mut stats)?;
+            staged_bytes = 0;
+        }
+    }
+    flush_filtered_batch(document, &mut candidates, level, batcher, &mut stats)?;
     Ok(stats)
 }
 
-pub fn compress_unfiltered_streams(
+pub fn optimize_flate_streams_with_cache(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
     batcher: &FlateBatchEncoder,
 ) -> Result<FlateOptimizationStats> {
-    // Size-mode transforms may already have produced exact level-9 bytes for their admission gate;
-    // collection preserves those while Processing leaves the baseline work for the batch executor.
-    let mut candidates = collect_unfiltered_candidates(document, level, reuse_cache)?;
-    batch_missing_baselines(&mut candidates, level, batcher)?;
-    batch_high_effort_candidates(&mut candidates, level, batcher)?;
+    optimize_flate_streams_bounded(
+        document,
+        level,
+        reuse_cache,
+        batcher,
+        FlateBatchLimits::DEFAULT,
+    )
+}
 
-    let mut stats = FlateOptimizationStats::default();
-    for candidate in candidates {
+fn flush_unfiltered_batch(
+    document: &mut crate::EditDocument,
+    candidates: &mut Vec<UnfilteredFlateCandidate>,
+    level: crate::FlateLevel,
+    batcher: &FlateBatchEncoder,
+    stats: &mut FlateOptimizationStats,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    batch_missing_baselines(candidates, level, batcher)?;
+    batch_high_effort_candidates(candidates, level, batcher)?;
+
+    for candidate in candidates.drain(..) {
         let Some(encoded) = candidate.encoded else {
             continue;
         };
@@ -380,7 +433,51 @@ pub fn compress_unfiltered_streams(
             *data = crate::StreamData::Owned(encoded.bytes);
         }
     }
+    Ok(())
+}
+
+fn compress_unfiltered_streams_bounded(
+    document: &mut crate::EditDocument,
+    level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
+    batcher: &FlateBatchEncoder,
+    limits: FlateBatchLimits,
+) -> Result<FlateOptimizationStats> {
+    // Preserve cached exact size-mode encodings and process the remaining
+    // streams in bounded groups, rather than holding all source and output
+    // buffers in memory until the final rewrite.
+    let mut candidates = Vec::new();
+    let mut staged_bytes = 0_usize;
+    let mut stats = FlateOptimizationStats::default();
+    for handle in document.reachable_streams()? {
+        let Some(candidate) = collect_unfiltered_candidate(document, handle, level, reuse_cache)?
+        else {
+            continue;
+        };
+        staged_bytes = staged_bytes.saturating_add(candidate.raw.len());
+        candidates.push(candidate);
+        if limits.full(candidates.len(), staged_bytes) {
+            flush_unfiltered_batch(document, &mut candidates, level, batcher, &mut stats)?;
+            staged_bytes = 0;
+        }
+    }
+    flush_unfiltered_batch(document, &mut candidates, level, batcher, &mut stats)?;
     Ok(stats)
+}
+
+pub fn compress_unfiltered_streams(
+    document: &mut crate::EditDocument,
+    level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
+    batcher: &FlateBatchEncoder,
+) -> Result<FlateOptimizationStats> {
+    compress_unfiltered_streams_bounded(
+        document,
+        level,
+        reuse_cache,
+        batcher,
+        FlateBatchLimits::DEFAULT,
+    )
 }
 
 #[cfg(test)]
@@ -454,15 +551,14 @@ mod tests {
             assert!(document.reachable_streams()?.contains(&handle));
             let before = document.current_owned_object(handle)?;
             let mut reuse = FlateReuseCache::default();
-            let candidates = collect_unfiltered_candidates(
-                &mut document,
-                crate::FlateLevel::PROCESSING,
-                &mut reuse,
-            )?;
             assert!(
-                candidates
-                    .iter()
-                    .all(|candidate| candidate.handle != handle),
+                collect_unfiltered_candidate(
+                    &mut document,
+                    handle,
+                    crate::FlateLevel::PROCESSING,
+                    &mut reuse,
+                )?
+                .is_none(),
                 "external-file stream was admitted for recompression: {entries:?}"
             );
             let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
@@ -524,6 +620,178 @@ mod tests {
             &batcher,
         )?;
         assert_eq!(document.current_owned_object(handle)?, before);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "modulo 251 bounds the generated sample to the u8 range"
+    )]
+    fn many_streams_fixture(
+        filtered: bool,
+    ) -> crate::Result<(crate::EditDocument, Vec<ObjectHandle>, Vec<Vec<u8>>)> {
+        use crate::test_support::ClassicPdfBuilder;
+        use crate::{OwnedDictionary, OwnedObject, StreamData};
+
+        let mut builder = ClassicPdfBuilder::new();
+        builder.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        builder.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        builder.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        let mut document = crate::EditDocument::from_bytes(builder.finish(1)?)?;
+        let mut handles = Vec::new();
+        let mut decoded_payloads = Vec::new();
+        for index in 0..76_usize {
+            let length = if index % 17 == 0 {
+                1_200_000
+            } else if index % 11 == 0 {
+                0
+            } else if index % 7 == 0 {
+                48
+            } else {
+                2048 + (index * 871) % 58_000
+            };
+            let decoded = (0..length)
+                .map(|offset| ((offset / 11 + offset % 37 + index * 3) % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut dictionary = OwnedDictionary::new();
+            if filtered {
+                dictionary.insert(
+                    b"Filter".to_vec(),
+                    OwnedObject::Name(b"FlateDecode".to_vec()),
+                );
+            }
+            if index % 19 == 0 {
+                dictionary.insert(b"F".to_vec(), OwnedObject::String(b"external.bin".to_vec()));
+            }
+            if index % 23 == 0 {
+                dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"Metadata".to_vec()));
+            }
+            let data = if filtered {
+                let mut destination = vec![0_u8; zlib_rs::compress_bound(decoded.len())];
+                let (encoded, code) = zlib_rs::compress_slice(
+                    &mut destination,
+                    &decoded,
+                    zlib_rs::DeflateConfig::new(0),
+                );
+                assert_eq!(code, zlib_rs::ReturnCode::Ok);
+                let length = encoded.len();
+                destination.truncate(length);
+                destination
+            } else {
+                decoded.clone()
+            };
+            let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+                dictionary,
+                data: StreamData::Owned(data),
+            }));
+            handles.push(handle);
+            decoded_payloads.push(decoded);
+        }
+        let page = document.edit_object(crate::ObjectId::new(3, 0))?;
+        let page = page.as_dictionary_mut().ok_or_else(|| {
+            crate::Error::Invalid("batch-test page is not a dictionary".to_owned())
+        })?;
+        page.insert(
+            b"Contents".to_vec(),
+            OwnedObject::Array(
+                handles
+                    .iter()
+                    .copied()
+                    .map(OwnedObject::Reference)
+                    .collect(),
+            ),
+        );
+        Ok((document, handles, decoded_payloads))
+    }
+
+    #[test]
+    fn bounded_batches_preserve_exact_streams_and_stats() -> crate::Result<()> {
+        let limits = [
+            FlateBatchLimits {
+                max_input_bytes: 12 * 1024,
+                max_streams: 3,
+            },
+            FlateBatchLimits::DEFAULT,
+            FlateBatchLimits {
+                max_input_bytes: usize::MAX,
+                max_streams: usize::MAX,
+            },
+        ];
+        // Exercise both compression phases, actual useful recompression, empty
+        // streams, source-cache reuse, external streams, large single inputs
+        // and worker-pool scheduling across multiple flush boundaries.
+        for filtered in [false, true] {
+            for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+                let mut results = Vec::new();
+                for (run_index, limit) in limits.into_iter().enumerate() {
+                    let (mut document, handles, payloads) = many_streams_fixture(filtered)?;
+                    assert_eq!(document.reachable_streams()?.len(), handles.len());
+                    let mut reuse_cache = FlateReuseCache::default();
+                    for index in (1..handles.len()).step_by(13) {
+                        reuse_cache.insert(
+                            handles[index],
+                            level,
+                            &payloads[index],
+                            crate::stream_codec::encode_flate(&payloads[index], level)?,
+                        );
+                    }
+                    let batcher = FlateBatchEncoder::new(
+                        std::num::NonZeroUsize::new(4).unwrap_or(std::num::NonZeroUsize::MIN),
+                    )?;
+                    let stats = match (filtered, run_index) {
+                        (true, 1) => optimize_flate_streams_with_cache(
+                            &mut document,
+                            level,
+                            &mut reuse_cache,
+                            &batcher,
+                        )?,
+                        (false, 1) => compress_unfiltered_streams(
+                            &mut document,
+                            level,
+                            &mut reuse_cache,
+                            &batcher,
+                        )?,
+                        (true, _) => optimize_flate_streams_bounded(
+                            &mut document,
+                            level,
+                            &mut reuse_cache,
+                            &batcher,
+                            limit,
+                        )?,
+                        (false, _) => compress_unfiltered_streams_bounded(
+                            &mut document,
+                            level,
+                            &mut reuse_cache,
+                            &batcher,
+                            limit,
+                        )?,
+                    };
+                    let objects = handles
+                        .into_iter()
+                        .map(|handle| document.current_owned_object(handle))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    results.push((stats, objects));
+                }
+                assert_eq!(
+                    results[0],
+                    results[1],
+                    "batch boundary changed encoded bytes or accounting: filtered={filtered}, level={}",
+                    level.value(),
+                );
+                assert_eq!(
+                    results[1],
+                    results[2],
+                    "production default differs from unlimited batch: filtered={filtered}, level={}",
+                    level.value(),
+                );
+                if filtered {
+                    assert!(results[0].0.streams_selected > 0);
+                }
+            }
+        }
         Ok(())
     }
 
