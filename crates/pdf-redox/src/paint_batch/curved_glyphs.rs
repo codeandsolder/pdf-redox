@@ -1041,15 +1041,16 @@ mod tests {
         format!("q 1 0 0 1 20 30 cm 0 0 m {width} 0 l {width} 1 l {width} 1.5 {width} {bulge} {width} 2 c {width} 3 l {width} 4 l 0 4 l 0 3 l 0 2 l h f Q\n").into_bytes()
     }
     #[test]
-    fn groups_squashed_bezier_and_produces_type3_body() {
+    fn groups_squashed_bezier_and_produces_type3_body() -> Result<()> {
         let mut b = shape(4., 2.);
         b.extend(shape(5., 2.));
-        let samples = collect(&b).expect("parse");
+        let samples = collect(&b).ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?;
         assert_eq!(samples.len(), 2);
         let g = group(&samples);
         assert_eq!(g.len(), 1);
         assert!(g[0].charproc(&samples).starts_with(b"0 0 d0\n"));
-        let text = replacement(b"Test", 1, &samples[1]).expect("placement");
+        let text = replacement(b"Test", 1, &samples[1])
+            .ok_or_else(|| crate::Error::Invalid("placement".to_owned()))?;
         assert!(text.windows(4).any(|x| x == b"BT 0"));
         assert!(text.ends_with(b"ET\nEMC\nQ\n"));
         assert!(text.starts_with(b"q\n/Span"));
@@ -1057,62 +1058,76 @@ mod tests {
             text.windows(b"/ActualText ()".len())
                 .any(|w| w == b"/ActualText ()")
         );
+        Ok(())
     }
     #[test]
-    fn refuses_different_shapes_and_interleaved_state() {
+    fn refuses_different_shapes_and_interleaved_state() -> Result<()> {
         let mut bytes = shape(4., 2.);
         bytes.extend(shape(4., 3.));
-        let appearances = collect(&bytes).expect("parse");
+        let appearances =
+            collect(&bytes).ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?;
         assert_eq!(appearances.len(), 2);
         assert!(group(&appearances).is_empty());
         bytes.extend(b"q 1 0 0 1 0 0 cm 0 0 m 3 0 l 3 4 l 0 4 l 1 3 l 2 2 l 2 1 l 0 1 l 0.5 g f Q");
-        assert_eq!(collect(&bytes).expect("parse").len(), 2);
+        assert_eq!(
+            collect(&bytes)
+                .ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?
+                .len(),
+            2
+        );
+        Ok(())
     }
 
     #[test]
-    fn recognizes_fills_inside_existing_graphics_and_marked_content_scopes() {
+    fn recognizes_fills_inside_existing_graphics_and_marked_content_scopes() -> Result<()> {
         let data = b"/OC /Glyphs BDC q 2 0 0 1 0 0 cm /GS1 gs \
           9 9 2 3 re 9 9 m 11 12 l f \
           13 9 2 3 re 13 9 m 15 12 l f Q EMC";
-        let found = collect(data).expect("source content");
+        let found =
+            collect(data).ok_or_else(|| crate::Error::Invalid("source content".to_owned()))?;
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].bounds, [9.0, 9.0, 11.0, 12.0]);
         assert_eq!(found[1].bounds, [13.0, 9.0, 15.0, 12.0]);
         assert_eq!(found[0].page_space_factor, 2.0);
         let groups = group(&found);
         assert_eq!(groups.len(), 1);
-        let rendered = replacement(b"Test", 1, &found[1]).expect("glyph rendering");
+        let rendered = replacement(b"Test", 1, &found[1])
+            .ok_or_else(|| crate::Error::Invalid("glyph rendering".to_owned()))?;
         assert!(rendered.starts_with(b"q\n/Span"));
         assert!(!rendered.windows(5).any(|part| part == b" cm\n"));
         assert!(rendered.ends_with(b"EMC\nQ\n"));
+        Ok(())
     }
 
     #[test]
-    fn preserves_clipping_and_excludes_incomplete_paths() {
+    fn preserves_clipping_and_excludes_incomplete_paths() -> Result<()> {
         let data = b"q 0 0 100 100 re W n \
             1 1 m 2 1 l 2 2 l f \
             3 3 m 4 3 l 4 4 l W n \
             7 7 m 8 7 l 8 8 l f Q";
-        let found = collect(data).expect("source content");
+        let found =
+            collect(data).ok_or_else(|| crate::Error::Invalid("source content".to_owned()))?;
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].bounds, [1.0, 1.0, 2.0, 2.0]);
         assert_eq!(found[1].bounds, [7.0, 7.0, 8.0, 8.0]);
+        Ok(())
     }
 
     #[test]
-    fn nested_transforms_constrain_canonical_error_in_page_space() {
+    fn nested_transforms_constrain_canonical_error_in_page_space() -> Result<()> {
         let a = b"q 20 0 0 20 1 2 cm \
             0 0 m 4 0 l 4 4 l 0 4 l 0 0 l f Q";
         let b = b"q 1 0 0 1 1 2 cm \
             0 0 m 4 0 l 4 4 l 0.04 4 l 0 0 l f Q";
-        let found_a = collect(a).expect("source a");
-        let found_b = collect(b).expect("source b");
+        let found_a = collect(a).ok_or_else(|| crate::Error::Invalid("source a".to_owned()))?;
+        let found_b = collect(b).ok_or_else(|| crate::Error::Invalid("source b".to_owned()))?;
         assert_eq!(found_a[0].page_space_factor, 20.0);
         let mut both = found_a;
         both.extend(found_b);
         // Dimensions differ; a single canonical would violate the 0.02pt
         // transformed error budget on the 20x-scaled member.
         assert!(group(&both).is_empty());
+        Ok(())
     }
 
     /// Optional corpus probe: `PDF_REDOX_CORPUS_PDF=/path/to/file.pdf`.
@@ -1132,12 +1147,11 @@ mod tests {
         let unique_pages: BTreeSet<_> = shapes.iter().map(|s| s.page_index).collect();
         eprintln!(
             "CORPUS_OUTLINE_PROBE pdf={path} pages={} content_pages={} shapes={} \
-             groups={} grouped_occurrences={} candidate_pages={}",
+             groups={} grouped_occurrences={all_members} candidate_pages={}",
             pages.len(),
             sources.len(),
             shapes.len(),
             groups.len(),
-            all_members,
             unique_pages.len()
         );
         let mut operators = BTreeMap::<usize, usize>::new();
@@ -1164,23 +1178,22 @@ mod tests {
             .map(|(_, v)| v)
             .sum();
         eprintln!(
-            "CORPUS_OUTLINE_PROBE short_ops={} size_bins={} most_common_ops={:?}",
-            shortest,
-            format_args!("{sizes:?}"),
+            "CORPUS_OUTLINE_PROBE short_ops={shortest} size_bins={sizes:?} most_common_ops={:?}",
             operators.iter().rev().take(12).collect::<Vec<_>>()
         );
         Ok(())
     }
 
     #[test]
-    fn compound_fill_keeps_nested_holes_and_unrelated_contours_separate() {
+    fn compound_fill_keeps_nested_holes_and_unrelated_contours_separate() -> Result<()> {
         // A rectangle with a nested even-odd hole must stay together, while
         // separated rectangles can each become an independent component.
         let stream = b"q \
             0 0 4 4 re 1 1 2 2 re \
             10 0 4 4 re \
             20 0 4 4 re f* Q";
-        let (parts, fills) = collect_compound(stream).expect("compound fill");
+        let (parts, fills) = collect_compound(stream)
+            .ok_or_else(|| crate::Error::Invalid("compound fill".to_owned()))?;
         assert_eq!(fills.len(), 1);
         assert_eq!(parts.len(), 3);
         assert_eq!(
@@ -1193,8 +1206,12 @@ mod tests {
         assert_eq!(fills[0].components, vec![0, 1, 2]);
         assert_eq!(
             fills[0].start,
-            stream.iter().position(|&b| b == b'0').expect("start")
+            stream
+                .iter()
+                .position(|&b| b == b'0')
+                .ok_or_else(|| crate::Error::Invalid("start".to_owned()))?
         );
+        Ok(())
     }
 
     #[test]
@@ -1239,7 +1256,7 @@ mod tests {
         );
         let rewritten =
             crate::content_stream::apply_replacements(&sources[0].decoded, &plan.edits[0])
-                .expect("nonoverlapping edits");
+                .ok_or_else(|| crate::Error::Invalid("nonoverlapping edits".to_owned()))?;
         assert_eq!(
             rewritten
                 .windows(b"/ActualText ()".len())
@@ -1271,24 +1288,27 @@ mod tests {
     }
 
     #[test]
-    fn nearly_touching_or_singular_compound_paths_are_not_split() {
-        let touching = collect(b"0 0 2 2 re 2 0 2 2 re 2 1 2 1 re f").expect("touching fill");
+    fn nearly_touching_or_singular_compound_paths_are_not_split() -> Result<()> {
+        let touching = collect(b"0 0 2 2 re 2 0 2 2 re 2 1 2 1 re f")
+            .ok_or_else(|| crate::Error::Invalid("touching fill".to_owned()))?;
         assert_eq!(touching.len(), 1);
-        let separated = collect(b"0 0 2 2 re 2.3 0 2 2 re 2.3 1 2 1 re f").expect("separated fill");
+        let separated = collect(b"0 0 2 2 re 2.3 0 2 2 re 2.3 1 2 1 re f")
+            .ok_or_else(|| crate::Error::Invalid("separated fill".to_owned()))?;
         assert_eq!(separated.len(), 2);
         let singular = collect(b"q 1 0 0 0 0 0 cm 0 0 2 2 re 10 0 2 2 re 20 0 2 2 re f Q")
-            .expect("singular graphics state");
+            .ok_or_else(|| crate::Error::Invalid("singular graphics state".to_owned()))?;
         assert!(
             singular.is_empty(),
             "cannot prove separated ink under singular CTM"
         );
+        Ok(())
     }
 
     #[test]
-    fn export_svg_encodes_pdf_curve_shorthands_correctly() {
+    fn export_svg_encodes_pdf_curve_shorthands_correctly() -> Result<()> {
         let data = b"0 0 m 1 1 2 2 v 2 4 3 3 y 4 4 l h \
             6 6 2 3 re f*";
-        let shapes = collect(data).expect("parse");
+        let shapes = collect(data).ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?;
         assert_eq!(shapes.len(), 2);
         let g = Group::first(0, &shapes[0]);
         let path = candidate_svg_path(&g, &shapes);
@@ -1301,6 +1321,7 @@ mod tests {
         assert!(rectangle_path.ends_with('Z'));
         let proc = g.charproc(&shapes);
         assert!(proc.ends_with(b"f*\n"));
+        Ok(())
     }
 
     #[test]
@@ -1359,14 +1380,14 @@ mod tests {
             let y = i / 40;
             content.extend_from_slice(
                 format!(
-                    "q 1 0 0 1 {x} {y} cm {} {} m {w} {} l {} {} l {} {} {} {} {} {} c {} {} l {} {} l {} {} l {} {} l {} {} l h f Q\n",
+                    "q 1 0 0 1 {x} {y} cm {} {} m {w} {} l {} {} l {} {} {} {} {} {} c {w} {} l {w} {} l {} {} l {} {} l {} {} l h f Q\n",
                     jitter(1), jitter(2), jitter(3),
                     w - jitter(4), 1.0 + jitter(5),
                     w - jitter(6), 1.5 + jitter(7),
                     w + jitter(8), 2.0 + jitter(9),
                     w + jitter(18), 2.4 + jitter(19),
-                    w, 3.0 + jitter(10),
-                    w, 4.0 + jitter(11),
+                    3.0 + jitter(10),
+                    4.0 + jitter(11),
                     jitter(12), 4.0 + jitter(13),
                     jitter(14), 3.0 + jitter(15),
                     jitter(16), 2.0 + jitter(17),
@@ -1409,12 +1430,14 @@ mod tests {
 
         assert!(stats.fonts_created >= 1);
         assert!(stats.occurrences_replaced >= 4000, "{stats:?}");
-        let object = doc.current_owned_object(pages[0])?.expect("page");
+        let object = doc
+            .current_owned_object(pages[0])?
+            .ok_or_else(|| crate::Error::Invalid("page".to_owned()))?;
         let contents = object
             .as_dictionary()
-            .expect("dictionary")
+            .ok_or_else(|| crate::Error::Invalid("dictionary".to_owned()))?
             .get(b"Contents".as_slice())
-            .expect("contents");
+            .ok_or_else(|| crate::Error::Invalid("contents".to_owned()))?;
         let mut rendered = Vec::new();
         decoded_content_value(&doc, contents, &mut rendered)?;
         assert!(rendered.windows(b" Tj ET".len()).any(|w| w == b" Tj ET"));
@@ -1423,13 +1446,22 @@ mod tests {
     }
 
     #[test]
-    fn refuses_open_path_or_text_context() {
+    fn refuses_open_path_or_text_context() -> Result<()> {
         let mut data = b"0 0 m ".to_vec();
         data.extend(shape(4., 2.));
-        assert!(collect(&data).expect("parse").is_empty());
+        assert!(
+            collect(&data)
+                .ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?
+                .is_empty()
+        );
         let mut data = b"BT ".to_vec();
         data.extend(shape(4., 2.));
         data.extend(b" ET");
-        assert!(collect(&data).expect("parse").is_empty());
+        assert!(
+            collect(&data)
+                .ok_or_else(|| crate::Error::Invalid("parse".to_owned()))?
+                .is_empty()
+        );
+        Ok(())
     }
 }
