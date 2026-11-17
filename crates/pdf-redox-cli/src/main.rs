@@ -3,7 +3,7 @@ mod corpus;
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
     AnnotationPolicy, Config, OptimizationGoal, PrivacyLevel, analyze_microstroke_rasterization,
-    analyze_pdf, analyze_pdf_preflight, optimize_pdf,
+    analyze_pdf, analyze_pdf_preflight, optimize_pdf, optimize_pdf_with_glyph_catalog,
 };
 use std::{
     io::{self, Write},
@@ -120,6 +120,10 @@ struct Args {
     /// Processing may skip expensive searches that only reduce encoded bytes.
     #[arg(long, value_enum, default_value = "size")]
     optimize_for: OptimizeForArg,
+    /// Export an OCR-ready JSON catalog of reused vector glyph components and
+    /// page placements. Requires the Processing optimization goal.
+    #[arg(long)]
+    glyph_catalog: Option<PathBuf>,
     /// Maximum persistent workers used for independent whole-stream Flate compression.
     #[arg(long)]
     flate_workers: Option<NonZeroUsize>,
@@ -332,9 +336,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(&r)?);
         return Ok(());
     }
-    let cfg = config_from_args(&a);
-    let (output, report) = optimize_pdf(&input, &cfg)?;
+    if a.glyph_catalog.is_some() && !matches!(a.optimize_for, OptimizeForArg::Processing) {
+        return Err("--glyph-catalog requires --optimize-for processing".into());
+    }
     let out_path = output_path(&a);
+    if a.glyph_catalog
+        .as_ref()
+        .is_some_and(|path| path == &out_path || path.as_os_str() == "-")
+    {
+        return Err("--glyph-catalog must name a separate output file".into());
+    }
+    let cfg = config_from_args(&a);
+    let (output, report, catalog) = if a.glyph_catalog.is_some() {
+        let (bytes, report, catalog) = optimize_pdf_with_glyph_catalog(&input, &cfg)?;
+        (bytes, report, Some(catalog))
+    } else {
+        let (bytes, report) = optimize_pdf(&input, &cfg)?;
+        (bytes, report, None)
+    };
     let output_to_stdout = out_path.as_os_str() == "-";
     if output_to_stdout {
         let stdout = io::stdout();
@@ -361,12 +380,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("wrote {}", out_path.display());
         }
     }
+    if let (Some(path), Some(catalog)) = (&a.glyph_catalog, &catalog) {
+        std::fs::write(path, serde_json::to_vec_pretty(catalog)?)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyph_catalog_flag_accepts_a_separate_processing_output() -> Result<(), clap::Error> {
+        let args = Args::try_parse_from([
+            "pdf-redox",
+            "source.pdf",
+            "--optimize-for",
+            "processing",
+            "--glyph-catalog",
+            "catalog.json",
+        ])?;
+        assert_eq!(args.glyph_catalog, Some(PathBuf::from("catalog.json")));
+        Ok(())
+    }
 
     #[test]
     fn private_authoring_data_is_explicit_opt_in() -> Result<(), clap::Error> {

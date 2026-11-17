@@ -1,7 +1,8 @@
 use crate::{
-    Config, EditDocument, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
+    Config, EditDocument, GlyphCatalog, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::analyze_document_for_optimization,
     content::{PageRewriteResult, normalize_page_contents},
+    dead_paint::{DeadPaintStats, eliminate_dead_image_paints},
     dedup::{
         canonicalize_appearance_streams, canonicalize_exact_extgstate_dictionaries,
         canonicalize_exact_font_dictionaries, canonicalize_exact_structure_attribute_dictionaries,
@@ -299,6 +300,34 @@ pub fn analyze_microstroke_rasterization(
 /// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
 /// an optimization pass fails, or the rewritten document cannot be serialized.
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
+    optimize_pdf_impl(input, cfg, None)
+}
+
+/// Optimize a PDF and return the document-wide catalog of Type3 outline
+/// components actually created by the Processing goal.
+///
+/// The catalog stores reusable geometry candidates and page placements, not
+/// Unicode predictions: one visual component is not necessarily one character.
+/// All ordinary optimization results remain identical when collection is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the PDF or optimization configuration is invalid.
+pub fn optimize_pdf_with_glyph_catalog(
+    input: &[u8],
+    cfg: &Config,
+) -> Result<(Vec<u8>, OptimizationReport, GlyphCatalog)> {
+    let mut catalog = GlyphCatalog::default();
+    let (output, report) = optimize_pdf_impl(input, cfg, Some(&mut catalog))?;
+    catalog.optimized_pdf_sha256 = crate::digest::sha256_hex(&output);
+    Ok((output, report, catalog))
+}
+
+fn optimize_pdf_impl(
+    input: &[u8],
+    cfg: &Config,
+    catalog: Option<&mut GlyphCatalog>,
+) -> Result<(Vec<u8>, OptimizationReport)> {
     validate_config(cfg)?;
     let mut timings = BTreeMap::new();
     let document = timed(&mut timings, "document-open", || {
@@ -313,6 +342,7 @@ pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, Optimization
         analysis.report,
         Some(&analysis.ext_gstate_dictionary_handles),
         timings,
+        catalog,
     )
 }
 
@@ -335,7 +365,7 @@ pub fn optimize_pdf_with_analysis(
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings)
+    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings, None)
 }
 
 fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
@@ -367,6 +397,7 @@ struct OptimizationRunStats {
     inline_image_dedup: DuplicateInlineImageStats,
     jpeg_entropy: crate::jpeg_optimize::JpegEntropyStats,
     image_dedup: crate::dedup::TargetedDedupStats,
+    dead_paint: DeadPaintStats,
     pattern_payload_factor: crate::dedup::PatternPayloadFactorStats,
     form_dedup: crate::dedup::TargetedDedupStats,
     form_metadata_payload_factor: crate::dedup::FormMetadataPayloadFactorStats,
@@ -403,6 +434,7 @@ fn optimize_pdf_with_document(
     before: PdfAnalysis,
     ext_gstate_dictionary_handles: Option<&[crate::ObjectHandle]>,
     mut timings: BTreeMap<String, f64>,
+    catalog: Option<&mut GlyphCatalog>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
     let flate_level = cfg.optimization_goal.flate_level();
     let preservation_fast_path = preservation_uses_fast_path(&cfg.preservation);
@@ -695,6 +727,19 @@ fn optimize_pdf_with_document(
             Ok(crate::dedup::FormMetadataPayloadFactorStats::default())
         }
     })?;
+    // Image and Form canonicalization make independently stored copies
+    // converge. Remove redundant opaque image-only paint invocations before
+    // downstream page-level factoring obscures the original duplicate runs.
+    let PageRewriteResult {
+        stats: dead_paint,
+        rewritten_pages: dead_paint_rewritten_pages,
+    } = timed(&mut timings, "dead-opaque-image-paints", || {
+        eliminate_dead_image_paints(&mut document, &stable_pages)
+    })?;
+    raster_vector_cache.retain(|page, _| !dead_paint_rewritten_pages.contains(page));
+    if dead_paint.paints_removed != 0 {
+        raster_resource_usage_exact = false;
+    }
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.appearance_key_count == 0 {
             Ok(crate::dedup::TargetedDedupStats::default())
@@ -866,7 +911,7 @@ fn optimize_pdf_with_document(
 
     let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(&mut document, &stable_pages, flate_level)
+            factor_outlined_glyphs(&mut document, &stable_pages, flate_level, catalog)
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -1003,6 +1048,7 @@ fn optimize_pdf_with_document(
         inline_image_dedup,
         jpeg_entropy,
         image_dedup,
+        dead_paint,
         pattern_payload_factor,
         form_dedup,
         form_metadata_payload_factor,

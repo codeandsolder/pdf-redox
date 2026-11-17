@@ -12,6 +12,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+mod curved_glyphs;
+
 const MAX_SOURCE_PATHS_PER_BATCH: usize = 64;
 const MIN_PAGE_CONTENT_BYTES: usize = 64 * 1024;
 const MIN_FORM_COLLINEAR_VERTICES_REMOVED: usize = 1024;
@@ -2302,7 +2304,7 @@ fn outlined_glyph_font_dictionary(
     ObjectHandle::New(document.add_object(OwnedObject::Dictionary(dictionary)))
 }
 
-pub fn factor_outlined_glyphs(
+fn factor_polyline_outlined_glyphs(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
@@ -2367,6 +2369,24 @@ pub fn factor_outlined_glyphs(
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
+    Ok(stats)
+}
+
+pub fn factor_outlined_glyphs(
+    doc: &mut EditDocument,
+    pages: &[ObjectHandle],
+    flate_level: crate::FlateLevel,
+    catalog: Option<&mut crate::GlyphCatalog>,
+) -> Result<OutlinedGlyphFactorStats> {
+    let mut stats = factor_polyline_outlined_glyphs(doc, pages, flate_level)?;
+    let curves = curved_glyphs::factor(doc, pages, flate_level, catalog)?;
+    stats.pages_rewritten += curves.pages_rewritten;
+    stats.fonts_created += curves.fonts_created;
+    stats.glyphs_created += curves.glyphs_created;
+    stats.occurrences_replaced += curves.occurrences_replaced;
+    stats.source_paints_replaced += curves.source_paints_replaced;
+    stats.decoded_bytes_removed += curves.decoded_bytes_removed;
+    stats.estimated_flate_bytes_saved += curves.estimated_flate_bytes_saved;
     Ok(stats)
 }
 

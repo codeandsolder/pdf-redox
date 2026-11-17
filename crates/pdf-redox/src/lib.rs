@@ -8,7 +8,9 @@ mod compression_corpus;
 mod config;
 mod content;
 pub(crate) mod content_stream;
+mod dead_paint;
 mod dedup;
+mod digest;
 mod direct_object;
 mod error;
 mod ext_gstate;
@@ -17,6 +19,8 @@ mod font;
 mod font_bitmap;
 mod font_subset;
 pub(crate) mod geometry;
+mod glyph_catalog;
+mod glyph_labels;
 pub(crate) mod hidden_text;
 mod icc_alternate;
 pub(crate) mod images;
@@ -24,6 +28,7 @@ mod inline_images;
 mod jpeg;
 mod jpeg_optimize;
 mod microstroke;
+mod ocr_overlay;
 mod optimize;
 mod page_representation;
 mod paint_batch;
@@ -56,8 +61,18 @@ pub use config::{
     PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
 };
 pub use error::{Error, Result, SourceLoadError};
+pub use glyph_catalog::{
+    GlyphCatalog, GlyphLabelOverride, GlyphLabelReport, GlyphLabels, GlyphOccurrence, GlyphTemplate,
+};
+pub use glyph_labels::apply_glyph_labels;
 pub use microstroke::MicrostrokeRasterStats;
-pub use optimize::{analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis};
+pub use ocr_overlay::{
+    OcrDocument, OcrLine, OcrOverlayOptions, OcrOverlayReport, OcrPage, apply_ocr_overlay,
+};
+pub use optimize::{
+    analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis,
+    optimize_pdf_with_glyph_catalog,
+};
 pub use report::{
     DocumentRepresentation, HiddenTextAction, HiddenTextCategory, HiddenTextFinding,
     HiddenTextMechanism, OptimizationReport, PageRect, PageRepresentation, PdfAnalysis,

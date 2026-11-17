@@ -20,6 +20,7 @@ Hayro is the source parser and codec layer. Source bytes stay immutable and lazi
 - `pdf-redox-cli`: native CLI
 - `pdf-redox-wasm`: WASM bindings
 - `web/`: static no-framework site
+- [pdf-redox-ocr](https://github.com/codeandsolder/pdf-redox-ocr): independently versioned Python/RapidOCR inference companion, using native Image `XObject` pixels, painted-page visibility proofs, and the Rust invisible-text importer provided by this repository.
 
 ## Status
 
@@ -37,7 +38,7 @@ Early but functional. The core currently provides:
 - policy-driven deletion of approved hidden-text operators from decoded page content streams, with category defaults and per-finding overrides;
 - a client-side WASM review UI that analyzes first and asks the user what invisible text to remove before rewriting; the WASM layer keeps that exact-byte analysis in memory and reuses it for the subsequent rewrite after a SHA-256 identity check, avoiding a second full structural scan.
 
-The workspace is pinned to `nightly-2026-08-01` (Rust 1.99.0-nightly) because the direct `zlib-rs-fast` compression engine uses portable SIMD. Stable Rust is not a supported build configuration for this repository.
+The workspace is pinned to `nightly-2026-11-12` because the direct `zlib-rs-fast` compression engine uses portable SIMD. Stable Rust is not a supported build configuration for this repository.
 
 Native formatting, strict Clippy, workspace tests, Rustdoc, and the `wasm32-unknown-unknown` build are CI gates.
 
