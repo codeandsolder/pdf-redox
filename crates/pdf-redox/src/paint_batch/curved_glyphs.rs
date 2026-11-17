@@ -4,11 +4,11 @@
 use super::{
     BTreeMap, BTreeSet, EditDocument, Event, GlyphComponent, GlyphFontPlan, GlyphShapePlan,
     MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
-    OutlinedGlyphFactorStats, Result, adjacent, decoded_content_value, effective_page_resources,
-    events_for, install_page_resource, outlined_glyph_estimated_after_flate,
-    outlined_glyph_font_dictionary, outlined_glyph_font_name, replace_page_content,
-    resolved_dictionary,
+    OutlinedGlyphFactorStats, Result, adjacent, effective_page_resources, events_for,
+    install_page_resource, outlined_glyph_estimated_after_flate, outlined_glyph_font_dictionary,
+    outlined_glyph_font_name, replace_page_content, resolved_dictionary,
 };
+use crate::content::page_content_if_present;
 use crate::glyph_catalog::{GlyphCatalog, GlyphOccurrence, GlyphTemplate};
 use sha2::{Digest as _, Sha256};
 
@@ -615,17 +615,9 @@ fn collect_sources(
     let mut shapes = Vec::<Shape>::new();
     let mut fills = Vec::<CompoundFill>::new();
     for (actual_page_index, &page) in pages.iter().enumerate() {
-        let Some(obj) = doc.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(doc, page)? else {
             continue;
         };
-        let Some(dict) = obj.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dict.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(doc, contents, &mut decoded)?;
         let Some((found, found_fills)) = collect_compound(&decoded) else {
             continue;
         };
@@ -1034,8 +1026,8 @@ pub(super) fn factor(
 mod tests {
     use super::{
         BTreeMap, BTreeSet, EditDocument, GlyphCatalog, Group, Result, candidate_svg_path, collect,
-        collect_catalog, collect_compound, collect_sources, decoded_content_value, factor, group,
-        prepare_plans, replacement,
+        collect_catalog, collect_compound, collect_sources, factor, group, prepare_plans,
+        replacement,
     };
     fn shape(width: f64, bulge: f64) -> Vec<u8> {
         format!("q 1 0 0 1 20 30 cm 0 0 m {width} 0 l {width} 1 l {width} 1.5 {width} {bulge} {width} 2 c {width} 3 l {width} 4 l 0 4 l 0 3 l 0 2 l h f Q\n").into_bytes()
@@ -1439,7 +1431,7 @@ mod tests {
             .get(b"Contents".as_slice())
             .ok_or_else(|| crate::Error::Invalid("contents".to_owned()))?;
         let mut rendered = Vec::new();
-        decoded_content_value(&doc, contents, &mut rendered)?;
+        crate::content::decoded_content_value(&doc, contents, &mut rendered)?;
         assert!(rendered.windows(b" Tj ET".len()).any(|w| w == b" Tj ET"));
         assert!(!rendered.windows(b" 1.5 ".len()).any(|w| w == b" 1.5 "));
         Ok(())

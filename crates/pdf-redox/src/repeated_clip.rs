@@ -7,9 +7,12 @@
 //! exact, resource-free clip prefix and rewrites a run so the clip is established
 //! once while each original body remains isolated in its own `q`/`Q` scope.
 
+use crate::content::page_content_if_present;
+use crate::content_stream::trivia_only;
+
 use crate::{
     EditDocument, OptimizationGoal, Result,
-    content::{PageRewriteResult, decoded_content_value, replace_page_content},
+    content::{PageRewriteResult, replace_page_content},
 };
 
 const MIN_CLIP_PREFIX_BYTES: usize = 4 * 1024;
@@ -246,25 +249,8 @@ fn clip_prefix<'a>(input: &'a [u8], block: &ClipBlock) -> Option<&'a [u8]> {
     input.get(block.start..block.clip_prefix_end?)
 }
 
-const fn gap_is_trivia(bytes: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => cursor += 1,
-            b'%' => {
-                cursor += 1;
-                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
-                    cursor += 1;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
 fn blocks_contiguous(input: &[u8], left: &ClipBlock, right: &ClipBlock) -> bool {
-    left.end <= right.start && gap_is_trivia(input.get(left.end..right.start).unwrap_or_default())
+    left.end <= right.start && trivia_only(input.get(left.end..right.start).unwrap_or_default())
 }
 
 fn repeated_runs(input: &[u8], blocks: &[ClipBlock]) -> Vec<ClipRun> {
@@ -360,17 +346,9 @@ pub fn hoist_repeated_clip_prefixes(
 ) -> Result<PageRewriteResult<RepeatedClipStats>> {
     let mut result: PageRewriteResult<RepeatedClipStats> = PageRewriteResult::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let Some(blocks) = Scanner::scan(&decoded)? else {
             continue;
         };

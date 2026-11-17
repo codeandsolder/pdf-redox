@@ -1,7 +1,7 @@
 use crate::geometry::Matrix;
 use crate::{
-    EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, Result,
-    content::{PageRewriteResult, page_content, replace_page_content, resolved_dictionary},
+    EditDocument, ObjectHandle as CowObjectHandle, Result,
+    content::{PageRewriteResult, page_content, page_xobject_handles, replace_page_content},
 };
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
@@ -404,31 +404,6 @@ impl PageScanner<'_> {
     }
 }
 
-fn page_xobjects(
-    document: &EditDocument,
-    page: CowObjectHandle,
-) -> Result<BTreeMap<Vec<u8>, CowObjectHandle>> {
-    let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(OwnedObject::Dictionary(resources)) =
-        document.resolve_owned_value(&resources_value)?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(xobjects
-        .into_iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(handle) => Some((name, handle)),
-            _ => None,
-        })
-        .collect())
-}
-
 fn close_position(a: &Candidate, b: &Candidate) -> bool {
     (a.x - b.x).abs() <= POSITION_TOLERANCE_PT && (a.y - b.y).abs() <= POSITION_TOLERANCE_PT
 }
@@ -543,7 +518,7 @@ pub fn repeated_page_objects_prefix_possible(
     let mut candidates = Vec::new();
     for (page_index, &page) in pages.iter().take(seed_pages).enumerate() {
         let content = page_content(document, page)?;
-        let xobjects = page_xobjects(document, page)?;
+        let xobjects = page_xobject_handles(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
@@ -566,7 +541,7 @@ pub fn remove_repeated_page_objects(
     let seed_pages = pages.len().min(MIN_SUPPORT_PAGES.saturating_add(1));
     for (page_index, &page) in pages.iter().take(seed_pages).enumerate() {
         let content = page_content(document, page)?;
-        let xobjects = page_xobjects(document, page)?;
+        let xobjects = page_xobject_handles(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
@@ -582,7 +557,7 @@ pub fn remove_repeated_page_objects(
     }
     for (page_index, &page) in pages.iter().enumerate().skip(seed_pages) {
         let content = page_content(document, page)?;
-        let xobjects = page_xobjects(document, page)?;
+        let xobjects = page_xobject_handles(document, page)?;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);

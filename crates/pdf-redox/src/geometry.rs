@@ -62,12 +62,13 @@ impl Rect {
         Self::new(rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
     }
 
-    pub fn from_ctm(ctm: Matrix) -> Self {
+    /// Axis-aligned bounding box after applying any affine PDF matrix.
+    pub fn transformed_bounds(self, matrix: Matrix) -> Self {
         let points = [
-            ctm.transform(0.0, 0.0),
-            ctm.transform(1.0, 0.0),
-            ctm.transform(0.0, 1.0),
-            ctm.transform(1.0, 1.0),
+            matrix.transform(self.x0, self.y0),
+            matrix.transform(self.x1, self.y0),
+            matrix.transform(self.x0, self.y1),
+            matrix.transform(self.x1, self.y1),
         ];
         Self {
             x0: points
@@ -87,6 +88,10 @@ impl Rect {
                 .map(|point| point.1)
                 .fold(f64::NEG_INFINITY, f64::max),
         }
+    }
+
+    pub fn from_ctm(ctm: Matrix) -> Self {
+        Self::new(0.0, 0.0, 1.0, 1.0).transformed_bounds(ctm)
     }
 
     pub fn area(self) -> f64 {
@@ -272,4 +277,30 @@ fn format_component(value: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transformed_rect_bounds_account_for_quarter_turns_and_unit_square() {
+        let matrix = Matrix::new(0.0, 2.0, -3.0, 0.0, 5.0, 7.0);
+        let rect = Rect::new(1.0, 2.0, 4.0, 6.0);
+        assert_eq!(
+            rect.transformed_bounds(matrix),
+            Rect::new(-13.0, 9.0, -1.0, 15.0)
+        );
+        assert_eq!(Rect::from_ctm(matrix), Rect::new(2.0, 7.0, 5.0, 9.0));
+    }
+
+    #[test]
+    fn transformed_rect_bounds_cover_all_four_corners_under_shear() {
+        let matrix = Matrix::new(1.0, 0.5, 0.25, 1.0, -10.0, 8.0);
+        let rect = Rect::new(-2.0, 3.0, 4.0, 6.0);
+        assert_eq!(
+            rect.transformed_bounds(matrix),
+            Rect::new(-11.25, 10.0, -4.5, 16.0)
+        );
+    }
 }

@@ -729,30 +729,7 @@ fn axis_aligned_transformed_rect(matrix: Matrix, rect: Rect) -> Option<Rect> {
     if !ordinary && !quarter_turn {
         return None;
     }
-    let points = [
-        matrix.transform(rect.x0, rect.y0),
-        matrix.transform(rect.x0, rect.y1),
-        matrix.transform(rect.x1, rect.y0),
-        matrix.transform(rect.x1, rect.y1),
-    ];
-    Some(Rect {
-        x0: points
-            .iter()
-            .map(|point| point.0)
-            .fold(f64::INFINITY, f64::min),
-        y0: points
-            .iter()
-            .map(|point| point.1)
-            .fold(f64::INFINITY, f64::min),
-        x1: points
-            .iter()
-            .map(|point| point.0)
-            .fold(f64::NEG_INFINITY, f64::max),
-        y1: points
-            .iter()
-            .map(|point| point.1)
-            .fold(f64::NEG_INFINITY, f64::max),
-    })
+    Some(rect.transformed_bounds(matrix))
 }
 
 fn union_coverage(rects: &[Rect], target: Rect) -> f64 {

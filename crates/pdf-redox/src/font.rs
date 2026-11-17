@@ -1,10 +1,11 @@
+use crate::content::page_content_if_present;
 use crate::stream_codec::{
     decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
 };
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData,
-    content::{decoded_content_value, resolved_dictionary, resolved_name},
+    content::{resolved_dictionary, resolved_name},
     direct_object::{
         DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
         walk_direct_output_objects,
@@ -452,6 +453,29 @@ struct SparseCidUnionCandidate {
     raw_len: usize,
 }
 
+/// Decode a stream eligible for in-place TrueType transformations.
+///
+/// A present /Filter and the lone-Flate policy are required by all three
+/// passes. Malformed encoded font programs remain untouched.
+fn editable_font_program(
+    document: &EditDocument,
+    program: CowObjectHandle,
+) -> Result<Option<(Vec<u8>, usize)>> {
+    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(program)?
+    else {
+        return Ok(None);
+    };
+    if !dictionary.contains_key(b"Filter".as_slice())
+        || !is_unfiltered_or_lone_flate(document, &dictionary)?
+    {
+        return Ok(None);
+    }
+    let raw = data.bytes(document.source())?;
+    Ok(decode_stream(document, &dictionary, raw.as_ref())
+        .ok()
+        .map(|decoded| (decoded, raw.len())))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "font discovery, compatibility checks, and document rewrites form one ordered optimization transaction"
@@ -504,19 +528,7 @@ fn union_sparse_cid_font_programs(
             continue;
         };
 
-        let Some(object) = document.current_owned_object(program)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, data } = object else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Filter".as_slice())
-            || !is_unfiltered_or_lone_flate(document, &dictionary)?
-        {
-            continue;
-        }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+        let Some((decoded, raw_len)) = editable_font_program(document, program)? else {
             continue;
         };
         if decoded.get(..4) != Some(&[0, 1, 0, 0]) {
@@ -533,7 +545,7 @@ fn union_sparse_cid_font_programs(
             descriptors: descriptors.clone(),
             base_name,
             font,
-            raw_len: raw.len(),
+            raw_len,
         });
     }
 
@@ -1705,17 +1717,9 @@ fn font_glyph_usage_with_hints(
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
-        let Some(page_object) = document.current_owned_object(page)? else {
+        let Some(content) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(page_dictionary) = page_object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = page_dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut content = Vec::new();
-        decoded_content_value(document, contents, &mut content)?;
         if usage.scan_scope(
             &content,
             &identity_eligible,
@@ -2342,19 +2346,7 @@ pub fn strip_font_editing_tables(
     ordered_programs.sort_unstable();
     let mut stats = FontOptimizationStats::default();
     for program in ordered_programs {
-        let Some(object) = document.current_owned_object(program)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, data } = object else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Filter".as_slice())
-            || !is_unfiltered_or_lone_flate(document, &dictionary)?
-        {
-            continue;
-        }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+        let Some((decoded, raw_len)) = editable_font_program(document, program)? else {
             continue;
         };
 
@@ -2377,12 +2369,12 @@ pub fn strip_font_editing_tables(
         let Ok(encoded) = encode_flate(&candidate, flate_level) else {
             continue;
         };
-        if encoded.len() >= raw.len() {
+        if encoded.len() >= raw_len {
             continue;
         }
 
         stats.programs_optimized += 1;
-        stats.original_encoded_bytes += raw.len();
+        stats.original_encoded_bytes += raw_len;
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
         replace_current_stream_data(document, program, encoded, true)?;
@@ -2743,19 +2735,7 @@ pub fn subset_font_outlines_after_dedup(
             continue;
         }
 
-        let Some(object) = document.current_owned_object(program)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, data } = object else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Filter".as_slice())
-            || !is_unfiltered_or_lone_flate(document, &dictionary)?
-        {
-            continue;
-        }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+        let Some((decoded, raw_len)) = editable_font_program(document, program)? else {
             continue;
         };
         let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
@@ -2777,7 +2757,7 @@ pub fn subset_font_outlines_after_dedup(
             let Ok(encoded) = encode_flate(&subset, flate_level) else {
                 continue;
             };
-            if encoded.len() >= raw.len()
+            if encoded.len() >= raw_len
                 || best
                     .as_ref()
                     .is_some_and(|(bytes, _, _)| bytes.len() <= encoded.len())
@@ -2792,7 +2772,7 @@ pub fn subset_font_outlines_after_dedup(
 
         stats.programs_optimized += 1;
         stats.programs_glyph_subset += 1;
-        stats.original_encoded_bytes += raw.len();
+        stats.original_encoded_bytes += raw_len;
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
         stats.glyph_subset_decoded_bytes_removed += glyph_subset_removed_bytes;

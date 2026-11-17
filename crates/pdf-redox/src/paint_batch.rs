@@ -1,8 +1,9 @@
+use crate::content::page_content_if_present;
+use crate::content_stream::trivia_only;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource,
-        replace_page_content, resolved_dictionary,
+        effective_page_resources, install_page_resource, replace_page_content, resolved_dictionary,
     },
 };
 use num_traits::ToPrimitive;
@@ -188,23 +189,6 @@ fn events_for(input: &[u8], _context: &str) -> Option<Vec<Event>> {
     })
     .ok()?;
     (!incomplete).then_some(events)
-}
-
-const fn trivia_only(bytes: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => cursor += 1,
-            b'%' => {
-                cursor += 1;
-                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
-                    cursor += 1;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
 }
 
 const fn path_operator(operator: &[u8]) -> bool {
@@ -882,17 +866,9 @@ pub fn coalesce_optional_content(
 ) -> Result<MarkedContentCoalesceStats> {
     let mut stats = MarkedContentCoalesceStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -1164,17 +1140,9 @@ pub fn compact_collinear_paths(
 ) -> Result<CollinearPathStats> {
     let mut stats = CollinearPathStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -1938,17 +1906,9 @@ pub fn factor_repeated_stroke_forms(
     let mut occupied_names = BTreeSet::<Vec<u8>>::new();
 
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -2311,17 +2271,9 @@ fn factor_polyline_outlined_glyphs(
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = OutlinedGlyphFactorStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -2396,17 +2348,9 @@ pub fn batch_page_paints(
 ) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -2762,7 +2706,7 @@ mod tests {
             return Err(crate::Error::Invalid("test page lost Contents".to_owned()));
         };
         let mut decoded = Vec::new();
-        decoded_content_value(&document, contents, &mut decoded)?;
+        crate::content::decoded_content_value(&document, contents, &mut decoded)?;
         assert!(!decoded.contains(&b'%'));
         assert_eq!(operator_count(&decoded, b"l"), 4000);
         Ok(())

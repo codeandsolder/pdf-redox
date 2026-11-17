@@ -6,6 +6,7 @@ use crate::{
     content::{
         form_content, form_resources, page_box_numbers_matching, page_content, page_resources,
         page_user_unit, resolved_bool, resolved_dictionary, resolved_non_null, resolved_number,
+        xobject_handles,
     },
     content_stream::{
         InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
@@ -720,18 +721,7 @@ impl RasterScanner {
             self.path_rect = None;
             return;
         }
-        let points = [
-            self.ctm.transform(x, y),
-            self.ctm.transform(x + width, y),
-            self.ctm.transform(x, y + height),
-            self.ctm.transform(x + width, y + height),
-        ];
-        let rect = Rect {
-            x0: points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
-            y0: points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
-            x1: points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
-            y1: points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
-        };
+        let rect = Rect::new(x, y, x + width, y + height).transformed_bounds(self.ctm);
         if self.path_rect.is_some() || self.path_complex {
             self.path_complex = true;
             self.path_rect = None;
@@ -1269,28 +1259,11 @@ fn collect_targets(document: &EditDocument, pages: &[ObjectHandle]) -> Result<Ve
     Ok(targets.into_iter().collect())
 }
 
-fn xobjects(
-    document: &EditDocument,
-    resources: &OwnedDictionary,
-) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(dictionary) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let mut out = BTreeMap::new();
-    for (name, value) in dictionary {
-        if let OwnedObject::Reference(handle) = value {
-            out.insert(name, handle);
-        }
-    }
-    Ok(out)
-}
-
 fn new_raster_scanner(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<RasterScanner> {
-    let xobjects = xobjects(document, resources)?;
+    let xobjects = xobject_handles(document, resources)?;
     let mut image_names = HashSet::new();
     for (name, handle) in &xobjects {
         if document.stream_subtype_is(*handle, b"Image")? {
