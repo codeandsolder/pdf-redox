@@ -17,7 +17,7 @@ permissions:
 jobs:
   rust:
     name: Rust 1.99 nightly
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@77dd7bb7dcbb8450e335bbbd1c47591733dc79a4 # main
     with:
       command: |
         cargo +nightly-2026-08-01 fmt --all -- --check
@@ -31,7 +31,7 @@ jobs:
 
   wasm:
     name: WASM compatibility
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@77dd7bb7dcbb8450e335bbbd1c47591733dc79a4 # main
     with:
       command: cargo +nightly-2026-08-01 check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
       rust-toolchain: "nightly-2026-08-01"
