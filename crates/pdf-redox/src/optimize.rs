@@ -2,6 +2,7 @@ use crate::{
     Config, EditDocument, GlyphCatalog, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::analyze_document_for_optimization,
     content::{PageRewriteResult, normalize_page_contents},
+    dead_paint::{DeadPaintStats, eliminate_dead_image_paints},
     dedup::{
         canonicalize_appearance_streams, canonicalize_exact_extgstate_dictionaries,
         canonicalize_exact_font_dictionaries, canonicalize_exact_structure_attribute_dictionaries,
@@ -396,6 +397,7 @@ struct OptimizationRunStats {
     inline_image_dedup: DuplicateInlineImageStats,
     jpeg_entropy: crate::jpeg_optimize::JpegEntropyStats,
     image_dedup: crate::dedup::TargetedDedupStats,
+    dead_paint: DeadPaintStats,
     pattern_payload_factor: crate::dedup::PatternPayloadFactorStats,
     form_dedup: crate::dedup::TargetedDedupStats,
     form_metadata_payload_factor: crate::dedup::FormMetadataPayloadFactorStats,
@@ -725,6 +727,19 @@ fn optimize_pdf_with_document(
             Ok(crate::dedup::FormMetadataPayloadFactorStats::default())
         }
     })?;
+    // Image and Form canonicalization make independently stored copies
+    // converge. Remove redundant opaque image-only paint invocations before
+    // downstream page-level factoring obscures the original duplicate runs.
+    let PageRewriteResult {
+        stats: dead_paint,
+        rewritten_pages: dead_paint_rewritten_pages,
+    } = timed(&mut timings, "dead-opaque-image-paints", || {
+        eliminate_dead_image_paints(&mut document, &stable_pages)
+    })?;
+    raster_vector_cache.retain(|page, _| !dead_paint_rewritten_pages.contains(page));
+    if dead_paint.paints_removed != 0 {
+        raster_resource_usage_exact = false;
+    }
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.appearance_key_count == 0 {
             Ok(crate::dedup::TargetedDedupStats::default())
@@ -1033,6 +1048,7 @@ fn optimize_pdf_with_document(
         inline_image_dedup,
         jpeg_entropy,
         image_dedup,
+        dead_paint,
         pattern_payload_factor,
         form_dedup,
         form_metadata_payload_factor,

@@ -101,6 +101,14 @@ impl OptimizationRunStats {
                 "Transformed {images_optimized} eligible raster image(s): {jpeg_images} to JPEG at quality {jpeg_quality} and {paper_indexed_images} paper-like RGB image(s) to Indexed color ({layered_indexed_images} using source-grid local-palette layers, {residual_indexed_images} using sparse residual overlays); reduced their encoded payload by {saved_bytes} bytes."
             ));
         }
+        if self.dead_paint.paints_removed > 0 {
+            let count = self.dead_paint.paints_removed;
+            let pages = self.dead_paint.pages_rewritten;
+            let bytes = self.dead_paint.decoded_bytes_removed;
+            notes.push(format!(
+                "Eliminated {count} redundant earlier opaque Image XObject paint(s) on {pages} page(s), removing {bytes} decoded content bytes while retaining the last covering paint."
+            ));
+        }
         if self.jpeg_entropy.streams_optimized > 0 {
             notes.push(format!(
                 "Entropy-optimized {} JPEG stream(s) without changing quantized DCT coefficients: {} -> {} encoded bytes ({} bytes saved).",
@@ -499,6 +507,9 @@ impl OptimizationRunStats {
             repeated_page_text_objects_removed: self.repeated_page_objects.text_objects_removed,
             repeated_page_xobject_paints_removed: self.repeated_page_objects.xobject_paints_removed,
             repeated_page_object_pages_rewritten: self.repeated_page_objects.pages_rewritten,
+            dead_image_paints_removed: self.dead_paint.paints_removed,
+            dead_image_paint_pages_rewritten: self.dead_paint.pages_rewritten,
+            dead_image_paint_decoded_bytes_removed: self.dead_paint.decoded_bytes_removed,
             raster_hidden_text_items_pruned: self
                 .physically_hidden_text
                 .removed

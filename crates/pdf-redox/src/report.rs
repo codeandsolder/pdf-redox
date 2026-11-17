@@ -568,6 +568,15 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of repeated page object pages rewritten.
     pub repeated_page_object_pages_rewritten: usize,
+    /// Redundant opaque raster image paint operations removed from page content.
+    #[serde(default)]
+    pub dead_image_paints_removed: usize,
+    /// Pages rewritten by redundant opaque image-paint elimination.
+    #[serde(default)]
+    pub dead_image_paint_pages_rewritten: usize,
+    /// Decoded PDF content-stream bytes removed by redundant image paints.
+    #[serde(default)]
+    pub dead_image_paint_decoded_bytes_removed: usize,
     #[serde(default)]
     /// Number of raster hidden text items pruned.
     pub raster_hidden_text_items_pruned: usize,
