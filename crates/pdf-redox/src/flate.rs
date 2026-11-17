@@ -17,6 +17,10 @@ const MIN_FLATE_SAVINGS_PERCENT: usize = 5;
 const ADAPTIVE_FLATE_MIN_DECODED_BYTES: usize = 1024 * 1024;
 const ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT: usize = 10;
 const MAX_REUSED_FLATE_BYTES: usize = 64 * 1024 * 1024;
+// The fresh PDF writer emits ` /Filter /FlateDecode` for an unfiltered
+// stream. An encoded payload must save more than those 21 dictionary bytes
+// before adding the filter can decrease the output size.
+const NEW_FLATE_FILTER_BYTES: usize = b" /Filter /FlateDecode".len();
 
 // Keep independent stream compression parallel without retaining every decoded
 // payload and its worst-case compressed buffer for the entire PDF at once.
@@ -158,7 +162,9 @@ fn collect_unfiltered_candidate(
     };
     // External /F streams do not have their authoritative payload in the
     // inline stream bytes. Never compress their fallback or strip filters.
-    if crate::stream_codec::has_external_file_stream_entries(&dictionary) {
+    if crate::stream_codec::has_external_file_stream_entries(&dictionary)
+        || has_special_stream_type(document, &dictionary)?
+    {
         return Ok(None);
     }
     let raw = data.bytes(document.source())?;
@@ -251,6 +257,18 @@ fn batch_high_effort_candidates(
     Ok(())
 }
 
+fn has_special_stream_type(
+    document: &crate::EditDocument,
+    dictionary: &crate::OwnedDictionary,
+) -> Result<bool> {
+    let Some(kind) = dictionary.get(b"Type".as_slice()) else {
+        return Ok(false);
+    };
+    Ok(
+        matches!(document.resolve_owned_value(kind)?, Some(crate::OwnedObject::Name(name)) if matches!(name.as_slice(), b"Metadata" | b"ObjStm" | b"XRef")),
+    )
+}
+
 fn is_safe_lone_flate(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
@@ -258,17 +276,9 @@ fn is_safe_lone_flate(
     // Reuse the codec's definition of one Flate filter, including PDF's
     // /Fl abbreviation, one-element filter arrays, and indirect names.
     // An absent /Filter is eligible for initial compression, not recompression.
-    if !dictionary.contains_key(b"Filter".as_slice())
-        || !crate::stream_codec::is_unfiltered_or_lone_flate(document, dictionary)?
-    {
-        return Ok(false);
-    }
-    if let Some(kind) = dictionary.get(b"Type".as_slice())
-        && matches!(document.resolve_owned_value(kind)?, Some(crate::OwnedObject::Name(name)) if matches!(name.as_slice(), b"Metadata" | b"ObjStm" | b"XRef"))
-    {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(dictionary.contains_key(b"Filter".as_slice())
+        && crate::stream_codec::is_unfiltered_or_lone_flate(document, dictionary)?
+        && !has_special_stream_type(document, dictionary)?)
 }
 
 struct FilteredFlateCandidate {
@@ -413,6 +423,10 @@ fn flush_unfiltered_batch(
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }
+        let saving = candidate.raw.len().saturating_sub(encoded.bytes.len());
+        if saving <= NEW_FLATE_FILTER_BYTES {
+            continue;
+        }
         if encoded.high_effort_selected {
             stats.high_effort_streams_selected =
                 stats.high_effort_streams_selected.saturating_add(1);
@@ -429,6 +443,10 @@ fn flush_unfiltered_batch(
             dictionary.remove(b"DecodeParms".as_slice());
             dictionary.remove(b"Length".as_slice());
             *data = crate::StreamData::Owned(encoded.bytes);
+            stats.streams_selected = stats.streams_selected.saturating_add(1);
+            stats.estimated_savings_bytes = stats
+                .estimated_savings_bytes
+                .saturating_add(saving - NEW_FLATE_FILTER_BYTES);
         }
     }
     Ok(())
@@ -618,6 +636,86 @@ mod tests {
             &batcher,
         )?;
         assert_eq!(document.current_owned_object(handle)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn unfiltered_compression_never_grows_written_pdf() -> crate::Result<()> {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let incompressible = (0..131_072)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed.to_le_bytes()[4]
+            })
+            .collect::<Vec<_>>();
+        let samples = [
+            (b"q Q".to_vec(), false),
+            (incompressible, false),
+            (vec![b'A'; 8192], true),
+            (b"BT /F1 12 Tf (Hello world) Tj ET\n".repeat(256), true),
+        ];
+        for (source, should_compress) in samples {
+            let (mut document, handle) = external_stream_fixture(&[], false, &source)?;
+            let before_object = document.current_owned_object(handle)?;
+            let before_pdf = crate::writer::write_pdf(&document)?;
+            let encoded =
+                crate::stream_codec::encode_flate(&source, crate::FlateLevel::PROCESSING)?;
+            assert_eq!(
+                source.len().saturating_sub(encoded.len()) > NEW_FLATE_FILTER_BYTES,
+                should_compress
+            );
+
+            let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+            let stats = compress_unfiltered_streams(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut FlateReuseCache::default(),
+                &batcher,
+            )?;
+            assert_eq!(stats.streams_selected, usize::from(should_compress));
+            let after_pdf = crate::writer::write_pdf(&document)?;
+            if should_compress {
+                assert!(after_pdf.len() < before_pdf.len());
+                assert_eq!(
+                    stats.estimated_savings_bytes,
+                    source.len() - encoded.len() - NEW_FLATE_FILTER_BYTES
+                );
+                assert_eq!(document.decoded_stream_data(handle)?, source);
+                let reloaded = crate::EditDocument::from_bytes(after_pdf)?;
+                let streams = reloaded.reachable_streams()?;
+                assert_eq!(streams.len(), 1);
+                assert_eq!(reloaded.decoded_stream_data(streams[0])?, source);
+            } else {
+                assert_eq!(document.current_owned_object(handle)?, before_object);
+                assert_eq!(after_pdf, before_pdf);
+                assert_eq!(stats.estimated_savings_bytes, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unfiltered_special_stream_types_keep_their_encoding() -> crate::Result<()> {
+        use crate::OwnedObject;
+
+        for kind in [b"Metadata".as_slice(), b"ObjStm", b"XRef"] {
+            let (mut document, handle) = external_stream_fixture(&[], false, &[b'X'; 8192])?;
+            if let OwnedObject::Stream { dictionary, .. } = document.edit_handle(handle)? {
+                dictionary.insert(b"Type".to_vec(), OwnedObject::Name(kind.to_vec()));
+            }
+            let before = document.current_owned_object(handle)?;
+            let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+            let stats = compress_unfiltered_streams(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut FlateReuseCache::default(),
+                &batcher,
+            )?;
+            assert_eq!(stats.streams_selected, 0, "{kind:?}");
+            assert_eq!(document.current_owned_object(handle)?, before, "{kind:?}");
+        }
         Ok(())
     }
 
