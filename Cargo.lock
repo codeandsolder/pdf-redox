@@ -793,7 +793,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=8c0cd70c0685ead7ace3a701dc06dc0ab905433d#8c0cd70c0685ead7ace3a701dc06dc0ab905433d"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=15e03425b94a7b1aae6487f3a79f8c295342fb5d#15e03425b94a7b1aae6487f3a79f8c295342fb5d"
 dependencies = [
  "rayon-core",
 ]
