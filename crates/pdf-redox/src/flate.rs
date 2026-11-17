@@ -21,6 +21,9 @@ const MAX_REUSED_FLATE_BYTES: usize = 64 * 1024 * 1024;
 // stream. An encoded payload must save more than those 21 dictionary bytes
 // before adding the filter can decrease the output size.
 const NEW_FLATE_FILTER_BYTES: usize = b" /Filter /FlateDecode".len();
+// RFC 1950 requires a two-byte header and a four-byte Adler-32 trailer,
+// even before accounting for the (nonempty) DEFLATE payload.
+const MIN_ZLIB_WRAPPER_BYTES: usize = 6;
 
 // Keep independent stream compression parallel without retaining every decoded
 // payload and its worst-case compressed buffer for the entire PDF at once.
@@ -186,7 +189,9 @@ fn collect_unfiltered_candidate(
         }
         return Ok(None);
     }
-    if has_filter {
+    if has_filter || raw.len() <= NEW_FLATE_FILTER_BYTES + MIN_ZLIB_WRAPPER_BYTES {
+        // Even the theoretical zero-byte DEFLATE payload cannot recover the
+        // added /Filter dictionary entry for a stream this small.
         return Ok(None);
     }
 
@@ -366,6 +371,11 @@ fn optimize_flate_streams_bounded(
             continue;
         }
         let raw_len = data.bytes(document.source())?.len();
+        if raw_len < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
+            // An RFC 1950 stream always needs at least six framing bytes.
+            // There is no possible encoding that clears the savings floor.
+            continue;
+        }
         let Ok(decoded) = document.decoded_stream_data(handle) else {
             continue;
         };
@@ -549,6 +559,100 @@ mod tests {
             .ok_or_else(|| crate::Error::Invalid("test page is not a dictionary".to_owned()))?;
         page.insert(b"Contents".to_vec(), OwnedObject::Reference(handle));
         Ok((document, handle))
+    }
+
+    #[test]
+    fn flate_size_floor_skips_unprofitable_streams_without_changing_output() -> crate::Result<()> {
+        // A zlib stream always carries at least six wrapper bytes, regardless
+        // of the compression algorithm's best achievable DEFLATE payload.
+        assert_eq!(MIN_ZLIB_WRAPPER_BYTES, 6);
+        let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+
+        for raw_len in [0_usize, 1, 6, 21, 22, 27, 28, 29, 64, 256] {
+            let source = vec![b'A'; raw_len];
+            let (mut document, handle) = external_stream_fixture(&[], false, &source)?;
+            let before = crate::writer::write_pdf(&document)?;
+            let candidate = collect_unfiltered_candidate(
+                &mut document,
+                handle,
+                crate::FlateLevel::PROCESSING,
+                &mut FlateReuseCache::default(),
+            )?;
+            assert_eq!(
+                candidate.is_none(),
+                raw_len <= NEW_FLATE_FILTER_BYTES + MIN_ZLIB_WRAPPER_BYTES,
+                "unfiltered candidate gate at {raw_len} bytes"
+            );
+            let encoded =
+                crate::stream_codec::encode_flate(&source, crate::FlateLevel::PROCESSING)?;
+            let should_compress =
+                source.len().saturating_sub(encoded.len()) > NEW_FLATE_FILTER_BYTES;
+            let stats = compress_unfiltered_streams(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut FlateReuseCache::default(),
+                &batcher,
+            )?;
+            assert_eq!(stats.streams_selected, usize::from(should_compress));
+            let after = crate::writer::write_pdf(&document)?;
+            if should_compress {
+                assert!(after.len() < before.len());
+                let reloaded = crate::EditDocument::from_bytes(after)?;
+                let streams = reloaded.reachable_streams()?;
+                assert_eq!(streams.len(), 1);
+                assert_eq!(reloaded.decoded_stream_data(streams[0])?, source);
+            } else {
+                assert_eq!(after, before, "unfiltered stream {raw_len} changed");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_flate_size_floor_skips_decoding_until_savings_are_possible() -> crate::Result<()> {
+        // Level 0 emits a stored block, so source payload size and encoded
+        // length can be selected precisely across the 1,030-byte boundary.
+        for encoded_len in [1028_usize, 1029, 1030, 1031, 2048] {
+            let decoded = vec![b'A'; encoded_len - 11];
+            let mut encoded = vec![0_u8; zlib_rs::compress_bound(decoded.len())];
+            let (result, code) =
+                zlib_rs::compress_slice(&mut encoded, &decoded, zlib_rs::DeflateConfig::new(0));
+            assert_eq!(code, zlib_rs::ReturnCode::Ok);
+            let result_len = result.len();
+            encoded.truncate(result_len);
+            assert_eq!(encoded.len(), encoded_len);
+
+            let (mut document, handle) = flate_filter_case_document(0, &encoded)?;
+            assert!(document.reachable_streams()?.contains(&handle));
+            let before = crate::writer::write_pdf(&document)?;
+            let baseline =
+                crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::PROCESSING)?;
+            let saving = encoded.len().saturating_sub(baseline.len());
+            let should_recompress = saving >= MIN_FLATE_SAVINGS_BYTES
+                && saving.saturating_mul(100)
+                    >= encoded.len().saturating_mul(MIN_FLATE_SAVINGS_PERCENT);
+            let stats = optimize_flate_streams_with_cache(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut FlateReuseCache::default(),
+                &FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?,
+            )?;
+            assert_eq!(
+                stats.streams_selected,
+                usize::from(should_recompress),
+                "encoded length {encoded_len}"
+            );
+            let after = crate::writer::write_pdf(&document)?;
+            if should_recompress {
+                let reloaded = crate::EditDocument::from_bytes(after)?;
+                let streams = reloaded.reachable_streams()?;
+                assert_eq!(streams.len(), 1);
+                assert_eq!(reloaded.decoded_stream_data(streams[0])?, decoded);
+            } else {
+                assert_eq!(after, before, "ineligible Flate stream changed");
+            }
+        }
+        Ok(())
     }
 
     #[test]
