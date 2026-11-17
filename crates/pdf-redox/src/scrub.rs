@@ -42,22 +42,41 @@ struct ActiveContentPlan {
 }
 
 fn owned_action_is_dangerous(document: &EditDocument, action: &OwnedObject) -> Result<bool> {
-    let Some(action) = document.resolve_owned_value(action)? else {
-        return Ok(false);
-    };
-    let OwnedObject::Dictionary(dictionary) = action else {
-        return Ok(false);
-    };
-    let Some(kind) = dictionary.get(b"S".as_slice()) else {
-        return Ok(false);
-    };
-    let Some(kind) = document.resolve_owned_value(kind)? else {
-        return Ok(false);
-    };
-    let OwnedObject::Name(name) = kind else {
-        return Ok(false);
-    };
-    Ok(DANGEROUS_ACTION_NAMES.contains(&name.as_slice()))
+    // /Next can be a single action or an array of actions, with indirect
+    // references at either level. Check the entire reachable action chain:
+    // inspecting only the first /S misses dangerous actions after benign ones.
+    //
+    // Only /Next is allowed to expand an array. In particular /OpenAction may
+    // instead be a destination array, which is not an array of actions.
+    let mut pending = vec![(action.clone(), false)];
+    let mut seen = BTreeSet::new();
+    while let Some((value, allow_array)) = pending.pop() {
+        match value {
+            OwnedObject::Reference(handle) => {
+                if seen.insert((handle, allow_array))
+                    && let Some(target) = document.current_owned_object(handle)?
+                {
+                    pending.push((target, allow_array));
+                }
+            }
+            OwnedObject::Array(actions) if allow_array => {
+                pending.extend(actions.into_iter().map(|action| (action, false)));
+            }
+            OwnedObject::Dictionary(dictionary) => {
+                if let Some(kind) = dictionary.get(b"S".as_slice())
+                    && let Some(OwnedObject::Name(name)) = document.resolve_owned_value(kind)?
+                    && DANGEROUS_ACTION_NAMES.contains(&name.as_slice())
+                {
+                    return Ok(true);
+                }
+                if let Some(next) = dictionary.get(b"Next".as_slice()) {
+                    pending.push((next.clone(), true));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
 }
 
 fn active_content_plan_for_handle(
@@ -708,6 +727,154 @@ mod tests {
         pdf.stream(5, b"/Type /Metadata /Subtype /XML", b"<xmp/>")?;
         pdf.object(6, b"<< /S /JavaScript /JS (app.alert('x')) >>")?;
         pdf.finish(1)
+    }
+
+    fn chained_actions_fixture() -> Result<Vec<u8>> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /OpenAction 6 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Annots [7 0 R 16 0 R] >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        // The first actions are benign. Only a subsequent chained action is
+        // executable. Both chains contain an indirect-reference cycle.
+        pdf.object(6, b"<< /S /URI /URI (https://example.org/) /Next 9 0 R >>")?;
+        pdf.object(
+            7,
+            b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 8 0 R >>",
+        )?;
+        pdf.object(8, b"<< /S /GoTo /D [3 0 R /Fit] /Next [10 0 R 11 0 R] >>")?;
+        pdf.object(9, b"<< /S /JavaScript /JS (app.alert('x')) /Next 6 0 R >>")?;
+        pdf.object(10, b"<< /S /URI /URI (https://example.org/) /Next 8 0 R >>")?;
+        pdf.object(11, b"<< /S /Launch /F (calc) >>")?;
+        // A benign cycle must terminate and must not cause its /A to be
+        // removed simply because it has a /Next chain.
+        pdf.object(
+            12,
+            b"<< /S /URI /URI (https://example.org/) /Next [13 0 R] >>",
+        )?;
+        pdf.object(13, b"<< /S /GoTo /D [3 0 R /Fit] /Next 12 0 R >>")?;
+        pdf.object(
+            16,
+            b"<< /Type /Annot /Subtype /Link /Rect [20 20 30 30] /A 12 0 R >>",
+        )?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn best_effort_scrub_follows_indirect_next_actions_and_cycles() -> Result<()> {
+        let mut document = EditDocument::from_bytes(chained_actions_fixture()?)?;
+        let cfg = PrivacyConfig {
+            level: PrivacyLevel::BestEffort,
+            remove_active_content: true,
+            ..PrivacyConfig::default()
+        };
+        let stats = scrub_edit_document_cos_privacy(&mut document, &cfg)?;
+        assert_eq!(stats.removed.get("dangerous-open-action"), Some(&1));
+        assert_eq!(stats.removed.get("dangerous-action"), Some(&1));
+
+        let catalog = document
+            .current_owned_object(CowObjectHandle::Existing(document.source().catalog_id()))?
+            .ok_or_else(|| Error::Invalid("missing catalog".to_owned()))?;
+        assert!(
+            !catalog
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(b"OpenAction".as_slice()))
+        );
+        let dangerous_link = document
+            .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(7, 0)))?
+            .ok_or_else(|| Error::Invalid("missing link".to_owned()))?;
+        assert!(
+            !dangerous_link
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(b"A".as_slice()))
+        );
+        let benign_link = document
+            .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(16, 0)))?
+            .ok_or_else(|| Error::Invalid("missing benign link".to_owned()))?;
+        assert!(
+            benign_link
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(b"A".as_slice()))
+        );
+
+        let compact = SourcePdf::from_bytes(document.write_compact()?)?;
+        let catalog = compact.materialize(compact.catalog_id())?;
+        assert!(
+            !catalog
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(b"OpenAction".as_slice()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn action_scanner_handles_destination_arrays_and_owned_next_references() -> Result<()> {
+        let mut document = EditDocument::from_bytes(chained_actions_fixture()?)?;
+        let page = CowObjectHandle::Existing(crate::ObjectId::new(3, 0));
+        let destination = OwnedObject::Array(vec![
+            OwnedObject::Reference(page),
+            OwnedObject::Name(b"Fit".to_vec()),
+        ]);
+        assert!(!owned_action_is_dangerous(&document, &destination)?);
+        let first = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([(b"S".to_vec(), OwnedObject::Name(b"URI".to_vec()))]),
+        )));
+        let second = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([(b"S".to_vec(), OwnedObject::Name(b"JavaScript".to_vec()))]),
+        )));
+        let next_actions = CowObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+            OwnedObject::Reference(first),
+            OwnedObject::Reference(second),
+        ])));
+        let OwnedObject::Dictionary(root) = document.edit_handle(first)? else {
+            return Err(Error::Invalid("missing owned first action".to_owned()));
+        };
+        root.insert(b"Next".to_vec(), OwnedObject::Reference(next_actions));
+        assert!(owned_action_is_dangerous(
+            &document,
+            &OwnedObject::Reference(first)
+        )?);
+        let direct_chained_action = OwnedObject::Dictionary(OwnedDictionary::from([
+            (b"S".to_vec(), OwnedObject::Name(b"URI".to_vec())),
+            (
+                b"Next".to_vec(),
+                OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"S".to_vec(),
+                    OwnedObject::Name(b"Launch".to_vec()),
+                )])),
+            ),
+        ]));
+        assert!(owned_action_is_dangerous(
+            &document,
+            &direct_chained_action
+        )?);
+
+        // The destination must remain a destination when stored as
+        // /OpenAction, even if it references a page object.
+        let catalog_id = document.source().catalog_id();
+        let catalog = document.edit_object(catalog_id)?;
+        let catalog = catalog
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("catalog not a dictionary".to_owned()))?;
+        catalog.insert(b"OpenAction".to_vec(), destination);
+        let cfg = PrivacyConfig {
+            level: PrivacyLevel::BestEffort,
+            remove_active_content: true,
+            ..PrivacyConfig::default()
+        };
+        let _ = scrub_edit_document_cos_privacy(&mut document, &cfg)?;
+        let catalog = document
+            .current_owned_object(CowObjectHandle::Existing(document.source().catalog_id()))?
+            .ok_or_else(|| Error::Invalid("missing catalog".to_owned()))?;
+        assert!(
+            catalog
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(b"OpenAction".as_slice()))
+        );
+        Ok(())
     }
 
     #[test]
