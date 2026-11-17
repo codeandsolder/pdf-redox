@@ -1,7 +1,14 @@
 //! Shared Type3 shapes for painted Bézier and line outlines in any graphics scope.
 //! Discovery is approximate, but canonical membership is checked across
 //! every occurrence using the same local-point coordinate bound.
-use super::*;
+use super::{
+    BTreeMap, BTreeSet, EditDocument, Event, GlyphComponent, GlyphFontPlan, GlyphShapePlan,
+    MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
+    OutlinedGlyphFactorStats, Result, adjacent, decoded_content_value, effective_page_resources,
+    events_for, install_page_resource, outlined_glyph_estimated_after_flate,
+    outlined_glyph_font_dictionary, outlined_glyph_font_name, replace_page_content,
+    resolved_dictionary,
+};
 use crate::glyph_catalog::{GlyphCatalog, GlyphOccurrence, GlyphTemplate};
 use sha2::{Digest as _, Sha256};
 
@@ -1025,7 +1032,11 @@ pub(super) fn factor(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        BTreeMap, BTreeSet, EditDocument, GlyphCatalog, Group, Result, candidate_svg_path, collect,
+        collect_catalog, collect_compound, collect_sources, decoded_content_value, factor, group,
+        prepare_plans, replacement,
+    };
     fn shape(width: f64, bulge: f64) -> Vec<u8> {
         format!("q 1 0 0 1 20 30 cm 0 0 m {width} 0 l {width} 1 l {width} 1.5 {width} {bulge} {width} 2 c {width} 3 l {width} 4 l 0 4 l 0 3 l 0 2 l h f Q\n").into_bytes()
     }

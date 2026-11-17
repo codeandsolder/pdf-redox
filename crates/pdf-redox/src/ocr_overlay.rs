@@ -122,7 +122,13 @@ fn valid_box(quad: &[[f64; 2]; 4]) -> bool {
     let h = [quad[3][0] - quad[0][0], quad[3][1] - quad[0][1]];
     let long = v[0].hypot(v[1]);
     let high = h[0].hypot(h[1]);
-    long > 0.25 && high > 0.25 && signed_area(quad) > 0.0625
+    long > 0.25
+        && high > 0.25
+        && signed_area(quad) > 0.0625
+        // Every visible OCR text region must be a strictly convex,
+        // counter-clockwise quadrilateral. A self-crossing or concave box
+        // cannot be used for meaningful polygon intersection.
+        && (0..4).all(|i| cross(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4]) > 1e-9)
 }
 
 fn actual_text_hex(value: &str) -> String {
@@ -148,33 +154,81 @@ fn render_invisible_line(out: &mut String, font: &str, line: &OcrLine) {
     );
 }
 
+fn cross(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    dx.mul_add(p[1] - a[1], -dy * (p[0] - a[0]))
+}
+
+fn polygon_area(points: &[[f64; 2]]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a[0].mul_add(b[1], -a[1] * b[0]))
+        .sum::<f64>()
+        .abs()
+        / 2.0
+}
+
 fn overlap(a: &[[f64; 2]; 4], b: &[[f64; 2]; 4]) -> f64 {
-    // Efficient AABB overlap for duplicate *OCR* detections. Structural
-    // page overlap is separately verified against PDF vector components.
-    let (ax0, ax1) = (
-        a.iter().map(|x| x[0]).fold(f64::INFINITY, f64::min),
-        a.iter().map(|x| x[0]).fold(f64::NEG_INFINITY, f64::max),
-    );
-    let (ay0, ay1) = (
-        a.iter().map(|x| x[1]).fold(f64::INFINITY, f64::min),
-        a.iter().map(|x| x[1]).fold(f64::NEG_INFINITY, f64::max),
-    );
-    let (bx0, bx1) = (
-        b.iter().map(|x| x[0]).fold(f64::INFINITY, f64::min),
-        b.iter().map(|x| x[0]).fold(f64::NEG_INFINITY, f64::max),
-    );
-    let (by0, by1) = (
-        b.iter().map(|x| x[1]).fold(f64::INFINITY, f64::min),
-        b.iter().map(|x| x[1]).fold(f64::NEG_INFINITY, f64::max),
-    );
-    let intersection =
-        (ax1.min(bx1) - ax0.max(bx0)).max(0.) * (ay1.min(by1) - ay0.max(by0)).max(0.);
-    let a_area = (ax1 - ax0) * (ay1 - ay0);
-    let b_area = (bx1 - bx0) * (by1 - by0);
-    if a_area > 0. && b_area > 0. {
-        intersection / a_area.min(b_area)
+    // The AABB is ONLY a cheap rejection test. Using AABB *area* as an
+    // overlap score incorrectly suppresses neighboring rotated labels:
+    // their bounding boxes intersect even if their glyph baselines do not.
+    for axis in 0..2 {
+        let a0 = a.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+        let a1 = a.iter().map(|p| p[axis]).fold(f64::NEG_INFINITY, f64::max);
+        let b0 = b.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+        let b1 = b.iter().map(|p| p[axis]).fold(f64::NEG_INFINITY, f64::max);
+        if a1.min(b1) <= a0.max(b0) {
+            return 0.0;
+        }
+    }
+
+    // Sutherland-Hodgman clipping of convex counter-clockwise source
+    // quadrilaterals (guaranteed by valid_box). Compute the exact polygon
+    // intersection area, normalized to the smaller source region.
+    let mut polygon = a.to_vec();
+    for i in 0..4 {
+        if polygon.is_empty() {
+            return 0.0;
+        }
+        let left = b[i];
+        let right = b[(i + 1) % 4];
+        let mut clipped = Vec::with_capacity(polygon.len() + 2);
+        let Some(&mut_previous) = polygon.last() else {
+            return 0.0;
+        };
+        let mut previous = mut_previous;
+        let mut previous_cross = cross(left, right, previous);
+        for &point in &polygon {
+            let current_cross = cross(left, right, point);
+            let previous_inside = previous_cross >= 0.0;
+            let current_inside = current_cross >= 0.0;
+            if previous_inside != current_inside {
+                let t = previous_cross / (previous_cross - current_cross);
+                clipped.push([
+                    previous[0].mul_add(1.0 - t, point[0] * t),
+                    previous[1].mul_add(1.0 - t, point[1] * t),
+                ]);
+            }
+            if current_inside {
+                clipped.push(point);
+            }
+            previous = point;
+            previous_cross = current_cross;
+        }
+        polygon = clipped;
+    }
+    let intersection = polygon_area(&polygon);
+    let min_area = signed_area(a).min(signed_area(b));
+    if min_area > 0.0 {
+        (intersection / min_area).clamp(0.0, 1.0)
     } else {
-        0.
+        0.0
     }
 }
 
@@ -404,6 +458,58 @@ pub fn apply_ocr_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_overlap_uses_rotated_polygons_not_axis_aligned_boxes() {
+        // Three adjacent lines on an actual rotated product photograph.
+        // Their AABBs overlap substantially, but their glyph polygons do
+        // not: rejecting two of them made genuine raster text disappear.
+        let texts = [
+            [
+                [148.904_439_606_741_56, 682.442_421_629_213_5],
+                [190.742_592_977_528_1, 712.258_117_134_831_4],
+                [184.971_813_202_247_18, 720.433_388_483_146],
+                [143.133_659_831_460_68, 690.617_692_977_528_1],
+            ],
+            [
+                [159.724_651_685_393_27, 677.152_540_168_539_3],
+                [201.562_805_056_179_8, 707.208_684_831_460_7],
+                [196.272_923_595_505_6, 714.662_608_707_865_2],
+                [154.434_770_224_719_1, 684.606_464_044_943_8],
+            ],
+            [
+                [175.353_846_910_112_37, 674.267_150_280_898_9],
+                [212.623_466_292_134_82, 700.957_006_741_573_1],
+                [207.814_483_146_067_4, 707.930_032_303_370_8],
+                [170.544_863_764_044_95, 681.240_175_842_696_7],
+            ],
+        ];
+        for quad in &texts {
+            assert!(valid_box(quad));
+        }
+        for i in 0..texts.len() {
+            for j in i + 1..texts.len() {
+                assert!(
+                    overlap(&texts[i], &texts[j]) < 0.60,
+                    "adjacent rotated labels {i} and {j} were mistaken for duplicates"
+                );
+            }
+        }
+
+        let horizontal = [[0., 0.], [100., 0.], [100., 20.], [0., 20.]];
+        let shifted = [[50., 0.], [150., 0.], [150., 20.], [50., 20.]];
+        let remote = [[200., 0.], [300., 0.], [300., 20.], [200., 20.]];
+        assert!((overlap(&horizontal, &horizontal) - 1.).abs() < 1e-9);
+        assert!((overlap(&horizontal, &shifted) - 0.5).abs() < 1e-9);
+        assert!(overlap(&horizontal, &remote).abs() < 1e-9);
+        let contained = [[25., 4.], [75., 4.], [75., 16.], [25., 16.]];
+        assert!((overlap(&horizontal, &contained) - 1.).abs() < 1e-9);
+
+        let concave = [[0., 0.], [10., 0.], [3., 1.], [0., 8.]];
+        assert!(!valid_box(&concave));
+        let bow_tie = [[0., 0.], [10., 0.], [0., 10.], [10., 10.]];
+        assert!(!valid_box(&bow_tie));
+    }
 
     #[test]
     fn applies_only_non_native_lines_on_multiple_pages() -> Result<()> {
