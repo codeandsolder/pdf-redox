@@ -255,14 +255,12 @@ fn is_safe_lone_flate(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
 ) -> Result<bool> {
-    let Some(filter) = dictionary.get(b"Filter".as_slice()) else {
-        return Ok(false);
-    };
-    if !matches!(document.resolve_owned_value(filter)?, Some(crate::OwnedObject::Name(name)) if name == b"FlateDecode")
+    // Reuse the codec's definition of one Flate filter, including PDF's
+    // /Fl abbreviation, one-element filter arrays, and indirect names.
+    // An absent /Filter is eligible for initial compression, not recompression.
+    if !dictionary.contains_key(b"Filter".as_slice())
+        || !crate::stream_codec::is_unfiltered_or_lone_flate(document, dictionary)?
     {
-        return Ok(false);
-    }
-    if crate::stream_codec::has_external_file_stream_entries(dictionary) {
         return Ok(false);
     }
     if let Some(kind) = dictionary.get(b"Type".as_slice())
@@ -790,6 +788,180 @@ mod tests {
                 if filtered {
                     assert!(results[0].0.streams_selected > 0);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn flate_filter_case_document(
+        case: usize,
+        encoded: &[u8],
+    ) -> crate::Result<(crate::EditDocument, ObjectHandle)> {
+        use crate::test_support::ClassicPdfBuilder;
+        use crate::{OwnedDictionary, OwnedObject, StreamData};
+
+        let mut builder = ClassicPdfBuilder::new();
+        builder.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        builder.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        builder.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        let mut document = crate::EditDocument::from_bytes(builder.finish(1)?)?;
+        let filter = match case {
+            0 | 10 | 11 | 12 => OwnedObject::Name(b"FlateDecode".to_vec()),
+            1 => OwnedObject::Name(b"Fl".to_vec()),
+            2 | 13 => OwnedObject::Array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
+            3 => OwnedObject::Array(vec![OwnedObject::Name(b"Fl".to_vec())]),
+            4 | 6 => {
+                let name = ObjectHandle::New(
+                    document.add_object(OwnedObject::Name(b"FlateDecode".to_vec())),
+                );
+                if case == 4 {
+                    OwnedObject::Reference(name)
+                } else {
+                    OwnedObject::Array(vec![OwnedObject::Reference(name)])
+                }
+            }
+            5 => OwnedObject::Reference(ObjectHandle::New(document.add_object(
+                OwnedObject::Array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
+            ))),
+            7 => OwnedObject::Null,
+            8 => OwnedObject::Array(vec![
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            ]),
+            9 => OwnedObject::Name(b"DCTDecode".to_vec()),
+            _ => return Err(crate::Error::Invalid("invalid test case".to_owned())),
+        };
+        let mut dictionary = OwnedDictionary::from([(b"Filter".to_vec(), filter)]);
+        if case == 10 {
+            dictionary.insert(b"F".to_vec(), OwnedObject::String(b"external.dat".to_vec()));
+        }
+        if case == 11 {
+            dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"Metadata".to_vec()));
+        }
+        if case == 12 || case == 13 {
+            let params = OwnedObject::Dictionary(OwnedDictionary::from([(
+                b"Predictor".to_vec(),
+                OwnedObject::Integer(1),
+            )]));
+            dictionary.insert(
+                b"DecodeParms".to_vec(),
+                if case == 13 {
+                    OwnedObject::Array(vec![params])
+                } else {
+                    params
+                },
+            );
+        }
+        let stream = OwnedObject::Stream {
+            dictionary,
+            data: StreamData::Owned(encoded.to_vec()),
+        };
+        let handle = ObjectHandle::New(document.add_object(stream));
+        let page = document.edit_object(crate::ObjectId::new(3, 0))?;
+        let page = page
+            .as_dictionary_mut()
+            .ok_or_else(|| crate::Error::Invalid("test page missing dictionary".to_owned()))?;
+        page.insert(b"Contents".to_vec(), OwnedObject::Reference(handle));
+        Ok((document, handle))
+    }
+
+    #[test]
+    fn flate_filter_alias_arrays_and_references_recompress_losslessly() -> crate::Result<()> {
+        use crate::OwnedObject;
+
+        // Level-0 zlib is a valid PDF Flate stream that the size/processing
+        // policies can shrink enough to pass the ordinary recompression gate.
+        let decoded = b"BT /F1 12 Tf (sample text) Tj ET\n".repeat(8192);
+        let mut source_encoded = vec![0_u8; zlib_rs::compress_bound(decoded.len())];
+        let (encoded, compression_code) = zlib_rs::compress_slice(
+            &mut source_encoded,
+            &decoded,
+            zlib_rs::DeflateConfig::new(0),
+        );
+        assert_eq!(compression_code, zlib_rs::ReturnCode::Ok);
+        let encoded_len = encoded.len();
+        source_encoded.truncate(encoded_len);
+
+        for variant in 0..28 {
+            let case = variant % 14;
+            let level = if variant < 14 {
+                crate::FlateLevel::PROCESSING
+            } else {
+                crate::FlateLevel::SIZE
+            };
+            let (mut document, handle) = flate_filter_case_document(case, &source_encoded)?;
+
+            let expected_rewrite = !matches!(case, 7..=11);
+            let before = document
+                .current_owned_object(handle)?
+                .ok_or_else(|| crate::Error::Invalid("test stream missing".to_owned()))?;
+            let dictionary = before.as_dictionary().ok_or_else(|| {
+                crate::Error::Invalid("test stream missing dictionary".to_owned())
+            })?;
+            assert_eq!(
+                is_safe_lone_flate(&document, dictionary)?,
+                expected_rewrite,
+                "eligibility case {case}"
+            );
+            if expected_rewrite {
+                assert_eq!(
+                    document.decoded_stream_data(handle)?,
+                    decoded,
+                    "before case {case}"
+                );
+            }
+
+            let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+            let stats = optimize_flate_streams_with_cache(
+                &mut document,
+                level,
+                &mut FlateReuseCache::default(),
+                &batcher,
+            )?;
+            assert_eq!(
+                stats.streams_selected,
+                usize::from(expected_rewrite),
+                "selected case {case}, level {}",
+                level.value()
+            );
+            let after = document
+                .current_owned_object(handle)?
+                .ok_or_else(|| crate::Error::Invalid("optimized stream missing".to_owned()))?;
+            if expected_rewrite {
+                let OwnedObject::Stream { dictionary, data } = after else {
+                    return Err(crate::Error::Invalid(
+                        "optimized object not stream".to_owned(),
+                    ));
+                };
+                assert_eq!(
+                    dictionary.get(b"Filter".as_slice()),
+                    Some(&OwnedObject::Name(b"FlateDecode".to_vec())),
+                    "normalized filter case {case}"
+                );
+                assert!(!dictionary.contains_key(b"DecodeParms".as_slice()));
+                assert!(data.bytes(document.source())?.len() < encoded_len);
+                assert_eq!(
+                    document.decoded_stream_data(handle)?,
+                    decoded,
+                    "after case {case}"
+                );
+
+                // Also verify that canonicalizing aliases/indirect filters
+                // survives the real output writer and another PDF parse.
+                let output = crate::writer::write_pdf(&document)?;
+                let reloaded = crate::EditDocument::from_bytes(output)?;
+                let streams = reloaded.reachable_streams()?;
+                assert_eq!(streams.len(), 1, "written stream graph case {case}");
+                assert_eq!(
+                    reloaded.decoded_stream_data(streams[0])?,
+                    decoded,
+                    "written PDF stream case {case}"
+                );
+            } else {
+                assert_eq!(after, before, "excluded stream mutated in case {case}");
             }
         }
         Ok(())
