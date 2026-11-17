@@ -1,5 +1,5 @@
 use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Default)]
 pub struct PageRewriteResult<S> {
@@ -148,19 +148,31 @@ pub fn resolved_dictionary(
         .and_then(|value| value.as_dictionary().cloned()))
 }
 
-pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
+/// Return decoded page contents only if a /Contents entry is present.
+///
+/// An absent page or non-dictionary page is distinct from an explicitly
+/// present, empty content stream. Callers that rewrite pages must preserve
+/// that distinction; read-only consumers can use `page_content`.
+pub fn page_content_if_present(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<Option<Vec<u8>>> {
     let Some(page) = document.current_owned_object(page)? else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some(dictionary) = page.as_dictionary() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let mut decoded = Vec::new();
     decoded_content_value(document, contents, &mut decoded)?;
-    Ok(decoded)
+    Ok(Some(decoded))
+}
+
+pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
+    Ok(page_content_if_present(document, page)?.unwrap_or_default())
 }
 
 pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
@@ -200,6 +212,35 @@ pub fn page_resources(
         return Ok(None);
     };
     resolved_dictionary(document, Some(&value))
+}
+
+/// Resolve the name -> object handle mapping of referenced `XObjects`.
+pub fn xobject_handles(
+    document: &EditDocument,
+    resources: &OwnedDictionary,
+) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(xobjects
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            OwnedObject::Reference(handle) => Some((name, handle)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Read an inherited page resource dictionary and resolve its `XObject` handles.
+pub fn page_xobject_handles(
+    document: &EditDocument,
+    page: ObjectHandle,
+) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+    let Some(resources) = page_resources(document, page)? else {
+        return Ok(BTreeMap::new());
+    };
+    xobject_handles(document, &resources)
 }
 
 pub fn form_resources(
@@ -308,17 +349,9 @@ pub fn replace_page_content_flate(
 
 pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandle]) -> Result<()> {
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let normalized = crate::content_stream::normalize_content_stream(&decoded);
         if normalized.as_slice() != decoded.as_slice() {
             replace_page_content(document, page, normalized)?;
@@ -331,6 +364,48 @@ pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandl
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn page_content_presence_and_inherited_xobjects_preserve_resource_semantics() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /Resources << /XObject 7 0 R >> >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"")?;
+        pdf.object(5, b"<< /Subtype /Image >>")?;
+        pdf.object(
+            6,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        pdf.object(7, b"<< /Im 5 0 R /Ignored 42 /Null null >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        assert_eq!(
+            page_content_if_present(&document, pages[0])?,
+            Some(Vec::new())
+        );
+        assert_eq!(page_content_if_present(&document, pages[1])?, None);
+        assert_eq!(page_content(&document, pages[1])?, Vec::<u8>::new());
+
+        let first = page_xobject_handles(&document, pages[0])?;
+        assert_eq!(first, page_xobject_handles(&document, pages[1])?);
+        assert_eq!(first.len(), 1);
+        assert!(first.contains_key(b"Im".as_slice()));
+
+        normalize_page_contents(&mut document, &pages)?;
+        assert_eq!(
+            page_content_if_present(&document, pages[0])?,
+            Some(Vec::new())
+        );
+        assert_eq!(page_content_if_present(&document, pages[1])?, None);
+        Ok(())
+    }
 
     #[test]
     #[expect(

@@ -8,9 +8,10 @@
 //! Distances are measured after CTM and `/UserUnit`, so the tolerance is in real
 //! page points rather than source-coordinate units.
 
+use crate::content::page_content_if_present;
 use crate::{
     EditDocument, Result,
-    content::{decoded_content_value, page_user_unit, replace_page_content},
+    content::{page_user_unit, replace_page_content},
     content_stream::{instruction_operands, operand_numbers},
     geometry::Matrix,
 };
@@ -416,17 +417,9 @@ pub fn simplify_page_polylines(
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;
         };
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let Some((replacements, vertices_removed, cubics_simplified)) =
             Scanner::new(&decoded, user_unit).scan()?
         else {

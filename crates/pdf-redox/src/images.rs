@@ -537,6 +537,40 @@ fn indexed_color_space_with_transparent_zero(
     ]))
 }
 
+/// Turn the replacement image layers into a unit-square Form `XObject`.
+fn install_indexed_form_wrapper(
+    document: &mut EditDocument,
+    handle: ObjectHandle,
+    resources: OwnedDictionary,
+    content: Vec<u8>,
+) -> Result<()> {
+    *document.edit_handle(handle)? = OwnedObject::Stream {
+        dictionary: OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
+            (b"FormType".to_vec(), OwnedObject::Integer(1)),
+            (
+                b"BBox".to_vec(),
+                OwnedObject::Array(vec![
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(0),
+                    OwnedObject::Integer(1),
+                    OwnedObject::Integer(1),
+                ]),
+            ),
+            (
+                b"Resources".to_vec(),
+                OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"XObject".to_vec(),
+                    OwnedObject::Dictionary(resources),
+                )])),
+            ),
+        ]),
+        data: StreamData::Owned(content),
+    };
+    Ok(())
+}
+
 fn install_local_layered_indexed_transform(
     document: &mut EditDocument,
     handle: ObjectHandle,
@@ -576,32 +610,7 @@ fn install_local_layered_indexed_transform(
         content.extend_from_slice(b" Do\n");
     }
 
-    let object = document.edit_handle(handle)?;
-    *object = OwnedObject::Stream {
-        dictionary: OwnedDictionary::from([
-            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
-            (b"FormType".to_vec(), OwnedObject::Integer(1)),
-            (
-                b"BBox".to_vec(),
-                OwnedObject::Array(vec![
-                    OwnedObject::Integer(0),
-                    OwnedObject::Integer(0),
-                    OwnedObject::Integer(1),
-                    OwnedObject::Integer(1),
-                ]),
-            ),
-            (
-                b"Resources".to_vec(),
-                OwnedObject::Dictionary(OwnedDictionary::from([(
-                    b"XObject".to_vec(),
-                    OwnedObject::Dictionary(resources),
-                )])),
-            ),
-        ]),
-        data: StreamData::Owned(content),
-    };
-    Ok(())
+    install_indexed_form_wrapper(document, handle, resources, content)
 }
 
 fn install_residual_indexed_transform(
@@ -663,31 +672,7 @@ fn install_residual_indexed_transform(
         content.extend_from_slice(name);
         content.extend_from_slice(b" Do\n");
     }
-    *document.edit_handle(handle)? = OwnedObject::Stream {
-        dictionary: OwnedDictionary::from([
-            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
-            (b"FormType".to_vec(), OwnedObject::Integer(1)),
-            (
-                b"BBox".to_vec(),
-                OwnedObject::Array(vec![
-                    OwnedObject::Integer(0),
-                    OwnedObject::Integer(0),
-                    OwnedObject::Integer(1),
-                    OwnedObject::Integer(1),
-                ]),
-            ),
-            (
-                b"Resources".to_vec(),
-                OwnedObject::Dictionary(OwnedDictionary::from([(
-                    b"XObject".to_vec(),
-                    OwnedObject::Dictionary(resources),
-                )])),
-            ),
-        ]),
-        data: StreamData::Owned(content),
-    };
-    Ok(())
+    install_indexed_form_wrapper(document, handle, resources, content)
 }
 
 fn install_layered_indexed_transform(

@@ -10,8 +10,8 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedObject, Result,
     content::{
-        PageRewriteResult, page_content, replace_page_content, resolved_dictionary,
-        resolved_finite_number_array,
+        PageRewriteResult, page_content, page_xobject_handles, replace_page_content,
+        resolved_dictionary, resolved_finite_number_array,
     },
     content_stream::{instruction_operands, visit_instructions},
 };
@@ -49,29 +49,6 @@ fn parsed_instructions(content: &[u8]) -> Result<Option<Vec<Instruction>>> {
         Ok(())
     })?;
     Ok((!incomplete).then_some(result))
-}
-
-fn image_resources(
-    document: &EditDocument,
-    page: ObjectHandle,
-) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(resources) = document.inherited_page_value(page, b"Resources")? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(OwnedObject::Dictionary(resources)) = document.resolve_owned_value(&resources)? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(xobjects
-        .into_iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(handle) => Some((name, handle)),
-            _ => None,
-        })
-        .collect())
 }
 
 /// Only ordinary fully opaque raster images qualify. In particular, JPX may
@@ -490,7 +467,7 @@ pub fn eliminate_dead_image_paints(
         if page_dict.contains_key(b"Group".as_slice()) {
             continue;
         }
-        let resources = image_resources(document, page)?;
+        let resources = page_xobject_handles(document, page)?;
         if resources.is_empty() {
             continue;
         }

@@ -1,6 +1,10 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result,
-    content::{form_content, form_resources, page_content, page_resources, resolved_dictionary},
+    content::{
+        form_content, form_resources, page_content, page_resources, resolved_dictionary,
+        xobject_handles,
+    },
+    content_stream::resource_type_for_operator,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -11,23 +15,10 @@ struct DetachedResourceUsage {
     names_by_resource_type: ResourceNamesByType,
 }
 
-const fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
-    match operator {
-        b"CS" | b"cs" => Some(b"ColorSpace"),
-        b"gs" => Some(b"ExtGState"),
-        b"Tf" => Some(b"Font"),
-        b"SCN" | b"scn" => Some(b"Pattern"),
-        b"BDC" | b"DP" => Some(b"Properties"),
-        b"sh" => Some(b"Shading"),
-        b"Do" => Some(b"XObject"),
-        _ => None,
-    }
-}
-
 fn scan(content: &[u8]) -> Option<DetachedResourceUsage> {
     let mut usage = DetachedResourceUsage::default();
     let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-        let Some(resource_type) = operator_resource_type(&instruction.operator[..]) else {
+        let Some(resource_type) = resource_type_for_operator(&instruction.operator[..]) else {
             return Ok(());
         };
         let mut last_name = None;
@@ -85,24 +76,6 @@ impl ResourcePruneStats {
         self.properties = self.properties.saturating_add(other.properties);
         self.shadings = self.shadings.saturating_add(other.shadings);
     }
-}
-
-fn xobject_handles(
-    document: &EditDocument,
-    resources: &OwnedDictionary,
-) -> Result<Vec<(Vec<u8>, ObjectHandle)>> {
-    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for (name, value) in xobjects {
-        let OwnedObject::Reference(handle) = value else {
-            continue;
-        };
-        out.push((name, handle));
-    }
-    Ok(out)
 }
 
 fn is_form(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {

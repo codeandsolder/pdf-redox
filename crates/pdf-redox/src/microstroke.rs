@@ -1,11 +1,12 @@
+use crate::content::page_content_if_present;
 use crate::ext_gstate::ext_gstate_semantics;
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster},
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource, page_user_unit,
-        replace_page_content, resolved_dictionary,
+        effective_page_resources, install_page_resource, page_user_unit, replace_page_content,
+        resolved_dictionary,
     },
 };
 use num_traits::ToPrimitive;
@@ -1050,17 +1051,9 @@ pub fn rasterize_pathological_microstrokes(
     let flate_level = goal.flate_level();
     let mut stats = MicrostrokeRasterStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let resources = effective_page_resources(document, page)?;
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;

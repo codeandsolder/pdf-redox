@@ -1,3 +1,5 @@
+use crate::content::page_content_if_present;
+use crate::content_stream::trivia_only;
 use crate::ext_gstate::ext_gstate_semantics;
 use crate::geometry::{Matrix, Rect};
 use crate::{
@@ -1635,17 +1637,9 @@ fn factor_repeated_path_forms(
     let mut cached_transformed = BTreeMap::new();
 
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let blocks = pre_scanned
             .remove(&page)
             .unwrap_or_else(|| factorable_processing_blocks(&decoded));
@@ -1935,17 +1929,9 @@ fn factor_repeated_transformed_blocks(
     let mut scanned_blocks = 0usize;
 
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let blocks = if rewritten_pages.contains(&page) {
             factorable_transformed_blocks(&decoded)
         } else {
@@ -2458,23 +2444,6 @@ fn factorable_shared_q_blocks(input: &[u8], targets: &SharedResourceTargets) -> 
     scanner.blocks
 }
 
-const fn shared_gap_is_trivia(bytes: &[u8]) -> bool {
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => cursor += 1,
-            b'%' => {
-                cursor += 1;
-                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
-                    cursor += 1;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
 fn shared_page_visible_box(document: &EditDocument, page: ObjectHandle) -> Result<Option<Rect>> {
     let Some(numbers) = page_box_numbers_matching(document, page, |numbers| {
         numbers.into_iter().all(f64::is_finite)
@@ -2522,7 +2491,7 @@ fn shared_blocks_contiguous(page: &SharedPageData, left: usize, right: usize) ->
         return false;
     };
     left.end <= right.start
-        && shared_gap_is_trivia(page.decoded.get(left.end..right.start).unwrap_or_default())
+        && trivia_only(page.decoded.get(left.end..right.start).unwrap_or_default())
 }
 
 fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunCandidate> {
@@ -2662,17 +2631,9 @@ fn factor_shared_q_prefix_runs(
 ) -> Result<VectorCompactionStats> {
     let mut eligible_pages = Vec::new();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         // Every selected shared run is a span inside one page content stream.
         // A page shorter than the run floor cannot possibly contribute.
         if shared_q_page_can_reach_minimum(decoded.len()) {
@@ -3231,6 +3192,7 @@ fn canonicalize_page_path_coordinates(
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;
         };
+        // Preserve the original /Contents handle for the Flate reuse cache.
         let Some(object) = document.current_owned_object(page)? else {
             continue;
         };
@@ -3305,17 +3267,9 @@ fn compact_processing_fill_tail(
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let resources = match document.inherited_page_value(page, b"Resources")? {
             Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
             None => OwnedDictionary::default(),
@@ -3534,17 +3488,9 @@ pub fn compact_vector_paths_with_flate_cache(
     let mut path_coordinate_plans = BTreeMap::<ObjectHandle, Option<PathCoordinatePlan>>::new();
     let mut vector_rewritten_pages = BTreeSet::<ObjectHandle>::new();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
         let resources = match document.inherited_page_value(page, b"Resources")? {
             Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
             None => OwnedDictionary::default(),
@@ -4258,8 +4204,8 @@ mod tests {
 
     #[test]
     fn shared_q_block_gap_accepts_only_pdf_trivia() {
-        assert!(shared_gap_is_trivia(b" \n% comment\r\n\t"));
-        assert!(!shared_gap_is_trivia(b" 0 0 m "));
+        assert!(trivia_only(b" \n% comment\r\n\t"));
+        assert!(!trivia_only(b" 0 0 m "));
     }
 
     #[test]

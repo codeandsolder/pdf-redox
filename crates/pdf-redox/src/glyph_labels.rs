@@ -5,6 +5,7 @@ use crate::{
     EditDocument, Error, GlyphCatalog, GlyphLabelReport, GlyphLabels, Result,
     content::{decoded_content_value, replace_page_content_flate},
     digest::sha256_hex,
+    geometry::compose_affine_matrix,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -89,17 +90,6 @@ fn matrix_operands(
         .map(|x| x.number)
         .collect::<Option<_>>()?;
     values.try_into().ok()
-}
-
-fn matrix_mul(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
-    [
-        a[2].mul_add(b[1], a[0] * b[0]),
-        a[3].mul_add(b[1], a[1] * b[0]),
-        a[2].mul_add(b[3], a[0] * b[2]),
-        a[3].mul_add(b[3], a[1] * b[2]),
-        a[2].mul_add(b[5], a[0].mul_add(b[4], a[4])),
-        a[3].mul_add(b[5], a[1].mul_add(b[4], a[5])),
-    ]
 }
 
 fn unit_quad(matrix: [f64; 6]) -> [[f64; 2]; 4] {
@@ -208,7 +198,7 @@ fn amend_page(
             b"cm" => {
                 let matrix = matrix_operands(decoded, instruction)
                     .ok_or_else(|| invalid("invalid page-space graphics transform"))?;
-                ctm = matrix_mul(ctm, matrix);
+                ctm = compose_affine_matrix(ctm, matrix);
             }
             b"Tm" => {
                 if let Some(mark) = pending.iter_mut().rev().find_map(Option::as_mut) {
@@ -217,7 +207,7 @@ fn amend_page(
                     }
                     let matrix = matrix_operands(decoded, instruction)
                         .ok_or_else(|| invalid("invalid Type3 text transform"))?;
-                    mark.page_quad = Some(unit_quad(matrix_mul(ctm, matrix)));
+                    mark.page_quad = Some(unit_quad(compose_affine_matrix(ctm, matrix)));
                 }
             }
             b"BDC" => {
