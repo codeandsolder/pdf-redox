@@ -5,9 +5,9 @@ This produces a PDF-bound *diagnostic* report, never automatic Unicode labels.
 Reused paths can represent parts of characters or non-text diagram strokes;
 confidence from one OCR model is not independent evidence of correctness.
 """
+
 import argparse
 from collections import Counter, defaultdict
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -17,8 +17,12 @@ from structural_evidence import local_coordinates
 
 
 def aabb(quad):
-    return (min(p[0] for p in quad), min(p[1] for p in quad),
-            max(p[0] for p in quad), max(p[1] for p in quad))
+    return (
+        min(p[0] for p in quad),
+        min(p[1] for p in quad),
+        max(p[0] for p in quad),
+        max(p[1] for p in quad),
+    )
 
 
 def index_catalog(catalog, cell_size=16):
@@ -36,9 +40,12 @@ def index_catalog(catalog, cell_size=16):
             width, height = x1 - x0, y1 - y0
             if width < 0.01 or height < 0.01:
                 continue
-            index[page][(math.floor((x0+x1)/2/cell_size),
-                         math.floor((y0+y1)/2/cell_size))].append(
-                             (gid, occurrence["index_on_page"], quad, width*height))
+            index[page][
+                (
+                    math.floor((x0 + x1) / 2 / cell_size),
+                    math.floor((y0 + y1) / 2 / cell_size),
+                )
+            ].append((gid, occurrence["index_on_page"], quad, width * height))
             occurrence_count[gid] += 1
     return index, occurrence_count
 
@@ -53,33 +60,38 @@ def match_char(char_quad, bins, cell_size=16):
     if len(char_quad) != 4 or any(not math.isfinite(v) for p in char_quad for v in p):
         return None, "invalid_char_box"
     cx0, cy0, cx1, cy1 = aabb(char_quad)
-    area = (cx1-cx0)*(cy1-cy0)
+    area = (cx1 - cx0) * (cy1 - cy0)
     if area <= 0.01:
         return None, "invalid_char_box"
     candidates = []
     # Padded broadphase for glyphs whose control-point bbox is slightly loose.
-    for gx in range(math.floor((cx0 - 2)/cell_size),
-                    math.floor((cx1 + 2)/cell_size) + 1):
-        for gy in range(math.floor((cy0 - 2)/cell_size),
-                        math.floor((cy1 + 2)/cell_size) + 1):
+    for gx in range(
+        math.floor((cx0 - 2) / cell_size), math.floor((cx1 + 2) / cell_size) + 1
+    ):
+        for gy in range(
+            math.floor((cy0 - 2) / cell_size), math.floor((cy1 + 2) / cell_size) + 1
+        ):
             for gid, ordinal, glyph_quad, glyph_area in bins.get((gx, gy), ()):
-                if not 0.12 <= glyph_area/area <= 3.0:
+                if not 0.12 <= glyph_area / area <= 3.0:
                     continue
-                center = [sum(p[0] for p in glyph_quad)/4,
-                          sum(p[1] for p in glyph_quad)/4]
+                center = [
+                    sum(p[0] for p in glyph_quad) / 4,
+                    sum(p[1] for p in glyph_quad) / 4,
+                ]
                 uv = local_coordinates(center, char_quad)
-                if uv is None or not (0.02 <= uv[0] <= 0.98
-                                      and -0.08 <= uv[1] <= 1.08):
+                if uv is None or not (0.02 <= uv[0] <= 0.98 and -0.08 <= uv[1] <= 1.08):
                     continue
                 # Reject a glyph that extends far outside the character's
                 # actual geometry (including outlined multi-character words).
                 projected = [local_coordinates(p, char_quad) for p in glyph_quad]
                 if any(v is None for v in projected):
                     continue
-                if (min(p[0] for p in projected) < -0.35
-                        or max(p[0] for p in projected) > 1.35
-                        or min(p[1] for p in projected) < -0.35
-                        or max(p[1] for p in projected) > 1.35):
+                if (
+                    min(p[0] for p in projected) < -0.35
+                    or max(p[0] for p in projected) > 1.35
+                    or min(p[1] for p in projected) < -0.35
+                    or max(p[1] for p in projected) > 1.35
+                ):
                     continue
                 candidates.append((gid, ordinal))
     if not candidates:
@@ -133,32 +145,52 @@ def audit(catalog, evidence, min_confidence=0.97, min_votes=3):
         unanimous = len(labels) == 1
         pages = len(set(page for _, _, page in observations))
         confident = unanimous and winning >= min_votes
-        ranked.append({
-            "glyph_id": gid,
-            "catalog_occurrences": occurrences[gid],
-            "observations": len(observations),
-            "pages": pages,
-            "unanimous": unanimous,
-            "evidence_candidate": confident,
-            "suggested_unicode": leader,
-            "confidence_median": statistics.median(prob for _,prob,_ in observations),
-            "votes": [{"text":text,"count":count} for text,count in labels.most_common()],
-        })
-    ranked.sort(key=lambda row: (-row["catalog_occurrences"] if row["evidence_candidate"]
-                                  else 0, -row["observations"], row["glyph_id"]))
+        ranked.append(
+            {
+                "glyph_id": gid,
+                "catalog_occurrences": occurrences[gid],
+                "observations": len(observations),
+                "pages": pages,
+                "unanimous": unanimous,
+                "evidence_candidate": confident,
+                "suggested_unicode": leader,
+                "confidence_median": statistics.median(
+                    prob for _, prob, _ in observations
+                ),
+                "votes": [
+                    {"text": text, "count": count}
+                    for text, count in labels.most_common()
+                ],
+            }
+        )
+    ranked.sort(
+        key=lambda row: (
+            -row["catalog_occurrences"] if row["evidence_candidate"] else 0,
+            -row["observations"],
+            row["glyph_id"],
+        )
+    )
     summary["observed_templates"] = len(ranked)
     summary["unanimous_templates"] = sum(r["unanimous"] for r in ranked)
     summary["conflicting_templates"] = sum(not r["unanimous"] for r in ranked)
     summary["evidence_candidates"] = sum(r["evidence_candidate"] for r in ranked)
-    summary["candidate_occurrences_total"] = sum(r["catalog_occurrences"] for r in ranked
-                                                  if r["evidence_candidate"])
-    summary["candidate_observations"] = sum(r["observations"] for r in ranked
-                                             if r["evidence_candidate"])
+    summary["candidate_occurrences_total"] = sum(
+        r["catalog_occurrences"] for r in ranked if r["evidence_candidate"]
+    )
+    summary["candidate_observations"] = sum(
+        r["observations"] for r in ranked if r["evidence_candidate"]
+    )
     summary["catalog_templates_total"] = len(catalog["glyphs"])
-    summary["catalog_occurrences_total"] = sum(len(g["occurrences"]) for g in catalog["glyphs"])
-    return {"schema_version": 1, "pdf_sha256": evidence["pdf_sha256"],
-            "input_model": evidence["model"], "summary": dict(summary),
-            "templates": ranked}
+    summary["catalog_occurrences_total"] = sum(
+        len(g["occurrences"]) for g in catalog["glyphs"]
+    )
+    return {
+        "schema_version": 1,
+        "pdf_sha256": evidence["pdf_sha256"],
+        "input_model": evidence["model"],
+        "summary": dict(summary),
+        "templates": ranked,
+    }
 
 
 def compare_holdout(training, holdout, min_holdout_votes=3):
@@ -167,8 +199,11 @@ def compare_holdout(training, holdout, min_holdout_votes=3):
         raise ValueError("training and holdout refer to different PDF content")
     if min_holdout_votes < 1:
         raise ValueError("min_holdout_votes must be positive")
-    trained = {row["glyph_id"]: row for row in training["templates"]
-               if row["evidence_candidate"]}
+    trained = {
+        row["glyph_id"]: row
+        for row in training["templates"]
+        if row["evidence_candidate"]
+    }
     unseen = {row["glyph_id"]: row for row in holdout["templates"]}
     score = Counter()
     assessments = []
@@ -185,12 +220,17 @@ def compare_holdout(training, holdout, min_holdout_votes=3):
         score["disagreeing_characters"] += disagree
         status = "consistent" if disagree == 0 else "conflicting"
         score[status + "_templates"] += 1
-        assessments.append({
-            "glyph_id": gid, "trained_unicode": expected,
-            "holdout_observations": target["observations"],
-            "agreeing": agrees, "disagreeing": disagree,
-            "holdout_votes": target["votes"], "status": status,
-        })
+        assessments.append(
+            {
+                "glyph_id": gid,
+                "trained_unicode": expected,
+                "holdout_observations": target["observations"],
+                "agreeing": agrees,
+                "disagreeing": disagree,
+                "holdout_votes": target["votes"],
+                "status": status,
+            }
+        )
     score["training_candidates"] = len(trained)
     return {"summary": dict(score), "assessments": assessments}
 
@@ -202,8 +242,11 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--min-confidence", type=float, default=0.97)
     p.add_argument("--min-votes", type=int, default=3)
-    p.add_argument("--holdout-char-evidence", type=Path,
-                   help="distinct pages for cross-page prediction consistency audit")
+    p.add_argument(
+        "--holdout-char-evidence",
+        type=Path,
+        help="distinct pages for cross-page prediction consistency audit",
+    )
     p.add_argument("--min-holdout-votes", type=int, default=3)
     args = p.parse_args()
     catalog = json.loads(args.glyph_catalog.read_text())
@@ -217,13 +260,17 @@ def main():
             raise ValueError("holdout character evidence must use disjoint PDF pages")
         holdout_report = audit(catalog, held, args.min_confidence, args.min_votes)
         report["holdout_validation"] = compare_holdout(
-            report, holdout_report, args.min_holdout_votes)
+            report, holdout_report, args.min_holdout_votes
+        )
         report["holdout_validation"]["pages"] = sorted(holdout_pages)
-        print("HOLDOUT_VALIDATION", json.dumps(
-            report["holdout_validation"]["summary"], sort_keys=True))
+        print(
+            "HOLDOUT_VALIDATION",
+            json.dumps(report["holdout_validation"]["summary"], sort_keys=True),
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(report["summary"], sort_keys=True))
+
 
 if __name__ == "__main__":
     main()

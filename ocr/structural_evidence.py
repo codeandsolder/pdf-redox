@@ -6,6 +6,7 @@ may be half a Chinese character, a dot, or part of a diagram, and OCR line
 boxes can contain unindexed native/raster text.  Do not promote matches to
 semantic PDF text without a coverage proof and independent recognition.
 """
+
 import argparse
 from collections import Counter, defaultdict
 import hashlib
@@ -27,8 +28,7 @@ def local_coordinates(point, quad):
     if not math.isfinite(determinant) or abs(determinant) < 1e-12:
         return None
     dx, dy = point[0] - origin[0], point[1] - origin[1]
-    return ((dx * by - dy * bx) / determinant,
-            (dy * ax - dx * ay) / determinant)
+    return ((dx * by - dy * bx) / determinant, (dy * ax - dx * ay) / determinant)
 
 
 def intersection(a, b):
@@ -72,8 +72,7 @@ def component_signature(line_quad, occurrences, quantization=0.1):
             continue
         if min(xs) < -0.12 or max(xs) > 1.12 or min(ys) < -0.3 or max(ys) > 1.3:
             continue
-        selected.append((gid, center_x, center_y,
-                         max(xs) - min(xs), max(ys) - min(ys)))
+        selected.append((gid, center_x, center_y, max(xs) - min(xs), max(ys) - min(ys)))
     if len(selected) < 3:
         return None, len(selected)
     # Sorting in OCR reading direction also makes the result deterministic.
@@ -83,10 +82,13 @@ def component_signature(line_quad, occurrences, quantization=0.1):
         return None, len(selected)
     x0 = selected[0][1]
     y0 = statistics.median(s[2] for s in selected)
+
     def q(value):
         return round(value / (scale * quantization))
-    signature = tuple((gid, q(x - x0), q(y - y0), q(w), q(h))
-                      for gid, x, y, w, h in selected)
+
+    signature = tuple(
+        (gid, q(x - x0), q(y - y0), q(w), q(h)) for gid, x, y, w, h in selected
+    )
     return signature, len(selected)
 
 
@@ -102,15 +104,18 @@ def audit(catalog, ocr, min_components=3, min_confidence=0.9):
     for page in ocr["pages"]:
         number = page["page"]
         occurrences = index.get(number, [])
-        page_stats = Counter(ocr_lines=len(page["lines"]),
-                             glyph_appearances=len(occurrences))
+        page_stats = Counter(
+            ocr_lines=len(page["lines"]), glyph_appearances=len(occurrences)
+        )
         for line in page["lines"]:
             stats["ocr_lines"] += 1
             if line["confidence"] < min_confidence or not line["text"].strip():
                 stats["low_confidence"] += 1
                 continue
-            if any(intersection(line["quad"], native)
-                   for native in page["native_text_regions"]):
+            if any(
+                intersection(line["quad"], native)
+                for native in page["native_text_regions"]
+            ):
                 stats["native_intersections"] += 1
                 continue
             signature, n = component_signature(line["quad"], occurrences)
@@ -119,13 +124,15 @@ def audit(catalog, ocr, min_components=3, min_confidence=0.9):
                 continue
             page_stats["structural_lines"] += 1
             stats["structural_lines"] += 1
-            groups[signature].append({
-                "page": number,
-                "text": line["text"],
-                "confidence": line["confidence"],
-                "component_count": n,
-                "quad": line["quad"],
-            })
+            groups[signature].append(
+                {
+                    "page": number,
+                    "text": line["text"],
+                    "confidence": line["confidence"],
+                    "component_count": n,
+                    "quad": line["quad"],
+                }
+            )
         per_page[str(number)] = dict(page_stats)
     repeats = []
     for signature, rows in groups.items():
@@ -133,23 +140,30 @@ def audit(catalog, ocr, min_components=3, min_confidence=0.9):
             continue
         texts = Counter(row["text"].strip() for row in rows)
         ident = hashlib.sha256(repr(signature).encode()).hexdigest()[:20]
-        repeats.append({
-            "shape_signature": ident,
-            "components": len(signature),
-            "observations": len(rows),
-            "ocr_agrees": len(texts) == 1,
-            "texts": [{"text": t, "count": c} for t, c in texts.most_common()],
-            "examples": rows[:8],
-        })
+        repeats.append(
+            {
+                "shape_signature": ident,
+                "components": len(signature),
+                "observations": len(rows),
+                "ocr_agrees": len(texts) == 1,
+                "texts": [{"text": t, "count": c} for t, c in texts.most_common()],
+                "examples": rows[:8],
+            }
+        )
     repeats.sort(key=lambda row: (-row["observations"], row["shape_signature"]))
     stats["repeated_groups"] = len(repeats)
     stats["repeated_observations"] = sum(row["observations"] for row in repeats)
     stats["ocr_conflicting_groups"] = sum(not row["ocr_agrees"] for row in repeats)
-    stats["potential_recognitions_reusable"] = sum(row["observations"] - 1
-                                                  for row in repeats)
-    return {"schema_version": 1, "pdf_sha256": ocr["pdf_sha256"],
-            "summary": dict(stats), "pages": per_page,
-            "repeated_groups": repeats}
+    stats["potential_recognitions_reusable"] = sum(
+        row["observations"] - 1 for row in repeats
+    )
+    return {
+        "schema_version": 1,
+        "pdf_sha256": ocr["pdf_sha256"],
+        "summary": dict(stats),
+        "pages": per_page,
+        "repeated_groups": repeats,
+    }
 
 
 def main():

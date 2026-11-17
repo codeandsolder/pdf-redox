@@ -16,16 +16,16 @@ permissions:
 
 jobs:
   rust:
-    name: Rust 1.99 nightly
+    name: Rust pinned nightly
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@c07d60593dc290c7949418bb259d5b1055b41e3d # main
     with:
       command: |
-        cargo +nightly-2026-08-01 fmt --all -- --check
+        cargo +nightly-2026-11-12 fmt --all -- --check
         git diff --check
-        cargo +nightly-2026-08-01 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +nightly-2026-08-01 test --locked --workspace --all-features
-        RUSTDOCFLAGS=-Dwarnings cargo +nightly-2026-08-01 doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "nightly-2026-08-01"
+        cargo +nightly-2026-11-12 clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo +nightly-2026-11-12 test --locked --workspace --all-features
+        RUSTDOCFLAGS=-Dwarnings cargo +nightly-2026-11-12 doc --locked --workspace --all-features --no-deps
+      rust-toolchain: "nightly-2026-11-12"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -33,7 +33,7 @@ jobs:
     name: WASM compatibility
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@c07d60593dc290c7949418bb259d5b1055b41e3d # main
     with:
-      command: cargo +nightly-2026-08-01 check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
-      rust-toolchain: "nightly-2026-08-01"
+      command: cargo +nightly-2026-11-12 check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
+      rust-toolchain: "nightly-2026-11-12"
       rust-targets: "wasm32-unknown-unknown"
       rustflags: ""
