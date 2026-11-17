@@ -156,6 +156,18 @@ impl Rect {
     }
 }
 
+/// Compose two PDF affine matrix arrays with their original floating-point order.
+pub fn compose_affine_matrix(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
+    [
+        a[2].mul_add(b[1], a[0] * b[0]),
+        a[3].mul_add(b[1], a[1] * b[0]),
+        a[2].mul_add(b[3], a[0] * b[2]),
+        a[3].mul_add(b[3], a[1] * b[2]),
+        a[2].mul_add(b[5], a[0].mul_add(b[4], a[4])),
+        a[3].mul_add(b[5], a[1].mul_add(b[4], a[5])),
+    ]
+}
+
 /// A PDF affine transformation matrix `[a b c d e f]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Matrix {
@@ -282,6 +294,16 @@ fn format_component(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_affine_composition_preserves_pdf_matrix_order() {
+        let a = [2.0, 0.0, 0.0, 3.0, 4.0, 5.0];
+        let b = [0.0, 1.0, -1.0, 0.0, 7.0, 11.0];
+        assert_eq!(
+            compose_affine_matrix(a, b),
+            [0.0, 3.0, -2.0, 0.0, 18.0, 38.0]
+        );
+    }
 
     #[test]
     fn transformed_rect_bounds_account_for_quarter_turns_and_unit_square() {

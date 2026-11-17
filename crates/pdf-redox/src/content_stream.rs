@@ -36,6 +36,20 @@ pub const fn trivia_only(bytes: &[u8]) -> bool {
     true
 }
 
+/// Resource dictionary category referenced by a content operator.
+pub const fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
+    match operator {
+        b"CS" | b"cs" => Some(b"ColorSpace"),
+        b"gs" => Some(b"ExtGState"),
+        b"Tf" => Some(b"Font"),
+        b"SCN" | b"scn" => Some(b"Pattern"),
+        b"BDC" | b"DP" => Some(b"Properties"),
+        b"sh" => Some(b"Shading"),
+        b"Do" => Some(b"XObject"),
+        _ => None,
+    }
+}
+
 /// Parsed scalar/name content operand with its byte offset in the source stream.
 #[derive(Debug, Clone)]
 pub struct InstructionOperand {
@@ -179,6 +193,25 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_operator_categories_are_authoritative_for_pruning_and_inventory() {
+        for (operator, category) in [
+            (b"CS".as_slice(), b"ColorSpace".as_slice()),
+            (b"cs".as_slice(), b"ColorSpace".as_slice()),
+            (b"gs".as_slice(), b"ExtGState".as_slice()),
+            (b"Tf".as_slice(), b"Font".as_slice()),
+            (b"SCN".as_slice(), b"Pattern".as_slice()),
+            (b"scn".as_slice(), b"Pattern".as_slice()),
+            (b"BDC".as_slice(), b"Properties".as_slice()),
+            (b"DP".as_slice(), b"Properties".as_slice()),
+            (b"sh".as_slice(), b"Shading".as_slice()),
+            (b"Do".as_slice(), b"XObject".as_slice()),
+        ] {
+            assert_eq!(resource_type_for_operator(operator), Some(category));
+        }
+        assert_eq!(resource_type_for_operator(b"Tj"), None);
+    }
 
     #[test]
     fn pdf_trivia_accepts_comments_and_whitespace_but_not_operators() {

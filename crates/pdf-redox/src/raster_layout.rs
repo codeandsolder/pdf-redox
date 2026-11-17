@@ -10,6 +10,7 @@ use crate::{
     },
     content_stream::{
         InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
+        resource_type_for_operator,
     },
     hidden_text::{HiddenTextSharedContext, PhysicalHiddenTextScanner, hidden_text_shared_context},
     inline_images::{
@@ -415,19 +416,6 @@ impl RasterScanner {
         }
     }
 
-    const fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
-        match operator {
-            b"CS" | b"cs" => Some(b"ColorSpace"),
-            b"gs" => Some(b"ExtGState"),
-            b"Tf" => Some(b"Font"),
-            b"SCN" | b"scn" => Some(b"Pattern"),
-            b"BDC" | b"DP" => Some(b"Properties"),
-            b"sh" => Some(b"Shading"),
-            b"Do" => Some(b"XObject"),
-            _ => None,
-        }
-    }
-
     fn record_resource_operator(&mut self, operator: &[u8]) {
         let name = self
             .operands
@@ -435,7 +423,7 @@ impl RasterScanner {
             .filter_map(|operand| operand.name.as_ref())
             .next_back()
             .cloned();
-        if let Some(resource_type) = Self::resource_type_for_operator(operator)
+        if let Some(resource_type) = resource_type_for_operator(operator)
             && let Some(name) = name
         {
             *self
@@ -1010,7 +998,7 @@ impl RasterScanner {
         // interpreting geometric operands. Keep the ordinary image-aware
         // scanner's exact operand path unchanged.
         let needs_operands =
-            !self.analysis_only_no_images || Self::resource_type_for_operator(operator).is_some();
+            !self.analysis_only_no_images || resource_type_for_operator(operator).is_some();
         if needs_operands {
             self.operands = instruction_operands(input, instruction);
         }
@@ -2759,12 +2747,21 @@ struct OpaqueCover {
     clip_polygon: Option<Vec<(f64, f64)>>,
 }
 
-fn rect_covered_by_union(target: Rect, covers: &[Rect], epsilon: f64) -> bool {
+/// Sweep the rectangular cover union once, testing each uncovered vertical
+/// gap against the visible target domain. For a polygon-clipped target, gaps
+/// completely outside its convex visible polygon do not require coverage.
+fn rect_covered_by_union_gaps(
+    target: Rect,
+    covers: &[Rect],
+    epsilon: f64,
+    allow_no_covers: bool,
+    mut gap_relevant: impl FnMut(Rect) -> bool,
+) -> bool {
     let clipped = covers
         .iter()
         .filter_map(|cover| cover.intersection(target))
         .collect::<Vec<_>>();
-    if clipped.is_empty() {
+    if clipped.is_empty() && !allow_no_covers {
         return false;
     }
     if clipped.iter().any(|cover| cover.contains(target, epsilon)) {
@@ -2795,25 +2792,41 @@ fn rect_covered_by_union(target: Rect, covers: &[Rect], epsilon: f64) -> bool {
                 (y1 - y0 > epsilon).then_some((y0, y1))
             })
             .collect::<Vec<_>>();
-        if ys.is_empty() {
-            return false;
-        }
         ys.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-        let mut covered_to = target.y0;
+
+        let mut cursor = target.y0;
         for (y0, y1) in ys {
-            if y0 > covered_to + epsilon {
+            if y0 > cursor + epsilon
+                && gap_relevant(Rect {
+                    x0: left,
+                    y0: cursor,
+                    x1: right,
+                    y1: y0,
+                })
+            {
                 return false;
             }
-            covered_to = covered_to.max(y1);
-            if covered_to + epsilon >= target.y1 {
+            cursor = cursor.max(y1);
+            if cursor + epsilon >= target.y1 {
                 break;
             }
         }
-        if covered_to + epsilon < target.y1 {
+        if cursor + epsilon < target.y1
+            && gap_relevant(Rect {
+                x0: left,
+                y0: cursor,
+                x1: right,
+                y1: target.y1,
+            })
+        {
             return false;
         }
     }
     true
+}
+
+fn rect_covered_by_union(target: Rect, covers: &[Rect], epsilon: f64) -> bool {
+    rect_covered_by_union_gaps(target, covers, epsilon, false, |_| true)
 }
 
 fn rect_covered_by_union_in_polygon(
@@ -2822,67 +2835,9 @@ fn rect_covered_by_union_in_polygon(
     polygon: &[(f64, f64)],
     epsilon: f64,
 ) -> bool {
-    let clipped = covers
-        .iter()
-        .filter_map(|cover| cover.intersection(target))
-        .collect::<Vec<_>>();
-    let mut xs = Vec::with_capacity(clipped.len() * 2 + 2);
-    xs.extend([target.x0, target.x1]);
-    for cover in &clipped {
-        xs.push(cover.x0.max(target.x0));
-        xs.push(cover.x1.min(target.x1));
-    }
-    xs.sort_by(f64::total_cmp);
-    xs.dedup_by(|a, b| (*a - *b).abs() <= epsilon);
-
-    for pair in xs.windows(2) {
-        let left = pair[0];
-        let right = pair[1];
-        if right - left <= epsilon {
-            continue;
-        }
-        let mut ys = clipped
-            .iter()
-            .filter(|cover| cover.x0 <= left + epsilon && cover.x1 + epsilon >= right)
-            .filter_map(|cover| {
-                let y0 = cover.y0.max(target.y0);
-                let y1 = cover.y1.min(target.y1);
-                (y1 - y0 > epsilon).then_some((y0, y1))
-            })
-            .collect::<Vec<_>>();
-        ys.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-
-        let mut cursor = target.y0;
-        for (y0, y1) in ys {
-            if y0 > cursor + epsilon {
-                let gap = Rect {
-                    x0: left,
-                    y0: cursor,
-                    x1: right,
-                    y1: y0,
-                };
-                if convex_polygon_intersects_rect(polygon, gap) {
-                    return false;
-                }
-            }
-            cursor = cursor.max(y1);
-            if cursor + epsilon >= target.y1 {
-                break;
-            }
-        }
-        if cursor + epsilon < target.y1 {
-            let gap = Rect {
-                x0: left,
-                y0: cursor,
-                x1: right,
-                y1: target.y1,
-            };
-            if convex_polygon_intersects_rect(polygon, gap) {
-                return false;
-            }
-        }
-    }
-    true
+    rect_covered_by_union_gaps(target, covers, epsilon, true, |gap| {
+        convex_polygon_intersects_rect(polygon, gap)
+    })
 }
 
 fn target_covered_by_opaque_union(
@@ -7445,6 +7400,64 @@ mod tests {
             },
         ];
         assert!(!rect_covered_by_union(target, &covers, 1.0e-6));
+    }
+
+    #[test]
+    fn polygon_coverage_ignores_only_gaps_outside_its_visible_domain() {
+        let target = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let left_cover = [Rect::new(0.0, 0.0, 5.0, 10.0)];
+        let left_triangle = [(1.0, 1.0), (4.0, 1.0), (1.0, 4.0)];
+        let right_triangle = [(7.0, 7.0), (9.0, 7.0), (9.0, 9.0)];
+
+        assert!(!rect_covered_by_union(target, &left_cover, 1.0e-6));
+        assert!(rect_covered_by_union_in_polygon(
+            target,
+            &left_cover,
+            &left_triangle,
+            1.0e-6
+        ));
+        assert!(!rect_covered_by_union_in_polygon(
+            target,
+            &left_cover,
+            &right_triangle,
+            1.0e-6
+        ));
+        // Without a cover even a small interior polygon must remain visible.
+        assert!(!rect_covered_by_union_in_polygon(
+            target,
+            &[],
+            &left_triangle,
+            1.0e-6
+        ));
+        // The polygon is entirely outside the target: no covering is required.
+        let outside_polygon = [(20.0, 20.0), (21.0, 20.0), (21.0, 21.0)];
+        assert!(rect_covered_by_union_in_polygon(
+            target,
+            &[],
+            &outside_polygon,
+            1.0e-6
+        ));
+        assert!(!rect_covered_by_union(target, &[], 1.0e-6));
+    }
+
+    #[test]
+    fn polygon_coverage_detects_uncovered_horizontal_bands() {
+        let target = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let lower_cover = [Rect::new(0.0, 0.0, 10.0, 4.0)];
+        let low_triangle = [(2.0, 1.0), (8.0, 1.0), (5.0, 3.0)];
+        let high_triangle = [(2.0, 6.0), (8.0, 6.0), (5.0, 9.0)];
+        assert!(rect_covered_by_union_in_polygon(
+            target,
+            &lower_cover,
+            &low_triangle,
+            1.0e-6
+        ));
+        assert!(!rect_covered_by_union_in_polygon(
+            target,
+            &lower_cover,
+            &high_triangle,
+            1.0e-6
+        ));
     }
 
     #[test]

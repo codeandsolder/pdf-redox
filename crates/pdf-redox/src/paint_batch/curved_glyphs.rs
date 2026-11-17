@@ -9,6 +9,7 @@ use super::{
     outlined_glyph_font_name, replace_page_content, resolved_dictionary,
 };
 use crate::content::page_content_if_present;
+use crate::geometry::compose_affine_matrix;
 use crate::glyph_catalog::{GlyphCatalog, GlyphOccurrence, GlyphTemplate};
 use sha2::{Digest as _, Sha256};
 
@@ -72,17 +73,6 @@ fn matrix_from_event(e: &Event) -> Option<[f64; 6]> {
         .iter()
         .all(|value| value.is_finite())
         .then_some(matrix)
-}
-
-fn compose_matrix(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
-    [
-        a[2].mul_add(b[1], a[0] * b[0]),
-        a[3].mul_add(b[1], a[1] * b[0]),
-        a[2].mul_add(b[3], a[0] * b[2]),
-        a[3].mul_add(b[3], a[1] * b[2]),
-        a[2].mul_add(b[5], a[0].mul_add(b[4], a[4])),
-        a[3].mul_add(b[5], a[1].mul_add(b[4], a[5])),
-    ]
 }
 
 fn normalize_control_points(
@@ -430,7 +420,7 @@ fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
         match e.operator.as_slice() {
             b"q" => stack.push(ctm),
             b"Q" => ctm = stack.pop()?,
-            b"cm" => ctm = compose_matrix(ctm, matrix_from_event(e)?),
+            b"cm" => ctm = compose_affine_matrix(ctm, matrix_from_event(e)?),
             _ => {}
         }
         if arity(&e.operator).is_some() {

@@ -1147,12 +1147,16 @@ fn shared_pattern_form(
     ))))
 }
 
-fn rewrite_pattern_as_form_wrapper(
+/// Convert one stream into a Form paint wrapper while retaining all
+/// non-stream dictionary metadata on the original object.
+fn rewrite_as_form_wrapper(
     document: &mut EditDocument,
-    pattern: CowObjectHandle,
-    form: CowObjectHandle,
+    wrapper: CowObjectHandle,
+    resource_name: &[u8],
+    target: CowObjectHandle,
+    commands: &[u8],
 ) -> Result<bool> {
-    let object = document.edit_handle(pattern)?;
+    let object = document.edit_handle(wrapper)?;
     let OwnedObject::Stream { dictionary, data } = object else {
         return Ok(false);
     };
@@ -1161,16 +1165,30 @@ fn rewrite_pattern_as_form_wrapper(
         OwnedObject::Dictionary(OwnedDictionary::from([(
             b"XObject".to_vec(),
             OwnedObject::Dictionary(OwnedDictionary::from([(
-                FACTORED_PATTERN_CELL_NAME.to_vec(),
-                OwnedObject::Reference(form),
+                resource_name.to_vec(),
+                OwnedObject::Reference(target),
             )])),
         )])),
     );
     dictionary.remove(b"Filter".as_slice());
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
-    *data = StreamData::Owned(FACTORED_PATTERN_CONTENT.to_vec());
+    *data = StreamData::Owned(commands.to_vec());
     Ok(true)
+}
+
+fn rewrite_pattern_as_form_wrapper(
+    document: &mut EditDocument,
+    pattern: CowObjectHandle,
+    form: CowObjectHandle,
+) -> Result<bool> {
+    rewrite_as_form_wrapper(
+        document,
+        pattern,
+        FACTORED_PATTERN_CELL_NAME,
+        form,
+        FACTORED_PATTERN_CONTENT,
+    )
 }
 
 pub fn factor_duplicate_pattern_payloads(
@@ -2216,25 +2234,13 @@ fn rewrite_form_as_metadata_wrapper(
     form: CowObjectHandle,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let object = document.edit_handle(form)?;
-    let OwnedObject::Stream { dictionary, data } = object else {
-        return Ok(false);
-    };
-    dictionary.insert(
-        b"Resources".to_vec(),
-        OwnedObject::Dictionary(OwnedDictionary::from([(
-            b"XObject".to_vec(),
-            OwnedObject::Dictionary(OwnedDictionary::from([(
-                FACTORED_FORM_BODY_NAME.to_vec(),
-                OwnedObject::Reference(canonical),
-            )])),
-        )])),
-    );
-    dictionary.remove(b"Filter".as_slice());
-    dictionary.remove(b"DecodeParms".as_slice());
-    dictionary.remove(b"Length".as_slice());
-    *data = StreamData::Owned(FACTORED_FORM_BODY_CONTENT.to_vec());
-    Ok(true)
+    rewrite_as_form_wrapper(
+        document,
+        form,
+        FACTORED_FORM_BODY_NAME,
+        canonical,
+        FACTORED_FORM_BODY_CONTENT,
+    )
 }
 
 pub fn factor_form_payloads_across_metadata(
