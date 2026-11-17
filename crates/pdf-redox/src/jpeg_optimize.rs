@@ -21,7 +21,7 @@ impl JpegEntropyStats {
 }
 
 fn is_safe_lone_dct(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
-    if dictionary.contains_key(b"F".as_slice()) {
+    if crate::stream_codec::has_external_file_stream_entries(dictionary) {
         return Ok(false);
     }
 
@@ -221,6 +221,30 @@ pub fn optimize_jpeg_entropy(
 mod tests {
     use super::*;
     use libjpeg_turbo_rs::{PixelFormat, Subsampling, compress, read_coefficients};
+
+    #[test]
+    fn jpeg_rewrite_excludes_all_external_file_stream_entries() -> crate::Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut dictionary = OwnedDictionary::new();
+        dictionary.insert(b"Filter".to_vec(), OwnedObject::Name(b"DCTDecode".to_vec()));
+        dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec()));
+        assert!(is_safe_lone_dct(&document, &dictionary)?);
+        for key in [b"F".as_slice(), b"FFilter", b"FDecodeParms"] {
+            dictionary.insert(key.to_vec(), OwnedObject::String(b"remote.jpeg".to_vec()));
+            assert!(!is_safe_lone_dct(&document, &dictionary)?);
+            dictionary.remove(key);
+        }
+        Ok(())
+    }
 
     #[test]
     fn huffman_optimization_preserves_source_app_markers_without_synthesizing_jfif()

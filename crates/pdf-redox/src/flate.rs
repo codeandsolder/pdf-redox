@@ -137,6 +137,11 @@ fn collect_unfiltered_candidates(
         else {
             continue;
         };
+        // External /F streams do not have their authoritative payload in the
+        // inline stream bytes. Never compress their fallback or strip filters.
+        if crate::stream_codec::has_external_file_stream_entries(&dictionary) {
+            continue;
+        }
         let raw = data.bytes(document.source())?.into_owned();
         let has_filter = dictionary.get(b"Filter".as_slice()).is_some_and(|value| {
             !matches!(
@@ -239,7 +244,7 @@ fn is_safe_lone_flate(
     {
         return Ok(false);
     }
-    if dictionary.contains_key(b"F".as_slice()) {
+    if crate::stream_codec::has_external_file_stream_entries(dictionary) {
         return Ok(false);
     }
     if let Some(kind) = dictionary.get(b"Type".as_slice())
@@ -381,6 +386,146 @@ pub fn compress_unfiltered_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_stream_fixture(
+        external_keys: &[&[u8]],
+        filtered: bool,
+        data: &[u8],
+    ) -> crate::Result<(crate::EditDocument, crate::ObjectHandle)> {
+        use crate::test_support::ClassicPdfBuilder;
+        use crate::{OwnedDictionary, OwnedObject, StreamData};
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        let mut document = crate::EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut dictionary = OwnedDictionary::new();
+        for &key in external_keys {
+            let value = match key {
+                b"F" => OwnedObject::String(b"remote.bin".to_vec()),
+                b"FFilter" => OwnedObject::Name(b"FlateDecode".to_vec()),
+                b"FDecodeParms" => OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"Predictor".to_vec(),
+                    OwnedObject::Integer(1),
+                )])),
+                _ => {
+                    return Err(crate::Error::Invalid(
+                        "unknown external test key".to_owned(),
+                    ));
+                }
+            };
+            dictionary.insert(key.to_vec(), value);
+        }
+        if filtered {
+            dictionary.insert(
+                b"Filter".to_vec(),
+                OwnedObject::Name(b"FlateDecode".to_vec()),
+            );
+        }
+        let handle = crate::ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary,
+            data: StreamData::Owned(data.to_vec()),
+        }));
+        let page = document.edit_object(crate::ObjectId::new(3, 0))?;
+        let page = page
+            .as_dictionary_mut()
+            .ok_or_else(|| crate::Error::Invalid("test page is not a dictionary".to_owned()))?;
+        page.insert(b"Contents".to_vec(), OwnedObject::Reference(handle));
+        Ok((document, handle))
+    }
+
+    #[test]
+    fn unfiltered_external_file_streams_are_never_recompressed() -> crate::Result<()> {
+        // Rewriting the inline fallback while retaining /F changes how the
+        // source PDF resolves an external-file stream. Treat every external
+        // filter declaration as an ownership boundary, even with no /Filter.
+        let source = vec![b'X'; 64 * 1024];
+        for entries in [
+            &[b"F".as_slice()][..],
+            &[b"FFilter".as_slice()][..],
+            &[b"FDecodeParms".as_slice()][..],
+            &[b"F".as_slice(), b"FFilter".as_slice()][..],
+        ] {
+            let (mut document, handle) = external_stream_fixture(entries, false, &source)?;
+            assert!(document.reachable_streams()?.contains(&handle));
+            let before = document.current_owned_object(handle)?;
+            let mut reuse = FlateReuseCache::default();
+            let candidates = collect_unfiltered_candidates(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut reuse,
+            )?;
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.handle != handle),
+                "external-file stream was admitted for recompression: {entries:?}"
+            );
+            let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+            let _ = compress_unfiltered_streams(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut reuse,
+                &batcher,
+            )?;
+            assert_eq!(
+                document.current_owned_object(handle)?,
+                before,
+                "external stream was mutated: {entries:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefiltered_external_file_streams_are_never_recompressed() -> crate::Result<()> {
+        let decoded = vec![b'Q'; 64 * 1024];
+        let encoded = crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::PROCESSING)?;
+        for entries in [
+            &[b"F".as_slice()][..],
+            &[b"FFilter".as_slice()][..],
+            &[b"FDecodeParms".as_slice()][..],
+        ] {
+            let (mut document, handle) = external_stream_fixture(entries, true, &encoded)?;
+            let before = document.current_owned_object(handle)?;
+            let mut reuse = FlateReuseCache::default();
+            let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+            let _ = optimize_flate_streams_with_cache(
+                &mut document,
+                crate::FlateLevel::PROCESSING,
+                &mut reuse,
+                &batcher,
+            )?;
+            assert_eq!(
+                document.current_owned_object(handle)?,
+                before,
+                "external filtered stream was rewritten: {entries:?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_external_streams_preserve_their_filter_dictionary() -> crate::Result<()> {
+        // Empty ordinary Flate streams can drop their filters, but external
+        // streams cannot: their inline bytes are not the external payload.
+        let (mut document, handle) = external_stream_fixture(&[b"F"], true, b"")?;
+        let before = document.current_owned_object(handle)?;
+        let mut reuse = FlateReuseCache::default();
+        let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+        let _ = compress_unfiltered_streams(
+            &mut document,
+            crate::FlateLevel::PROCESSING,
+            &mut reuse,
+            &batcher,
+        )?;
+        assert_eq!(document.current_owned_object(handle)?, before);
+        Ok(())
+    }
 
     #[test]
     fn flate_reuse_cache_requires_matching_level_and_decoded_bytes() {

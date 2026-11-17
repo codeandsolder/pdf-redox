@@ -2,6 +2,17 @@
 
 use crate::{EditDocument, Error, OwnedDictionary, OwnedObject, Result};
 
+/// Whether the stream dictionary declares payload from an external file.
+///
+/// `/F` supplies an external file specification and `/FFilter` plus
+/// `/FDecodeParms` describe its independent filter chain. The inline bytes
+/// cannot be treated as the authoritative decoded stream in this case.
+pub fn has_external_file_stream_entries(dictionary: &OwnedDictionary) -> bool {
+    [b"F".as_slice(), b"FFilter", b"FDecodeParms"]
+        .iter()
+        .any(|key| dictionary.contains_key(*key))
+}
+
 fn write_resolved_value(
     document: &EditDocument,
     value: &OwnedObject,
@@ -68,10 +79,7 @@ fn standalone_filter_dictionary(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
 ) -> Result<Vec<u8>> {
-    if dictionary.contains_key(b"F".as_slice())
-        || dictionary.contains_key(b"FFilter".as_slice())
-        || dictionary.contains_key(b"FDecodeParms".as_slice())
-    {
+    if has_external_file_stream_entries(dictionary) {
         return Err(Error::Invalid(
             "external-file stream filters are unsupported".to_owned(),
         ));
@@ -98,6 +106,11 @@ pub fn decode_stream(
     dictionary: &OwnedDictionary,
     encoded: &[u8],
 ) -> Result<Vec<u8>> {
+    if has_external_file_stream_entries(dictionary) {
+        return Err(Error::Invalid(
+            "external-file stream data cannot be decoded as inline payload".to_owned(),
+        ));
+    }
     if !dictionary.contains_key(b"Filter".as_slice()) {
         return Ok(encoded.to_vec());
     }
@@ -116,6 +129,11 @@ pub fn decode_image_stream(
     bits_per_component: u8,
     components: u8,
 ) -> Result<Vec<u8>> {
+    if has_external_file_stream_entries(dictionary) {
+        return Err(Error::Invalid(
+            "external-file image data cannot be decoded as inline payload".to_owned(),
+        ));
+    }
     if !dictionary.contains_key(b"Filter".as_slice()) {
         return Ok(encoded.to_vec());
     }
@@ -295,6 +313,9 @@ pub fn is_unfiltered_or_lone_flate(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
 ) -> Result<bool> {
+    if has_external_file_stream_entries(dictionary) {
+        return Ok(false);
+    }
     let Some(filter) = dictionary.get(b"Filter".as_slice()) else {
         return Ok(true);
     };
@@ -334,6 +355,55 @@ pub fn set_plain_flate(dictionary: &mut OwnedDictionary) {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_file_streams_are_not_decoded_or_used_as_flate_inputs() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let payload = b"inline fallback data";
+        let mut ordinary = OwnedDictionary::new();
+        assert_eq!(decode_stream(&document, &ordinary, payload)?, payload);
+        assert_eq!(
+            decode_image_stream(&document, &ordinary, payload, 1, 1, 8, 3)?,
+            payload
+        );
+        assert!(is_unfiltered_or_lone_flate(&document, &ordinary)?);
+
+        for key in [b"F".as_slice(), b"FFilter", b"FDecodeParms"] {
+            ordinary.insert(key.to_vec(), OwnedObject::String(b"external".to_vec()));
+            for filtered in [false, true] {
+                if filtered {
+                    ordinary.insert(
+                        b"Filter".to_vec(),
+                        OwnedObject::Name(b"FlateDecode".to_vec()),
+                    );
+                }
+                assert!(
+                    !is_unfiltered_or_lone_flate(&document, &ordinary)?,
+                    "external entry {key:?}, filtered={filtered} admitted for compression"
+                );
+                assert!(
+                    decode_stream(&document, &ordinary, payload).is_err(),
+                    "external entry {key:?}, filtered={filtered} decoded as inline stream"
+                );
+                assert!(
+                    decode_image_stream(&document, &ordinary, payload, 1, 1, 8, 3).is_err(),
+                    "external entry {key:?}, filtered={filtered} decoded as inline image"
+                );
+                ordinary.remove(b"Filter".as_slice());
+            }
+            ordinary.remove(key);
+        }
+        Ok(())
+    }
 
     #[test]
     fn capped_lengths_match_scalar_exact_at_overflow_boundaries() -> Result<()> {
