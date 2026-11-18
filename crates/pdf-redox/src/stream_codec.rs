@@ -260,21 +260,6 @@ impl FlateBatchEncoder {
             .collect()
     }
 
-    pub fn encode_many(&self, inputs: &[&[u8]], level: crate::FlateLevel) -> Result<Vec<Vec<u8>>> {
-        let limits = inputs
-            .iter()
-            .map(|input| zlib_rs::compress_bound(input.len()))
-            .collect::<Vec<_>>();
-        self.encode_many_with_limits(inputs, &limits, level)?
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| {
-                    Error::Compression("Flate compress_bound was too small".to_owned())
-                })
-            })
-            .collect()
-    }
-
     /// Compress into at most each requested output limit. None indicates
     /// the candidate cannot fit; successful outputs are the exact zlib bytes,
     /// without recompressing the input.
@@ -521,10 +506,14 @@ mod tests {
             std::num::NonZeroUsize::new(4).unwrap_or(std::num::NonZeroUsize::MIN),
         )?;
 
+        let limits = inputs
+            .iter()
+            .map(|input| zlib_rs::compress_bound(input.len()))
+            .collect::<Vec<_>>();
         for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
             assert_eq!(
-                parallel.encode_many(&inputs, level)?,
-                serial.encode_many(&inputs, level)?
+                parallel.encode_many_capped(&inputs, &limits, level)?,
+                serial.encode_many_capped(&inputs, &limits, level)?
             );
         }
         Ok(())
