@@ -200,55 +200,24 @@ impl FlateBatchEncoder {
         }
     }
 
-    pub fn encode_many(&self, inputs: &[&[u8]], level: crate::FlateLevel) -> Result<Vec<Vec<u8>>> {
-        #[cfg(not(target_family = "wasm"))]
-        if inputs.len() > 1
-            && let Some(compressor) = &self.compressor
-        {
-            let mut outputs = inputs
-                .iter()
-                .map(|input| vec![0_u8; zlib_rs::compress_bound(input.len())])
-                .collect::<Vec<_>>();
-            let mut jobs = inputs
-                .iter()
-                .zip(&mut outputs)
-                .map(|(input, output)| zlib_rs::BatchCompressJob::new(input, output))
-                .collect::<Vec<_>>();
-            let results = compressor.compress(&mut jobs, flate_config(level));
-            drop(jobs);
-
-            for (output, result) in outputs.iter_mut().zip(results) {
-                if result.code != zlib_rs::ReturnCode::Ok {
-                    return Err(compression_code_error(result.code));
-                }
-                output.truncate(result.written);
-            }
-            return Ok(outputs);
-        }
-
-        inputs
-            .iter()
-            .map(|input| encode_flate(input, level))
-            .collect()
-    }
-
-    /// Exact encoded lengths, provided they fit within the corresponding output
-    /// limit. None means that compression exceeded that limit, without needing
-    /// to allocate the worst-case compressed bound for the decoded input.
-    pub fn encode_many_capped_lengths(
+    // Encode directly into bounded outputs. A failed cap is a normal rejection
+    // of a candidate, not a compression error. For unrestricted callers the
+    // zlib compress_bound provides an output size guaranteed to succeed.
+    fn encode_many_with_limits(
         &self,
         inputs: &[&[u8]],
         maximum_lengths: &[usize],
         level: crate::FlateLevel,
-    ) -> Result<Vec<Option<usize>>> {
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         if inputs.len() != maximum_lengths.len() {
             return Err(Error::Invalid(
                 "Flate input and output-limit counts differ".to_owned(),
             ));
         }
-        let mut outputs = maximum_lengths
+        let mut outputs = inputs
             .iter()
-            .map(|&limit| vec![0_u8; limit])
+            .zip(maximum_lengths)
+            .map(|(input, &limit)| vec![0_u8; limit.min(zlib_rs::compress_bound(input.len()))])
             .collect::<Vec<_>>();
 
         #[cfg(not(target_family = "wasm"))]
@@ -261,20 +230,62 @@ impl FlateBatchEncoder {
                 .map(|(input, output)| zlib_rs::BatchCompressJob::new(input, output))
                 .collect::<Vec<_>>();
             let results = compressor.compress(&mut jobs, flate_config(level));
-            return results
+            drop(jobs);
+            return outputs
                 .into_iter()
-                .map(|result| flate_length_with_limit(result.written, result.code))
+                .zip(results)
+                .map(|(mut output, result)| {
+                    let Some(written) = flate_length_with_limit(result.written, result.code)?
+                    else {
+                        return Ok(None);
+                    };
+                    output.truncate(written);
+                    Ok(Some(output))
+                })
                 .collect();
         }
 
         inputs
             .iter()
-            .zip(&mut outputs)
-            .map(|(input, output)| {
-                let (encoded, code) = zlib_rs::compress_slice(output, input, flate_config(level));
-                flate_length_with_limit(encoded.len(), code)
+            .zip(outputs)
+            .map(|(input, mut output)| {
+                let (encoded, code) =
+                    zlib_rs::compress_slice(&mut output, input, flate_config(level));
+                let Some(written) = flate_length_with_limit(encoded.len(), code)? else {
+                    return Ok(None);
+                };
+                output.truncate(written);
+                Ok(Some(output))
             })
             .collect()
+    }
+
+    /// Compress into at most each requested output limit. None indicates
+    /// the candidate cannot fit; successful outputs are the exact zlib bytes,
+    /// without recompressing the input.
+    pub fn encode_many_capped(
+        &self,
+        inputs: &[&[u8]],
+        maximum_lengths: &[usize],
+        level: crate::FlateLevel,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.encode_many_with_limits(inputs, maximum_lengths, level)
+    }
+
+    /// Exact encoded lengths, provided they fit within the corresponding output
+    /// limit. None means that compression exceeded that limit, without needing
+    /// to allocate the worst-case compressed bound for the decoded input.
+    pub fn encode_many_capped_lengths(
+        &self,
+        inputs: &[&[u8]],
+        maximum_lengths: &[usize],
+        level: crate::FlateLevel,
+    ) -> Result<Vec<Option<usize>>> {
+        Ok(self
+            .encode_many_with_limits(inputs, maximum_lengths, level)?
+            .into_iter()
+            .map(|output| output.map(|bytes| bytes.len()))
+            .collect())
     }
 }
 
@@ -426,10 +437,11 @@ mod tests {
         let inputs = buffers.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
         for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
-            let exact = inputs
+            let canonical = inputs
                 .iter()
-                .map(|input| encode_flate(input, level).map(|output| output.len()))
+                .map(|input| encode_flate(input, level))
                 .collect::<Result<Vec<_>>>()?;
+            let exact = canonical.iter().map(Vec::len).collect::<Vec<_>>();
             for adjustment in [-1_i64, 0, 1, 1024] {
                 let caps = exact
                     .iter()
@@ -450,10 +462,22 @@ mod tests {
                     let encoder = FlateBatchEncoder::new(
                         std::num::NonZeroUsize::new(workers).unwrap_or(std::num::NonZeroUsize::MIN),
                     )?;
+                    let capped = encoder.encode_many_capped(&inputs, &caps, level)?;
+                    let expected_bytes = canonical
+                        .iter()
+                        .zip(&caps)
+                        .map(|(bytes, &cap)| (bytes.len() <= cap).then(|| bytes.clone()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        capped,
+                        expected_bytes,
+                        "capped bytes: level={}, adjustment={adjustment}, workers={workers}",
+                        level.value()
+                    );
                     assert_eq!(
                         encoder.encode_many_capped_lengths(&inputs, &caps, level)?,
                         expected,
-                        "level={}, adjustment={adjustment}, workers={workers}",
+                        "capped lengths: level={}, adjustment={adjustment}, workers={workers}",
                         level.value()
                     );
                 }
@@ -482,10 +506,14 @@ mod tests {
             std::num::NonZeroUsize::new(4).unwrap_or(std::num::NonZeroUsize::MIN),
         )?;
 
+        let limits = inputs
+            .iter()
+            .map(|input| zlib_rs::compress_bound(input.len()))
+            .collect::<Vec<_>>();
         for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
             assert_eq!(
-                parallel.encode_many(&inputs, level)?,
-                serial.encode_many(&inputs, level)?
+                parallel.encode_many_capped(&inputs, &limits, level)?,
+                serial.encode_many_capped(&inputs, &limits, level)?
             );
         }
         Ok(())

@@ -122,9 +122,11 @@ impl AdaptiveFlateEncoding {
         }
     }
 
-    fn consider_high_effort(&mut self, high_effort: Vec<u8>) {
+    fn consider_high_effort(&mut self, high_effort: Option<Vec<u8>>) {
         self.high_effort_tested = true;
-        if high_effort.len() < self.bytes.len() {
+        if let Some(high_effort) = high_effort
+            && high_effort.len() < self.bytes.len()
+        {
             self.high_effort_extra_savings_bytes =
                 self.bytes.len().saturating_sub(high_effort.len());
             self.bytes = high_effort;
@@ -225,10 +227,16 @@ fn batch_missing_baselines(
             .iter()
             .map(|&index| candidates[index].raw.as_slice())
             .collect::<Vec<_>>();
-        batcher.encode_many(&inputs, level)?
+        // A new /Filter costs 21 bytes, and an equal-size rewrite is useless.
+        // No encoding longer than raw_len - 22 can ever be selected.
+        let limits = inputs
+            .iter()
+            .map(|input| input.len().saturating_sub(NEW_FLATE_FILTER_BYTES + 1))
+            .collect::<Vec<_>>();
+        batcher.encode_many_capped(&inputs, &limits, level)?
     };
     for (index, bytes) in indices.into_iter().zip(outputs) {
-        candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
+        candidates[index].encoded = bytes.map(AdaptiveFlateEncoding::baseline);
     }
     Ok(())
 }
@@ -252,7 +260,18 @@ fn batch_high_effort_candidates(
             .iter()
             .map(|&index| candidates[index].raw.as_slice())
             .collect::<Vec<_>>();
-        batcher.encode_many(&inputs, crate::FlateLevel::SIZE)?
+        // High effort is selected only if its result is strictly smaller
+        // than baseline. Cap the buffer at baseline_len - 1.
+        let limits = indices
+            .iter()
+            .map(|&index| {
+                candidates[index]
+                    .encoded
+                    .as_ref()
+                    .map_or(0, |encoded| encoded.bytes.len().saturating_sub(1))
+            })
+            .collect::<Vec<_>>();
+        batcher.encode_many_capped(&inputs, &limits, crate::FlateLevel::SIZE)?
     };
     for (index, bytes) in indices.into_iter().zip(outputs) {
         if let Some(encoded) = &mut candidates[index].encoded {
@@ -260,6 +279,14 @@ fn batch_high_effort_candidates(
         }
     }
     Ok(())
+}
+
+// ceil(raw_len * percent / 100), split to avoid overflowing usize
+// for large inputs. The same bound is used for admission and allocation.
+fn minimum_flate_savings(raw_len: usize) -> usize {
+    let proportional = (raw_len / 100) * MIN_FLATE_SAVINGS_PERCENT
+        + ((raw_len % 100) * MIN_FLATE_SAVINGS_PERCENT).div_ceil(100);
+    MIN_FLATE_SAVINGS_BYTES.max(proportional)
 }
 
 fn has_special_stream_type(
@@ -313,10 +340,20 @@ fn flush_filtered_batch(
             .iter()
             .map(|&index| candidates[index].decoded.as_slice())
             .collect::<Vec<_>>();
-        batcher.encode_many(&inputs, level)?
+        // Keep only outputs satisfying both exact admission thresholds.
+        // This is especially important when a highly compressed source
+        // expands to a very large decoded buffer.
+        let limits = indices
+            .iter()
+            .map(|&index| {
+                let raw_len = candidates[index].raw_len;
+                raw_len.saturating_sub(minimum_flate_savings(raw_len))
+            })
+            .collect::<Vec<_>>();
+        batcher.encode_many_capped(&inputs, &limits, level)?
     };
     for (index, bytes) in indices.into_iter().zip(outputs) {
-        candidates[index].encoded = Some(AdaptiveFlateEncoding::baseline(bytes));
+        candidates[index].encoded = bytes.map(AdaptiveFlateEncoding::baseline);
     }
 
     for candidate in candidates.drain(..) {
@@ -327,10 +364,7 @@ fn flush_filtered_batch(
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }
         let saving = candidate.raw_len.saturating_sub(encoded.bytes.len());
-        if saving < MIN_FLATE_SAVINGS_BYTES
-            || saving.saturating_mul(100)
-                < candidate.raw_len.saturating_mul(MIN_FLATE_SAVINGS_PERCENT)
-        {
+        if saving < minimum_flate_savings(candidate.raw_len) {
             continue;
         }
         if encoded.high_effort_selected {
@@ -562,6 +596,27 @@ mod tests {
     }
 
     #[test]
+    fn minimum_flate_savings_handles_overflow_and_rounding() {
+        for raw_len in [
+            0,
+            1,
+            1024,
+            1030,
+            20_479,
+            20_480,
+            20_481,
+            1_048_576,
+            usize::MAX,
+        ] {
+            assert_eq!(
+                minimum_flate_savings(raw_len),
+                MIN_FLATE_SAVINGS_BYTES.max(raw_len / 20 + usize::from(raw_len % 20 != 0)),
+                "saving threshold for raw length {raw_len}",
+            );
+        }
+    }
+
+    #[test]
     fn flate_size_floor_skips_unprofitable_streams_without_changing_output() -> crate::Result<()> {
         // A zlib stream always carries at least six wrapper bytes, regardless
         // of the compression algorithm's best achievable DEFLATE payload.
@@ -605,6 +660,46 @@ mod tests {
                 assert_eq!(after, before, "unfiltered stream {raw_len} changed");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn capped_recompression_handles_large_expansion_without_changing_streams() -> crate::Result<()>
+    {
+        // A tiny compressed PDF stream can inflate to many MiB. Even though
+        // the input must be decoded, its output allocation should be limited
+        // by the original encoded size, not its uncompressed length.
+        let decoded = vec![0_u8; 8 * 1024 * 1024];
+        let original = crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::SIZE)?;
+        let allowed = original
+            .len()
+            .saturating_sub(minimum_flate_savings(original.len()));
+        assert!(original.len() < decoded.len() / 100);
+        assert!(allowed < decoded.len() / 100);
+
+        let (mut document, handle) = flate_filter_case_document(0, &original)?;
+        let before = crate::writer::write_pdf(&document)?;
+        let baseline = crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::PROCESSING)?;
+        let expected_rewrite = baseline.len() <= allowed;
+        let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+        let stats = optimize_flate_streams_with_cache(
+            &mut document,
+            crate::FlateLevel::PROCESSING,
+            &mut FlateReuseCache::default(),
+            &batcher,
+        )?;
+        assert_eq!(stats.streams_selected, usize::from(expected_rewrite));
+        let after = crate::writer::write_pdf(&document)?;
+        if expected_rewrite {
+            assert!(after.len() < before.len());
+        } else {
+            assert_eq!(after, before);
+        }
+        assert_eq!(document.decoded_stream_data(handle)?, decoded);
+        let reloaded = crate::EditDocument::from_bytes(after)?;
+        let streams = reloaded.reachable_streams()?;
+        assert_eq!(streams.len(), 1);
+        assert_eq!(reloaded.decoded_stream_data(streams[0])?, decoded);
         Ok(())
     }
 
