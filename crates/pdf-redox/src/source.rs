@@ -861,7 +861,7 @@ impl EditDocument {
 
     /// Decode a current indirect stream through the standalone filter-codec bridge.
     pub(crate) fn decoded_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
-        let Some(stream) = self.current_owned_object(handle)? else {
+        let Some(stream) = self.current_owned_object_cow(handle)? else {
             return Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
             ));
@@ -935,16 +935,22 @@ impl EditDocument {
         }
     }
 
-    pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
+    /// Borrow an already-owned overlay object, materializing only untouched
+    /// source objects. Useful for reading large overlay streams without cloning
+    /// their payload merely to inspect the stream dictionary.
+    pub(crate) fn current_owned_object_cow(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<Cow<'_, OwnedObject>>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
-                Some(ExistingObjectChange::Replace(object)) => Ok(Some(object.clone())),
+                Some(ExistingObjectChange::Replace(object)) => Ok(Some(Cow::Borrowed(object))),
                 Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
                     number: id.number,
                     generation: id.generation,
                 }),
                 None => match self.source.materialize(id) {
-                    Ok(object) => Ok(Some(object)),
+                    Ok(object) => Ok(Some(Cow::Owned(object))),
                     Err(Error::MissingSourceObject { .. }) => Ok(None),
                     Err(error) => Err(error),
                 },
@@ -952,10 +958,14 @@ impl EditDocument {
             ObjectHandle::New(id) => self
                 .overlay
                 .added(id)
-                .cloned()
+                .map(Cow::Borrowed)
                 .ok_or_else(|| Error::MissingNewObject { index: id.index() })
                 .map(Some),
         }
+    }
+
+    pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
+        Ok(self.current_owned_object_cow(handle)?.map(Cow::into_owned))
     }
 
     /// Resolve a chain of indirect references against the current COW graph.

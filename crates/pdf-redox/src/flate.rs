@@ -148,14 +148,41 @@ fn should_test_high_effort(
             <= decoded_len.saturating_mul(ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT)
 }
 
+/// Keep ordinary bytes in their original source or overlay allocation. Only
+/// retain an owned buffer when decoding the source returned allocated bytes.
+#[derive(Debug)]
+enum UnfilteredFlateInput {
+    Source(crate::ObjectId),
+    Overlay(ObjectHandle),
+    Decrypted(Vec<u8>),
+}
+
 struct UnfilteredFlateCandidate {
     handle: ObjectHandle,
-    // Source streams stay backed by the immutable PDF instead of cloning
-    // their payload into a second batch-sized Vec. Overlay-owned streams
-    // also avoid the extra into_owned copy.
-    raw: crate::StreamData,
+    raw: UnfilteredFlateInput,
     raw_len: usize,
     encoded: Option<AdaptiveFlateEncoding>,
+}
+
+impl UnfilteredFlateCandidate {
+    fn raw_bytes<'a>(
+        &'a self,
+        document: &'a crate::EditDocument,
+    ) -> Result<std::borrow::Cow<'a, [u8]>> {
+        match &self.raw {
+            UnfilteredFlateInput::Source(id) => document.source().stream_data(*id),
+            UnfilteredFlateInput::Decrypted(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+            UnfilteredFlateInput::Overlay(handle) => match document.current_object(*handle)? {
+                Some(crate::source::CurrentObject::Owned(crate::OwnedObject::Stream {
+                    data,
+                    ..
+                })) => data.bytes(document.source()),
+                _ => Err(crate::Error::Invalid(
+                    "Flate candidate no longer references an owned stream".into(),
+                )),
+            },
+        }
+    }
 }
 
 fn collect_unfiltered_candidate(
@@ -164,15 +191,16 @@ fn collect_unfiltered_candidate(
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
 ) -> Result<Option<UnfilteredFlateCandidate>> {
-    let Some(crate::OwnedObject::Stream { dictionary, data }) =
-        document.current_owned_object(handle)?
-    else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
+        return Ok(None);
+    };
+    let crate::OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     // External /F streams do not have their authoritative payload in the
     // inline stream bytes. Never compress their fallback or strip filters.
-    if crate::stream_codec::has_external_file_stream_entries(&dictionary)
-        || has_special_stream_type(document, &dictionary)?
+    if crate::stream_codec::has_external_file_stream_entries(dictionary)
+        || has_special_stream_type(document, dictionary)?
     {
         return Ok(None);
     }
@@ -184,6 +212,8 @@ fn collect_unfiltered_candidate(
         )
     });
     if raw.is_empty() {
+        drop(raw);
+        drop(object);
         if has_filter {
             let object = document.edit_handle(handle)?;
             if let crate::OwnedObject::Stream { dictionary, data } = object {
@@ -209,12 +239,14 @@ fn collect_unfiltered_candidate(
     } else {
         None
     };
-    // Hayro borrows ordinary raw source bytes, but decryption can return an
-    // owned buffer. Retain that buffer instead of decrypting the same stream
-    // again at baseline and high-effort compression.
+    // If Hayro returned an owned buffer (e.g. decrypted bytes), preserve
+    // that buffer for both compression passes instead of decrypting again.
     let raw = match raw {
-        std::borrow::Cow::Borrowed(_) => data,
-        std::borrow::Cow::Owned(bytes) => crate::StreamData::Owned(bytes),
+        std::borrow::Cow::Borrowed(_) => match data {
+            crate::StreamData::Source(id) => UnfilteredFlateInput::Source(*id),
+            crate::StreamData::Owned(_) => UnfilteredFlateInput::Overlay(handle),
+        },
+        std::borrow::Cow::Owned(bytes) => UnfilteredFlateInput::Decrypted(bytes),
     };
     Ok(Some(UnfilteredFlateCandidate {
         handle,
@@ -240,7 +272,7 @@ fn batch_missing_baselines(
         // decryption-owned buffers alive for the full compression batch.
         let raw_buffers = indices
             .iter()
-            .map(|&index| candidates[index].raw.bytes(document.source()))
+            .map(|&index| candidates[index].raw_bytes(document))
             .collect::<Result<Vec<_>>>()?;
         let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // A new /Filter costs 21 bytes, and an equal-size rewrite is useless.
@@ -279,7 +311,7 @@ fn batch_high_effort_candidates(
     let outputs = {
         let raw_buffers = indices
             .iter()
-            .map(|&index| candidates[index].raw.bytes(document.source()))
+            .map(|&index| candidates[index].raw_bytes(document))
             .collect::<Result<Vec<_>>>()?;
         let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // High effort is selected only if its result is strictly smaller
@@ -418,15 +450,17 @@ fn optimize_flate_streams_bounded(
     let mut staged_bytes = 0_usize;
     let mut stats = FlateOptimizationStats::default();
     for handle in document.reachable_streams()? {
-        let Some(crate::OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(handle)?
-        else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
-        if !is_safe_lone_flate(document, &dictionary)? {
+        let crate::OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+            continue;
+        };
+        if !is_safe_lone_flate(document, dictionary)? {
             continue;
         }
         let raw_len = data.bytes(document.source())?.len();
+        drop(object);
         if raw_len < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
             // An RFC 1950 stream always needs at least six framing bytes.
             // There is no possible encoding that clears the savings floor.
@@ -687,13 +721,16 @@ mod tests {
                     )?
                     .ok_or_else(|| crate::Error::Invalid("missing source candidate".into()))?;
                     assert_eq!(candidate.raw_len, expected_len);
-                    assert_eq!(
-                        candidate.raw,
-                        StreamData::Source(match handle {
-                            ObjectHandle::Existing(id) => id,
-                            ObjectHandle::New(_) => unreachable!("test uses source PDF handles"),
-                        }),
+                    let ObjectHandle::Existing(id) = handle else {
+                        return Err(crate::Error::Invalid("expected source handle".into()));
+                    };
+                    assert!(
+                        matches!(&candidate.raw, UnfilteredFlateInput::Source(raw_id) if *raw_id == id)
                     );
+                    let borrowed = candidate.raw_bytes(&source)?;
+                    let original = source.source().stream_data(id)?;
+                    assert!(matches!(&borrowed, std::borrow::Cow::Borrowed(_)));
+                    assert_eq!(borrowed.as_ptr(), original.as_ptr());
 
                     // Store the unchanged source bytes as an owned COW payload
                     // to check both representations take the same encoder path.
@@ -706,6 +743,29 @@ mod tests {
                     if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
                         *data = StreamData::Owned(raw);
                     }
+                }
+
+                for handle in handles {
+                    let candidate = collect_unfiltered_candidate(
+                        &mut overlay,
+                        handle,
+                        level,
+                        &mut FlateReuseCache::default(),
+                    )?
+                    .ok_or_else(|| crate::Error::Invalid("missing overlay candidate".into()))?;
+                    assert!(
+                        matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
+                    );
+                    let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+                        data: StreamData::Owned(bytes),
+                        ..
+                    })) = overlay.current_object(handle)?
+                    else {
+                        return Err(crate::Error::Invalid("missing owned overlay bytes".into()));
+                    };
+                    // Borrow the existing allocation; the candidate must not
+                    // duplicate a potentially enormous owned stream.
+                    assert_eq!(candidate.raw_bytes(&overlay)?.as_ptr(), bytes.as_ptr());
                 }
 
                 let batcher = FlateBatchEncoder::new(
@@ -740,6 +800,46 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn newly_added_overlay_stream_borrows_payload_until_compression() -> crate::Result<()> {
+        use crate::{OwnedObject, StreamData};
+        let source = vec![b'Q'; 2 * 1024 * 1024];
+        let (mut document, handle) = external_stream_fixture(&[], false, &source)?;
+        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+            data: StreamData::Owned(bytes),
+            ..
+        })) = document.current_object(handle)?
+        else {
+            return Err(crate::Error::Invalid("missing newly added stream".into()));
+        };
+        let original_ptr = bytes.as_ptr();
+        let candidate = collect_unfiltered_candidate(
+            &mut document,
+            handle,
+            crate::FlateLevel::PROCESSING,
+            &mut FlateReuseCache::default(),
+        )?
+        .ok_or_else(|| crate::Error::Invalid("missing candidate".into()))?;
+        assert!(
+            matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
+        );
+        assert_eq!(candidate.raw_bytes(&document)?.as_ptr(), original_ptr);
+        let stats = compress_unfiltered_streams(
+            &mut document,
+            crate::FlateLevel::PROCESSING,
+            &mut FlateReuseCache::default(),
+            &FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?,
+        )?;
+        assert_eq!(stats.streams_selected, 1);
+        assert_eq!(document.decoded_stream_data(handle)?, source);
+        let rewritten = crate::EditDocument::from_bytes(crate::writer::write_pdf(&document)?)?;
+        assert_eq!(
+            rewritten.decoded_stream_data(rewritten.reachable_streams()?[0])?,
+            source
+        );
         Ok(())
     }
 
