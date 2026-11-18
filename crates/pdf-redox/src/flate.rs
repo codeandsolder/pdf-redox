@@ -242,10 +242,7 @@ fn batch_missing_baselines(
             .iter()
             .map(|&index| candidates[index].raw.bytes(document.source()))
             .collect::<Result<Vec<_>>>()?;
-        let inputs = raw_buffers
-            .iter()
-            .map(|raw| raw.as_ref())
-            .collect::<Vec<_>>();
+        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // A new /Filter costs 21 bytes, and an equal-size rewrite is useless.
         // No encoding longer than raw_len - 22 can ever be selected.
         let limits = indices
@@ -284,10 +281,7 @@ fn batch_high_effort_candidates(
             .iter()
             .map(|&index| candidates[index].raw.bytes(document.source()))
             .collect::<Result<Vec<_>>>()?;
-        let inputs = raw_buffers
-            .iter()
-            .map(|raw| raw.as_ref())
-            .collect::<Vec<_>>();
+        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // High effort is selected only if its result is strictly smaller
         // than baseline. Cap the buffer at baseline_len - 1.
         let limits = indices
