@@ -1049,9 +1049,9 @@ fn pattern_payload_fingerprint(
     let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
-    if pattern_integer(document, &dictionary, b"PatternType")? != Some(1)
-        || pattern_integer(document, &dictionary, b"PaintType")? != Some(1)
-        || pattern_already_factored(document, &dictionary)?
+    if pattern_integer(document, dictionary, b"PatternType")? != Some(1)
+        || pattern_integer(document, dictionary, b"PaintType")? != Some(1)
+        || pattern_already_factored(document, dictionary)?
         || dictionary.contains_key(b"F".as_slice())
         || dictionary.contains_key(b"FFilter".as_slice())
         || dictionary.contains_key(b"FDecodeParms".as_slice())
@@ -2752,8 +2752,8 @@ mod tests {
         stream_ids: &[i32],
         pass: impl Fn(&mut EditDocument) -> Result<T>,
     ) -> Result<()> {
-        let mut source = EditDocument::from_bytes(input.clone())?;
         let mut overlay = overlay_with_owned_streams(&input, stream_ids)?;
+        let mut source = EditDocument::from_bytes(input)?;
         for &id in stream_ids {
             let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
             assert_eq!(
