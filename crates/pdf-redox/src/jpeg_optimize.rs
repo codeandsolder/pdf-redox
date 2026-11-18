@@ -177,12 +177,13 @@ pub fn optimize_jpeg_entropy(
 ) -> Result<JpegEntropyStats> {
     let mut stats = JpegEntropyStats::default();
     for handle in document.reachable_streams_with_subtype(b"Image")? {
-        let Some(OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(handle)?
-        else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
-        if !is_safe_lone_dct(document, &dictionary)? {
+        let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+            continue;
+        };
+        if !is_safe_lone_dct(document, dictionary)? {
             continue;
         }
 
@@ -206,6 +207,9 @@ pub fn optimize_jpeg_entropy(
 
         let original_len = raw.len();
         let optimized_len = optimized.len();
+        // Drop the borrowed image before replacing its encoded payload.
+        drop(raw);
+        drop(object);
         let object = document.edit_handle(handle)?;
         if let OwnedObject::Stream { data, .. } = object {
             *data = StreamData::Owned(optimized);

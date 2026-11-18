@@ -213,7 +213,7 @@ pub fn encode_jpeg_raster(
 }
 
 fn is_image(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
-    let Some(object) = document.current_owned_object(handle)? else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(false);
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -224,12 +224,12 @@ fn is_image(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
     };
     Ok(
         matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Image")
-            && matches!(object, OwnedObject::Stream { .. }),
+            && matches!(object.as_ref(), OwnedObject::Stream { .. }),
     )
 }
 
 fn object_subtype(document: &EditDocument, handle: ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let Some(object) = document.current_owned_object(handle)? else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(None);
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -306,7 +306,7 @@ fn image_binding_counts(
             if !seen_forms.insert(form) {
                 continue;
             }
-            let Some(object) = document.current_owned_object(form)? else {
+            let Some(object) = document.current_owned_object_cow(form)? else {
                 continue;
             };
             let Some(dictionary) = object.as_dictionary() else {
@@ -399,7 +399,7 @@ fn collect_non_xobject_references(
 fn non_xobject_reference_targets(document: &EditDocument) -> Result<HashSet<ObjectHandle>> {
     let mut unsafe_targets = document.output_roots().into_iter().collect::<HashSet<_>>();
     for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
         let allow_direct_resources = direct_resource_owner(&object);
@@ -1480,12 +1480,17 @@ fn transform_one(
     if !is_image(document, handle)? {
         return Ok(false);
     }
-    let Some(image) = document.current_owned_object(handle)? else {
-        return Ok(false);
-    };
-    let transform = match target {
-        Some(target) => resize_image(document, &image, options, target, flate_level)?,
-        None => transcode_image(document, &image, options, flate_level)?,
+    let transform = {
+        // Reading an overlay-owned image must not clone its entire encoded
+        // payload before the transform can even decide whether it applies.
+        // End this borrow before any edit or layered-reference installation.
+        let Some(image) = document.current_owned_object_cow(handle)? else {
+            return Ok(false);
+        };
+        match target {
+            Some(target) => resize_image(document, &image, options, target, flate_level)?,
+            None => transcode_image(document, &image, options, flate_level)?,
+        }
     };
     let Some(transform) = transform else {
         return Ok(false);
@@ -1676,6 +1681,93 @@ mod tests {
             Subsampling::S420,
         )
         .map_err(|error| Error::Invalid(format!("test JPEG encode failed: {error}")))
+    }
+
+    fn assert_image_overlay_borrowed(document: &EditDocument, handle: ObjectHandle) -> Result<()> {
+        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+            data: StreamData::Owned(bytes),
+            ..
+        })) = document.current_object(handle)?
+        else {
+            return Err(Error::Invalid("expected overlay-owned image stream".into()));
+        };
+        let Some(image) = document.current_owned_object_cow(handle)? else {
+            return Err(Error::Invalid("overlay image missing".into()));
+        };
+        assert!(matches!(&image, std::borrow::Cow::Borrowed(_)));
+        let OwnedObject::Stream { data, .. } = image.as_ref() else {
+            return Err(Error::Invalid("overlay image is not a stream".into()));
+        };
+        let raw = data.bytes(document.source())?;
+        assert_eq!(raw.as_ptr(), bytes.as_ptr());
+        assert!(is_image(document, handle)?);
+        assert_eq!(object_subtype(document, handle)?, Some(b"Image".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn image_optimizers_borrow_overlay_streams_and_preserve_exact_output() -> Result<()> {
+        let jpeg = rgb_jpeg(100)?;
+        let input = direct_jpeg_pdf(&jpeg, b"")?;
+        let options = ImageOptimizationOptions {
+            min_width: 0,
+            min_height: 0,
+            min_area: 0,
+            min_savings_bytes: 1,
+            min_savings_percent: 0,
+            jpeg_quality: 85,
+            ..ImageOptimizationOptions::default()
+        };
+        for entropy_only in [false, true] {
+            let mut source = EditDocument::from_bytes(input.clone())?;
+            let mut overlay = EditDocument::from_bytes(input.clone())?;
+            let Some(&handle) = source.reachable_streams_with_subtype(b"Image")?.first() else {
+                return Err(Error::Invalid(
+                    "image fixture has no reachable image".into(),
+                ));
+            };
+            let ObjectHandle::Existing(id) = handle else {
+                return Err(Error::Invalid("image fixture used new object id".into()));
+            };
+            let raw = overlay.source().stream_data(id)?.into_owned();
+            if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
+                *data = StreamData::Owned(raw);
+            }
+            assert_image_overlay_borrowed(&overlay, handle)?;
+            assert_eq!(
+                crate::writer::write_pdf(&source)?,
+                crate::writer::write_pdf(&overlay)?
+            );
+            assert_eq!(source.page_handles()?, overlay.page_handles()?);
+            assert_eq!(
+                image_binding_counts(&source, &source.page_handles()?)?,
+                image_binding_counts(&overlay, &overlay.page_handles()?)?
+            );
+            assert_eq!(
+                non_xobject_reference_targets(&source)?,
+                non_xobject_reference_targets(&overlay)?
+            );
+            if entropy_only {
+                let source_stats = crate::jpeg_optimize::optimize_jpeg_entropy(&mut source, 1, 0)?;
+                let overlay_stats =
+                    crate::jpeg_optimize::optimize_jpeg_entropy(&mut overlay, 1, 0)?;
+                assert_eq!(source_stats, overlay_stats);
+                assert_eq!(source_stats.streams_considered, 1);
+            } else {
+                let pages = source.page_handles()?;
+                let source_stats =
+                    optimize_images(&mut source, &pages, options, crate::FlateLevel::SIZE)?;
+                let overlay_stats =
+                    optimize_images(&mut overlay, &pages, options, crate::FlateLevel::SIZE)?;
+                assert_eq!(source_stats, overlay_stats);
+                assert_eq!(source_stats.images_optimized, 1);
+            }
+            let encoded = crate::writer::write_pdf(&source)?;
+            assert_eq!(encoded, crate::writer::write_pdf(&overlay)?);
+            let reparsed = EditDocument::from_bytes(encoded)?;
+            assert_eq!(reparsed.reachable_streams_with_subtype(b"Image")?.len(), 1);
+        }
+        Ok(())
     }
 
     fn direct_jpeg_pdf(jpeg: &[u8], extra_image_dictionary: &[u8]) -> Result<Vec<u8>> {
