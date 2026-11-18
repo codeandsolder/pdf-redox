@@ -543,6 +543,13 @@ impl ObjectOverlay {
     }
 }
 
+// Resolve the source-vs-overlay decision only once for both Hayro's borrowed
+// COS view and the optional owned COS representation.
+enum CurrentObjectStorage<'a> {
+    Source(ObjectId),
+    Overlay(&'a OwnedObject),
+}
+
 /// Borrowed view of one object encountered while walking the current COW graph.
 pub enum CurrentObject<'a> {
     /// Object parsed lazily from the immutable Hayro source.
@@ -861,7 +868,7 @@ impl EditDocument {
 
     /// Decode a current indirect stream through the standalone filter-codec bridge.
     pub(crate) fn decoded_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
-        let Some(stream) = self.current_owned_object(handle)? else {
+        let Some(stream) = self.current_owned_object_cow(handle)? else {
             return Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
             ));
@@ -908,54 +915,70 @@ impl EditDocument {
         self.decoded_content_stream_value(&stream)
     }
 
-    /// Borrow the current value of an object handle without materializing an
-    /// untouched source object into the owned COS representation.
-    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+    fn current_object_storage(&self, handle: ObjectHandle) -> Result<CurrentObjectStorage<'_>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
                 Some(ExistingObjectChange::Replace(object)) => {
-                    Ok(Some(CurrentObject::Owned(object)))
+                    Ok(CurrentObjectStorage::Overlay(object))
                 }
                 Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
                     number: id.number,
                     generation: id.generation,
                 }),
-                None => match self.source.object(id) {
-                    Ok(object) => Ok(Some(CurrentObject::Source(object))),
-                    Err(Error::MissingSourceObject { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                },
+                None => Ok(CurrentObjectStorage::Source(id)),
             },
             ObjectHandle::New(id) => self
                 .overlay
                 .added(id)
-                .map(CurrentObject::Owned)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
-                .map(Some),
+                .map(CurrentObjectStorage::Overlay)
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() }),
         }
     }
 
-    pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
-        match handle {
-            ObjectHandle::Existing(id) => match self.overlay.change(id) {
-                Some(ExistingObjectChange::Replace(object)) => Ok(Some(object.clone())),
-                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
-                    number: id.number,
-                    generation: id.generation,
-                }),
-                None => match self.source.materialize(id) {
-                    Ok(object) => Ok(Some(object)),
-                    Err(Error::MissingSourceObject { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                },
+    /// Resolve an existing-source object or borrow an overlay object using one
+    /// shared missing/deleted/new-object policy, independently of representation.
+    fn current_object_with<'a, T>(
+        &'a self,
+        handle: ObjectHandle,
+        source_view: impl FnOnce(ObjectId) -> Result<T>,
+        overlay_view: impl FnOnce(&'a OwnedObject) -> T,
+    ) -> Result<Option<T>> {
+        match self.current_object_storage(handle)? {
+            CurrentObjectStorage::Overlay(object) => Ok(Some(overlay_view(object))),
+            CurrentObjectStorage::Source(id) => match source_view(id) {
+                Ok(object) => Ok(Some(object)),
+                Err(Error::MissingSourceObject { .. }) => Ok(None),
+                Err(error) => Err(error),
             },
-            ObjectHandle::New(id) => self
-                .overlay
-                .added(id)
-                .cloned()
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
-                .map(Some),
         }
+    }
+
+    /// Borrow the current value of an object handle without materializing an
+    /// untouched source object into the owned COS representation.
+    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+        self.current_object_with(
+            handle,
+            |id| self.source.object(id).map(CurrentObject::Source),
+            CurrentObject::Owned,
+        )
+    }
+
+    /// Borrow an already-owned overlay object, materializing only untouched
+    /// source objects. Useful for reading large overlay streams without cloning
+    /// their payload merely to inspect the stream dictionary.
+    pub(crate) fn current_owned_object_cow(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<Cow<'_, OwnedObject>>> {
+        self.current_object_with(
+            handle,
+            |id| self.source.materialize(id).map(Cow::Owned),
+            Cow::Borrowed,
+        )
+    }
+
+    pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
+        Ok(self.current_owned_object_cow(handle)?.map(Cow::into_owned))
     }
 
     /// Resolve a chain of indirect references against the current COW graph.
