@@ -260,37 +260,52 @@ fn hash_owned_object(hasher: &mut Sha256, object: &OwnedObject) -> Result<()> {
     Ok(())
 }
 
-fn source_stream_fingerprint_ignoring(
+/// Hash source and overlay stream data in place. The callback selects the
+/// dictionary-value hashing semantics without copying encoded payloads.
+fn hash_stream_with_keys(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
     ignored_dictionary_keys: &[&[u8]],
+    mut hash_value: impl FnMut(&mut Sha256, &OwnedObject) -> Result<()>,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object(stream)? else {
+    let Some(object) = document.current_owned_object_cow(stream)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object else {
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let raw = data.bytes(document.source())?;
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
-
-    let is_semantic = |key: &[u8]| key != b"Length" && !ignored_dictionary_keys.contains(&key);
-    let semantic_entry_count = dictionary
-        .keys()
-        .filter(|key| is_semantic(key.as_slice()))
-        .count();
-    hasher.update((semantic_entry_count as u64).to_le_bytes());
-    for (key, value) in dictionary
+    let entries = dictionary
         .iter()
-        .filter(|(key, _)| is_semantic(key.as_slice()))
-    {
+        .filter(|(key, _)| {
+            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+        })
+        .collect::<Vec<_>>();
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
         hash_len_prefixed(&mut hasher, key);
-        hash_owned_object(&mut hasher, value)?;
+        hash_value(&mut hasher, value)?;
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn source_stream_fingerprint_ignoring(
+    document: &EditDocument,
+    stream: CowObjectHandle,
+    domain: &[u8],
+    ignored_dictionary_keys: &[&[u8]],
+) -> Result<Option<([u8; 32], usize)>> {
+    hash_stream_with_keys(
+        document,
+        stream,
+        domain,
+        ignored_dictionary_keys,
+        hash_owned_object,
+    )
 }
 
 fn source_stream_fingerprint(
@@ -306,10 +321,10 @@ fn source_font_program_fingerprint(
     program: CowObjectHandle,
     key: &[u8],
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object(program)? else {
+    let Some(object) = document.current_owned_object_cow(program)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object else {
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let raw = data.bytes(document.source())?;
@@ -319,7 +334,7 @@ fn source_font_program_fingerprint(
     hash_len_prefixed(&mut hasher, raw.as_ref());
 
     hasher.update((dictionary.len() as u64).to_le_bytes());
-    for (dict_key, value) in &dictionary {
+    for (dict_key, value) in dictionary {
         hash_len_prefixed(&mut hasher, dict_key);
         if matches!(dict_key.as_slice(), b"Length1" | b"Length2" | b"Length3")
             && let Some(OwnedObject::Integer(integer)) = document.resolve_owned_value(value)?
@@ -633,7 +648,7 @@ fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDict
 fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
     let mut holders = Vec::new();
     for target in type3_charproc_targets(document)? {
-        let Some(root) = document.current_owned_object(target.root)? else {
+        let Some(root) = document.current_owned_object_cow(target.root)? else {
             continue;
         };
         let Some(charprocs) = object_at_direct_path(&root, &target.path) else {
@@ -760,28 +775,13 @@ fn source_stream_fingerprint_with_redirects(
     ignored_dictionary_keys: &[&[u8]],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object(stream)? else {
-        return Ok(None);
-    };
-    let OwnedObject::Stream { dictionary, data } = object else {
-        return Ok(None);
-    };
-    let raw = data.bytes(document.source())?;
-    let mut hasher = Sha256::new();
-    hash_len_prefixed(&mut hasher, domain);
-    hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary
-        .iter()
-        .filter(|(key, _)| {
-            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-        })
-        .collect::<Vec<_>>();
-    hasher.update((entries.len() as u64).to_le_bytes());
-    for (key, value) in entries {
-        hash_len_prefixed(&mut hasher, key);
-        hash_owned_object_with_redirects(&mut hasher, value, redirects)?;
-    }
-    Ok(Some((hasher.finalize().into(), raw.len())))
+    hash_stream_with_keys(
+        document,
+        stream,
+        domain,
+        ignored_dictionary_keys,
+        |hasher, value| hash_owned_object_with_redirects(hasher, value, redirects),
+    )
 }
 
 fn reachable_streams_with_subtype(
@@ -855,7 +855,7 @@ fn rewrite_dictionary_reference_keys(
     keys: &[&[u8]],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
-    let Some(object) = document.current_owned_object(handle)? else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(0);
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -874,6 +874,7 @@ fn rewrite_dictionary_reference_keys(
     if changes.is_empty() {
         return Ok(0);
     }
+    drop(object);
     let object = document.edit_handle(handle)?;
     let Some(dictionary) = object.as_dictionary_mut() else {
         return Ok(0);
@@ -934,6 +935,27 @@ fn dictionary_targets(
     Ok(targets)
 }
 
+fn apply_dictionary_redirect_changes(
+    document: &mut EditDocument,
+    target: &DirectDictionaryTarget,
+    changes: Vec<(Vec<u8>, CowObjectHandle)>,
+) -> Result<usize> {
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    let root = document.edit_handle(target.root)?;
+    let Some(dictionary) =
+        object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
+    else {
+        return Ok(0);
+    };
+    let count = changes.len();
+    for (name, canonical) in changes {
+        dictionary.insert(name, OwnedObject::Reference(canonical));
+    }
+    Ok(count)
+}
+
 fn rewrite_dictionary_target_entries(
     document: &mut EditDocument,
     targets: &BTreeSet<DirectDictionaryTarget>,
@@ -941,7 +963,7 @@ fn rewrite_dictionary_target_entries(
 ) -> Result<usize> {
     let mut rewritten = 0;
     for target in targets {
-        let Some(root_snapshot) = document.current_owned_object(target.root)? else {
+        let Some(root_snapshot) = document.current_owned_object_cow(target.root)? else {
             continue;
         };
         let Some(dictionary) = object_at_direct_path(&root_snapshot, &target.path)
@@ -959,19 +981,8 @@ fn rewrite_dictionary_target_entries(
                 (canonical != *reference).then(|| (name.clone(), canonical))
             })
             .collect::<Vec<_>>();
-        if changes.is_empty() {
-            continue;
-        }
-        let root = document.edit_handle(target.root)?;
-        let Some(dictionary) =
-            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
-        else {
-            continue;
-        };
-        for (name, canonical) in changes {
-            dictionary.insert(name, OwnedObject::Reference(canonical));
-            rewritten += 1;
-        }
+        drop(root_snapshot);
+        rewritten += apply_dictionary_redirect_changes(document, target, changes)?;
     }
     Ok(rewritten)
 }
@@ -1032,13 +1043,15 @@ fn pattern_payload_fingerprint(
     document: &EditDocument,
     pattern: CowObjectHandle,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(pattern)?
-    else {
+    let Some(object) = document.current_owned_object_cow(pattern)? else {
         return Ok(None);
     };
-    if pattern_integer(document, &dictionary, b"PatternType")? != Some(1)
-        || pattern_integer(document, &dictionary, b"PaintType")? != Some(1)
-        || pattern_already_factored(document, &dictionary)?
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+        return Ok(None);
+    };
+    if pattern_integer(document, dictionary, b"PatternType")? != Some(1)
+        || pattern_integer(document, dictionary, b"PaintType")? != Some(1)
+        || pattern_already_factored(document, dictionary)?
         || dictionary.contains_key(b"F".as_slice())
         || dictionary.contains_key(b"FFilter".as_slice())
         || dictionary.contains_key(b"FDecodeParms".as_slice())
@@ -1076,17 +1089,23 @@ fn pattern_payloads_equal(
     left: CowObjectHandle,
     right: CowObjectHandle,
 ) -> Result<bool> {
-    let Some(OwnedObject::Stream {
+    let Some(left) = document.current_owned_object_cow(left)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Stream {
         dictionary: left_dict,
         data: left_data,
-    }) = document.current_owned_object(left)?
+    } = left.as_ref()
     else {
         return Ok(false);
     };
-    let Some(OwnedObject::Stream {
+    let Some(right) = document.current_owned_object_cow(right)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Stream {
         dictionary: right_dict,
         data: right_data,
-    }) = document.current_owned_object(right)?
+    } = right.as_ref()
     else {
         return Ok(false);
     };
@@ -1315,13 +1334,16 @@ fn hash_non_stream_object_with_redirects(
     domain: &[u8],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(object) = document.current_owned_object(handle)? else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(None);
     };
-    if matches!(object, OwnedObject::Stream { .. }) {
+    if matches!(object.as_ref(), OwnedObject::Stream { .. }) {
         return Ok(None);
     }
-    if !matches!(object, OwnedObject::Dictionary(_) | OwnedObject::Array(_)) {
+    if !matches!(
+        object.as_ref(),
+        OwnedObject::Dictionary(_) | OwnedObject::Array(_)
+    ) {
         return Ok(None);
     }
     let mut hasher = Sha256::new();
@@ -1341,10 +1363,13 @@ fn collect_form_resource_handles_from_value(
             if !seen.insert(*handle) {
                 return Ok(());
             }
-            let Some(object) = document.current_owned_object(*handle)? else {
+            let Some(object) = document.current_owned_object_cow(*handle)? else {
                 return Ok(());
             };
-            if matches!(object, OwnedObject::Dictionary(_) | OwnedObject::Array(_)) {
+            if matches!(
+                object.as_ref(),
+                OwnedObject::Dictionary(_) | OwnedObject::Array(_)
+            ) {
                 handles.insert(*handle);
             }
             collect_form_resource_handles_from_value(document, &object, seen, handles)?;
@@ -1371,8 +1396,10 @@ fn form_resource_handles(
     let mut seen = BTreeSet::new();
     let mut handles = BTreeSet::new();
     for &form in forms {
-        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(form)?
-        else {
+        let Some(object) = document.current_owned_object_cow(form)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
             continue;
         };
         let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
@@ -1555,12 +1582,14 @@ fn exact_dictionary_redirects(
     handles: impl IntoIterator<Item = CowObjectHandle>,
     domain: &[u8],
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
+    // Store borrowed overlay dictionaries without a deep clone; source-only
+    // dictionaries are materialized once and retained for collision checks.
     let mut canonical_by_fingerprint =
-        HashMap::<[u8; 32], Vec<(CowObjectHandle, OwnedObject)>>::new();
+        HashMap::<[u8; 32], Vec<(CowObjectHandle, std::borrow::Cow<'_, OwnedObject>)>>::new();
     let mut redirects = HashMap::new();
 
     for handle in handles {
-        let Some(object) = document.current_owned_object(handle)? else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
         let Some(fingerprint) = exact_dictionary_fingerprint(&object, domain)? else {
@@ -1589,7 +1618,7 @@ pub fn has_exact_duplicate_extgstate_dictionaries(
 ) -> Result<bool> {
     let mut fingerprints = HashSet::new();
     for handle in handles {
-        let Some(object) = document.current_owned_object(*handle)? else {
+        let Some(object) = document.current_owned_object_cow(*handle)? else {
             continue;
         };
         let Some(fingerprint) =
@@ -1612,7 +1641,7 @@ pub fn canonicalize_exact_extgstate_dictionaries(
     let targets = dictionary_targets(document, b"ExtGState")?;
     let mut handles = BTreeSet::new();
     for target in &targets {
-        let Some(snapshot) = document.current_owned_object(target.root)? else {
+        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
             continue;
         };
         let Some(dictionary) =
@@ -1788,30 +1817,21 @@ fn source_stream_fingerprint_top_level_redirects(
     ignored_dictionary_keys: &[&[u8]],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(stream)?
-    else {
-        return Ok(None);
-    };
-    let raw = data.bytes(document.source())?;
-    let mut hasher = Sha256::new();
-    hash_len_prefixed(&mut hasher, domain);
-    hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary
-        .iter()
-        .filter(|(key, _)| {
-            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-        })
-        .collect::<Vec<_>>();
-    hasher.update((entries.len() as u64).to_le_bytes());
-    for (key, value) in entries {
-        hash_len_prefixed(&mut hasher, key);
-        if let OwnedObject::Reference(handle) = value {
-            hash_cow_handle(&mut hasher, canonical_cow_redirect(*handle, redirects));
-        } else {
-            hash_owned_object(&mut hasher, value)?;
-        }
-    }
-    Ok(Some(hasher.finalize().into()))
+    Ok(hash_stream_with_keys(
+        document,
+        stream,
+        domain,
+        ignored_dictionary_keys,
+        |hasher, value| {
+            if let OwnedObject::Reference(handle) = value {
+                hash_cow_handle(hasher, canonical_cow_redirect(*handle, redirects));
+                Ok(())
+            } else {
+                hash_owned_object(hasher, value)
+            }
+        },
+    )?
+    .map(|(fingerprint, _)| fingerprint))
 }
 
 fn virtual_form_image_redirects(
@@ -1924,8 +1944,10 @@ fn source_form_fingerprint(
     image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
     form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(form)?
-    else {
+    let Some(object) = document.current_owned_object_cow(form)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
@@ -2056,7 +2078,7 @@ fn inspect_widget_mk_targets(
 fn widget_mk_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
     let mut targets = BTreeSet::new();
     for root in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(root)? else {
+        let Some(object) = document.current_owned_object_cow(root)? else {
             continue;
         };
         inspect_widget_mk_targets(document, root, &object, &mut Vec::new(), &mut targets)?;
@@ -2072,7 +2094,7 @@ fn rewrite_selected_dictionary_entries(
 ) -> Result<usize> {
     let mut rewritten = 0;
     for target in targets {
-        let Some(snapshot) = document.current_owned_object(target.root)? else {
+        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
             continue;
         };
         let Some(dictionary) =
@@ -2090,19 +2112,8 @@ fn rewrite_selected_dictionary_entries(
                 changes.push((key.to_vec(), canonical));
             }
         }
-        if changes.is_empty() {
-            continue;
-        }
-        let root = document.edit_handle(target.root)?;
-        let Some(dictionary) =
-            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
-        else {
-            continue;
-        };
-        for (key, canonical) in changes {
-            dictionary.insert(key, OwnedObject::Reference(canonical));
-            rewritten += 1;
-        }
+        drop(snapshot);
+        rewritten += apply_dictionary_redirect_changes(document, target, changes)?;
     }
     Ok(rewritten)
 }
@@ -2118,7 +2129,10 @@ struct FormDependencyRedirects {
 fn stream_payloads_may_repeat(document: &EditDocument, forms: &[CowObjectHandle]) -> Result<bool> {
     let mut seen = HashSet::<[u8; 32]>::new();
     for &form in forms {
-        let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(form)? else {
+        let Some(object) = document.current_owned_object_cow(form)? else {
+            continue;
+        };
+        let OwnedObject::Stream { data, .. } = object.as_ref() else {
             continue;
         };
         let raw = data.bytes(document.source())?;
@@ -2177,8 +2191,10 @@ fn metadata_wrapper_safe_form(
     document: &EditDocument,
     form: CowObjectHandle,
 ) -> Result<Option<usize>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(form)?
-    else {
+    let Some(object) = document.current_owned_object_cow(form)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let allowed = [
@@ -2223,7 +2239,10 @@ fn form_last_modified(
     document: &EditDocument,
     form: CowObjectHandle,
 ) -> Result<Option<OwnedObject>> {
-    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(form)? else {
+    let Some(object) = document.current_owned_object_cow(form)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
         return Ok(None);
     };
     Ok(dictionary.get(b"LastModified".as_slice()).cloned())
@@ -2309,7 +2328,8 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
     let mut duplicate_raw_bytes = 0_usize;
     for &form in &dependencies.form_streams {
         if dependencies.forms.contains_key(&form)
-            && let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(form)?
+            && let Some(object) = document.current_owned_object_cow(form)?
+            && let OwnedObject::Stream { data, .. } = object.as_ref()
         {
             duplicate_raw_bytes += data.bytes(document.source())?.len();
         }
@@ -2337,7 +2357,7 @@ fn appearance_dictionary_targets(
     let mut targets = dictionary_targets(document, b"AP")?;
     let initial = targets.iter().cloned().collect::<Vec<_>>();
     for target in initial {
-        let Some(snapshot) = document.current_owned_object(target.root)? else {
+        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
             continue;
         };
         let Some(dictionary) =
@@ -2384,7 +2404,7 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
     let dependencies = form_dependency_redirects(document, &[])?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
-        let Some(snapshot) = document.current_owned_object(holder.root)? else {
+        let Some(snapshot) = document.current_owned_object_cow(holder.root)? else {
             continue;
         };
         let Some(dictionary) =
@@ -2448,7 +2468,7 @@ fn page_content_holders(
 ) -> Result<Vec<PageContentHolder>> {
     let mut holders = Vec::new();
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(object) = document.current_owned_object_cow(page)? else {
             continue;
         };
         let Some(dictionary) = object.as_dictionary() else {
@@ -2458,35 +2478,42 @@ fn page_content_holders(
             continue;
         };
         match contents {
-            OwnedObject::Reference(target) => match document.current_owned_object(*target)? {
-                Some(OwnedObject::Stream { .. }) => {
-                    holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
-                        root: page,
-                        path: Vec::new(),
-                        key: b"Contents".to_vec(),
-                        target: *target,
-                    }));
-                }
-                Some(OwnedObject::Array(values)) => {
-                    for (index, value) in values.iter().enumerate() {
-                        let OwnedObject::Reference(stream) = value else {
-                            continue;
-                        };
-                        if document
-                            .current_object(*stream)?
-                            .is_some_and(|object| object.is_stream())
-                        {
-                            holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
-                                root: *target,
-                                path: Vec::new(),
-                                index,
-                                target: *stream,
-                            }));
+            OwnedObject::Reference(target) => {
+                let Some(resolved) = document.current_owned_object_cow(*target)? else {
+                    continue;
+                };
+                match resolved.as_ref() {
+                    OwnedObject::Stream { .. } => {
+                        holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
+                            root: page,
+                            path: Vec::new(),
+                            key: b"Contents".to_vec(),
+                            target: *target,
+                        }));
+                    }
+                    OwnedObject::Array(values) => {
+                        for (index, value) in values.iter().enumerate() {
+                            let OwnedObject::Reference(stream) = value else {
+                                continue;
+                            };
+                            if document
+                                .current_object(*stream)?
+                                .is_some_and(|object| object.is_stream())
+                            {
+                                holders.push(PageContentHolder::Array(
+                                    DirectArrayReferenceHolder {
+                                        root: *target,
+                                        path: Vec::new(),
+                                        index,
+                                        target: *stream,
+                                    },
+                                ));
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             OwnedObject::Array(values) => {
                 for (index, value) in values.iter().enumerate() {
                     let OwnedObject::Reference(stream) = value else {
@@ -2531,16 +2558,23 @@ mod tests {
     use super::*;
     use crate::{SourcePdf, test_support::ClassicPdfBuilder};
 
-    fn duplicate_image_fixture() -> Result<Vec<u8>> {
+    fn duplicate_image_fixture_with_payload(sample_count: usize) -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
         pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /A 5 0 R /B 6 0 R >> >> /Contents 4 0 R >>")?;
         pdf.stream(4, b"", b"q /A Do /B Do Q")?;
-        let image = b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
-        pdf.stream(5, image, &[0x80])?;
-        pdf.stream(6, image, &[0x80])?;
+        let image = format!(
+            "/Type /XObject /Subtype /Image /Width {sample_count} /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8"
+        );
+        let pixels = vec![0x80; sample_count];
+        pdf.stream(5, image.as_bytes(), &pixels)?;
+        pdf.stream(6, image.as_bytes(), &pixels)?;
         pdf.finish(1)
+    }
+
+    fn duplicate_image_fixture() -> Result<Vec<u8>> {
+        duplicate_image_fixture_with_payload(1)
     }
 
     fn duplicate_page_content_fixture() -> Result<Vec<u8>> {
@@ -2681,6 +2715,184 @@ mod tests {
                 references_canonicalized: 2,
             }
         );
+    }
+
+    fn overlay_with_owned_streams(input: &[u8], stream_ids: &[i32]) -> Result<EditDocument> {
+        let mut overlay = EditDocument::from_bytes(input.to_vec())?;
+        for &id in stream_ids {
+            let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+            let bytes = overlay
+                .source()
+                .stream_data(crate::ObjectId::new(id, 0))?
+                .into_owned();
+            if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
+                *data = StreamData::Owned(bytes);
+            }
+            let Some(std::borrow::Cow::Borrowed(OwnedObject::Stream {
+                data: StreamData::Owned(borrowed),
+                ..
+            })) = overlay.current_owned_object_cow(handle)?
+            else {
+                return Err(crate::Error::Invalid("stream data was cloned".into()));
+            };
+            let Some(CurrentObject::Owned(OwnedObject::Stream {
+                data: StreamData::Owned(original),
+                ..
+            })) = overlay.current_object(handle)?
+            else {
+                return Err(crate::Error::Invalid("missing overlay stream".into()));
+            };
+            assert_eq!(borrowed.as_ptr(), original.as_ptr());
+        }
+        Ok(overlay)
+    }
+
+    fn dedup_source_overlay_pair<T: std::fmt::Debug + PartialEq>(
+        input: Vec<u8>,
+        stream_ids: &[i32],
+        pass: impl Fn(&mut EditDocument) -> Result<T>,
+    ) -> Result<()> {
+        let mut overlay = overlay_with_owned_streams(&input, stream_ids)?;
+        let mut source = EditDocument::from_bytes(input)?;
+        for &id in stream_ids {
+            let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+            assert_eq!(
+                source_stream_fingerprint(&source, handle, b"owned-payload")?,
+                source_stream_fingerprint(&overlay, handle, b"owned-payload")?
+            );
+        }
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        assert_eq!(pass(&mut source)?, pass(&mut overlay)?);
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_dictionary_redirects_compare_borrowed_overlay_candidates() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        for (id, value) in [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /ExtGState << /A 5 0 R /B 6 0 R /C 7 0 R >> >> /Contents 4 0 R >>".as_slice()),
+            (5, b"<< /Type /ExtGState /CA 0.5 /ca 0.5 >>".as_slice()),
+            (6, b"<< /Type /ExtGState /CA 0.5 /ca 0.5 >>".as_slice()),
+            (7, b"<< /Type /ExtGState /CA 0.9 /ca 0.5 >>".as_slice()),
+        ] {
+            pdf.object(id, value)?;
+        }
+        pdf.stream(4, b"", b"q /A gs Q q /B gs Q q /C gs Q")?;
+        let bytes = pdf.finish(1)?;
+        let mut source = EditDocument::from_bytes(bytes.clone())?;
+        let mut overlay = EditDocument::from_bytes(bytes)?;
+        let handles = [5, 6, 7].map(|id| CowObjectHandle::Existing(crate::ObjectId::new(id, 0)));
+
+        for handle in handles {
+            let _ = overlay.edit_handle(handle)?;
+            let Some(std::borrow::Cow::Borrowed(borrowed)) =
+                overlay.current_owned_object_cow(handle)?
+            else {
+                return Err(crate::Error::Invalid("expected borrowed dictionary".into()));
+            };
+            let Some(CurrentObject::Owned(original)) = overlay.current_object(handle)? else {
+                return Err(crate::Error::Invalid("missing owned dictionary".into()));
+            };
+            assert!(std::ptr::eq(borrowed, original));
+        }
+        assert!(has_exact_duplicate_extgstate_dictionaries(
+            &source, &handles
+        )?);
+        assert!(has_exact_duplicate_extgstate_dictionaries(
+            &overlay, &handles
+        )?);
+        let expected = exact_dictionary_redirects(&source, handles, b"exact-extgstate-dictionary")?;
+        assert_eq!(
+            exact_dictionary_redirects(&overlay, handles, b"exact-extgstate-dictionary")?,
+            expected
+        );
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected.get(&handles[1]), Some(&handles[0]));
+        assert_eq!(
+            canonicalize_exact_extgstate_dictionaries(&mut source)?,
+            canonicalize_exact_extgstate_dictionaries(&mut overlay)?
+        );
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_image_stream_dedup_matches_source_with_megabyte_payloads() -> Result<()> {
+        dedup_source_overlay_pair(
+            duplicate_image_fixture_with_payload(1 << 20)?,
+            &[5, 6],
+            canonicalize_image_xobjects,
+        )
+    }
+
+    #[test]
+    fn owned_page_stream_dedup_matches_source() -> Result<()> {
+        dedup_source_overlay_pair(duplicate_page_content_fixture()?, &[5, 6], |document| {
+            let pages = document.page_handles()?;
+            canonicalize_page_contents(document, &pages)
+        })
+    }
+
+    #[test]
+    fn owned_pattern_dedup_preserves_fingerprints_and_output() -> Result<()> {
+        let (input, _) = duplicate_pattern_payload_fixture()?;
+        let mut source = EditDocument::from_bytes(input.clone())?;
+        let mut overlay = overlay_with_owned_streams(&input, &[5, 6])?;
+        for id in [5, 6] {
+            let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+            assert_eq!(
+                pattern_payload_fingerprint(&source, handle)?,
+                pattern_payload_fingerprint(&overlay, handle)?
+            );
+        }
+        let a = CowObjectHandle::Existing(crate::ObjectId::new(5, 0));
+        let b = CowObjectHandle::Existing(crate::ObjectId::new(6, 0));
+        assert_eq!(
+            pattern_payloads_equal(&source, a, b)?,
+            pattern_payloads_equal(&overlay, a, b)?
+        );
+        assert_eq!(
+            factor_duplicate_pattern_payloads(&mut source)?,
+            factor_duplicate_pattern_payloads(&mut overlay)?
+        );
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_form_metadata_dedup_preserves_hashes_and_output() -> Result<()> {
+        let (input, _) = metadata_variant_form_fixture(false)?;
+        let mut source = EditDocument::from_bytes(input.clone())?;
+        let mut overlay = overlay_with_owned_streams(&input, &[5, 6])?;
+        let handles = [5, 6].map(|id| CowObjectHandle::Existing(crate::ObjectId::new(id, 0)));
+        for handle in handles {
+            assert_eq!(
+                metadata_wrapper_safe_form(&source, handle)?,
+                metadata_wrapper_safe_form(&overlay, handle)?
+            );
+            assert_eq!(
+                form_last_modified(&source, handle)?,
+                form_last_modified(&overlay, handle)?
+            );
+            let empty = HashMap::new();
+            assert_eq!(
+                source_form_fingerprint(&source, handle, &[], &empty, &empty, &empty, &empty)?,
+                source_form_fingerprint(&overlay, handle, &[], &empty, &empty, &empty, &empty)?
+            );
+        }
+        assert_eq!(
+            stream_payloads_may_repeat(&source, &handles)?,
+            stream_payloads_may_repeat(&overlay, &handles)?
+        );
+        assert_eq!(
+            factor_form_payloads_across_metadata(&mut source)?,
+            factor_form_payloads_across_metadata(&mut overlay)?
+        );
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
     }
 
     #[test]
