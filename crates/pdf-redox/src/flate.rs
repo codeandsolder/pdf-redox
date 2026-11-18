@@ -150,7 +150,11 @@ fn should_test_high_effort(
 
 struct UnfilteredFlateCandidate {
     handle: ObjectHandle,
-    raw: Vec<u8>,
+    // Source streams stay backed by the immutable PDF instead of cloning
+    // their payload into a second batch-sized Vec. Overlay-owned streams
+    // also avoid the extra into_owned copy.
+    raw: crate::StreamData,
+    raw_len: usize,
     encoded: Option<AdaptiveFlateEncoding>,
 }
 
@@ -197,7 +201,7 @@ fn collect_unfiltered_candidate(
         return Ok(None);
     }
 
-    let raw = raw.into_owned();
+    let raw_len = raw.len();
     let encoded = if level == crate::FlateLevel::SIZE {
         reuse_cache
             .take_matching(handle, level, &raw)
@@ -205,14 +209,23 @@ fn collect_unfiltered_candidate(
     } else {
         None
     };
+    // Hayro borrows ordinary raw source bytes, but decryption can return an
+    // owned buffer. Retain that buffer instead of decrypting the same stream
+    // again at baseline and high-effort compression.
+    let raw = match raw {
+        std::borrow::Cow::Borrowed(_) => data,
+        std::borrow::Cow::Owned(bytes) => crate::StreamData::Owned(bytes),
+    };
     Ok(Some(UnfilteredFlateCandidate {
         handle,
         raw,
+        raw_len,
         encoded,
     }))
 }
 
 fn batch_missing_baselines(
+    document: &crate::EditDocument,
     candidates: &mut [UnfilteredFlateCandidate],
     level: crate::FlateLevel,
     batcher: &FlateBatchEncoder,
@@ -223,15 +236,22 @@ fn batch_missing_baselines(
         .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
         .collect::<Vec<_>>();
     let outputs = {
-        let inputs = indices
+        // These Cows borrow ordinary streams from SourcePdf. Keep any
+        // decryption-owned buffers alive for the full compression batch.
+        let raw_buffers = indices
             .iter()
-            .map(|&index| candidates[index].raw.as_slice())
-            .collect::<Vec<_>>();
+            .map(|&index| candidates[index].raw.bytes(document.source()))
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // A new /Filter costs 21 bytes, and an equal-size rewrite is useless.
         // No encoding longer than raw_len - 22 can ever be selected.
-        let limits = inputs
+        let limits = indices
             .iter()
-            .map(|input| input.len().saturating_sub(NEW_FLATE_FILTER_BYTES + 1))
+            .map(|&index| {
+                candidates[index]
+                    .raw_len
+                    .saturating_sub(NEW_FLATE_FILTER_BYTES + 1)
+            })
             .collect::<Vec<_>>();
         batcher.encode_many_capped(&inputs, &limits, level)?
     };
@@ -242,6 +262,7 @@ fn batch_missing_baselines(
 }
 
 fn batch_high_effort_candidates(
+    document: &crate::EditDocument,
     candidates: &mut [UnfilteredFlateCandidate],
     level: crate::FlateLevel,
     batcher: &FlateBatchEncoder,
@@ -251,15 +272,16 @@ fn batch_high_effort_candidates(
         .enumerate()
         .filter_map(|(index, candidate)| {
             let encoded = candidate.encoded.as_ref()?;
-            should_test_high_effort(candidate.raw.len(), level, encoded.bytes.len(), true)
+            should_test_high_effort(candidate.raw_len, level, encoded.bytes.len(), true)
                 .then_some(index)
         })
         .collect::<Vec<_>>();
     let outputs = {
-        let inputs = indices
+        let raw_buffers = indices
             .iter()
-            .map(|&index| candidates[index].raw.as_slice())
-            .collect::<Vec<_>>();
+            .map(|&index| candidates[index].raw.bytes(document.source()))
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         // High effort is selected only if its result is strictly smaller
         // than baseline. Cap the buffer at baseline_len - 1.
         let limits = indices
@@ -457,8 +479,8 @@ fn flush_unfiltered_batch(
     if candidates.is_empty() {
         return Ok(());
     }
-    batch_missing_baselines(candidates, level, batcher)?;
-    batch_high_effort_candidates(candidates, level, batcher)?;
+    batch_missing_baselines(document, candidates, level, batcher)?;
+    batch_high_effort_candidates(document, candidates, level, batcher)?;
 
     for candidate in candidates.drain(..) {
         let Some(encoded) = candidate.encoded else {
@@ -467,7 +489,7 @@ fn flush_unfiltered_batch(
         if encoded.high_effort_tested {
             stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
         }
-        let saving = candidate.raw.len().saturating_sub(encoded.bytes.len());
+        let saving = candidate.raw_len.saturating_sub(encoded.bytes.len());
         if saving <= NEW_FLATE_FILTER_BYTES {
             continue;
         }
@@ -514,7 +536,7 @@ fn compress_unfiltered_streams_bounded(
         else {
             continue;
         };
-        staged_bytes = staged_bytes.saturating_add(candidate.raw.len());
+        staged_bytes = staged_bytes.saturating_add(candidate.raw_len);
         candidates.push(candidate);
         if limits.full(candidates.len(), staged_bytes) {
             flush_unfiltered_batch(document, &mut candidates, level, batcher, &mut stats)?;
@@ -614,6 +636,111 @@ mod tests {
                 "saving threshold for raw length {raw_len}",
             );
         }
+    }
+
+    #[test]
+    fn source_backed_unfiltered_streams_encode_identically_to_overlay_owned() -> crate::Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        use crate::{ObjectId, OwnedObject, StreamData};
+
+        let compressible = b"BT (source backed contents) Tj ET\n".repeat(2_000);
+        let mut state = 0xB3F7_AE12_DAC1_0439_u64;
+        let incompressible = (0..128 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[3]
+            })
+            .collect::<Vec<_>>();
+        let mut builder = ClassicPdfBuilder::new();
+        builder.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        builder.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        builder.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents [4 0 R 5 0 R] >>",
+        )?;
+        builder.stream(4, b"", &compressible)?;
+        builder.stream(5, b"", &incompressible)?;
+        let source_pdf = builder.finish(1)?;
+
+        for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+            for workers in [1, 4] {
+                let mut source = crate::EditDocument::from_bytes(source_pdf.clone())?;
+                let mut overlay = crate::EditDocument::from_bytes(source_pdf.clone())?;
+                let handles = [
+                    ObjectHandle::Existing(ObjectId::new(4, 0)),
+                    ObjectHandle::Existing(ObjectId::new(5, 0)),
+                ];
+                assert_eq!(source.reachable_streams()?, handles);
+
+                // Source handles must not materialize a second payload copy.
+                for (handle, expected_len) in handles
+                    .into_iter()
+                    .zip([compressible.len(), incompressible.len()])
+                {
+                    let candidate = collect_unfiltered_candidate(
+                        &mut source,
+                        handle,
+                        level,
+                        &mut FlateReuseCache::default(),
+                    )?
+                    .ok_or_else(|| crate::Error::Invalid("missing source candidate".into()))?;
+                    assert_eq!(candidate.raw_len, expected_len);
+                    assert_eq!(
+                        candidate.raw,
+                        StreamData::Source(match handle {
+                            ObjectHandle::Existing(id) => id,
+                            ObjectHandle::New(_) => unreachable!("test uses source PDF handles"),
+                        }),
+                    );
+
+                    // Store the unchanged source bytes as an owned COW payload
+                    // to check both representations take the same encoder path.
+                    let raw = match overlay.current_owned_object(handle)? {
+                        Some(OwnedObject::Stream { data, .. }) => {
+                            data.bytes(overlay.source())?.into_owned()
+                        }
+                        _ => return Err(crate::Error::Invalid("missing source data".into())),
+                    };
+                    if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
+                        *data = StreamData::Owned(raw);
+                    }
+                }
+
+                let batcher = FlateBatchEncoder::new(
+                    std::num::NonZeroUsize::new(workers)
+                        .ok_or_else(|| crate::Error::Invalid("zero workers".into()))?,
+                )?;
+                let source_stats = compress_unfiltered_streams(
+                    &mut source,
+                    level,
+                    &mut FlateReuseCache::default(),
+                    &batcher,
+                )?;
+                let overlay_stats = compress_unfiltered_streams(
+                    &mut overlay,
+                    level,
+                    &mut FlateReuseCache::default(),
+                    &batcher,
+                )?;
+                assert_eq!(source_stats, overlay_stats);
+                assert_eq!(source_stats.streams_selected, 1);
+                assert_eq!(
+                    crate::writer::write_pdf(&source)?,
+                    crate::writer::write_pdf(&overlay)?,
+                    "mode={}, workers={workers}",
+                    level.value()
+                );
+                for (handle, expected) in handles
+                    .into_iter()
+                    .zip([compressible.as_slice(), incompressible.as_slice()])
+                {
+                    assert_eq!(source.decoded_stream_data(handle)?, expected);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
