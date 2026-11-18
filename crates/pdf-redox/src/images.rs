@@ -212,19 +212,15 @@ pub fn encode_jpeg_raster(
     .map_err(|error| Error::Invalid(format!("JPEG encode failed: {error}")))
 }
 
-fn is_image(document: &EditDocument, handle: ObjectHandle) -> Result<bool> {
-    let Some(object) = document.current_owned_object_cow(handle)? else {
-        return Ok(false);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
+fn is_image_value(document: &EditDocument, object: &OwnedObject) -> Result<bool> {
+    let OwnedObject::Stream { dictionary, .. } = object else {
         return Ok(false);
     };
     let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
         return Ok(false);
     };
     Ok(
-        matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Image")
-            && matches!(object.as_ref(), OwnedObject::Stream { .. }),
+        matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Image"),
     )
 }
 
@@ -1477,16 +1473,16 @@ fn transform_one(
     layered_safety: &mut LayeredTransformSafety<'_>,
     stats: &mut ImageOptimizationStats,
 ) -> Result<bool> {
-    if !is_image(document, handle)? {
-        return Ok(false);
-    }
     let transform = {
-        // Reading an overlay-owned image must not clone its entire encoded
-        // payload before the transform can even decide whether it applies.
-        // End this borrow before any edit or layered-reference installation.
+        // Read source/overlay data only once and avoid cloning the entire
+        // encoded payload, including images that fail eligibility checks.
+        // End this borrow before editing or layered-reference installation.
         let Some(image) = document.current_owned_object_cow(handle)? else {
             return Ok(false);
         };
+        if !is_image_value(document, &image)? {
+            return Ok(false);
+        }
         match target {
             Some(target) => resize_image(document, &image, options, target, flate_level)?,
             None => transcode_image(document, &image, options, flate_level)?,
@@ -1700,7 +1696,7 @@ mod tests {
         };
         let raw = data.bytes(document.source())?;
         assert_eq!(raw.as_ptr(), bytes.as_ptr());
-        assert!(is_image(document, handle)?);
+        assert!(is_image_value(document, image.as_ref())?);
         assert_eq!(object_subtype(document, handle)?, Some(b"Image".to_vec()));
         Ok(())
     }
