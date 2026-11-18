@@ -115,7 +115,7 @@ fn descriptor_base_font_name(
     document: &EditDocument,
     descriptor: CowObjectHandle,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(object) = document.current_owned_object(descriptor)? else {
+    let Some(object) = document.current_owned_object_cow(descriptor)? else {
         return Ok(None);
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -461,17 +461,19 @@ fn editable_font_program(
     document: &EditDocument,
     program: CowObjectHandle,
 ) -> Result<Option<(Vec<u8>, usize)>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(program)?
-    else {
+    let Some(object) = document.current_owned_object_cow(program)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     if !dictionary.contains_key(b"Filter".as_slice())
-        || !is_unfiltered_or_lone_flate(document, &dictionary)?
+        || !is_unfiltered_or_lone_flate(document, dictionary)?
     {
         return Ok(None);
     }
     let raw = data.bytes(document.source())?;
-    Ok(decode_stream(document, &dictionary, raw.as_ref())
+    Ok(decode_stream(document, dictionary, raw.as_ref())
         .ok()
         .map(|decoded| (decoded, raw.len())))
 }
@@ -628,13 +630,13 @@ fn union_sparse_cid_font_programs(
         if !closure_ok {
             continue;
         }
-        let Some(object) = document.current_owned_object(canonical.program)? else {
+        let Some(object) = document.current_owned_object_cow(canonical.program)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, .. } = object else {
+        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
             continue;
         };
-        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
+        if !is_unfiltered_or_lone_flate(document, dictionary)? {
             continue;
         }
         let Ok(encoded) = encode_flate(&union_font, flate_level) else {
@@ -648,7 +650,9 @@ fn union_sparse_cid_font_programs(
             continue;
         }
 
-        replace_current_stream_data(document, canonical.program, encoded.clone(), true)?;
+        let encoded_len = encoded.len();
+        drop(object);
+        replace_current_stream_data(document, canonical.program, encoded, true)?;
         // Keep Length1 truthful for the newly synthesized program. Existing
         // single-program table stripping intentionally preserves candidate-32
         // behavior; this only applies to the union stream.
@@ -696,7 +700,7 @@ fn union_sparse_cid_font_programs(
 
         stats.programs_optimized += indices.len();
         stats.original_encoded_bytes += original_encoded;
-        stats.optimized_encoded_bytes += encoded.len();
+        stats.optimized_encoded_bytes += encoded_len;
     }
     if !eliminated_programs.is_empty() {
         let reachable = document
@@ -745,8 +749,10 @@ fn descriptor_program_ref(
 }
 
 fn is_cidfont_type0c_program(document: &EditDocument, program: CowObjectHandle) -> Result<bool> {
-    let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(program)?
-    else {
+    let Some(object) = document.current_owned_object_cow(program)? else {
+        return Ok(false);
+    };
+    let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
         return Ok(false);
     };
     Ok(
@@ -759,7 +765,7 @@ fn union_fontfile2_program(
     document: &EditDocument,
     descriptor: CowObjectHandle,
 ) -> Result<Option<CowObjectHandle>> {
-    let Some(object) = document.current_owned_object(descriptor)? else {
+    let Some(object) = document.current_owned_object_cow(descriptor)? else {
         return Ok(None);
     };
     let Some(dictionary) = object.as_dictionary() else {
@@ -1516,8 +1522,10 @@ fn form_xobject_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>>
 fn tiling_pattern_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
     let mut patterns = Vec::new();
     for handle in document.reachable_streams()? {
-        let Some(OwnedObject::Stream { dictionary, .. }) = document.current_owned_object(handle)?
-        else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
             continue;
         };
         let Some(pattern_type) = dictionary.get(b"PatternType".as_slice()) else {
@@ -1572,7 +1580,7 @@ fn collect_type3_font_dictionaries(
 fn type3_font_dictionaries(document: &EditDocument) -> Result<Vec<OwnedDictionary>> {
     let mut fonts = Vec::new();
     for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
         collect_type3_font_dictionaries(document, &object, &mut fonts)?;
@@ -1598,9 +1606,10 @@ fn scan_tiling_pattern_font_usage(
     usage: &mut FontUsageAccumulator,
 ) -> Result<bool> {
     for pattern in tiling_pattern_handles(document)? {
-        let Some(OwnedObject::Stream { dictionary, .. }) =
-            document.current_owned_object(pattern)?
-        else {
+        let Some(object) = document.current_owned_object_cow(pattern)? else {
+            continue;
+        };
+        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
             continue;
         };
         let Some(resources_value) = dictionary.get(b"Resources".as_slice()) else {
@@ -1731,10 +1740,10 @@ fn font_glyph_usage_with_hints(
     }
 
     for form in form_xobject_handles(document)? {
-        let Some(form_object) = document.current_owned_object(form)? else {
+        let Some(form_object) = document.current_owned_object_cow(form)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, .. } = &form_object else {
+        let OwnedObject::Stream { dictionary, .. } = form_object.as_ref() else {
             continue;
         };
         let Some(resources) =
@@ -2013,7 +2022,7 @@ fn dense_cid_program_users(
 ) -> Result<HashMap<CowObjectHandle, DenseCidProgramUsers>> {
     let mut users = HashMap::new();
     for handle in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object(handle)? else {
+        let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
         collect_dense_cidfont_users_from_object(document, &object, &mut users)?;
@@ -2031,21 +2040,24 @@ fn decoded_u16_mapping(
     document: &EditDocument,
     handle: CowObjectHandle,
 ) -> Result<Option<(OwnedDictionary, Vec<u16>, usize)>> {
-    let Some(OwnedObject::Stream { dictionary, data }) = document.current_owned_object(handle)?
-    else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let raw = data.bytes(document.source())?;
     let decoded = if dictionary.contains_key(b"Filter".as_slice()) {
-        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
+        if !is_unfiltered_or_lone_flate(document, dictionary)? {
             return Ok(None);
         }
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+        let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
             return Ok(None);
         };
-        decoded
+        std::borrow::Cow::Owned(decoded)
     } else {
-        raw.as_ref().to_vec()
+        // Direct maps can be inspected without copying the entire raw stream.
+        std::borrow::Cow::Borrowed(raw.as_ref())
     };
     if decoded.len() % 2 != 0 {
         return Ok(None);
@@ -2056,7 +2068,7 @@ fn decoded_u16_mapping(
         .iter()
         .map(|pair| u16::from_be_bytes(*pair))
         .collect::<Vec<_>>();
-    Ok(Some((dictionary, values, raw.len())))
+    Ok(Some((dictionary.clone(), values, raw.len())))
 }
 
 fn encode_like_stream(
@@ -2182,32 +2194,35 @@ fn dense_compact_cidfont_type2_programs_with_usage(
             continue;
         }
 
-        let Some(OwnedObject::Stream {
+        let Some(program_object) = document.current_owned_object_cow(program)? else {
+            continue;
+        };
+        let OwnedObject::Stream {
             dictionary: program_dictionary,
             data: program_data,
-        }) = document.current_owned_object(program)?
+        } = program_object.as_ref()
         else {
             continue;
         };
         let program_raw = program_data.bytes(document.source())?;
         let program_decoded = if program_dictionary.contains_key(b"Filter".as_slice()) {
-            if !is_unfiltered_or_lone_flate(document, &program_dictionary)? {
+            if !is_unfiltered_or_lone_flate(document, program_dictionary)? {
                 continue;
             }
-            let Ok(decoded) = decode_stream(document, &program_dictionary, program_raw.as_ref())
+            let Ok(decoded) = decode_stream(document, program_dictionary, program_raw.as_ref())
             else {
                 continue;
             };
-            decoded
+            std::borrow::Cow::Owned(decoded)
         } else {
-            program_raw.as_ref().to_vec()
+            std::borrow::Cow::Borrowed(program_raw.as_ref())
         };
         let Some(dense) = crate::font_subset::compact_glyph_ids(&program_decoded, &requested_gids)
         else {
             continue;
         };
         let Some((encoded_program, program_plain_flate)) =
-            encode_like_stream(document, &program_dictionary, &dense.bytes, flate_level)?
+            encode_like_stream(document, program_dictionary, &dense.bytes, flate_level)?
         else {
             continue;
         };
@@ -2254,6 +2269,9 @@ fn dense_compact_cidfont_type2_programs_with_usage(
             continue;
         }
 
+        drop(program_decoded);
+        drop(program_raw);
+        drop(program_object);
         replace_current_stream_data(document, program, encoded_program, program_plain_flate)?;
         set_font_program_length1(document, program, dense.bytes.len())?;
         for (map, encoded, _, plain_flate) in encoded_maps {
@@ -2444,16 +2462,17 @@ fn cid_cmap_hint_has_material_opportunity(
         .collect::<BTreeSet<_>>();
     let mut total_cmap_len = 0_usize;
     for program in programs {
-        let Some(OwnedObject::Stream { dictionary, data }) =
-            document.current_owned_object(program)?
-        else {
+        let Some(object) = document.current_owned_object_cow(program)? else {
             continue;
         };
-        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
+        let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+            continue;
+        };
+        if !is_unfiltered_or_lone_flate(document, dictionary)? {
             continue;
         }
         let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+        let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
             continue;
         };
         let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
@@ -2484,6 +2503,38 @@ fn cid_cmap_candidate_usage(
             usage.cidfont_type2_only() && !graph.direct_program_usage.contains_key(program)
         })
         .then_some(ordered)
+}
+
+fn cid_cmap_strip_candidate(
+    document: &EditDocument,
+    program: CowObjectHandle,
+) -> Result<Option<CidCmapStripCandidate>> {
+    let Some(object) = document.current_owned_object_cow(program)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+        return Ok(None);
+    };
+    if !is_unfiltered_or_lone_flate(document, dictionary)? {
+        return Ok(None);
+    }
+    let raw = data.bytes(document.source())?;
+    let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
+        return Ok(None);
+    };
+    if cmap_len < MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM {
+        return Ok(None);
+    }
+    Ok(Some(CidCmapStripCandidate {
+        program,
+        dictionary: dictionary.clone(),
+        raw_len: raw.len(),
+        cmap_len,
+        had_length1: dictionary.contains_key(b"Length1".as_slice()),
+    }))
 }
 
 /// Remove the sfnt `cmap` only from programs whose complete current PDF usage
@@ -2519,34 +2570,11 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
         {
             continue;
         }
-        let Some(object) = document.current_owned_object(program)? else {
+        let Some(candidate) = cid_cmap_strip_candidate(document, program)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, data } = object else {
-            continue;
-        };
-        if !is_unfiltered_or_lone_flate(document, &dictionary)? {
-            continue;
-        }
-        let had_length1 = dictionary.contains_key(b"Length1".as_slice());
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
-            continue;
-        };
-        let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
-            continue;
-        };
-        if cmap_len < MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM {
-            continue;
-        }
-        total_cmap_len = total_cmap_len.saturating_add(cmap_len);
-        candidates.push(CidCmapStripCandidate {
-            program,
-            dictionary,
-            raw_len: raw.len(),
-            cmap_len,
-            had_length1,
-        });
+        total_cmap_len = total_cmap_len.saturating_add(candidate.cmap_len);
+        candidates.push(candidate);
     }
     if total_cmap_len < MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT {
         return Ok(FontOptimizationStats::default());
@@ -2554,8 +2582,10 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 
     let mut stats = FontOptimizationStats::default();
     for info in candidates {
-        let Some(OwnedObject::Stream { data, .. }) = document.current_owned_object(info.program)?
-        else {
+        let Some(program_object) = document.current_owned_object_cow(info.program)? else {
+            continue;
+        };
+        let OwnedObject::Stream { data, .. } = program_object.as_ref() else {
             continue;
         };
         let raw = data.bytes(document.source())?;
@@ -2590,6 +2620,8 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
         stats.cid_cmap_decoded_bytes_removed += removed_decoded_bytes;
         stats.original_encoded_bytes += info.raw_len;
         stats.optimized_encoded_bytes += encoded.len();
+        drop(raw);
+        drop(program_object);
         replace_current_stream_data(document, info.program, encoded, plain_flate)?;
         if info.had_length1 {
             set_font_program_length1(document, info.program, candidate.len())?;
@@ -2667,18 +2699,19 @@ pub fn probe_profitable_font_outline_subset(
             if gids.is_empty() {
                 continue;
             }
-            let Some(OwnedObject::Stream { dictionary, data }) =
-                document.current_owned_object(*program)?
-            else {
+            let Some(object) = document.current_owned_object_cow(*program)? else {
+                continue;
+            };
+            let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
                 continue;
             };
             if !dictionary.contains_key(b"Filter".as_slice())
-                || !is_unfiltered_or_lone_flate(document, &dictionary)?
+                || !is_unfiltered_or_lone_flate(document, dictionary)?
             {
                 continue;
             }
             let raw = data.bytes(document.source())?;
-            let Ok(decoded) = decode_stream(document, &dictionary, raw.as_ref()) else {
+            let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
                 continue;
             };
             let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
@@ -2786,6 +2819,119 @@ pub fn subset_font_outlines_after_dedup(
 mod tests {
     use super::*;
     use crate::ObjectId;
+
+    fn overlay_with_owned_font_streams(input: &[u8], ids: &[i32]) -> Result<EditDocument> {
+        let mut overlay = EditDocument::from_bytes(input.to_vec())?;
+        for &id in ids {
+            let object_id = ObjectId::new(id, 0);
+            let handle = CowObjectHandle::Existing(object_id);
+            let bytes = overlay.source().stream_data(object_id)?.into_owned();
+            let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? else {
+                return Err(Error::Invalid("expected a font fixture stream".into()));
+            };
+            *data = StreamData::Owned(bytes);
+            let Some(std::borrow::Cow::Borrowed(OwnedObject::Stream {
+                data: StreamData::Owned(borrowed),
+                ..
+            })) = overlay.current_owned_object_cow(handle)?
+            else {
+                return Err(Error::Invalid("font stream was cloned".into()));
+            };
+            let Some(CurrentObject::Owned(OwnedObject::Stream {
+                data: StreamData::Owned(original),
+                ..
+            })) = overlay.current_object(handle)?
+            else {
+                return Err(Error::Invalid("overlay font stream missing".into()));
+            };
+            assert_eq!(borrowed.as_ptr(), original.as_ptr());
+        }
+        Ok(overlay)
+    }
+
+    #[test]
+    fn overlay_font_cmap_removal_matches_source_exactly() -> Result<()> {
+        let input = cid_cmap_fixture(false, false, 8192)?;
+        let mut source = EditDocument::from_bytes(input.clone())?;
+        let mut overlay = overlay_with_owned_font_streams(&input, &[10])?;
+        let program = CowObjectHandle::Existing(ObjectId::new(10, 0));
+        let descriptor = CowObjectHandle::Existing(ObjectId::new(7, 0));
+
+        assert_eq!(
+            editable_font_program(&source, program)?,
+            editable_font_program(&overlay, program)?
+        );
+        assert_eq!(
+            descriptor_base_font_name(&source, descriptor)?,
+            descriptor_base_font_name(&overlay, descriptor)?
+        );
+        assert_eq!(
+            union_fontfile2_program(&source, descriptor)?,
+            union_fontfile2_program(&overlay, descriptor)?
+        );
+        let source_graph = collect_font_usage_graph(&source)?;
+        let overlay_graph = collect_font_usage_graph(&overlay)?;
+        assert_eq!(
+            cid_cmap_hint_has_material_opportunity(&source, &source_graph)?,
+            cid_cmap_hint_has_material_opportunity(&overlay, &overlay_graph)?
+        );
+
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        let expected =
+            strip_cidfont_type2_cmaps_after_dedup(&mut source, crate::FlateLevel::SIZE, None)?;
+        let actual =
+            strip_cidfont_type2_cmaps_after_dedup(&mut overlay, crate::FlateLevel::SIZE, None)?;
+        assert_eq!(actual, expected);
+        assert_eq!(expected.cid_cmaps_removed, 1);
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_cid_dense_compaction_matches_source_exactly() -> Result<()> {
+        let input = dense_cidfont_fixture()?;
+        let mut source = EditDocument::from_bytes(input.clone())?;
+        let mut overlay = overlay_with_owned_font_streams(&input, &[5, 9])?;
+        let map = CowObjectHandle::Existing(ObjectId::new(9, 0));
+        let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
+        assert_eq!(
+            decoded_u16_mapping(&source, map)?,
+            decoded_u16_mapping(&overlay, map)?
+        );
+        assert_eq!(
+            is_cidfont_type0c_program(&source, program)?,
+            is_cidfont_type0c_program(&overlay, program)?
+        );
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        let expected = dense_compact_cidfont_type2_programs(&mut source, crate::FlateLevel::SIZE)?;
+        let actual = dense_compact_cidfont_type2_programs(&mut overlay, crate::FlateLevel::SIZE)?;
+        assert_eq!(actual, expected);
+        assert_eq!(expected.programs_dense_remapped, 1);
+        assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_pattern_and_type3_font_scans_match_source() -> Result<()> {
+        for (input, streams) in [
+            (pattern_font_usage_fixture(), vec![5, 9]),
+            (type3_font_usage_fixture(true), vec![9, 10]),
+        ] {
+            let source = EditDocument::from_bytes(input.clone())?;
+            let overlay = overlay_with_owned_font_streams(&input, &streams)?;
+            assert_eq!(
+                tiling_pattern_handles(&source)?,
+                tiling_pattern_handles(&overlay)?
+            );
+            assert_eq!(
+                type3_font_dictionaries(&source)?,
+                type3_font_dictionaries(&overlay)?
+            );
+            assert_eq!(font_glyph_usage(&source)?, font_glyph_usage(&overlay)?);
+            assert_eq!(source.write_compact()?, overlay.write_compact()?);
+        }
+        Ok(())
+    }
 
     fn append_pdf_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]) {
         offsets.push(pdf.len());
