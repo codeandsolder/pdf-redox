@@ -935,17 +935,32 @@ impl EditDocument {
         }
     }
 
-    /// Borrow the current value of an object handle without materializing an
-    /// untouched source object into the owned COS representation.
-    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+    /// Resolve an existing-source object or borrow an overlay object using one
+    /// shared missing/deleted/new-object policy, independently of representation.
+    fn current_object_with<'a, T>(
+        &'a self,
+        handle: ObjectHandle,
+        source_view: impl FnOnce(ObjectId) -> Result<T>,
+        overlay_view: impl FnOnce(&'a OwnedObject) -> T,
+    ) -> Result<Option<T>> {
         match self.current_object_storage(handle)? {
-            CurrentObjectStorage::Overlay(object) => Ok(Some(CurrentObject::Owned(object))),
-            CurrentObjectStorage::Source(id) => match self.source.object(id) {
-                Ok(object) => Ok(Some(CurrentObject::Source(object))),
+            CurrentObjectStorage::Overlay(object) => Ok(Some(overlay_view(object))),
+            CurrentObjectStorage::Source(id) => match source_view(id) {
+                Ok(object) => Ok(Some(object)),
                 Err(Error::MissingSourceObject { .. }) => Ok(None),
                 Err(error) => Err(error),
             },
         }
+    }
+
+    /// Borrow the current value of an object handle without materializing an
+    /// untouched source object into the owned COS representation.
+    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+        self.current_object_with(
+            handle,
+            |id| self.source.object(id).map(CurrentObject::Source),
+            CurrentObject::Owned,
+        )
     }
 
     /// Borrow an already-owned overlay object, materializing only untouched
@@ -955,14 +970,11 @@ impl EditDocument {
         &self,
         handle: ObjectHandle,
     ) -> Result<Option<Cow<'_, OwnedObject>>> {
-        match self.current_object_storage(handle)? {
-            CurrentObjectStorage::Overlay(object) => Ok(Some(Cow::Borrowed(object))),
-            CurrentObjectStorage::Source(id) => match self.source.materialize(id) {
-                Ok(object) => Ok(Some(Cow::Owned(object))),
-                Err(Error::MissingSourceObject { .. }) => Ok(None),
-                Err(error) => Err(error),
-            },
-        }
+        self.current_object_with(
+            handle,
+            |id| self.source.materialize(id).map(Cow::Owned),
+            Cow::Borrowed,
+        )
     }
 
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
