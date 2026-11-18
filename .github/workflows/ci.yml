@@ -20,12 +20,18 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@68ff0c543bfd83222d36c7f95321c3f47481c69e # main
     with:
       command: |
-        cargo +nightly-2026-11-12 fmt --all -- --check
+        # Fail CI if Renovate updates the manifest but leaves these workflow pins stale.
+        declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+        if [ "$declared" != "$RUST_TOOLCHAIN" ]; then
+          echo "CI toolchain $RUST_TOOLCHAIN differs from rust-toolchain.toml ($declared)" >&2
+          exit 1
+        fi
+        cargo fmt --all -- --check
         git diff --check
-        cargo +nightly-2026-11-12 clippy --locked --workspace --all-targets --all-features -- -D warnings
-        cargo +nightly-2026-11-12 test --locked --workspace --all-features
-        RUSTDOCFLAGS=-Dwarnings cargo +nightly-2026-11-12 doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "nightly-2026-11-12"
+        cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        cargo test --locked --workspace --all-features
+        RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps
+      rust-toolchain: "nightly-2026-11-15"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -33,7 +39,10 @@ jobs:
     name: WASM compatibility
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@68ff0c543bfd83222d36c7f95321c3f47481c69e # main
     with:
-      command: cargo +nightly-2026-11-12 check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
-      rust-toolchain: "nightly-2026-11-12"
+      command: |
+        declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+        test "$declared" = "$RUST_TOOLCHAIN" || { echo "WASM toolchain $RUST_TOOLCHAIN differs from $declared" >&2; exit 1; }
+        cargo check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
+      rust-toolchain: "nightly-2026-11-15"
       rust-targets: "wasm32-unknown-unknown"
       rustflags: ""

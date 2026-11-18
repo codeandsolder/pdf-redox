@@ -214,11 +214,13 @@ impl FlateBatchEncoder {
                 "Flate input and output-limit counts differ".to_owned(),
             ));
         }
-        let mut outputs = inputs
+        let outputs = inputs
             .iter()
             .zip(maximum_lengths)
             .map(|(input, &limit)| vec![0_u8; limit.min(zlib_rs::compress_bound(input.len()))])
             .collect::<Vec<_>>();
+        #[cfg(not(target_family = "wasm"))]
+        let mut outputs = outputs;
 
         #[cfg(not(target_family = "wasm"))]
         if inputs.len() > 1
