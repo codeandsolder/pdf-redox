@@ -664,6 +664,46 @@ mod tests {
     }
 
     #[test]
+    fn capped_recompression_handles_large_expansion_without_changing_streams() -> crate::Result<()>
+    {
+        // A tiny compressed PDF stream can inflate to many MiB. Even though
+        // the input must be decoded, its output allocation should be limited
+        // by the original encoded size, not its uncompressed length.
+        let decoded = vec![0_u8; 8 * 1024 * 1024];
+        let original = crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::SIZE)?;
+        let allowed = original
+            .len()
+            .saturating_sub(minimum_flate_savings(original.len()));
+        assert!(original.len() < decoded.len() / 100);
+        assert!(allowed < decoded.len() / 100);
+
+        let (mut document, handle) = flate_filter_case_document(0, &original)?;
+        let before = crate::writer::write_pdf(&document)?;
+        let baseline = crate::stream_codec::encode_flate(&decoded, crate::FlateLevel::PROCESSING)?;
+        let expected_rewrite = baseline.len() <= allowed;
+        let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+        let stats = optimize_flate_streams_with_cache(
+            &mut document,
+            crate::FlateLevel::PROCESSING,
+            &mut FlateReuseCache::default(),
+            &batcher,
+        )?;
+        assert_eq!(stats.streams_selected, usize::from(expected_rewrite));
+        let after = crate::writer::write_pdf(&document)?;
+        if expected_rewrite {
+            assert!(after.len() < before.len());
+        } else {
+            assert_eq!(after, before);
+        }
+        assert_eq!(document.decoded_stream_data(handle)?, decoded);
+        let reloaded = crate::EditDocument::from_bytes(after)?;
+        let streams = reloaded.reachable_streams()?;
+        assert_eq!(streams.len(), 1);
+        assert_eq!(reloaded.decoded_stream_data(streams[0])?, decoded);
+        Ok(())
+    }
+
+    #[test]
     fn filtered_flate_size_floor_skips_decoding_until_savings_are_possible() -> crate::Result<()> {
         // Level 0 emits a stored block, so source payload size and encoded
         // length can be selected precisely across the 1,030-byte boundary.
