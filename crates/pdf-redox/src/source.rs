@@ -543,6 +543,13 @@ impl ObjectOverlay {
     }
 }
 
+// Resolve the source-vs-overlay decision only once for both Hayro's borrowed
+// COS view and the optional owned COS representation.
+enum CurrentObjectStorage<'a> {
+    Source(ObjectId),
+    Overlay(&'a OwnedObject),
+}
+
 /// Borrowed view of one object encountered while walking the current COW graph.
 pub enum CurrentObject<'a> {
     /// Object parsed lazily from the immutable Hayro source.
@@ -908,30 +915,36 @@ impl EditDocument {
         self.decoded_content_stream_value(&stream)
     }
 
-    /// Borrow the current value of an object handle without materializing an
-    /// untouched source object into the owned COS representation.
-    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+    fn current_object_storage(&self, handle: ObjectHandle) -> Result<CurrentObjectStorage<'_>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
                 Some(ExistingObjectChange::Replace(object)) => {
-                    Ok(Some(CurrentObject::Owned(object)))
+                    Ok(CurrentObjectStorage::Overlay(object))
                 }
                 Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
                     number: id.number,
                     generation: id.generation,
                 }),
-                None => match self.source.object(id) {
-                    Ok(object) => Ok(Some(CurrentObject::Source(object))),
-                    Err(Error::MissingSourceObject { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                },
+                None => Ok(CurrentObjectStorage::Source(id)),
             },
             ObjectHandle::New(id) => self
                 .overlay
                 .added(id)
-                .map(CurrentObject::Owned)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
-                .map(Some),
+                .map(CurrentObjectStorage::Overlay)
+                .ok_or_else(|| Error::MissingNewObject { index: id.index() }),
+        }
+    }
+
+    /// Borrow the current value of an object handle without materializing an
+    /// untouched source object into the owned COS representation.
+    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
+        match self.current_object_storage(handle)? {
+            CurrentObjectStorage::Overlay(object) => Ok(Some(CurrentObject::Owned(object))),
+            CurrentObjectStorage::Source(id) => match self.source.object(id) {
+                Ok(object) => Ok(Some(CurrentObject::Source(object))),
+                Err(Error::MissingSourceObject { .. }) => Ok(None),
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -942,25 +955,13 @@ impl EditDocument {
         &self,
         handle: ObjectHandle,
     ) -> Result<Option<Cow<'_, OwnedObject>>> {
-        match handle {
-            ObjectHandle::Existing(id) => match self.overlay.change(id) {
-                Some(ExistingObjectChange::Replace(object)) => Ok(Some(Cow::Borrowed(object))),
-                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
-                    number: id.number,
-                    generation: id.generation,
-                }),
-                None => match self.source.materialize(id) {
-                    Ok(object) => Ok(Some(Cow::Owned(object))),
-                    Err(Error::MissingSourceObject { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                },
+        match self.current_object_storage(handle)? {
+            CurrentObjectStorage::Overlay(object) => Ok(Some(Cow::Borrowed(object))),
+            CurrentObjectStorage::Source(id) => match self.source.materialize(id) {
+                Ok(object) => Ok(Some(Cow::Owned(object))),
+                Err(Error::MissingSourceObject { .. }) => Ok(None),
+                Err(error) => Err(error),
             },
-            ObjectHandle::New(id) => self
-                .overlay
-                .added(id)
-                .map(Cow::Borrowed)
-                .ok_or_else(|| Error::MissingNewObject { index: id.index() })
-                .map(Some),
         }
     }
 

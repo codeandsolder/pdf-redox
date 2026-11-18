@@ -672,6 +672,53 @@ mod tests {
         }
     }
 
+    fn assert_source_candidate_borrows(
+        document: &mut crate::EditDocument,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+        expected_len: usize,
+    ) -> crate::Result<()> {
+        let candidate =
+            collect_unfiltered_candidate(document, handle, level, &mut FlateReuseCache::default())?
+                .ok_or_else(|| crate::Error::Invalid("missing source candidate".into()))?;
+        assert_eq!(candidate.raw_len, expected_len);
+        let ObjectHandle::Existing(id) = handle else {
+            return Err(crate::Error::Invalid("expected source handle".into()));
+        };
+        assert!(matches!(&candidate.raw, UnfilteredFlateInput::Source(raw_id) if *raw_id == id));
+        let borrowed = candidate.raw_bytes(document)?;
+        let original = document.source().stream_data(id)?;
+        assert!(matches!(&borrowed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(borrowed.as_ptr(), original.as_ptr());
+        Ok(())
+    }
+
+    fn assert_overlay_candidate_borrows(
+        document: &mut crate::EditDocument,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+    ) -> crate::Result<()> {
+        use crate::{OwnedObject, StreamData};
+
+        let candidate =
+            collect_unfiltered_candidate(document, handle, level, &mut FlateReuseCache::default())?
+                .ok_or_else(|| crate::Error::Invalid("missing overlay candidate".into()))?;
+        assert!(
+            matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
+        );
+        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+            data: StreamData::Owned(bytes),
+            ..
+        })) = document.current_object(handle)?
+        else {
+            return Err(crate::Error::Invalid("missing owned overlay bytes".into()));
+        };
+        let raw = candidate.raw_bytes(document)?;
+        assert!(matches!(&raw, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(raw.as_ptr(), bytes.as_ptr());
+        Ok(())
+    }
+
     #[test]
     fn source_backed_unfiltered_streams_encode_identically_to_overlay_owned() -> crate::Result<()> {
         use crate::test_support::ClassicPdfBuilder;
@@ -713,24 +760,7 @@ mod tests {
                     .into_iter()
                     .zip([compressible.len(), incompressible.len()])
                 {
-                    let candidate = collect_unfiltered_candidate(
-                        &mut source,
-                        handle,
-                        level,
-                        &mut FlateReuseCache::default(),
-                    )?
-                    .ok_or_else(|| crate::Error::Invalid("missing source candidate".into()))?;
-                    assert_eq!(candidate.raw_len, expected_len);
-                    let ObjectHandle::Existing(id) = handle else {
-                        return Err(crate::Error::Invalid("expected source handle".into()));
-                    };
-                    assert!(
-                        matches!(&candidate.raw, UnfilteredFlateInput::Source(raw_id) if *raw_id == id)
-                    );
-                    let borrowed = candidate.raw_bytes(&source)?;
-                    let original = source.source().stream_data(id)?;
-                    assert!(matches!(&borrowed, std::borrow::Cow::Borrowed(_)));
-                    assert_eq!(borrowed.as_ptr(), original.as_ptr());
+                    assert_source_candidate_borrows(&mut source, handle, level, expected_len)?;
 
                     // Store the unchanged source bytes as an owned COW payload
                     // to check both representations take the same encoder path.
@@ -746,26 +776,7 @@ mod tests {
                 }
 
                 for handle in handles {
-                    let candidate = collect_unfiltered_candidate(
-                        &mut overlay,
-                        handle,
-                        level,
-                        &mut FlateReuseCache::default(),
-                    )?
-                    .ok_or_else(|| crate::Error::Invalid("missing overlay candidate".into()))?;
-                    assert!(
-                        matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
-                    );
-                    let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
-                        data: StreamData::Owned(bytes),
-                        ..
-                    })) = overlay.current_object(handle)?
-                    else {
-                        return Err(crate::Error::Invalid("missing owned overlay bytes".into()));
-                    };
-                    // Borrow the existing allocation; the candidate must not
-                    // duplicate a potentially enormous owned stream.
-                    assert_eq!(candidate.raw_bytes(&overlay)?.as_ptr(), bytes.as_ptr());
+                    assert_overlay_candidate_borrows(&mut overlay, handle, level)?;
                 }
 
                 let batcher = FlateBatchEncoder::new(
@@ -805,28 +816,9 @@ mod tests {
 
     #[test]
     fn newly_added_overlay_stream_borrows_payload_until_compression() -> crate::Result<()> {
-        use crate::{OwnedObject, StreamData};
         let source = vec![b'Q'; 2 * 1024 * 1024];
         let (mut document, handle) = external_stream_fixture(&[], false, &source)?;
-        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
-            data: StreamData::Owned(bytes),
-            ..
-        })) = document.current_object(handle)?
-        else {
-            return Err(crate::Error::Invalid("missing newly added stream".into()));
-        };
-        let original_ptr = bytes.as_ptr();
-        let candidate = collect_unfiltered_candidate(
-            &mut document,
-            handle,
-            crate::FlateLevel::PROCESSING,
-            &mut FlateReuseCache::default(),
-        )?
-        .ok_or_else(|| crate::Error::Invalid("missing candidate".into()))?;
-        assert!(
-            matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
-        );
-        assert_eq!(candidate.raw_bytes(&document)?.as_ptr(), original_ptr);
+        assert_overlay_candidate_borrows(&mut document, handle, crate::FlateLevel::PROCESSING)?;
         let stats = compress_unfiltered_streams(
             &mut document,
             crate::FlateLevel::PROCESSING,
