@@ -573,6 +573,147 @@ fn prepare_raster_preflight(
     })
 }
 
+/// The ordered vector/paint mutation phase consumes raster preflight facts and
+/// returns its Flate cache for the later stream compression passes. Keeping the
+/// transformations together preserves the dependencies between factoring,
+/// subsequent paint rewrites, and resource-usage proof invalidation.
+struct VectorPhaseResult {
+    repeated_clips: RepeatedClipStats,
+    vector_compaction: VectorCompactionStats,
+    marked_content: MarkedContentCoalesceStats,
+    collinear_paths: CollinearPathStats,
+    outlined_glyphs: OutlinedGlyphFactorStats,
+    paint_batch: PaintBatchStats,
+    stroke_forms: StrokeFormFactorStats,
+    polyline_simplification: PolylineSimplificationStats,
+    flate_reuse_cache: FlateReuseCache,
+}
+
+fn run_vector_optimization_phase(
+    document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
+    cfg: &Config,
+    layout: &RasterLayoutStats,
+    evidence: &mut RasterPhaseEvidence,
+    timings: &mut BTreeMap<String, f64>,
+    catalog: Option<&mut GlyphCatalog>,
+) -> Result<VectorPhaseResult> {
+    let flate_level = cfg.optimization_goal.flate_level();
+    let PageRewriteResult {
+        stats: repeated_clips,
+        rewritten_pages: repeated_clip_rewritten_pages,
+    } = timed(timings, "repeated-clip-hoist", || {
+        // The clip/body rewrite is exact in either mode. Size requires a
+        // strictly smaller encoded stream; Processing also accepts equal-sized
+        // rewrites when they eliminate redundant clipping work.
+        hoist_repeated_clip_prefixes(document, pages, flate_level, cfg.optimization_goal)
+    })?;
+    // Clip hoisting changes page operators, but not their resource references.
+    evidence.after_page_rewrite(&repeated_clip_rewritten_pages, false);
+
+    let mut flate_reuse_cache = FlateReuseCache::default();
+    let mut vector_compaction = timed(timings, "vector-compaction", || {
+        let raster_proved_no_vector_candidate = cfg.optimization_goal
+            != crate::OptimizationGoal::Processing
+            && cfg.raster_layout.enabled
+            && layout.page_vector_inventory_complete
+            && !layout.page_vector_merge_candidate;
+        let processing_proved_no_vector_candidate = cfg.optimization_goal
+            == crate::OptimizationGoal::Processing
+            && cfg.raster_layout.enabled
+            && layout.page_vector_inventory_complete
+            && !layout.page_vector_merge_candidate
+            && evidence.rules_out_processing_vector_factor(layout.page_count, pages);
+        if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
+            let vector_cache = evidence.take_vector_analysis();
+            compact_vector_paths_with_flate_cache(
+                document,
+                pages,
+                flate_level,
+                cfg.optimization_goal,
+                vector_cache,
+                &mut flate_reuse_cache,
+            )
+        } else {
+            Ok(VectorCompactionStats::default())
+        }
+    })?;
+    // A proof that there are no mergeable page fills says nothing about
+    // identical, resource-proven q runs across different page streams.
+    // Keep the cheap fill-compaction fast path while considering exact
+    // shared Forms independently in Size mode. Processing already runs
+    // this factor as part of its ordered structural-Form closure.
+    if cfg.optimization_goal == crate::OptimizationGoal::Size {
+        let forms = timed(timings, "size-shared-form-factor", || {
+            factor_size_shared_forms(document, flate_level, pages)
+        })?;
+        vector_compaction.absorb(forms);
+    }
+    evidence.after_resource_mutation(vector_compaction.shared_run_forms_created != 0);
+
+    let marked_content = timed(timings, "marked-content-coalesce", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            coalesce_optional_content(document, pages, flate_level)
+        } else {
+            Ok(MarkedContentCoalesceStats::default())
+        }
+    })?;
+
+    let collinear_paths = timed(timings, "collinear-path-compact", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            compact_collinear_paths(document, pages, flate_level)
+        } else {
+            Ok(CollinearPathStats::default())
+        }
+    })?;
+
+    let outlined_glyphs = timed(timings, "outlined-glyph-factor", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            factor_outlined_glyphs(document, pages, flate_level, catalog)
+        } else {
+            Ok(OutlinedGlyphFactorStats::default())
+        }
+    })?;
+    evidence.after_resource_mutation(outlined_glyphs.fonts_created != 0);
+
+    let paint_batch = timed(timings, "paint-batching", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            batch_page_paints(document, pages)
+        } else {
+            Ok(PaintBatchStats::default())
+        }
+    })?;
+
+    let stroke_forms = timed(timings, "stroke-form-factor", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            factor_repeated_stroke_forms(document, pages, flate_level)
+        } else {
+            Ok(StrokeFormFactorStats::default())
+        }
+    })?;
+    evidence.after_resource_mutation(stroke_forms.forms_created != 0);
+
+    let polyline_simplification = timed(timings, "polyline-simplify", || {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            simplify_page_polylines(document, pages, flate_level)
+        } else {
+            Ok(PolylineSimplificationStats::default())
+        }
+    })?;
+
+    Ok(VectorPhaseResult {
+        repeated_clips,
+        vector_compaction,
+        marked_content,
+        collinear_paths,
+        outlined_glyphs,
+        paint_batch,
+        stroke_forms,
+        polyline_simplification,
+        flate_reuse_cache,
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the optimization pipeline intentionally keeps ordered mutations and their shared document state together"
@@ -947,113 +1088,25 @@ fn optimize_pdf_with_document(
         raster_transform_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    let PageRewriteResult {
-        stats: repeated_clips,
-        rewritten_pages: repeated_clip_rewritten_pages,
-    } = timed(&mut timings, "repeated-clip-hoist", || {
-        // The clip/body rewrite is exact in either mode. Size requires a
-        // strictly smaller encoded stream; Processing also accepts equal-sized
-        // rewrites when they eliminate redundant clipping work.
-        hoist_repeated_clip_prefixes(
-            &mut document,
-            &stable_pages,
-            flate_level,
-            cfg.optimization_goal,
-        )
-    })?;
-    // Clip hoisting changes page operators, but not their resource references.
-    raster_evidence.after_page_rewrite(&repeated_clip_rewritten_pages, false);
-
-    let mut flate_reuse_cache = FlateReuseCache::default();
-    let mut vector_compaction = timed(&mut timings, "vector-compaction", || {
-        let raster_proved_no_vector_candidate = cfg.optimization_goal
-            != crate::OptimizationGoal::Processing
-            && cfg.raster_layout.enabled
-            && raster_layout.page_vector_inventory_complete
-            && !raster_layout.page_vector_merge_candidate;
-        let processing_proved_no_vector_candidate = cfg.optimization_goal
-            == crate::OptimizationGoal::Processing
-            && cfg.raster_layout.enabled
-            && raster_layout.page_vector_inventory_complete
-            && !raster_layout.page_vector_merge_candidate
-            && raster_evidence
-                .rules_out_processing_vector_factor(raster_layout.page_count, &stable_pages);
-        if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
-            let vector_cache = raster_evidence.take_vector_analysis();
-            compact_vector_paths_with_flate_cache(
-                &mut document,
-                &stable_pages,
-                flate_level,
-                cfg.optimization_goal,
-                vector_cache,
-                &mut flate_reuse_cache,
-            )
-        } else {
-            Ok(VectorCompactionStats::default())
-        }
-    })?;
-    // A proof that there are no mergeable page fills says nothing about
-    // identical, resource-proven q runs across different page streams.
-    // Keep the cheap fill-compaction fast path while considering exact
-    // shared Forms independently in Size mode. Processing already runs
-    // this factor as part of its ordered structural-Form closure.
-    if cfg.optimization_goal == crate::OptimizationGoal::Size {
-        let forms = timed(&mut timings, "size-shared-form-factor", || {
-            factor_size_shared_forms(&mut document, flate_level, &stable_pages)
-        })?;
-        vector_compaction.absorb(forms);
-    }
-    raster_evidence.after_resource_mutation(vector_compaction.shared_run_forms_created != 0);
-
-    let marked_content = timed(&mut timings, "marked-content-coalesce", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            coalesce_optional_content(&mut document, &stable_pages, flate_level)
-        } else {
-            Ok(MarkedContentCoalesceStats::default())
-        }
-    })?;
-
-    let collinear_paths = timed(&mut timings, "collinear-path-compact", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            compact_collinear_paths(&mut document, &stable_pages, flate_level)
-        } else {
-            Ok(CollinearPathStats::default())
-        }
-    })?;
-
-    let outlined_glyphs = timed(&mut timings, "outlined-glyph-factor", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(&mut document, &stable_pages, flate_level, catalog)
-        } else {
-            Ok(OutlinedGlyphFactorStats::default())
-        }
-    })?;
-    raster_evidence.after_resource_mutation(outlined_glyphs.fonts_created != 0);
-
-    let paint_batch = timed(&mut timings, "paint-batching", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            batch_page_paints(&mut document, &stable_pages)
-        } else {
-            Ok(PaintBatchStats::default())
-        }
-    })?;
-
-    let stroke_forms = timed(&mut timings, "stroke-form-factor", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_repeated_stroke_forms(&mut document, &stable_pages, flate_level)
-        } else {
-            Ok(StrokeFormFactorStats::default())
-        }
-    })?;
-    raster_evidence.after_resource_mutation(stroke_forms.forms_created != 0);
-
-    let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            simplify_page_polylines(&mut document, &stable_pages, flate_level)
-        } else {
-            Ok(PolylineSimplificationStats::default())
-        }
-    })?;
+    let VectorPhaseResult {
+        repeated_clips,
+        vector_compaction,
+        marked_content,
+        collinear_paths,
+        outlined_glyphs,
+        paint_batch,
+        stroke_forms,
+        polyline_simplification,
+        mut flate_reuse_cache,
+    } = run_vector_optimization_phase(
+        &mut document,
+        &stable_pages,
+        cfg,
+        &raster_layout,
+        &mut raster_evidence,
+        &mut timings,
+        catalog,
+    )?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
         if raster_evidence.resource_usage_exact {
