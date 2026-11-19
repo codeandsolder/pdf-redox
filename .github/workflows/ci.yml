@@ -17,7 +17,7 @@ permissions:
 jobs:
   rust:
     name: Rust pinned nightly
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@68ff0c543bfd83222d36c7f95321c3f47481c69e # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5b148ef9deccf94ecff26f00e31c907619304500 # main
     with:
       command: |
         # Fail CI if Renovate updates the manifest but leaves these workflow pins stale.
@@ -37,7 +37,7 @@ jobs:
 
   wasm:
     name: WASM compatibility
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@68ff0c543bfd83222d36c7f95321c3f47481c69e # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5b148ef9deccf94ecff26f00e31c907619304500 # main
     with:
       command: |
         declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
