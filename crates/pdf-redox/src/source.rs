@@ -609,13 +609,15 @@ const MAX_DECODED_CONTENT_STREAM_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 struct DecodedContentCache {
     bytes: usize,
-    streams: BTreeMap<ObjectId, Vec<u8>>,
+    streams: BTreeMap<ObjectId, Arc<[u8]>>,
 }
 
-/// A content reference is either a decoded stream or a non-stream COS value.
-/// Returning the latter borrowed keeps overlay-backed reference chains cheap.
+/// A content reference is a fresh stream, a shared cached stream, or a COS value.
+/// Cached bytes are reference-counted so consumers can append them directly
+/// without copying or holding an active borrow of the document's cache.
 pub enum ContentRead<'a> {
     Decoded(Vec<u8>),
+    Cached(Arc<[u8]>),
     Other(Cow<'a, OwnedObject>),
 }
 
@@ -896,7 +898,7 @@ impl EditDocument {
         if let Some(id) = unchanged_source_id
             && let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id)
         {
-            return Ok(Some(ContentRead::Decoded(decoded.clone())));
+            return Ok(Some(ContentRead::Cached(Arc::clone(decoded))));
         }
 
         let Some(object) = self.current_owned_object_cow(handle)? else {
@@ -915,7 +917,7 @@ impl EditDocument {
             let mut cache = self.decoded_content_stream_cache.borrow_mut();
             if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES {
                 cache.bytes = cache.bytes.saturating_add(decoded.len());
-                cache.streams.insert(id, decoded.clone());
+                cache.streams.insert(id, Arc::from(decoded.as_slice()));
             }
         }
         Ok(Some(ContentRead::Decoded(decoded)))
@@ -928,6 +930,7 @@ impl EditDocument {
     pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
         match self.content_read(handle)? {
             Some(ContentRead::Decoded(bytes)) => Ok(bytes),
+            Some(ContentRead::Cached(bytes)) => Ok(bytes.as_ref().to_vec()),
             Some(ContentRead::Other(_)) => Err(Error::Invalid("object is not a stream".to_owned())),
             None => Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
@@ -1726,6 +1729,39 @@ mod tests {
     }
 
     #[test]
+    fn cached_content_reads_share_payload_and_survive_source_edits() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let id = ObjectId::new(4, 0);
+        let handle = ObjectHandle::Existing(id);
+
+        // The first read fills the cache without changing the owned stream API.
+        assert_eq!(document.decoded_content_stream_data(handle)?, b"q Q");
+        let Some(ContentRead::Cached(first)) = document.content_read(handle)? else {
+            return Err(Error::Invalid("expected a cached stream".to_owned()));
+        };
+        let Some(ContentRead::Cached(second)) = document.content_read(handle)? else {
+            return Err(Error::Invalid("expected the same cached stream".to_owned()));
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), b"q Q");
+
+        // Holding the shared payload does not lock the cache or prevent COW
+        // edits; it remains an immutable snapshot after an overlay change.
+        let stream = document.edit_object(id)?;
+        let OwnedObject::Stream { data, .. } = stream else {
+            return Err(Error::Invalid("expected a stream".to_owned()));
+        };
+        *data = StreamData::Owned(b"BT ET".to_vec());
+        assert_eq!(first.as_ref(), b"q Q");
+        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
+        assert!(matches!(
+            document.content_read(handle)?,
+            Some(ContentRead::Decoded(bytes)) if bytes == b"BT ET"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn content_cache_reuses_unchanged_source_only_and_bypasses_indirect_filters() -> Result<()> {
         use crate::test_support::ClassicPdfBuilder;
 
@@ -1761,8 +1797,8 @@ mod tests {
             let cache = document.decoded_content_stream_cache.borrow();
             assert_eq!(cache.streams.len(), 1);
             assert_eq!(
-                cache.streams.get(&ObjectId::new(4, 0)),
-                Some(&b"q Q".to_vec())
+                cache.streams.get(&ObjectId::new(4, 0)).map(AsRef::as_ref),
+                Some(b"q Q".as_slice())
             );
             assert!(!cache.streams.contains_key(&ObjectId::new(5, 0)));
         }
