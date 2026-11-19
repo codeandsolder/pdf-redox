@@ -56,18 +56,18 @@ pub fn decoded_content_value(
                             "cyclic indirect reference in page contents".to_owned(),
                         ));
                     }
-                    let Some(resolved) = document.current_owned_object(handle)? else {
-                        continue;
-                    };
-                    if matches!(resolved, OwnedObject::Stream { .. }) {
-                        // A stream is a leaf: the common single-stream page
-                        // does not need an allocated active-reference set.
-                        let decoded = document.decoded_content_stream_data(handle)?;
-                        append_decoded_content(out, &decoded);
-                    } else {
-                        active_references.insert(handle);
-                        pending.push(Task::LeaveReference(handle));
-                        pending.push(Task::Visit(std::borrow::Cow::Owned(resolved)));
+                    match document.content_read(handle)? {
+                        // A stream is a leaf: no active-reference entry is
+                        // needed for the common single-stream page.
+                        Some(crate::source::ContentRead::Decoded(decoded)) => {
+                            append_decoded_content(out, &decoded);
+                        }
+                        Some(crate::source::ContentRead::Other(resolved)) => {
+                            active_references.insert(handle);
+                            pending.push(Task::LeaveReference(handle));
+                            pending.push(Task::Visit(resolved));
+                        }
+                        None => {}
                     }
                 }
                 OwnedObject::Stream { .. } => {
