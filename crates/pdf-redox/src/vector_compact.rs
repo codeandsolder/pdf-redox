@@ -16,12 +16,106 @@ use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::LazyLock,
 };
 
 static DEBUG_VECTOR: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_VECTOR").is_some());
+
+// Only the encoded length is retained: no unbounded copies of source streams
+// or compressed payloads. A fixed FIFO makes worst-case retention O(1) per
+// input and prevents duplicate- or adversarial-document memory growth.
+// Key by the *full decoded bytes' SHA-256* and the exact Flate level, never
+// page identity: the same content can reappear on different pages and passes.
+const MAX_VECTOR_FLATE_LENGTHS: usize = 8_192;
+type VectorFlateKey = (i32, [u8; 32]);
+
+#[derive(Default)]
+struct VectorFlateLengthMemo {
+    enabled: bool,
+    lengths: HashMap<VectorFlateKey, usize>,
+    insertion_order: VecDeque<VectorFlateKey>,
+    hits: usize,
+    misses: usize,
+    evictions: usize,
+}
+
+impl VectorFlateLengthMemo {
+    fn processing() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    fn log_debug(&self) {
+        if *DEBUG_VECTOR && self.enabled {
+            eprintln!(
+                "vector-flate-lengths hits={} misses={} entries={} evictions={}",
+                self.hits,
+                self.misses,
+                self.lengths.len(),
+                self.evictions,
+            );
+        }
+    }
+
+    fn encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
+        if !self.enabled {
+            return crate::stream_codec::flate_encoded_len(decoded, level);
+        }
+        let key = (level.value(), Sha256::digest(decoded).into());
+        if let Some(&length) = self.lengths.get(&key) {
+            self.hits = self.hits.saturating_add(1);
+            return Ok(length);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let length = crate::stream_codec::flate_encoded_len(decoded, level)?;
+        self.insert_length(key, length);
+        Ok(length)
+    }
+
+    fn remember_encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel, length: usize) {
+        if self.enabled {
+            let key = (level.value(), Sha256::digest(decoded).into());
+            self.insert_length(key, length);
+        }
+    }
+
+    fn insert_length(&mut self, key: VectorFlateKey, length: usize) {
+        if self.lengths.contains_key(&key) {
+            return;
+        }
+        if self.lengths.len() == MAX_VECTOR_FLATE_LENGTHS
+            && let Some(evicted) = self.insertion_order.pop_front()
+        {
+            self.lengths.remove(&evicted);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        self.insertion_order.push_back(key);
+        self.lengths.insert(key, length);
+    }
+}
+
+// Related caches form one unit during page mutations: compressed bytes
+// benefit the final Flate phase, while encoded lengths benefit form factoring.
+struct VectorCompactionFlateState<'a> {
+    reuse: &'a mut FlateReuseCache,
+    lengths: VectorFlateLengthMemo,
+}
+
+impl<'a> VectorCompactionFlateState<'a> {
+    fn new(reuse: &'a mut FlateReuseCache, goal: OptimizationGoal) -> Self {
+        Self {
+            reuse,
+            lengths: match goal {
+                OptimizationGoal::Processing => VectorFlateLengthMemo::processing(),
+                OptimizationGoal::Size => VectorFlateLengthMemo::default(),
+            },
+        }
+    }
+}
 
 const RECT_SNAP_PAGE_GAP_PT: f64 = 0.001;
 // Keep independently painted thin rectangles separate. Some PDF renderers
@@ -1515,6 +1609,23 @@ struct PathFactoringOutcome {
     rewritten_pages: BTreeSet<ObjectHandle>,
 }
 
+// All three exact Form-factoring passes measure the same operation: the
+// encoded size of the source and its span-replaced content. Do it once in
+// one place so the memo and the original fail-closed behavior stay aligned.
+fn measured_span_replacement(
+    input: &[u8],
+    replacements: &[(usize, usize, Vec<u8>)],
+    level: crate::FlateLevel,
+    flate_lengths: &mut VectorFlateLengthMemo,
+) -> Result<Option<(usize, usize, Vec<u8>)>> {
+    let before = flate_lengths.encoded_len(input, level)?;
+    let Some(rewritten) = apply_span_replacements(input, replacements) else {
+        return Ok(None);
+    };
+    let after = flate_lengths.encoded_len(&rewritten, level)?;
+    Ok(Some((before, after, rewritten)))
+}
+
 fn cached_path_factoring_is_impossible_after_transformed_preference(
     document: &EditDocument,
     pre_scanned: &BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
@@ -1607,6 +1718,7 @@ fn factor_repeated_path_forms(
     flate_level: crate::FlateLevel,
     mut pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
     pages: &[ObjectHandle],
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<PathFactoringOutcome> {
     if cached_path_factoring_is_impossible_after_transformed_preference(
         document,
@@ -1772,12 +1884,12 @@ fn factor_repeated_path_forms(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+        let Some((before, after, rewritten)) = measured_span_replacement(
             &page.decoded,
+            &replacements_by_page[page_index],
             flate_level,
-        )?);
-        let Some(rewritten) =
-            apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
+            flate_lengths,
+        )?
         else {
             return Ok(PathFactoringOutcome {
                 stats: VectorCompactionStats::default(),
@@ -1786,10 +1898,8 @@ fn factor_repeated_path_forms(
                 rewritten_pages: BTreeSet::new(),
             });
         };
-        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &rewritten,
-            flate_level,
-        )?);
+        before_flate = before_flate.saturating_add(before);
+        after_flate = after_flate.saturating_add(after);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -1819,8 +1929,7 @@ fn factor_repeated_path_forms(
         });
     }
     for (bytes, _, _, _) in &selected {
-        after_flate =
-            after_flate.saturating_add(crate::stream_codec::flate_encoded_len(bytes, flate_level)?);
+        after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
         eprintln!("path-forms flate before={before_flate} after={after_flate}");
@@ -1922,6 +2031,7 @@ fn factor_repeated_transformed_blocks(
     mut cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
     rewritten_pages: &BTreeSet<ObjectHandle>,
     pages: &[ObjectHandle],
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut page_data = Vec::with_capacity(pages.len());
     let mut groups = BTreeMap::<SemanticKey, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
@@ -2024,19 +2134,17 @@ fn factor_repeated_transformed_blocks(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+        let Some((before, after, rewritten)) = measured_span_replacement(
             &page.decoded,
+            &replacements_by_page[page_index],
             flate_level,
-        )?);
-        let Some(rewritten) =
-            apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
+            flate_lengths,
+        )?
         else {
             return Ok(VectorCompactionStats::default());
         };
-        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &rewritten,
-            flate_level,
-        )?);
+        before_flate = before_flate.saturating_add(before);
+        after_flate = after_flate.saturating_add(after);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -2061,8 +2169,7 @@ fn factor_repeated_transformed_blocks(
         return Ok(VectorCompactionStats::default());
     }
     for (bytes, _, _, _, _) in &selected {
-        after_flate =
-            after_flate.saturating_add(crate::stream_codec::flate_encoded_len(bytes, flate_level)?);
+        after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
     }
     if *DEBUG_VECTOR {
         eprintln!("transform-forms flate before={before_flate} after={after_flate}");
@@ -2617,7 +2724,12 @@ pub fn factor_size_shared_forms(
     if pages.len() < 2 {
         return Ok(VectorCompactionStats::default());
     }
-    factor_shared_q_prefix_runs(document, flate_level, pages)
+    factor_shared_q_prefix_runs(
+        document,
+        flate_level,
+        pages,
+        &mut VectorFlateLengthMemo::default(),
+    )
 }
 
 #[expect(
@@ -2628,6 +2740,7 @@ fn factor_shared_q_prefix_runs(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut eligible_pages = Vec::new();
     for &page in pages {
@@ -2688,7 +2801,7 @@ fn factor_shared_q_prefix_runs(
         else {
             continue;
         };
-        let compressed_body_bytes = crate::stream_codec::flate_encoded_len(&body, flate_level)?;
+        let compressed_body_bytes = flate_lengths.encoded_len(&body, flate_level)?;
         let conservative_overhead = 384usize
             .saturating_add(resources.len().saturating_mul(96))
             .saturating_add(candidate.page_indices.len().saturating_mul(32));
@@ -2730,19 +2843,17 @@ fn factor_shared_q_prefix_runs(
     let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
     for &page_index in &affected_pages {
         let page = &page_data[page_index];
-        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
+        let Some((before, after, rewritten)) = measured_span_replacement(
             &page.decoded,
+            &replacements_by_page[page_index],
             flate_level,
-        )?);
-        let Some(rewritten) =
-            apply_span_replacements(&page.decoded, &replacements_by_page[page_index])
+            flate_lengths,
+        )?
         else {
             return Ok(VectorCompactionStats::default());
         };
-        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &rewritten,
-            flate_level,
-        )?);
+        before_flate = before_flate.saturating_add(before);
+        after_flate = after_flate.saturating_add(after);
         rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
@@ -3184,7 +3295,7 @@ fn canonicalize_page_path_coordinates(
     pages: &[ObjectHandle],
     mut pre_scanned: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
     rewritten_pages: &BTreeSet<ObjectHandle>,
-    reuse_cache: &mut FlateReuseCache,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<PathCoordinateOutcome> {
     let mut stats = VectorCompactionStats::default();
     let mut coordinate_rewritten_pages = BTreeSet::new();
@@ -3220,7 +3331,12 @@ fn canonicalize_page_path_coordinates(
         };
         let before_encoded = crate::stream_codec::encode_flate(&decoded, flate_level)?;
         let before_flate = before_encoded.len();
-        let after_flate = crate::stream_codec::flate_encoded_len(&canonicalized, flate_level)?;
+        flate_state
+            .lengths
+            .remember_encoded_len(&decoded, flate_level, before_flate);
+        let after_flate = flate_state
+            .lengths
+            .encoded_len(&canonicalized, flate_level)?;
         let savings = before_flate.saturating_sub(after_flate);
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
             .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
@@ -3233,7 +3349,9 @@ fn canonicalize_page_path_coordinates(
         }
         if savings < required {
             if let OwnedObject::Reference(handle) = contents {
-                reuse_cache.insert(*handle, flate_level, &decoded, before_encoded);
+                flate_state
+                    .reuse
+                    .insert(*handle, flate_level, &decoded, before_encoded);
             }
             continue;
         }
@@ -3264,6 +3382,7 @@ fn compact_processing_fill_tail(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &BTreeSet<ObjectHandle>,
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     for &page in pages {
@@ -3279,8 +3398,8 @@ fn compact_processing_fill_tail(
         if compacted == decoded {
             continue;
         }
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&compacted, flate_level)?;
+        let before_flate = flate_lengths.encoded_len(&decoded, flate_level)?;
+        let after_flate = flate_lengths.encoded_len(&compacted, flate_level)?;
         replace_page_content(document, page, compacted)?;
         total.pages_compacted = total.pages_compacted.saturating_add(1);
         total.fill_groups_batched = total
@@ -3309,6 +3428,7 @@ fn factor_processing_structural_forms(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     pre_scanned: ProcessingFactorBlocks,
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<(
     VectorCompactionStats,
     BTreeSet<ObjectHandle>,
@@ -3319,15 +3439,16 @@ fn factor_processing_structural_forms(
         cached_transformed,
         mut reusable_blocks,
         rewritten_pages: path_rewritten,
-    } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages)?;
+    } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages, flate_lengths)?;
     let transformed = factor_repeated_transformed_blocks(
         document,
         flate_level,
         cached_transformed,
         &path_rewritten,
         pages,
+        flate_lengths,
     )?;
-    let shared = factor_shared_q_prefix_runs(document, flate_level, pages)?;
+    let shared = factor_shared_q_prefix_runs(document, flate_level, pages, flate_lengths)?;
     let mut rewritten = path_rewritten;
     rewritten.extend(transformed.generated_page_xobjects.keys().copied());
     rewritten.extend(shared.generated_page_xobjects.keys().copied());
@@ -3355,12 +3476,18 @@ fn close_processing_exact_factoring(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     let mut pre_scanned = ProcessingFactorBlocks::new();
     loop {
-        let (forms, rewritten, reusable_blocks) =
-            factor_processing_structural_forms(document, flate_level, pages, pre_scanned)?;
+        let (forms, rewritten, reusable_blocks) = factor_processing_structural_forms(
+            document,
+            flate_level,
+            pages,
+            pre_scanned,
+            flate_lengths,
+        )?;
         let changed = forms.path_forms_created != 0
             || forms.transformed_forms_created != 0
             || forms.shared_run_forms_created != 0;
@@ -3369,7 +3496,7 @@ fn close_processing_exact_factoring(
         }
         // A page rewritten by any Form pass must be scanned using its new
         // content and resources; do not recycle pre-mutation raster/path proofs.
-        let fills = compact_processing_fill_tail(document, flate_level, &rewritten)?;
+        let fills = compact_processing_fill_tail(document, flate_level, &rewritten, flate_lengths)?;
         // Fill cleanup rewrites only pages already present in rewritten;
         // every retained metadata entry is still tied to identical bytes.
         pre_scanned = reusable_blocks;
@@ -3386,14 +3513,19 @@ fn finish_processing_vector_compaction(
     pre_scanned_processing: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
     mut path_coordinate_plans: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
     mut vector_rewritten_pages: BTreeSet<ObjectHandle>,
-    flate_reuse_cache: &mut FlateReuseCache,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     for page in &vector_rewritten_pages {
         path_coordinate_plans.remove(page);
     }
-    let (factored, factored_pages, _) =
-        factor_processing_structural_forms(document, flate_level, pages, pre_scanned_processing)?;
+    let (factored, factored_pages, _) = factor_processing_structural_forms(
+        document,
+        flate_level,
+        pages,
+        pre_scanned_processing,
+        &mut flate_state.lengths,
+    )?;
     for page in &factored_pages {
         path_coordinate_plans.remove(page);
     }
@@ -3407,7 +3539,7 @@ fn finish_processing_vector_compaction(
         pages,
         path_coordinate_plans,
         &vector_rewritten_pages,
-        flate_reuse_cache,
+        flate_state,
     )?;
     vector_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
     late_rewritten_pages.extend(path_coordinates.rewritten_pages.iter().copied());
@@ -3425,13 +3557,23 @@ fn finish_processing_vector_compaction(
     // Processing-only coordinate/factoring rewrites can make exact rectangle
     // adjacency visible only after the initial fill scan. Close that local
     // dependency here instead of requiring another whole optimizer pass.
-    let fill_tail = compact_processing_fill_tail(document, flate_level, &late_rewritten_pages)?;
+    let fill_tail = compact_processing_fill_tail(
+        document,
+        flate_level,
+        &late_rewritten_pages,
+        &mut flate_state.lengths,
+    )?;
     total.absorb(fill_tail);
     // The earlier lossless factor passes had already run before bounded-error
     // coordinate rewriting and the fill tail. Close only the exact stages
     // that those mutations may expose, without rounding any path twice.
     if !late_rewritten_pages.is_empty() {
-        let closure = close_processing_exact_factoring(document, flate_level, pages)?;
+        let closure = close_processing_exact_factoring(
+            document,
+            flate_level,
+            pages,
+            &mut flate_state.lengths,
+        )?;
         total.absorb(closure);
     }
     Ok(total)
@@ -3444,20 +3586,25 @@ fn write_compacted_vector_page(
     compacted: Vec<u8>,
     flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
-    flate_reuse_cache: &mut FlateReuseCache,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<Option<usize>> {
-    let before_flate = crate::stream_codec::flate_encoded_len(decoded, flate_level)?;
+    let before_flate = flate_state.lengths.encoded_len(decoded, flate_level)?;
     // Processing also needs the exact encoded length for its savings report.
     // Retain those already-computed bytes for the final unfiltered-stream
     // compression phase instead of recompressing unchanged page content.
     let after_encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
     let after_flate = after_encoded.len();
+    flate_state
+        .lengths
+        .remember_encoded_len(&compacted, flate_level, after_flate);
     if goal == OptimizationGoal::Size && after_flate >= before_flate {
         return Ok(None);
     }
     let decoded_sha256 = Sha256::digest(&compacted).into();
     let replacement = replace_page_content_with_handle(document, page, compacted)?;
-    flate_reuse_cache.insert_with_digest(replacement, flate_level, decoded_sha256, after_encoded);
+    flate_state
+        .reuse
+        .insert_with_digest(replacement, flate_level, decoded_sha256, after_encoded);
     Ok(Some(before_flate.saturating_sub(after_flate)))
 }
 
@@ -3470,6 +3617,7 @@ pub fn compact_vector_paths_with_flate_cache(
     flate_reuse_cache: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
+    let mut flate_state = VectorCompactionFlateState::new(flate_reuse_cache, goal);
     let mut pre_scanned_processing =
         BTreeMap::<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>::new();
     let mut path_coordinate_plans = BTreeMap::<ObjectHandle, Option<PathCoordinatePlan>>::new();
@@ -3533,7 +3681,7 @@ pub fn compact_vector_paths_with_flate_cache(
             compacted,
             flate_level,
             goal,
-            flate_reuse_cache,
+            &mut flate_state,
         )?
         else {
             continue;
@@ -3554,9 +3702,10 @@ pub fn compact_vector_paths_with_flate_cache(
             pre_scanned_processing,
             path_coordinate_plans,
             vector_rewritten_pages,
-            flate_reuse_cache,
+            &mut flate_state,
         )?);
     }
+    flate_state.lengths.log_debug();
     Ok(total)
 }
 
@@ -3564,6 +3713,39 @@ pub fn compact_vector_paths_with_flate_cache(
 mod tests {
     use super::*;
     use crate::ObjectId;
+
+    #[test]
+    fn vector_flate_length_memo_preserves_exact_lengths_and_bounds_entries() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let data = b"0 0 50 50 re f\n".repeat(64);
+        let mut memo = VectorFlateLengthMemo {
+            enabled: true,
+            ..VectorFlateLengthMemo::default()
+        };
+        let expected = crate::stream_codec::flate_encoded_len(&data, level)?;
+        assert_eq!(memo.encoded_len(&data, level)?, expected);
+        assert_eq!(memo.encoded_len(&data, level)?, expected);
+        assert_eq!(memo.hits, 1);
+        assert_eq!(memo.misses, 1);
+        let other_level = crate::FlateLevel::SIZE;
+        assert_eq!(
+            memo.encoded_len(&data, other_level)?,
+            crate::stream_codec::flate_encoded_len(&data, other_level)?
+        );
+        assert_eq!(memo.misses, 2);
+        for i in 0..=MAX_VECTOR_FLATE_LENGTHS {
+            let unique = i.to_le_bytes();
+            memo.remember_encoded_len(&unique, level, unique.len());
+        }
+        assert_eq!(memo.lengths.len(), MAX_VECTOR_FLATE_LENGTHS);
+        assert_eq!(memo.insertion_order.len(), memo.lengths.len());
+        assert!(memo.evictions > 0);
+        assert_eq!(
+            memo.encoded_len(&data, level)?,
+            crate::stream_codec::flate_encoded_len(&data, level)?
+        );
+        Ok(())
+    }
 
     #[test]
     fn compacted_page_processing_reuses_exact_encoding() -> Result<()> {
@@ -3591,6 +3773,8 @@ mod tests {
             let mut uncached = EditDocument::from_bytes(source.clone())?;
             let mut cache = FlateReuseCache::default();
             let mut empty = FlateReuseCache::default();
+            let mut cache_state = VectorCompactionFlateState::new(&mut cache, goal);
+            let mut empty_state = VectorCompactionFlateState::new(&mut empty, goal);
             let estimated = write_compacted_vector_page(
                 &mut cached,
                 page,
@@ -3598,7 +3782,7 @@ mod tests {
                 compacted.clone(),
                 level,
                 goal,
-                &mut cache,
+                &mut cache_state,
             )?;
             let reference_estimated = write_compacted_vector_page(
                 &mut uncached,
@@ -3607,7 +3791,7 @@ mod tests {
                 compacted.clone(),
                 level,
                 goal,
-                &mut empty,
+                &mut empty_state,
             )?;
             assert_eq!(estimated, reference_estimated);
             assert!(estimated.is_some());
@@ -3615,6 +3799,8 @@ mod tests {
                 .saturating_sub(crate::stream_codec::flate_encoded_len(&compacted, level)?);
             assert_eq!(estimated, Some(expected_savings));
             // The reference must use a fresh uncached encoding.
+            drop(cache_state);
+            drop(empty_state);
             empty = FlateReuseCache::default();
 
             let reused_stats = crate::flate::compress_unfiltered_streams(
@@ -3729,17 +3915,21 @@ mod tests {
         let mut cold = EditDocument::from_bytes(bytes)?;
         let pages = [3, 4, 5].map(|number| ObjectHandle::Existing(ObjectId::new(number, 0)));
 
+        let mut warm_lengths = VectorFlateLengthMemo::processing();
+        let mut cold_lengths = VectorFlateLengthMemo::processing();
         let (warm_first, changed, reusable) = factor_processing_structural_forms(
             &mut warm,
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
+            &mut warm_lengths,
         )?;
         let (cold_first, cold_changed, _) = factor_processing_structural_forms(
             &mut cold,
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
+            &mut cold_lengths,
         )?;
         assert_eq!(warm_first, cold_first);
         assert_eq!(changed, cold_changed);
@@ -3755,31 +3945,21 @@ mod tests {
             FlateLevel::PROCESSING,
             &pages,
             reusable,
+            &mut warm_lengths,
         )?;
         let (cold_second, cold_changed, _) = factor_processing_structural_forms(
             &mut cold,
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
+            &mut cold_lengths,
         )?;
         assert_eq!(warm_second, cold_second);
         assert_eq!(warm_changed, cold_changed);
         for page in pages {
-            let content = |document: &EditDocument| -> Result<Vec<u8>> {
-                let Some(object) = document.current_owned_object(page)? else {
-                    return Err(crate::Error::Invalid("missing page".to_owned()));
-                };
-                let Some(dictionary) = object.as_dictionary() else {
-                    return Err(crate::Error::Invalid("page lacks dictionary".to_owned()));
-                };
-                let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-                    return Err(crate::Error::Invalid("page lacks contents".to_owned()));
-                };
-                let mut decoded = Vec::new();
-                decoded_content_value(document, contents, &mut decoded)?;
-                Ok(decoded)
-            };
-            assert_eq!(content(&warm)?, content(&cold)?);
+            let warm_content = page_content_if_present(&warm, page)?;
+            assert!(warm_content.is_some());
+            assert_eq!(warm_content, page_content_if_present(&cold, page)?);
         }
         Ok(())
     }
