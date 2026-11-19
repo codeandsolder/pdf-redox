@@ -497,11 +497,15 @@ impl RasterPhaseEvidence {
         page_count: usize,
         stable_pages: &[crate::ObjectHandle],
     ) -> bool {
-        self.vectors_by_page.len() == page_count
-            && stable_pages.len() == page_count
-            && stable_pages
-                .iter()
-                .all(|page| self.vectors_by_page.contains_key(page))
+        if self.vectors_by_page.len() != page_count || stable_pages.len() != page_count {
+            return false;
+        }
+        // Page tree order need not match object-id order. Sorting a copy keeps
+        // the original page order intact, and comparing iterators also rejects
+        // duplicate page handles compensated by stale cached entries.
+        let mut expected_pages = stable_pages.to_vec();
+        expected_pages.sort_unstable();
+        self.vectors_by_page.keys().copied().eq(expected_pages)
             && !processing_factor_candidate(&self.vectors_by_page)
     }
 
@@ -1229,6 +1233,7 @@ mod tests {
         );
         assert!(evidence.resource_usage_exact);
         assert!(evidence.rules_out_processing_vector_factor(2, &[first, second]));
+        assert!(evidence.rules_out_processing_vector_factor(2, &[second, first]));
         assert!(!evidence.rules_out_processing_vector_factor(2, &[first, first]));
         assert!(!evidence.rules_out_processing_vector_factor(
             2,
