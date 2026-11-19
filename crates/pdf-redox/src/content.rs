@@ -7,44 +7,85 @@ pub struct PageRewriteResult<S> {
     pub rewritten_pages: BTreeSet<ObjectHandle>,
 }
 
+/// Decode PDF content streams and arrays in order, resolving indirect values.
+/// An explicit work stack prevents deep arrays from overflowing the call stack;
+/// active references detect cycles without rejecting repeated sibling streams.
 pub fn decoded_content_value(
     document: &EditDocument,
     value: &OwnedObject,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let value = match value {
-        OwnedObject::Reference(handle) => {
-            let Some(value) = document.current_owned_object(*handle)? else {
-                return Ok(());
-            };
-            if matches!(value, OwnedObject::Stream { .. }) {
-                let bytes = document.decoded_content_stream_data(*handle)?;
-                if !out.is_empty() && out.last() != Some(&b'\n') {
-                    out.push(b'\n');
+    enum Task<'a> {
+        Visit(std::borrow::Cow<'a, OwnedObject>),
+        LeaveReference(ObjectHandle),
+    }
+
+    let mut pending = vec![Task::Visit(std::borrow::Cow::Borrowed(value))];
+    let mut active_references = BTreeSet::new();
+    while let Some(task) = pending.pop() {
+        let value = match task {
+            Task::Visit(value) => value,
+            Task::LeaveReference(handle) => {
+                active_references.remove(&handle);
+                continue;
+            }
+        };
+
+        match value {
+            std::borrow::Cow::Borrowed(OwnedObject::Array(values)) => {
+                pending.extend(
+                    values
+                        .iter()
+                        .rev()
+                        .map(|value| Task::Visit(std::borrow::Cow::Borrowed(value))),
+                );
+            }
+            std::borrow::Cow::Owned(OwnedObject::Array(values)) => {
+                pending.extend(
+                    values
+                        .into_iter()
+                        .rev()
+                        .map(|value| Task::Visit(std::borrow::Cow::Owned(value))),
+                );
+            }
+            value => match value.as_ref() {
+                OwnedObject::Reference(handle) => {
+                    let handle = *handle;
+                    if active_references.contains(&handle) {
+                        return Err(crate::Error::Invalid(
+                            "cyclic indirect reference in page contents".to_owned(),
+                        ));
+                    }
+                    let Some(resolved) = document.current_owned_object(handle)? else {
+                        continue;
+                    };
+                    if matches!(resolved, OwnedObject::Stream { .. }) {
+                        // A stream is a leaf: the common single-stream page
+                        // does not need an allocated active-reference set.
+                        let decoded = document.decoded_content_stream_data(handle)?;
+                        append_decoded_content(out, &decoded);
+                    } else {
+                        active_references.insert(handle);
+                        pending.push(Task::LeaveReference(handle));
+                        pending.push(Task::Visit(std::borrow::Cow::Owned(resolved)));
+                    }
                 }
-                out.extend_from_slice(&bytes);
-                return Ok(());
-            }
-            value
+                OwnedObject::Stream { .. } => {
+                    let decoded = document.decoded_content_stream_value(value.as_ref())?;
+                    append_decoded_content(out, &decoded);
+                }
+                _ => {}
+            },
         }
-        value => value.clone(),
-    };
-    match value {
-        OwnedObject::Stream { .. } => {
-            let bytes = document.decoded_content_stream_value(&value)?;
-            if !out.is_empty() && out.last() != Some(&b'\n') {
-                out.push(b'\n');
-            }
-            out.extend_from_slice(&bytes);
-        }
-        OwnedObject::Array(values) => {
-            for value in values {
-                decoded_content_value(document, &value, out)?;
-            }
-        }
-        _ => {}
     }
     Ok(())
+}
+
+fn append_decoded_content(out: &mut Vec<u8>, decoded: &[u8]) {
+    if !out.is_empty() && out.last() != Some(&b'\n') {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(decoded);
 }
 
 pub fn resolved_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
@@ -363,7 +404,77 @@ pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectId;
     use crate::test_support::ClassicPdfBuilder;
+
+    fn content_reference(number: i32) -> OwnedObject {
+        OwnedObject::Reference(ObjectHandle::Existing(ObjectId::new(number, 0)))
+    }
+
+    #[test]
+    fn content_traversal_follows_reference_chains_and_preserves_repeated_streams() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let alias = document.add_object(content_reference(4));
+        let second_alias = document.add_object(OwnedObject::Reference(ObjectHandle::New(alias)));
+        let array = document.add_object(OwnedObject::Array(vec![
+            content_reference(4),
+            OwnedObject::Reference(ObjectHandle::New(second_alias)),
+        ]));
+        let contents = OwnedObject::Array(vec![
+            OwnedObject::Reference(ObjectHandle::New(array)),
+            OwnedObject::Reference(ObjectHandle::New(second_alias)),
+            OwnedObject::Stream {
+                dictionary: OwnedDictionary::new(),
+                data: StreamData::Owned(b"BT ET".to_vec()),
+            },
+        ]);
+        let mut decoded = Vec::new();
+        decoded_content_value(&document, &contents, &mut decoded)?;
+        assert_eq!(decoded, b"q Q\nq Q\nq Q\nBT ET");
+        Ok(())
+    }
+
+    #[test]
+    fn content_traversal_rejects_reference_cycles() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.object(4, b"[5 0 R]")?;
+        pdf.object(5, b"[4 0 R]")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut decoded = Vec::new();
+        assert!(matches!(
+            decoded_content_value(&document, &content_reference(4), &mut decoded),
+            Err(crate::Error::Invalid(message)) if message.contains("cyclic indirect reference")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn content_traversal_handles_deep_direct_arrays_iteratively() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut content = OwnedObject::Stream {
+            dictionary: OwnedDictionary::new(),
+            data: StreamData::Owned(b"q Q".to_vec()),
+        };
+        for _ in 0..2048 {
+            content = OwnedObject::Array(vec![content]);
+        }
+        let mut decoded = Vec::new();
+        decoded_content_value(&document, &content, &mut decoded)?;
+        assert_eq!(decoded, b"q Q");
+        Ok(())
+    }
 
     #[test]
     fn page_content_presence_and_inherited_xobjects_preserve_resource_semantics() -> Result<()> {
