@@ -232,13 +232,12 @@ fn collect_unfiltered_candidate(
     }
 
     let raw_len = raw.len();
-    let encoded = if level == crate::FlateLevel::SIZE {
-        reuse_cache
-            .take_matching(handle, level, &raw)
-            .map(AdaptiveFlateEncoding::baseline)
-    } else {
-        None
-    };
+    // Both optimization goals may have measured an exact encoded candidate
+    // during page transformation. Reuse it only when the decoded bytes and
+    // requested compression level still match; changed pages fall through.
+    let encoded = reuse_cache
+        .take_matching(handle, level, &raw)
+        .map(AdaptiveFlateEncoding::baseline);
     // If Hayro returned an owned buffer (e.g. decrypted bytes), preserve
     // that buffer for both compression passes instead of decrypting again.
     let raw = match raw {
@@ -1523,6 +1522,57 @@ mod tests {
             cache.take_matching(handle, crate::FlateLevel::PROCESSING, decoded),
             Some(vec![9, 10])
         );
+    }
+
+    #[test]
+    fn processing_cached_stream_matches_uncached_compression() -> crate::Result<()> {
+        // The final unfiltered-stream phase must honor a previously encoded
+        // Processing stream, just as it already does for Size. The digest and
+        // level guard are independently covered by the cache tests above.
+        let raw = b"0 0 30 30 re f\n".repeat(4_096);
+        let (mut cached, handle) = external_stream_fixture(&[], false, &raw)?;
+        let (mut uncached, _) = external_stream_fixture(&[], false, &raw)?;
+        let encoded = crate::stream_codec::encode_flate(&raw, crate::FlateLevel::PROCESSING)?;
+        let mut reuse = FlateReuseCache::default();
+        reuse.insert(handle, crate::FlateLevel::PROCESSING, &raw, encoded.clone());
+
+        let candidate = collect_unfiltered_candidate(
+            &mut cached,
+            handle,
+            crate::FlateLevel::PROCESSING,
+            &mut reuse,
+        )?
+        .ok_or_else(|| crate::Error::Invalid("missing cached stream candidate".into()))?;
+        assert_eq!(
+            candidate
+                .encoded
+                .as_ref()
+                .map(|entry| entry.bytes.as_slice()),
+            Some(encoded.as_slice())
+        );
+        assert_eq!(reuse.retained_bytes, 0);
+        reuse.insert(handle, crate::FlateLevel::PROCESSING, &raw, encoded);
+
+        let batcher = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+        let from_cache = compress_unfiltered_streams(
+            &mut cached,
+            crate::FlateLevel::PROCESSING,
+            &mut reuse,
+            &batcher,
+        )?;
+        let freshly_encoded = compress_unfiltered_streams(
+            &mut uncached,
+            crate::FlateLevel::PROCESSING,
+            &mut FlateReuseCache::default(),
+            &batcher,
+        )?;
+        assert_eq!(from_cache, freshly_encoded);
+        assert_eq!(from_cache.streams_selected, 1);
+        assert_eq!(
+            crate::writer::write_pdf(&cached)?,
+            crate::writer::write_pdf(&uncached)?
+        );
+        Ok(())
     }
 
     #[test]
