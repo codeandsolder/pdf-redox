@@ -453,14 +453,14 @@ struct OptimizationRunStats {
 /// Raster preflight facts are observations of a specific content generation,
 /// not durable facts about page handles. Page rewrites invalidate only their
 /// vector analyses; resource mutations invalidate the global resource inventory
-/// independently (including mutations confined to Form XObjects).
+/// independently (including mutations confined to Form `XObjects`).
 struct RasterPhaseEvidence {
     vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
     resource_usage_exact: bool,
 }
 
 impl RasterPhaseEvidence {
-    fn from_layout(
+    const fn from_layout(
         vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
         layout_enabled: bool,
         layout: &RasterLayoutStats,
