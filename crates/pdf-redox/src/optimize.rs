@@ -45,7 +45,7 @@ use crate::{
         apply_preservation_policy_with_hints, drop_page_thumbnails, drop_private_authoring_data,
     },
     print::{PrintPlanHayro, plan_print_downsampling},
-    prune::{prune_resources, prune_resources_with_usage},
+    prune::{VerifiedResourceUsage, prune_resources},
     raster_layout::{RasterLayoutStats, normalize_raster_layout},
     repeated_clip::{RepeatedClipStats, hoist_repeated_clip_prefixes},
     repeated_page_objects::{
@@ -456,18 +456,18 @@ struct OptimizationRunStats {
 /// independently (including mutations confined to Form `XObjects`).
 struct RasterPhaseEvidence {
     vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
-    resource_usage_exact: bool,
+    resource_usage: Option<VerifiedResourceUsage>,
 }
 
 impl RasterPhaseEvidence {
-    const fn from_layout(
+    fn from_layout(
         vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
         layout_enabled: bool,
-        layout: &RasterLayoutStats,
+        layout: &mut RasterLayoutStats,
     ) -> Self {
         Self {
             vectors_by_page,
-            resource_usage_exact: layout_enabled && layout.resource_inventory_complete,
+            resource_usage: VerifiedResourceUsage::take_from_layout(layout, layout_enabled),
         }
     }
 
@@ -483,9 +483,24 @@ impl RasterPhaseEvidence {
         self.after_resource_mutation(resource_usage_may_change);
     }
 
-    const fn after_resource_mutation(&mut self, resource_usage_may_change: bool) {
+    fn after_resource_mutation(&mut self, resource_usage_may_change: bool) {
         if resource_usage_may_change {
-            self.resource_usage_exact = false;
+            // The inventory belongs to the content generation it describes;
+            // discarding it makes stale reuse impossible after a rewrite.
+            self.resource_usage = None;
+        }
+    }
+
+    fn prune_resources(
+        &self,
+        document: &mut EditDocument,
+        pages: &[crate::ObjectHandle],
+        generated_page_xobjects: &BTreeMap<crate::ObjectHandle, BTreeSet<Vec<u8>>>,
+    ) -> Result<crate::prune::ResourcePruneStats> {
+        if let Some(verified) = &self.resource_usage {
+            verified.prune(document, generated_page_xobjects)
+        } else {
+            prune_resources(document, pages)
         }
     }
 
@@ -532,7 +547,7 @@ fn prepare_raster_preflight(
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
         && repeated_page_objects_prefix_possible(document, pages)?;
     let mut raster_vector_cache = BTreeMap::new();
-    let raster_layout = timed(timings, "raster-layout", || {
+    let mut raster_layout = timed(timings, "raster-layout", || {
         let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
             && !repeated_page_objects_may_rewrite)
             .then_some(&mut raster_vector_cache);
@@ -565,7 +580,7 @@ fn prepare_raster_preflight(
     let evidence = RasterPhaseEvidence::from_layout(
         raster_vector_cache,
         cfg.raster_layout.enabled,
-        &raster_layout,
+        &mut raster_layout,
     );
     Ok(RasterPreflight {
         layout: raster_layout,
@@ -1109,16 +1124,11 @@ fn optimize_pdf_with_document(
     )?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
-        if raster_evidence.resource_usage_exact {
-            prune_resources_with_usage(
-                &mut document,
-                &raster_layout.page_resource_names_by_type,
-                &raster_layout.form_resource_names_by_type,
-                &vector_compaction.generated_page_xobjects,
-            )
-        } else {
-            prune_resources(&mut document, &stable_pages)
-        }
+        raster_evidence.prune_resources(
+            &mut document,
+            &stable_pages,
+            &vector_compaction.generated_page_xobjects,
+        )
     })?;
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         if cfg.rasterize_excessive_small_vectors {
@@ -1279,12 +1289,13 @@ mod tests {
             resource_inventory_complete: true,
             ..RasterLayoutStats::default()
         };
+        let mut layout = layout;
         let mut evidence = RasterPhaseEvidence::from_layout(
             BTreeMap::from([(first, blank_analysis()?), (second, blank_analysis()?)]),
             true,
-            &layout,
+            &mut layout,
         );
-        assert!(evidence.resource_usage_exact);
+        assert!(evidence.resource_usage.is_some());
         assert!(evidence.rules_out_processing_vector_factor(2, &[first, second]));
         assert!(evidence.rules_out_processing_vector_factor(2, &[second, first]));
         assert!(!evidence.rules_out_processing_vector_factor(2, &[first, first]));
@@ -1299,20 +1310,132 @@ mod tests {
         assert!(evidence.vectors_by_page.contains_key(&second));
         assert!(!evidence.vectors_by_page.contains_key(&first));
         assert!(!evidence.rules_out_processing_vector_factor(2, &[first, second]));
-        assert!(evidence.resource_usage_exact);
+        assert!(evidence.resource_usage.is_some());
 
         // A Form-only edit can invalidate resource usage without rewriting any
         // page, while resource invalidation must remain sticky thereafter.
         evidence.after_page_rewrite(&BTreeSet::new(), true);
         assert!(evidence.vectors_by_page.contains_key(&second));
-        assert!(!evidence.resource_usage_exact);
+        assert!(evidence.resource_usage.is_none());
         evidence.after_page_rewrite(&BTreeSet::new(), false);
-        assert!(!evidence.resource_usage_exact);
+        assert!(evidence.resource_usage.is_none());
         assert_eq!(evidence.take_vector_analysis().len(), 1);
         assert!(evidence.vectors_by_page.is_empty());
 
-        let disabled = RasterPhaseEvidence::from_layout(BTreeMap::new(), false, &layout);
-        assert!(!disabled.resource_usage_exact);
+        let disabled = RasterPhaseEvidence::from_layout(BTreeMap::new(), false, &mut layout);
+        assert!(disabled.resource_usage.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resource_pruning_proof_keeps_current_names_and_falls_back_after_rewrite() -> Result<()> {
+        use crate::{
+            ObjectHandle, ObjectId,
+            content::{page_resources, replace_page_content, resolved_dictionary},
+        };
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Keep 5 0 R /Drop 6 0 R >> >> /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"/Keep Do")?;
+        for (id, gray) in [(5, 42), (6, 84)] {
+            pdf.stream(
+                id,
+                b"/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8",
+                &[gray],
+            )?;
+        }
+        let input = pdf.finish(1)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let source_usage = || RasterLayoutStats {
+            resource_inventory_complete: true,
+            page_resource_names_by_type: BTreeMap::from([(
+                page,
+                BTreeMap::from([(b"XObject".to_vec(), BTreeSet::from([b"Keep".to_vec()]))]),
+            )]),
+            ..RasterLayoutStats::default()
+        };
+        let remaining_names = |doc: &EditDocument| -> Result<BTreeSet<Vec<u8>>> {
+            let page_resources = page_resources(doc, page)?
+                .ok_or_else(|| Error::Invalid("page has no resources".to_owned()))?;
+            let xobjects = resolved_dictionary(doc, page_resources.get(b"XObject".as_slice()))?
+                .ok_or_else(|| Error::Invalid("page has no XObjects".to_owned()))?;
+            Ok(xobjects.keys().cloned().collect())
+        };
+
+        let mut fast_document = EditDocument::from_bytes(input.clone())?;
+        let mut fresh_layout = source_usage();
+        let evidence = RasterPhaseEvidence::from_layout(BTreeMap::new(), true, &mut fresh_layout);
+        assert!(evidence.resource_usage.is_some());
+        assert!(fresh_layout.page_resource_names_by_type.is_empty());
+        assert!(fresh_layout.form_resource_names_by_type.is_empty());
+        let stats = evidence.prune_resources(&mut fast_document, &[page], &BTreeMap::new())?;
+        assert_eq!(stats.xobjects, 1);
+        assert_eq!(
+            remaining_names(&fast_document)?,
+            BTreeSet::from([b"Keep".to_vec()])
+        );
+
+        // Form factoring can introduce a page XObject name after raster
+        // preflight. Verified pruning must preserve such explicitly generated
+        // names even if the original content inventory did not contain them.
+        let mut generated_document = EditDocument::from_bytes(input.clone())?;
+        let mut generated_layout = source_usage();
+        let generated_evidence =
+            RasterPhaseEvidence::from_layout(BTreeMap::new(), true, &mut generated_layout);
+        let generated = BTreeMap::from([(page, BTreeSet::from([b"Drop".to_vec()]))]);
+        assert_eq!(
+            generated_evidence.prune_resources(&mut generated_document, &[page], &generated)?,
+            crate::prune::ResourcePruneStats::default()
+        );
+        assert_eq!(
+            remaining_names(&generated_document)?,
+            BTreeSet::from([b"Keep".to_vec(), b"Drop".to_vec()])
+        );
+
+        // Replacing content with a reference to a previously unused resource
+        // invalidates the original proof: the full scanner must retain /Drop.
+        let mut rewritten_document = EditDocument::from_bytes(input.clone())?;
+        let mut stale_layout = source_usage();
+        let mut stale_evidence =
+            RasterPhaseEvidence::from_layout(BTreeMap::new(), true, &mut stale_layout);
+        replace_page_content(&mut rewritten_document, page, b"/Drop Do".to_vec())?;
+        stale_evidence.after_page_rewrite(&BTreeSet::from([page]), true);
+        assert!(stale_evidence.resource_usage.is_none());
+        let fallback =
+            stale_evidence.prune_resources(&mut rewritten_document, &[page], &BTreeMap::new())?;
+        assert_eq!(fallback.xobjects, 1);
+        assert_eq!(
+            remaining_names(&rewritten_document)?,
+            BTreeSet::from([b"Drop".to_vec()])
+        );
+
+        // If raster proof collection is unavailable, its maps are left
+        // unconsumed and pruning likewise uses the canonical full scan.
+        let mut disabled_layout = source_usage();
+        let disabled =
+            RasterPhaseEvidence::from_layout(BTreeMap::new(), false, &mut disabled_layout);
+        assert!(disabled.resource_usage.is_none());
+        assert!(!disabled_layout.page_resource_names_by_type.is_empty());
+        let mut incomplete_layout = source_usage();
+        incomplete_layout.resource_inventory_complete = false;
+        let incomplete =
+            RasterPhaseEvidence::from_layout(BTreeMap::new(), true, &mut incomplete_layout);
+        assert!(incomplete.resource_usage.is_none());
+        assert!(!incomplete_layout.page_resource_names_by_type.is_empty());
+        let mut fallback_document = EditDocument::from_bytes(input)?;
+        assert_eq!(
+            disabled.prune_resources(&mut fallback_document, &[page], &BTreeMap::new())?,
+            stats
+        );
+        assert_eq!(
+            remaining_names(&fallback_document)?,
+            BTreeSet::from([b"Keep".to_vec()])
+        );
         Ok(())
     }
 
