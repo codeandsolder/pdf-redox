@@ -18,7 +18,7 @@ version = "0.1.0"
 hayro-syntax = { git = "https://github.com/codeandsolder/hayro", branch = "pdf-redox/zero-flpdf-base", default-features = false, features = ["std", "images"] }
 # Use our zlib-rs line directly so independent PDF streams can use its exact batch API.
 # Processing remains level 7; Size remains level 9.
-zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "6c23bfb7497cf5cd07e279827e88064fae4a938a", default-features = false, features = ["std"] }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "1a34532703a9960ce9f499810a5465b7086ba186", default-features = false, features = ["std"] }
 libjpeg-turbo-rs = "=0.9.0"
 fast_image_resize = "6.1"
 fax = "=0.3.0"
