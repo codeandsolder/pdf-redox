@@ -3447,30 +3447,17 @@ fn write_compacted_vector_page(
     flate_reuse_cache: &mut FlateReuseCache,
 ) -> Result<Option<usize>> {
     let before_flate = crate::stream_codec::flate_encoded_len(decoded, flate_level)?;
-    let after_encoded = if goal == OptimizationGoal::Size {
-        Some(crate::stream_codec::encode_flate(&compacted, flate_level)?)
-    } else {
-        None
-    };
-    let after_flate = match &after_encoded {
-        Some(encoded) => encoded.len(),
-        None => crate::stream_codec::flate_encoded_len(&compacted, flate_level)?,
-    };
+    // Processing also needs the exact encoded length for its savings report.
+    // Retain those already-computed bytes for the final unfiltered-stream
+    // compression phase instead of recompressing unchanged page content.
+    let after_encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
+    let after_flate = after_encoded.len();
     if goal == OptimizationGoal::Size && after_flate >= before_flate {
         return Ok(None);
     }
-    if let Some(after_encoded) = after_encoded {
-        let decoded_sha256 = Sha256::digest(&compacted).into();
-        let replacement = replace_page_content_with_handle(document, page, compacted)?;
-        flate_reuse_cache.insert_with_digest(
-            replacement,
-            flate_level,
-            decoded_sha256,
-            after_encoded,
-        );
-    } else {
-        replace_page_content(document, page, compacted)?;
-    }
+    let decoded_sha256 = Sha256::digest(&compacted).into();
+    let replacement = replace_page_content_with_handle(document, page, compacted)?;
+    flate_reuse_cache.insert_with_digest(replacement, flate_level, decoded_sha256, after_encoded);
     Ok(Some(before_flate.saturating_sub(after_flate)))
 }
 
@@ -3577,6 +3564,79 @@ pub fn compact_vector_paths_with_flate_cache(
 mod tests {
     use super::*;
     use crate::ObjectId;
+
+    #[test]
+    fn compacted_page_processing_reuses_exact_encoding() -> Result<()> {
+        use crate::{FlateLevel, test_support::ClassicPdfBuilder};
+
+        let original = b"0 0 30 30 re f\n".repeat(3_000);
+        let compacted = b"0 0 30 30 re f\n".repeat(1_000);
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", &original)?;
+        let source = pdf.finish(1)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let batcher = crate::stream_codec::FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?;
+
+        for (goal, level) in [
+            (OptimizationGoal::Processing, FlateLevel::PROCESSING),
+            (OptimizationGoal::Size, FlateLevel::SIZE),
+        ] {
+            let mut cached = EditDocument::from_bytes(source.clone())?;
+            let mut uncached = EditDocument::from_bytes(source.clone())?;
+            let mut cache = FlateReuseCache::default();
+            let mut empty = FlateReuseCache::default();
+            let estimated = write_compacted_vector_page(
+                &mut cached,
+                page,
+                &original,
+                compacted.clone(),
+                level,
+                goal,
+                &mut cache,
+            )?;
+            let reference_estimated = write_compacted_vector_page(
+                &mut uncached,
+                page,
+                &original,
+                compacted.clone(),
+                level,
+                goal,
+                &mut empty,
+            )?;
+            assert_eq!(estimated, reference_estimated);
+            assert!(estimated.is_some());
+            let expected_savings = crate::stream_codec::flate_encoded_len(&original, level)?
+                .saturating_sub(crate::stream_codec::flate_encoded_len(&compacted, level)?);
+            assert_eq!(estimated, Some(expected_savings));
+            // The reference must use a fresh uncached encoding.
+            empty = FlateReuseCache::default();
+
+            let reused_stats = crate::flate::compress_unfiltered_streams(
+                &mut cached,
+                level,
+                &mut cache,
+                &batcher,
+            )?;
+            let reference_stats = crate::flate::compress_unfiltered_streams(
+                &mut uncached,
+                level,
+                &mut empty,
+                &batcher,
+            )?;
+            assert_eq!(reused_stats, reference_stats);
+            assert_eq!(
+                crate::writer::write_pdf(&cached)?,
+                crate::writer::write_pdf(&uncached)?
+            );
+        }
+        Ok(())
+    }
 
     fn processing_analysis(
         path_keys: &[&[u8]],
