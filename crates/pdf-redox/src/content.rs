@@ -62,6 +62,9 @@ pub fn decoded_content_value(
                         Some(crate::source::ContentRead::Decoded(decoded)) => {
                             append_decoded_content(out, &decoded);
                         }
+                        Some(crate::source::ContentRead::Cached(decoded)) => {
+                            append_decoded_content(out, &decoded);
+                        }
                         Some(crate::source::ContentRead::Other(resolved)) => {
                             active_references.insert(handle);
                             pending.push(Task::LeaveReference(handle));
