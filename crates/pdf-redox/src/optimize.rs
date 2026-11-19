@@ -1,6 +1,6 @@
 use crate::{
     Config, EditDocument, GlyphCatalog, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
-    analyze::analyze_document_for_optimization,
+    analyze::{OptimizationAnalysis, analyze_document_for_optimization},
     content::{PageRewriteResult, normalize_page_contents},
     dead_paint::{DeadPaintStats, eliminate_dead_image_paints},
     dedup::{
@@ -323,6 +323,27 @@ pub fn optimize_pdf_with_glyph_catalog(
     Ok((output, report, catalog))
 }
 
+/// A freshly analyzed document carries source-local handles; a cached public
+/// report cannot, so optimizations requiring those handles must rescan.
+/// Keeping the two states distinct prevents accidentally treating cached
+/// reports as complete source inventories.
+enum PreparedAnalysis {
+    Fresh(OptimizationAnalysis),
+    Cached(PdfAnalysis),
+}
+
+impl PreparedAnalysis {
+    fn into_parts(self) -> (PdfAnalysis, Option<Vec<crate::ObjectHandle>>) {
+        match self {
+            Self::Fresh(analysis) => (
+                analysis.report,
+                Some(analysis.ext_gstate_dictionary_handles),
+            ),
+            Self::Cached(report) => (report, None),
+        }
+    }
+}
+
 fn optimize_pdf_impl(
     input: &[u8],
     cfg: &Config,
@@ -339,8 +360,7 @@ fn optimize_pdf_impl(
     optimize_pdf_with_document(
         document,
         cfg,
-        analysis.report,
-        Some(&analysis.ext_gstate_dictionary_handles),
+        PreparedAnalysis::Fresh(analysis),
         timings,
         catalog,
     )
@@ -365,7 +385,13 @@ pub fn optimize_pdf_with_analysis(
     let document = timed(&mut timings, "document-open", || {
         EditDocument::from_bytes(input.to_vec())
     })?;
-    optimize_pdf_with_document(document, cfg, analysis.clone(), None, timings, None)
+    optimize_pdf_with_document(
+        document,
+        cfg,
+        PreparedAnalysis::Cached(analysis.clone()),
+        timings,
+        None,
+    )
 }
 
 fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
@@ -431,11 +457,12 @@ struct OptimizationRunStats {
 fn optimize_pdf_with_document(
     mut document: EditDocument,
     cfg: &Config,
-    before: PdfAnalysis,
-    ext_gstate_dictionary_handles: Option<&[crate::ObjectHandle]>,
+    analysis: PreparedAnalysis,
     mut timings: BTreeMap<String, f64>,
     catalog: Option<&mut GlyphCatalog>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
+    let (before, ext_gstate_handles) = analysis.into_parts();
+    let ext_gstate_dictionary_handles = ext_gstate_handles.as_deref();
     let flate_level = cfg.optimization_goal.flate_level();
     let preservation_fast_path = preservation_uses_fast_path(&cfg.preservation);
     let preservation_scan_hints = PreservationScanHints {
@@ -1688,10 +1715,16 @@ mod tests {
         let analysis = analyze_document_for_optimization(&input, &document)?;
         assert_eq!(analysis.ext_gstate_dictionary_handles.len(), 2);
 
-        let (_, report) =
-            optimize_pdf_with_analysis(&input, &Config::optimize_only(), &analysis.report)?;
+        let cfg = Config::optimize_only();
+        let (fresh_output, fresh_report) = optimize_pdf(&input, &cfg)?;
+        let (cached_output, report) = optimize_pdf_with_analysis(&input, &cfg, &analysis.report)?;
+        assert_eq!(cached_output, fresh_output);
         assert_eq!(report.extgstate_duplicate_dictionaries_detected, 1);
         assert_eq!(report.extgstate_dictionary_references_canonicalized, 1);
+        assert_eq!(
+            report.extgstate_dictionary_references_canonicalized,
+            fresh_report.extgstate_dictionary_references_canonicalized
+        );
         Ok(())
     }
 
