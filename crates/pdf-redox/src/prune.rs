@@ -5,10 +5,48 @@ use crate::{
         xobject_handles,
     },
     content_stream::resource_type_for_operator,
+    raster_layout::RasterLayoutStats,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
+
+type ResourceUsageByTarget = BTreeMap<ObjectHandle, ResourceNamesByType>;
+
+/// A resource-name inventory proven complete by the raster scanner. The
+/// owned maps cannot be detached from the proof or reconstructed by callers.
+/// Any intervening resource-affecting mutation must discard the entire value.
+pub struct VerifiedResourceUsage {
+    page_names_by_type: ResourceUsageByTarget,
+    form_names_by_type: ResourceUsageByTarget,
+}
+
+impl VerifiedResourceUsage {
+    /// Consume the inventory from the raster scan only when the scanner
+    /// completed every relevant scope. Otherwise the caller must rescan.
+    pub(crate) fn take_from_layout(layout: &mut RasterLayoutStats, enabled: bool) -> Option<Self> {
+        if !enabled || !layout.resource_inventory_complete {
+            return None;
+        }
+        Some(Self {
+            page_names_by_type: std::mem::take(&mut layout.page_resource_names_by_type),
+            form_names_by_type: std::mem::take(&mut layout.form_resource_names_by_type),
+        })
+    }
+
+    pub(crate) fn prune(
+        &self,
+        document: &mut EditDocument,
+        generated_page_xobjects: &BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
+    ) -> Result<ResourcePruneStats> {
+        prune_resources_with_usage(
+            document,
+            &self.page_names_by_type,
+            &self.form_names_by_type,
+            generated_page_xobjects,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct DetachedResourceUsage {
@@ -244,7 +282,7 @@ pub fn prune_xobject_candidates_for_content(
     Ok((resources, removed))
 }
 
-pub fn prune_resources_with_usage(
+fn prune_resources_with_usage(
     document: &mut EditDocument,
     page_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
     form_names_by_type: &BTreeMap<ObjectHandle, ResourceNamesByType>,
