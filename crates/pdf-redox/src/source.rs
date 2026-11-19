@@ -612,6 +612,13 @@ struct DecodedContentCache {
     streams: BTreeMap<ObjectId, Vec<u8>>,
 }
 
+/// A content reference is either a decoded stream or a non-stream COS value.
+/// Returning the latter borrowed keeps overlay-backed reference chains cheap.
+pub enum ContentRead<'a> {
+    Decoded(Vec<u8>),
+    Other(Cow<'a, OwnedObject>),
+}
+
 struct ReachableOutputCache {
     generation: u64,
     traversal: Vec<ObjectHandle>,
@@ -876,43 +883,56 @@ impl EditDocument {
         self.decoded_owned_stream_data(&stream)
     }
 
-    /// Decode page/Form content while memoizing untouched source streams.
+    /// Resolve a page/Form content reference, decoding streams in one pass.
     ///
-    /// The cache is intentionally content-specific rather than attached to the
-    /// generic stream decoder so large image/font payloads are never retained
-    /// merely because an optimization pass inspected them. Overlay-edited or
-    /// newly created streams bypass the cache, so mutations need no invalidation.
-    pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
-        if let ObjectHandle::Existing(id) = handle
-            && self.overlay.change(id).is_none()
+    /// Cache lookup precedes source object materialization. A cache entry was
+    /// inserted only for an immutable source stream with direct filter values;
+    /// references into the mutable overlay are deliberately never cached.
+    pub(crate) fn content_read(&self, handle: ObjectHandle) -> Result<Option<ContentRead<'_>>> {
+        let unchanged_source_id = match handle {
+            ObjectHandle::Existing(id) if self.overlay.change(id).is_none() => Some(id),
+            _ => None,
+        };
+        if let Some(id) = unchanged_source_id
+            && let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id)
         {
-            let Some(stream) = self.current_owned_object(handle)? else {
-                return Err(Error::Invalid(
-                    "stream reference resolves to null".to_owned(),
-                ));
-            };
-            if stream_filter_configuration_is_direct(&stream) {
-                if let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id) {
-                    return Ok(decoded.clone());
-                }
-                let decoded = self.decoded_content_stream_value(&stream)?;
-                if decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES {
-                    let mut cache = self.decoded_content_stream_cache.borrow_mut();
-                    if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES
-                    {
-                        cache.bytes = cache.bytes.saturating_add(decoded.len());
-                        cache.streams.insert(id, decoded.clone());
-                    }
-                }
-                return Ok(decoded);
+            return Ok(Some(ContentRead::Decoded(decoded.clone())));
+        }
+
+        let Some(object) = self.current_owned_object_cow(handle)? else {
+            return Ok(None);
+        };
+        if !matches!(object.as_ref(), OwnedObject::Stream { .. }) {
+            return Ok(Some(ContentRead::Other(object)));
+        }
+
+        let cache_id =
+            unchanged_source_id.filter(|_| stream_filter_configuration_is_direct(&object));
+        let decoded = self.decoded_content_stream_value(&object)?;
+        if let Some(id) = cache_id
+            && decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES
+        {
+            let mut cache = self.decoded_content_stream_cache.borrow_mut();
+            if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES {
+                cache.bytes = cache.bytes.saturating_add(decoded.len());
+                cache.streams.insert(id, decoded.clone());
             }
         }
-        let Some(stream) = self.current_owned_object(handle)? else {
-            return Err(Error::Invalid(
+        Ok(Some(ContentRead::Decoded(decoded)))
+    }
+
+    /// Decode page/Form content while memoizing untouched source streams.
+    ///
+    /// The cache is content-specific: image and font decoding never retains
+    /// large payloads. Source edits bypass entries without invalidation.
+    pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
+        match self.content_read(handle)? {
+            Some(ContentRead::Decoded(bytes)) => Ok(bytes),
+            Some(ContentRead::Other(_)) => Err(Error::Invalid("object is not a stream".to_owned())),
+            None => Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
-            ));
-        };
-        self.decoded_content_stream_value(&stream)
+            )),
+        }
     }
 
     fn current_object_storage(&self, handle: ObjectHandle) -> Result<CurrentObjectStorage<'_>> {
@@ -1702,6 +1722,78 @@ mod tests {
         *data = StreamData::Owned(b"BT ET".to_vec());
         let second = document.decoded_content_stream_data(handle)?;
         assert_eq!(second, b"BT ET");
+        Ok(())
+    }
+
+    #[test]
+    fn content_cache_reuses_unchanged_source_only_and_bypasses_indirect_filters() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents [4 0 R 5 0 R] >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        let encoded = crate::stream_codec::encode_flate(b"BT ET", crate::FlateLevel::PROCESSING)?;
+        pdf.stream(5, b"/Filter 6 0 R", &encoded)?;
+        pdf.object(6, b"/FlateDecode")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let plain = ObjectHandle::Existing(ObjectId::new(4, 0));
+        let indirect = ObjectHandle::Existing(ObjectId::new(5, 0));
+        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
+        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
+        assert_eq!(document.decoded_content_stream_data(indirect)?, b"BT ET");
+        assert_eq!(document.decoded_content_stream_data(indirect)?, b"BT ET");
+        let page = document.page_handles()?[0];
+        assert_eq!(
+            crate::content::page_content(&document, page)?,
+            b"q Q\nBT ET"
+        );
+        assert_eq!(
+            crate::content::page_content(&document, page)?,
+            b"q Q\nBT ET"
+        );
+        {
+            let cache = document.decoded_content_stream_cache.borrow();
+            assert_eq!(cache.streams.len(), 1);
+            assert_eq!(
+                cache.streams.get(&ObjectId::new(4, 0)),
+                Some(&b"q Q".to_vec())
+            );
+            assert!(!cache.streams.contains_key(&ObjectId::new(5, 0)));
+        }
+
+        *document.edit_object(ObjectId::new(6, 0))? = OwnedObject::Name(b"ASCIIHexDecode".to_vec());
+        // Indirect filter aliases depend on the COW graph and must be decoded
+        // again after changing the referenced object.
+        assert!(document.decoded_content_stream_data(indirect).is_err());
+        assert!(crate::content::page_content(&document, page).is_err());
+        // Editing an unrelated filter does not invalidate a direct source's
+        // cached bytes.
+        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
+        Ok(())
+    }
+
+    #[test]
+    fn content_decode_borrows_new_overlay_streams_without_source_cache_entries() -> Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary: OwnedDictionary::new(),
+            data: StreamData::Owned(b"BT ET".to_vec()),
+        }));
+        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
+        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
+        assert!(
+            document
+                .decoded_content_stream_cache
+                .borrow()
+                .streams
+                .is_empty()
+        );
         Ok(())
     }
 
