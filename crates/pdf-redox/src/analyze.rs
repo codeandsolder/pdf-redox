@@ -806,13 +806,35 @@ fn filter_name(
     filter_value_name(document, value)
 }
 
+/// The three supported analysis contracts. Each exposes a different set of
+/// facts, rather than letting callers combine independent Boolean switches.
+#[derive(Clone, Copy)]
+enum AnalysisMode {
+    /// Source-only inventories for optimization, without display-oriented work.
+    Optimization,
+    /// Source inventories plus page/Form content-density statistics.
+    Preflight,
+    /// Full duplicate, compression, risk, and content analysis.
+    Complete,
+}
+
+impl AnalysisMode {
+    const fn deep(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    const fn content_density(self) -> bool {
+        !matches!(self, Self::Optimization)
+    }
+}
+
 /// Analyze a PDF without modifying it.
 ///
 /// # Errors
 ///
 /// Returns an error when the input cannot be parsed or a referenced stream cannot be decoded.
 pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
-    analyze_pdf_impl(input, true, true)
+    analyze_pdf_impl(input, AnalysisMode::Complete)
 }
 
 /// Analyze inexpensive structural and content-density metrics without deep duplicate/compression work.
@@ -823,7 +845,7 @@ pub fn analyze_pdf(input: &[u8]) -> Result<PdfAnalysis> {
 ///
 /// Returns an error when the input cannot be parsed or required structural streams cannot be decoded.
 pub fn analyze_pdf_preflight(input: &[u8]) -> Result<PdfAnalysis> {
-    analyze_pdf_impl(input, false, true)
+    analyze_pdf_impl(input, AnalysisMode::Preflight)
 }
 
 /// Internal optimizer analysis plus non-serialized source-handle hints.
@@ -838,7 +860,7 @@ pub fn analyze_document_for_optimization(
     input: &[u8],
     document: &EditDocument,
 ) -> Result<OptimizationAnalysis> {
-    analyze_document_impl(input, document, false, false)
+    analyze_document_impl(input, document, AnalysisMode::Optimization)
 }
 
 #[derive(Default)]
@@ -1112,9 +1134,9 @@ fn record_content_analysis(out: &mut PdfAnalysis, content: &ContentAnalysisStats
     out.form_content_incomplete_parse_forms = content.form_incomplete_parse_count;
 }
 
-fn analyze_pdf_impl(input: &[u8], deep: bool, content_density: bool) -> Result<PdfAnalysis> {
+fn analyze_pdf_impl(input: &[u8], mode: AnalysisMode) -> Result<PdfAnalysis> {
     let document = EditDocument::from_bytes(input.to_vec())?;
-    Ok(analyze_document_impl(input, &document, deep, content_density)?.report)
+    Ok(analyze_document_impl(input, &document, mode)?.report)
 }
 
 // Exact deep-analysis recompression estimates can run independently. Keep decoded
@@ -1760,9 +1782,10 @@ impl ObjectAnalysisAccumulator {
 fn analyze_document_impl(
     input: &[u8],
     document: &EditDocument,
-    deep: bool,
-    content_density: bool,
+    mode: AnalysisMode,
 ) -> Result<OptimizationAnalysis> {
+    let deep = mode.deep();
+    let content_density = mode.content_density();
     let object_ids = deep.then(|| document.source().object_ids());
     let mut objects = object_ids
         .as_ref()
@@ -2543,6 +2566,38 @@ mod tests {
         );
         assert_eq!(analysis.object_role_counts.get("stream:other"), Some(&1));
         assert_eq!(analysis.object_role_counts.get("dict:Page"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn analysis_modes_expose_consistent_source_facts_without_extra_work() -> Result<()> {
+        let input = content_density_fixture()?;
+        let document = EditDocument::from_bytes(input.clone())?;
+        let optimizer = analyze_document_for_optimization(&input, &document)?.report;
+        let preflight = analyze_pdf_preflight(&input)?;
+        let complete = analyze_pdf(&input)?;
+
+        assert!(!optimizer.analysis_complete);
+        assert!(!preflight.analysis_complete);
+        assert!(complete.analysis_complete);
+        assert_eq!(optimizer.page_content_instruction_count, 0);
+        assert!(preflight.page_content_instruction_count > 0);
+        assert_eq!(
+            preflight.page_content_instruction_count,
+            complete.page_content_instruction_count
+        );
+        for analysis in [&preflight, &complete] {
+            assert_eq!(optimizer.input_sha256, analysis.input_sha256);
+            assert_eq!(optimizer.object_count, analysis.object_count);
+            assert_eq!(
+                optimizer.piece_info_key_count,
+                analysis.piece_info_key_count
+            );
+            assert_eq!(
+                optimizer.targeted_dedup_key_inventory_version,
+                analysis.targeted_dedup_key_inventory_version
+            );
+        }
         Ok(())
     }
 

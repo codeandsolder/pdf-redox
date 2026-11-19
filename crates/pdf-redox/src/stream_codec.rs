@@ -79,12 +79,6 @@ fn standalone_filter_dictionary(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
 ) -> Result<Vec<u8>> {
-    if has_external_file_stream_entries(dictionary) {
-        return Err(Error::Invalid(
-            "external-file stream filters are unsupported".to_owned(),
-        ));
-    }
-
     let mut output = Vec::new();
     output.extend_from_slice(b"<<");
     for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
@@ -100,21 +94,32 @@ fn standalone_filter_dictionary(
     Ok(output)
 }
 
+/// Prepare the inline filter chain once for both ordinary and image streams.
+/// External-file entries take precedence even when no inline `/Filter` exists.
+fn inline_filter_dictionary(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<Option<Vec<u8>>> {
+    if has_external_file_stream_entries(dictionary) {
+        return Err(Error::Invalid(
+            "external-file stream data cannot be decoded as inline payload".to_owned(),
+        ));
+    }
+    dictionary
+        .contains_key(b"Filter".as_slice())
+        .then(|| standalone_filter_dictionary(document, dictionary))
+        .transpose()
+}
+
 /// Decode bytes using the stream's current `/Filter` and `/DecodeParms`.
 pub fn decode_stream(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     encoded: &[u8],
 ) -> Result<Vec<u8>> {
-    if has_external_file_stream_entries(dictionary) {
-        return Err(Error::Invalid(
-            "external-file stream data cannot be decoded as inline payload".to_owned(),
-        ));
-    }
-    if !dictionary.contains_key(b"Filter".as_slice()) {
+    let Some(filter_dictionary) = inline_filter_dictionary(document, dictionary)? else {
         return Ok(encoded.to_vec());
-    }
-    let filter_dictionary = standalone_filter_dictionary(document, dictionary)?;
+    };
     hayro_syntax::object::stream::decode_standalone_stream(&filter_dictionary, encoded)
         .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
 }
@@ -129,15 +134,9 @@ pub fn decode_image_stream(
     bits_per_component: u8,
     components: u8,
 ) -> Result<Vec<u8>> {
-    if has_external_file_stream_entries(dictionary) {
-        return Err(Error::Invalid(
-            "external-file image data cannot be decoded as inline payload".to_owned(),
-        ));
-    }
-    if !dictionary.contains_key(b"Filter".as_slice()) {
+    let Some(filter_dictionary) = inline_filter_dictionary(document, dictionary)? else {
         return Ok(encoded.to_vec());
-    }
-    let filter_dictionary = standalone_filter_dictionary(document, dictionary)?;
+    };
     let params = hayro_syntax::object::stream::ImageDecodeParams {
         is_indexed: false,
         bpc: Some(bits_per_component),
@@ -414,6 +413,46 @@ mod tests {
                 ordinary.remove(b"Filter".as_slice());
             }
             ordinary.remove(key);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_filter_preparation_resolves_indirect_filters_and_parameters() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        )?;
+        pdf.object(4, b"/FlateDecode")?;
+        pdf.object(5, b"<< /Predictor 1 >>")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let raw = b"x";
+        let encoded = encode_flate(raw, crate::FlateLevel::PROCESSING)?;
+        let filter =
+            OwnedObject::Reference(crate::ObjectHandle::Existing(crate::ObjectId::new(4, 0)));
+        let parms =
+            OwnedObject::Reference(crate::ObjectHandle::Existing(crate::ObjectId::new(5, 0)));
+        for (filter, parms) in [
+            (filter.clone(), parms.clone()),
+            (
+                OwnedObject::Array(vec![filter]),
+                OwnedObject::Array(vec![parms]),
+            ),
+        ] {
+            let dictionary = OwnedDictionary::from([
+                (b"Filter".to_vec(), filter),
+                (b"DecodeParms".to_vec(), parms),
+            ]);
+            assert_eq!(decode_stream(&document, &dictionary, &encoded)?, raw);
+            assert_eq!(
+                decode_image_stream(&document, &dictionary, &encoded, 1, 1, 8, 1)?,
+                raw
+            );
         }
         Ok(())
     }
