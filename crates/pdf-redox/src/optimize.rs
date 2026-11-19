@@ -46,7 +46,7 @@ use crate::{
     },
     print::{PrintPlanHayro, plan_print_downsampling},
     prune::{prune_resources, prune_resources_with_usage},
-    raster_layout::normalize_raster_layout,
+    raster_layout::{RasterLayoutStats, normalize_raster_layout},
     repeated_clip::{RepeatedClipStats, hoist_repeated_clip_prefixes},
     repeated_page_objects::{
         RepeatedPageObjectStats, remove_repeated_page_objects,
@@ -56,8 +56,8 @@ use crate::{
     stream_codec::FlateBatchEncoder,
     structure_compact::compact_structure,
     vector_compact::{
-        VectorCompactionStats, compact_vector_paths_with_flate_cache, factor_size_shared_forms,
-        processing_factor_candidate,
+        ProcessingVectorAnalysis, VectorCompactionStats, compact_vector_paths_with_flate_cache,
+        factor_size_shared_forms, processing_factor_candidate,
     },
 };
 use std::{
@@ -450,6 +450,125 @@ struct OptimizationRunStats {
     font_cid_cmap_strip: FontOptimizationStats,
 }
 
+/// Raster preflight facts are observations of a specific content generation,
+/// not durable facts about page handles. Page rewrites invalidate only their
+/// vector analyses; resource mutations invalidate the global resource inventory
+/// independently (including mutations confined to Form XObjects).
+struct RasterPhaseEvidence {
+    vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
+    resource_usage_exact: bool,
+}
+
+impl RasterPhaseEvidence {
+    fn from_layout(
+        vectors_by_page: BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis>,
+        layout_enabled: bool,
+        layout: &RasterLayoutStats,
+    ) -> Self {
+        Self {
+            vectors_by_page,
+            resource_usage_exact: layout_enabled && layout.resource_inventory_complete,
+        }
+    }
+
+    /// A page rewrite can invalidate previously parsed vector candidates.
+    /// A resource effect may also originate in a Form, with no page rewrite.
+    fn after_page_rewrite(
+        &mut self,
+        rewritten_pages: &BTreeSet<crate::ObjectHandle>,
+        resource_usage_may_change: bool,
+    ) {
+        self.vectors_by_page
+            .retain(|page, _| !rewritten_pages.contains(page));
+        self.after_resource_mutation(resource_usage_may_change);
+    }
+
+    const fn after_resource_mutation(&mut self, resource_usage_may_change: bool) {
+        if resource_usage_may_change {
+            self.resource_usage_exact = false;
+        }
+    }
+
+    /// A negative candidate proof requires a current analysis for *every*
+    /// page in the stable page snapshot. Matching counts alone are insufficient:
+    /// an extra/stale page must not compensate for a missing current one.
+    fn rules_out_processing_vector_factor(
+        &self,
+        page_count: usize,
+        stable_pages: &[crate::ObjectHandle],
+    ) -> bool {
+        self.vectors_by_page.len() == page_count
+            && stable_pages.len() == page_count
+            && stable_pages
+                .iter()
+                .all(|page| self.vectors_by_page.contains_key(page))
+            && !processing_factor_candidate(&self.vectors_by_page)
+    }
+
+    fn take_vector_analysis(&mut self) -> BTreeMap<crate::ObjectHandle, ProcessingVectorAnalysis> {
+        std::mem::take(&mut self.vectors_by_page)
+    }
+}
+
+/// Analysis and its reusable proofs originate from the same raster pass.
+/// Subsequent mutating phases must update the proof lifecycle explicitly.
+struct RasterPreflight {
+    layout: RasterLayoutStats,
+    evidence: RasterPhaseEvidence,
+}
+
+fn prepare_raster_preflight(
+    document: &mut EditDocument,
+    pages: &[crate::ObjectHandle],
+    cfg: &Config,
+    flate_level: crate::FlateLevel,
+    timings: &mut BTreeMap<String, f64>,
+) -> Result<RasterPreflight> {
+    let repeated_page_objects_may_rewrite = cfg.remove_repeated_page_objects
+        && cfg.optimization_goal == crate::OptimizationGoal::Processing
+        && repeated_page_objects_prefix_possible(document, pages)?;
+    let mut raster_vector_cache = BTreeMap::new();
+    let raster_layout = timed(timings, "raster-layout", || {
+        let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
+            && !repeated_page_objects_may_rewrite)
+            .then_some(&mut raster_vector_cache);
+        normalize_raster_layout(
+            document,
+            pages,
+            &cfg.raster_layout,
+            flate_level,
+            cfg.optimization_goal == crate::OptimizationGoal::Processing,
+            vector_cache,
+        )
+    })?;
+    for (name, micros) in [
+        ("inline-externalize", raster_layout.inline_externalize_us),
+        ("target-scan", raster_layout.target_scan_us),
+        ("hidden-prune", raster_layout.hidden_prune_us),
+        ("hidden-state", raster_layout.hidden_state_us),
+        ("hidden-visibility", raster_layout.hidden_visibility_us),
+        ("hidden-coverage", raster_layout.hidden_coverage_us),
+        ("hidden-rewrite", raster_layout.hidden_rewrite_us),
+        ("image-materialize", raster_layout.image_materialize_us),
+        ("native-plan", raster_layout.native_plan_us),
+        ("stripe-plan", raster_layout.stripe_plan_us),
+        ("pixel-plan", raster_layout.pixel_plan_us),
+        ("apply-plans", raster_layout.apply_plans_us),
+        ("staging-cleanup", raster_layout.staging_cleanup_us),
+    ] {
+        timings.insert(format!("raster/{name}"), micros_to_millis(micros));
+    }
+    let evidence = RasterPhaseEvidence::from_layout(
+        raster_vector_cache,
+        cfg.raster_layout.enabled,
+        &raster_layout,
+    );
+    Ok(RasterPreflight {
+        layout: raster_layout,
+        evidence,
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the optimization pipeline intentionally keeps ordered mutations and their shared document state together"
@@ -640,42 +759,10 @@ fn optimize_pdf_with_document(
             Ok(IccAlternateElisionStats::default())
         }
     })?;
-    let repeated_page_objects_may_rewrite = cfg.remove_repeated_page_objects
-        && cfg.optimization_goal == crate::OptimizationGoal::Processing
-        && repeated_page_objects_prefix_possible(&document, &stable_pages)?;
-    let mut raster_vector_cache = BTreeMap::new();
-    let raster_layout = timed(&mut timings, "raster-layout", || {
-        let vector_cache = (cfg.optimization_goal == crate::OptimizationGoal::Processing
-            && !repeated_page_objects_may_rewrite)
-            .then_some(&mut raster_vector_cache);
-        normalize_raster_layout(
-            &mut document,
-            &stable_pages,
-            &cfg.raster_layout,
-            flate_level,
-            cfg.optimization_goal == crate::OptimizationGoal::Processing,
-            vector_cache,
-        )
-    })?;
-    for (name, micros) in [
-        ("inline-externalize", raster_layout.inline_externalize_us),
-        ("target-scan", raster_layout.target_scan_us),
-        ("hidden-prune", raster_layout.hidden_prune_us),
-        ("hidden-state", raster_layout.hidden_state_us),
-        ("hidden-visibility", raster_layout.hidden_visibility_us),
-        ("hidden-coverage", raster_layout.hidden_coverage_us),
-        ("hidden-rewrite", raster_layout.hidden_rewrite_us),
-        ("image-materialize", raster_layout.image_materialize_us),
-        ("native-plan", raster_layout.native_plan_us),
-        ("stripe-plan", raster_layout.stripe_plan_us),
-        ("pixel-plan", raster_layout.pixel_plan_us),
-        ("apply-plans", raster_layout.apply_plans_us),
-        ("staging-cleanup", raster_layout.staging_cleanup_us),
-    ] {
-        timings.insert(format!("raster/{name}"), micros_to_millis(micros));
-    }
-    let mut raster_resource_usage_exact =
-        cfg.raster_layout.enabled && raster_layout.resource_inventory_complete;
+    let RasterPreflight {
+        layout: raster_layout,
+        evidence: mut raster_evidence,
+    } = prepare_raster_preflight(&mut document, &stable_pages, cfg, flate_level, &mut timings)?;
     let PageRewriteResult {
         stats: physically_hidden_text,
         rewritten_pages: physically_hidden_text_rewritten_pages,
@@ -698,10 +785,10 @@ fn optimize_pdf_with_document(
             prune_physically_hidden_text(&mut document, &stable_pages, None)
         }
     })?;
-    raster_vector_cache.retain(|page, _| !physically_hidden_text_rewritten_pages.contains(page));
-    if !physically_hidden_text_rewritten_pages.is_empty() {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_page_rewrite(
+        &physically_hidden_text_rewritten_pages,
+        !physically_hidden_text_rewritten_pages.is_empty(),
+    );
 
     let PageRewriteResult {
         stats: inline_image_dedup,
@@ -716,14 +803,12 @@ fn optimize_pdf_with_document(
             externalize_duplicate_inline_images(&mut document, &stable_pages)
         }
     })?;
-    raster_vector_cache.retain(|page, _| !inline_image_rewritten_pages.contains(page));
-    if inline_image_dedup.occurrences_externalized != 0 {
-        // Processing-vector analysis is page-content-local: Form rewrites do not
-        // invalidate callers' cached path analysis, while rewritten pages do.
-        // Resource-usage inventories are document-wide and therefore still lose
-        // exactness for either target kind.
-        raster_resource_usage_exact = false;
-    }
+    // Processing-vector analysis is page-content-local: Form rewrites do not
+    // invalidate cached paths, while resource inventories cover both targets.
+    raster_evidence.after_page_rewrite(
+        &inline_image_rewritten_pages,
+        inline_image_dedup.occurrences_externalized != 0,
+    );
 
     // Entropy-optimize surviving/reconstructed JPEGs before exact image
     // canonicalization. This preserves quantized DCT coefficients while allowing
@@ -763,10 +848,7 @@ fn optimize_pdf_with_document(
     } = timed(&mut timings, "dead-opaque-image-paints", || {
         eliminate_dead_image_paints(&mut document, &stable_pages)
     })?;
-    raster_vector_cache.retain(|page, _| !dead_paint_rewritten_pages.contains(page));
-    if dead_paint.paints_removed != 0 {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_page_rewrite(&dead_paint_rewritten_pages, dead_paint.paints_removed != 0);
     let appearance_dedup = timed(&mut timings, "appearance-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.appearance_key_count == 0 {
             Ok(crate::dedup::TargetedDedupStats::default())
@@ -791,10 +873,10 @@ fn optimize_pdf_with_document(
             Ok(PageRewriteResult::default())
         }
     })?;
-    raster_vector_cache.retain(|page, _| !repeated_page_objects_rewritten_pages.contains(page));
-    if repeated_page_objects.objects_removed != 0 {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_page_rewrite(
+        &repeated_page_objects_rewritten_pages,
+        repeated_page_objects.objects_removed != 0,
+    );
 
     let print_plan_started = Instant::now();
     let (print_plan, print_plan_error) = match &cfg.image_policy {
@@ -875,7 +957,8 @@ fn optimize_pdf_with_document(
             cfg.optimization_goal,
         )
     })?;
-    raster_vector_cache.retain(|page, _| !repeated_clip_rewritten_pages.contains(page));
+    // Clip hoisting changes page operators, but not their resource references.
+    raster_evidence.after_page_rewrite(&repeated_clip_rewritten_pages, false);
 
     let mut flate_reuse_cache = FlateReuseCache::default();
     let mut vector_compaction = timed(&mut timings, "vector-compaction", || {
@@ -889,10 +972,10 @@ fn optimize_pdf_with_document(
             && cfg.raster_layout.enabled
             && raster_layout.page_vector_inventory_complete
             && !raster_layout.page_vector_merge_candidate
-            && raster_vector_cache.len() == raster_layout.page_count
-            && !processing_factor_candidate(&raster_vector_cache);
+            && raster_evidence
+                .rules_out_processing_vector_factor(raster_layout.page_count, &stable_pages);
         if !raster_proved_no_vector_candidate && !processing_proved_no_vector_candidate {
-            let vector_cache = std::mem::take(&mut raster_vector_cache);
+            let vector_cache = raster_evidence.take_vector_analysis();
             compact_vector_paths_with_flate_cache(
                 &mut document,
                 &stable_pages,
@@ -916,9 +999,7 @@ fn optimize_pdf_with_document(
         })?;
         vector_compaction.absorb(forms);
     }
-    if vector_compaction.shared_run_forms_created != 0 {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_resource_mutation(vector_compaction.shared_run_forms_created != 0);
 
     let marked_content = timed(&mut timings, "marked-content-coalesce", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -943,9 +1024,7 @@ fn optimize_pdf_with_document(
             Ok(OutlinedGlyphFactorStats::default())
         }
     })?;
-    if outlined_glyphs.fonts_created != 0 {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_resource_mutation(outlined_glyphs.fonts_created != 0);
 
     let paint_batch = timed(&mut timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -962,9 +1041,7 @@ fn optimize_pdf_with_document(
             Ok(StrokeFormFactorStats::default())
         }
     })?;
-    if stroke_forms.forms_created != 0 {
-        raster_resource_usage_exact = false;
-    }
+    raster_evidence.after_resource_mutation(stroke_forms.forms_created != 0);
 
     let polyline_simplification = timed(&mut timings, "polyline-simplify", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
@@ -975,7 +1052,7 @@ fn optimize_pdf_with_document(
     })?;
 
     let resource_prune = timed(&mut timings, "resource-prune", || {
-        if raster_resource_usage_exact {
+        if raster_evidence.resource_usage_exact {
             prune_resources_with_usage(
                 &mut document,
                 &raster_layout.page_resource_names_by_type,
@@ -1124,6 +1201,62 @@ mod tests {
 
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn raster_phase_evidence_invalidates_only_affected_observations() -> Result<()> {
+        use crate::{
+            ObjectHandle, ObjectId, OwnedDictionary, vector_compact::ProcessingPageScanner,
+        };
+
+        let input = practical_cleanup_fixture()?;
+        let document = EditDocument::from_bytes(input)?;
+        let first = ObjectHandle::Existing(ObjectId::new(30, 0));
+        let second = ObjectHandle::Existing(ObjectId::new(31, 0));
+        let blank_analysis = || -> Result<ProcessingVectorAnalysis> {
+            Ok(
+                ProcessingPageScanner::for_resources(&document, &OwnedDictionary::new(), None)?
+                    .finish(b""),
+            )
+        };
+        let layout = RasterLayoutStats {
+            resource_inventory_complete: true,
+            ..RasterLayoutStats::default()
+        };
+        let mut evidence = RasterPhaseEvidence::from_layout(
+            BTreeMap::from([(first, blank_analysis()?), (second, blank_analysis()?)]),
+            true,
+            &layout,
+        );
+        assert!(evidence.resource_usage_exact);
+        assert!(evidence.rules_out_processing_vector_factor(2, &[first, second]));
+        assert!(!evidence.rules_out_processing_vector_factor(2, &[first, first]));
+        assert!(!evidence.rules_out_processing_vector_factor(
+            2,
+            &[first, ObjectHandle::Existing(ObjectId::new(32, 0))]
+        ));
+
+        // A content-only rewrite must not discard the unrelated page's scan
+        // or the independent resource usage proof.
+        evidence.after_page_rewrite(&BTreeSet::from([first]), false);
+        assert!(evidence.vectors_by_page.contains_key(&second));
+        assert!(!evidence.vectors_by_page.contains_key(&first));
+        assert!(!evidence.rules_out_processing_vector_factor(2, &[first, second]));
+        assert!(evidence.resource_usage_exact);
+
+        // A Form-only edit can invalidate resource usage without rewriting any
+        // page, while resource invalidation must remain sticky thereafter.
+        evidence.after_page_rewrite(&BTreeSet::new(), true);
+        assert!(evidence.vectors_by_page.contains_key(&second));
+        assert!(!evidence.resource_usage_exact);
+        evidence.after_page_rewrite(&BTreeSet::new(), false);
+        assert!(!evidence.resource_usage_exact);
+        assert_eq!(evidence.take_vector_analysis().len(), 1);
+        assert!(evidence.vectors_by_page.is_empty());
+
+        let disabled = RasterPhaseEvidence::from_layout(BTreeMap::new(), false, &layout);
+        assert!(!disabled.resource_usage_exact);
+        Ok(())
+    }
 
     #[test]
     fn size_hoists_large_exact_repeated_clip_without_coordinate_rounding() -> Result<()> {
