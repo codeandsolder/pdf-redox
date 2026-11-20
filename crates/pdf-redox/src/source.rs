@@ -1610,7 +1610,7 @@ impl EditDocument {
         Ok(reachable)
     }
 
-    fn references_for_handle(&self, handle: ObjectHandle) -> Result<Vec<ObjectHandle>> {
+    pub(crate) fn references_for_handle(&self, handle: ObjectHandle) -> Result<Vec<ObjectHandle>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
                 Some(ExistingObjectChange::Replace(object)) => Ok(object.references()),

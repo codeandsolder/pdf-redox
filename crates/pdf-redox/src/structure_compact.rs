@@ -1,8 +1,8 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     direct_object::{
-        DirectArrayView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
-        object_at_direct_path_mut, walk_direct_object,
+        DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep,
+        DirectWalkControl, object_at_direct_path_mut, walk_direct_object,
     },
     source::{CurrentObject, PAGE_INHERITABLE_KEYS, owned_from_maybe_ref},
 };
@@ -329,12 +329,27 @@ fn page_tree_node_kind(
 /// structural passes. Never substitute the reader's recovery page list.
 struct PageTreePlan {
     root: ObjectHandle,
-    internal_nodes: usize,
+    branches: BTreeSet<ObjectHandle>,
+    owners: BTreeMap<ObjectHandle, InheritedOwners>,
     pages: Vec<PageTreeLeaf>,
     shadowed_entries: Vec<(ObjectHandle, Vec<Vec<u8>>)>,
 }
 
 type InheritedOwners = [Option<ObjectHandle>; PAGE_INHERITABLE_KEYS.len()];
+
+fn nearest_page_tree_owners(
+    node: ObjectHandle,
+    defined: [bool; PAGE_INHERITABLE_KEYS.len()],
+    inherited_from: InheritedOwners,
+) -> InheritedOwners {
+    std::array::from_fn(|index| {
+        if defined[index] {
+            Some(node)
+        } else {
+            inherited_from[index]
+        }
+    })
+}
 
 struct PageTreeLeaf {
     handle: ObjectHandle,
@@ -382,13 +397,7 @@ impl PageTreePruneFrame {
         Ok(Some(Self {
             node,
             defined,
-            nearest_owners: std::array::from_fn(|index| {
-                if defined[index] {
-                    Some(node)
-                } else {
-                    inherited_from[index]
-                }
-            }),
+            nearest_owners: nearest_page_tree_owners(node, defined, inherited_from),
             kids,
             next_child: 0,
             covered_by_children: [true; PAGE_INHERITABLE_KEYS.len()],
@@ -456,21 +465,21 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     else {
         return Ok(None);
     };
-    let mut seen = BTreeSet::from([root]);
-    let mut pending = vec![root_frame];
     let mut plan = PageTreePlan {
         root,
-        internal_nodes: 1,
+        branches: BTreeSet::from([root]),
+        owners: BTreeMap::from([(root, root_frame.nearest_owners)]),
         pages: Vec::new(),
         shadowed_entries: Vec::new(),
     };
+    let mut pending = vec![root_frame];
 
     while let Some(frame) = pending.last_mut() {
         if let Some(&kid) = frame.kids.get(frame.next_child) {
             frame.next_child += 1;
             // The two directions of the page tree must agree before we can
             // infer inheritance from /Kids or change a page's /Parent.
-            if !seen.insert(kid) {
+            if plan.owners.contains_key(&kid) {
                 return Ok(None);
             }
             let Some(child) = document.current_owned_object_cow(kid)? else {
@@ -495,6 +504,10 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
                             }
                         }),
                     });
+                    plan.owners.insert(
+                        kid,
+                        nearest_page_tree_owners(kid, defined, frame.nearest_owners),
+                    );
                     frame.include_child(defined);
                 }
                 Some(PageTreeNodeKind::Branch) => {
@@ -503,7 +516,8 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
                     else {
                         return Ok(None);
                     };
-                    plan.internal_nodes += 1;
+                    plan.branches.insert(kid);
+                    plan.owners.insert(kid, child_frame.nearest_owners);
                     pending.push(child_frame);
                 }
                 None => return Ok(None),
@@ -671,6 +685,197 @@ fn materialize_page_inheritance(
     Ok(result)
 }
 
+type ProtectedInheritance = BTreeSet<(ObjectHandle, usize)>;
+
+fn protect_inherited_owners(owners: InheritedOwners, protected: &mut ProtectedInheritance) {
+    protected.extend(
+        owners
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, owner)| owner.map(|owner| (owner, index))),
+    );
+}
+
+struct ExternalParentVisitor<'a> {
+    owners: &'a BTreeMap<ObjectHandle, InheritedOwners>,
+    protected: &'a mut ProtectedInheritance,
+}
+
+impl DirectObjectVisitor for ExternalParentVisitor<'_> {
+    fn visit_source_stream_length(&self) -> bool {
+        false
+    }
+
+    fn visit_dictionary(
+        &mut self,
+        document: &EditDocument,
+        root: ObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        if !(path.is_empty() && self.owners.contains_key(&root))
+            && let Some(parent) = dictionary.reference(b"Parent")
+            && let Some(owners) = self.owners.get(&parent)
+        {
+            // Only validated member Parent links are covered by the
+            // post-order proof. Protect the effective properties needed by
+            // every independent boundary, including nested dictionaries.
+            let mut needed = *owners;
+            for (index, key) in PAGE_INHERITABLE_KEYS.into_iter().enumerate() {
+                if needed[index].is_none() {
+                    continue;
+                }
+                let effective = match dictionary {
+                    DirectDictionaryView::Owned(dictionary) => match dictionary.get(key) {
+                        Some(value) => document.effective_page_inherited_value(key, value)?,
+                        None => false,
+                    },
+                    DirectDictionaryView::Source(dictionary) => match dictionary
+                        .get_raw::<HayroObject<'_>>(key)
+                    {
+                        Some(value) => document
+                            .effective_page_inherited_value(key, &owned_from_maybe_ref(value))?,
+                        None => false,
+                    },
+                };
+                if effective {
+                    needed[index] = None;
+                }
+            }
+            protect_inherited_owners(needed, self.protected);
+        }
+        Ok(DirectWalkControl::Descend)
+    }
+}
+
+fn external_parent_dependencies(
+    document: &EditDocument,
+    plan: &PageTreePlan,
+) -> Result<ProtectedInheritance> {
+    let mut protected = ProtectedInheritance::new();
+    for handle in document.reachable_output_objects()? {
+        if !document
+            .references_for_handle(handle)?
+            .iter()
+            .any(|target| plan.owners.contains_key(target))
+        {
+            continue;
+        }
+        if let Some(object) = document.current_object(handle)? {
+            walk_direct_object(
+                document,
+                handle,
+                object,
+                &mut ExternalParentVisitor {
+                    owners: &plan.owners,
+                    protected: &mut protected,
+                },
+            )?;
+        }
+    }
+    // Direct trailer dictionaries are not themselves indirect object roots.
+    for value in document.trailer().values() {
+        for target in value.references() {
+            if let Some(owners) = plan.owners.get(&target) {
+                protect_inherited_owners(*owners, &mut protected);
+            }
+        }
+    }
+    Ok(protected)
+}
+
+struct RebuildReferenceVisitor<'a> {
+    replaced_key: &'a [u8],
+    references: Vec<ObjectHandle>,
+}
+
+impl DirectObjectVisitor for RebuildReferenceVisitor<'_> {
+    fn visit_source_stream_length(&self) -> bool {
+        false
+    }
+
+    fn visit_reference(
+        &mut self,
+        _root: ObjectHandle,
+        path: &[DirectPathStep],
+        target: ObjectHandle,
+    ) -> Result<()> {
+        if !matches!(path.first(), Some(DirectPathStep::DictKey(key)) if key == self.replaced_key) {
+            self.references.push(target);
+        }
+        Ok(())
+    }
+}
+
+// Follow the references surviving replacement of root Kids and live leaf
+// Parent, including future children and newly materialized inheritance.
+fn retained_page_tree_branches(
+    document: &EditDocument,
+    plan: &PageTreePlan,
+    inherited: &[(ObjectHandle, OwnedDictionary)],
+) -> Result<BTreeSet<ObjectHandle>> {
+    let mut pending = document.output_roots();
+    pending.extend(plan.pages.iter().map(|page| page.handle));
+    for (_, dictionary) in inherited {
+        pending.extend(dictionary.values().flat_map(OwnedObject::references));
+    }
+    let mut visited = BTreeSet::new();
+    let mut retained = BTreeSet::new();
+    while let Some(handle) = pending.pop() {
+        if !visited.insert(handle) {
+            continue;
+        }
+        if handle != plan.root && plan.branches.contains(&handle) {
+            retained.insert(handle);
+        }
+        let replaced_key = if handle == plan.root {
+            Some(b"Kids".as_slice())
+        } else if plan.owners.contains_key(&handle) && !plan.branches.contains(&handle) {
+            Some(b"Parent".as_slice())
+        } else {
+            None
+        };
+        if let Some(replaced_key) = replaced_key {
+            if let Some(object) = document.current_object(handle)? {
+                let mut visitor = RebuildReferenceVisitor {
+                    replaced_key,
+                    references: Vec::new(),
+                };
+                walk_direct_object(document, handle, object, &mut visitor)?;
+                pending.extend(visitor.references);
+            }
+        } else {
+            match document.references_for_handle(handle) {
+                Ok(references) => pending.extend(references),
+                Err(Error::MissingSourceObject { .. })
+                    if matches!(handle, ObjectHandle::Existing(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(retained)
+}
+
+fn remove_unprotected_inheritance(
+    document: &mut EditDocument,
+    removals: Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+    protected: &ProtectedInheritance,
+) -> Result<usize> {
+    let removals = removals
+        .into_iter()
+        .filter_map(|(owner, mut keys)| {
+            keys.retain(|key| {
+                PAGE_INHERITABLE_KEYS
+                    .iter()
+                    .position(|candidate| *candidate == key.as_slice())
+                    .is_none_or(|index| !protected.contains(&(owner, index)))
+            });
+            (!keys.is_empty()).then_some((owner, keys))
+        })
+        .collect();
+    apply_shadowed_page_tree_entries(document, removals)
+}
+
 fn compact_page_tree(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
@@ -678,28 +883,42 @@ fn compact_page_tree(
     // A single strict traversal proves both pruning and page-tree rebuilding.
     // Malformed trees remain intact, instead of using a recovery list that
     // may omit invalid, duplicated, or disconnected page-tree entries.
-    let Some(PageTreePlan {
-        root,
-        internal_nodes: before_nodes,
-        pages,
-        shadowed_entries,
-    }) = plan_page_tree(document)?
-    else {
+    let Some(plan) = plan_page_tree(document)? else {
         return Ok(());
     };
+    let before_nodes = plan.branches.len();
+    let after_nodes = page_tree_required_nodes(plan.pages.len());
     stats.page_tree_nodes_before = before_nodes;
-    let after_nodes = page_tree_required_nodes(pages.len());
-    if pages.is_empty() || after_nodes >= before_nodes {
-        stats.page_tree_nodes_after = before_nodes;
-        stats.shadowed_page_tree_inherited_entries_removed =
-            apply_shadowed_page_tree_entries(document, shadowed_entries)?;
+    stats.page_tree_nodes_after = before_nodes;
+    let rebuild = !plan.pages.is_empty() && after_nodes < before_nodes;
+    if !rebuild && plan.shadowed_entries.is_empty() {
         return Ok(());
     }
 
-    let inherited = materialize_page_inheritance(document, &pages)?;
+    let mut protected = external_parent_dependencies(document, &plan)?;
+    let inherited = if rebuild {
+        materialize_page_inheritance(document, &plan.pages)?
+    } else {
+        Vec::new()
+    };
+    let retained = if rebuild {
+        retained_page_tree_branches(document, &plan, &inherited)?
+    } else {
+        BTreeSet::new()
+    };
+    for branch in &retained {
+        if let Some(owners) = plan.owners.get(branch) {
+            protect_inherited_owners(*owners, &mut protected);
+        }
+    }
     stats.shadowed_page_tree_inherited_entries_removed =
-        apply_shadowed_page_tree_entries(document, shadowed_entries)?;
+        remove_unprotected_inheritance(document, plan.shadowed_entries, &protected)?;
+    if !rebuild || !retained.is_empty() {
+        return Ok(());
+    }
     stats.page_tree_nodes_after = after_nodes;
+    let root = plan.root;
+    let pages = plan.pages;
 
     for (page, values) in inherited {
         let Some(dictionary) = document.edit_handle(page)?.as_dictionary_mut() else {
@@ -732,8 +951,10 @@ fn compact_page_tree(
         OwnedObject::Integer(i64::try_from(pages.len()).unwrap_or(i64::MAX)),
     );
     root_dictionary.remove(b"Parent".as_slice());
-    for key in PAGE_INHERITABLE_KEYS {
-        root_dictionary.remove(key);
+    for (index, key) in PAGE_INHERITABLE_KEYS.into_iter().enumerate() {
+        if !protected.contains(&(root, index)) {
+            root_dictionary.remove(key);
+        }
     }
 
     stats.page_tree_pages_reparented = pages.len();
@@ -1086,7 +1307,8 @@ mod tests {
         let Some(plan) = plan_page_tree(document)? else {
             return Ok(0);
         };
-        apply_shadowed_page_tree_entries(document, plan.shadowed_entries)
+        let protected = external_parent_dependencies(document, &plan)?;
+        remove_unprotected_inheritance(document, plan.shadowed_entries, &protected)
     }
 
     fn ordered_page_tree_fixture() -> Result<EditDocument> {
@@ -1187,6 +1409,106 @@ mod tests {
             leaf.get(b"Rotate".as_slice()),
             Some(&OwnedObject::Integer(180))
         );
+        Ok(())
+    }
+
+    fn detached_inheritance_fixture(nested: bool, parent: u32) -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /OpenAction [9 0 R /Fit] >>",
+        )?;
+        let child = if nested { 5 } else { 3 };
+        pdf.object(
+            2,
+            format!(
+                "<< /Type /Pages /Kids [{child} 0 R] /Count 1 /Rotate 90 /MediaBox [0 0 10 20] >>"
+            )
+            .as_bytes(),
+        )?;
+        pdf.object(3, format!("<< /Type /Page /Parent {child_parent} 0 R /Rotate 180 /MediaBox [0 0 20 10] /Contents 4 0 R >>", child_parent = if nested { 5 } else { 2 }).as_bytes())?;
+        if nested {
+            pdf.object(
+                5,
+                b"<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 /Rotate 270 >>",
+            )?;
+        }
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(
+            9,
+            format!("<< /Type /Page /Parent {parent} 0 R /MediaBox [0 0 30 40] /Contents 4 0 R >>")
+                .as_bytes(),
+        )?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn detached_parent_preserves_only_needed_root_inheritance() -> Result<()> {
+        for nested in [false, true] {
+            let mut document = detached_inheritance_fixture(nested, 2)?;
+            let before = document.inherited_page_value(existing(9), b"Rotate")?;
+            assert_eq!(before, Some(OwnedObject::Integer(90)));
+            let stats = compact_structure(&mut document)?;
+            assert_eq!(stats.stale_page_destination_references_rewritten, 0);
+            assert_eq!(stats.page_tree_nodes_removed, usize::from(nested));
+            assert_eq!(stats.page_tree_nodes_after, 1);
+            assert_eq!(document.page_handles()?, vec![existing(3)]);
+            assert_eq!(
+                document.inherited_page_value(existing(9), b"Rotate")?,
+                before
+            );
+            assert_eq!(
+                document.inherited_page_value(existing(3), b"Rotate")?,
+                Some(OwnedObject::Integer(180))
+            );
+            let Some(root) = current_dictionary(&document, existing(2))? else {
+                return Err(Error::Invalid("missing fixture root".to_owned()));
+            };
+            assert_eq!(root.get(b"Rotate".as_slice()), before.as_ref());
+            assert!(!root.contains_key(b"MediaBox".as_slice()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_intermediate_branch_prevents_inconsistent_rebuild() -> Result<()> {
+        let mut document = detached_inheritance_fixture(true, 5)?;
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.page_tree_nodes_before, 2);
+        assert_eq!(stats.page_tree_nodes_after, 2);
+        assert_eq!(stats.page_tree_nodes_removed, 0);
+        assert_eq!(stats.page_tree_pages_reparented, 0);
+        assert_eq!(
+            document.inherited_page_value(existing(9), b"Rotate")?,
+            Some(OwnedObject::Integer(270))
+        );
+        let Some(leaf) = current_dictionary(&document, existing(3))? else {
+            return Err(Error::Invalid("missing fixture page".to_owned()));
+        };
+        assert_eq!(dictionary_reference(&leaf, b"Parent"), Some(existing(5)));
+        Ok(())
+    }
+
+    #[test]
+    fn independently_reachable_indirect_kids_keep_old_branches() -> Result<()> {
+        let mut document = ordered_page_tree_fixture()?;
+        let root = ObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+            OwnedObject::Reference(existing(5)),
+            OwnedObject::Reference(existing(3)),
+        ])));
+        let Some(tree) = document.edit_handle(existing(2))?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture tree".to_owned()));
+        };
+        tree.insert(b"Kids".to_vec(), OwnedObject::Reference(root));
+        let Some(catalog) = document.edit_handle(existing(1))?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture catalog".to_owned()));
+        };
+        catalog.insert(b"ExternalKids".to_vec(), OwnedObject::Reference(root));
+        let mut stats = StructureCompactionStats::default();
+        compact_page_tree(&mut document, &mut stats)?;
+        assert_eq!(stats.page_tree_nodes_after, 3);
+        assert_eq!(stats.page_tree_nodes_removed, 0);
+        assert_eq!(document.page_handles()?, vec![existing(6), existing(4)]);
         Ok(())
     }
 
