@@ -612,6 +612,27 @@ impl<'a> CurrentValue<'a> {
         }
     }
 
+    pub fn dictionary_keys(&self) -> Option<Vec<Vec<u8>>> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Dict(dictionary)), _) => Some(
+                dictionary
+                    .entries()
+                    .map(|(key, _)| key.as_ref().to_vec())
+                    .collect(),
+            ),
+            Self::Source(MaybeRef::NotRef(Object::Stream(stream)), _) => Some(
+                stream
+                    .dict()
+                    .entries()
+                    .filter(|(key, _)| key.as_ref() != b"Length")
+                    .map(|(key, _)| key.as_ref().to_vec())
+                    .collect(),
+            ),
+            Self::Owned(value) => Some(value.as_dictionary()?.keys().cloned().collect()),
+            Self::Source(..) => None,
+        }
+    }
+
     pub const fn has_dictionary(&self) -> bool {
         matches!(
             self,
@@ -1364,14 +1385,6 @@ impl EditDocument {
     /// Determine whether a dictionary entry actually overrides an inherited
     /// page property. Match the reader's typed fallback through null/invalid
     /// values while retaining the raw value when inheritance is materialized.
-    pub(crate) fn effective_page_inherited_value(
-        &self,
-        key: &[u8],
-        value: &OwnedObject,
-    ) -> Result<bool> {
-        self.effective_page_value(key, CurrentValue::Owned(value))
-    }
-
     pub(crate) fn effective_page_value(&self, key: &[u8], value: CurrentValue<'_>) -> Result<bool> {
         let Some(value) = self.resolve_current_value(value)? else {
             return Ok(false);
@@ -1468,7 +1481,7 @@ impl EditDocument {
         self.inherited_page_value_from_view(object, key)
     }
 
-    fn inherited_page_value_from_view<'a>(
+    pub(crate) fn inherited_page_value_from_view<'a>(
         &'a self,
         mut object: CurrentValue<'a>,
         key: &[u8],
@@ -1493,35 +1506,6 @@ impl EditDocument {
                 return Ok(None);
             };
             object = parent_object;
-        }
-    }
-
-    /// The preservation pass can start from a materialized direct subtree.
-    /// Inspect that root once, then use the same selective ancestor reader.
-    pub(crate) fn inherited_page_value_from_object<'a>(
-        &'a self,
-        object: Cow<'a, OwnedObject>,
-        key: &[u8],
-    ) -> Result<Option<Cow<'a, OwnedObject>>> {
-        match object {
-            Cow::Borrowed(object) => Ok(self
-                .inherited_page_value_from_view(CurrentValue::Owned(object), key)?
-                .map(CurrentValue::into_cow)),
-            Cow::Owned(mut object) => {
-                let Some(dictionary) = object.as_dictionary_mut() else {
-                    return Ok(None);
-                };
-                if let Some(value) = dictionary.get(key)
-                    && self.effective_page_inherited_value(key, value)?
-                {
-                    return Ok(dictionary.remove(key).map(Cow::Owned));
-                }
-                let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice())
-                else {
-                    return Ok(None);
-                };
-                self.inherited_page_value_cow(*parent, key)
-            }
         }
     }
 

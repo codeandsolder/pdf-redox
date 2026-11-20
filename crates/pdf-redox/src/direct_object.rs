@@ -44,21 +44,19 @@ pub fn object_at_direct_path<'a>(
     Some(object)
 }
 
-/// Project a COW root onto a direct child without copying the selected
-/// subtree or unrelated root entries.
-pub fn object_at_direct_path_cow<'a>(
-    object: std::borrow::Cow<'a, OwnedObject>,
+/// Project a current value onto a direct child without resolving indirect
+/// references or materializing the enclosing object.
+pub fn value_at_direct_path<'a>(
+    mut value: CurrentValue<'a>,
     path: &[DirectPathStep],
-) -> Option<std::borrow::Cow<'a, OwnedObject>> {
-    use std::borrow::Cow;
-    match object {
-        Cow::Borrowed(object) => object_at_direct_path(object, path).map(Cow::Borrowed),
-        Cow::Owned(object) if path.is_empty() => Some(Cow::Owned(object)),
-        Cow::Owned(mut object) => {
-            let child = object_at_direct_path_mut(&mut object, path)?;
-            Some(Cow::Owned(std::mem::replace(child, OwnedObject::Null)))
-        }
+) -> Option<CurrentValue<'a>> {
+    for step in path {
+        value = match step {
+            DirectPathStep::DictKey(key) => value.dictionary_entry(key)?,
+            DirectPathStep::ArrayIndex(index) => value.array_items()?.nth(*index)?,
+        };
     }
+    Some(value)
 }
 
 #[derive(Clone, Copy)]
