@@ -4,6 +4,7 @@ use hayro_syntax::{
     Pdf, PdfVersion,
     object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream},
 };
+use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -576,15 +577,37 @@ impl CurrentObject<'_> {
     }
 }
 
-fn contains_indirect_reference(value: &OwnedObject) -> bool {
-    match value {
-        OwnedObject::Reference(_) => true,
-        OwnedObject::Array(values) => values.iter().any(contains_indirect_reference),
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            dictionary.values().any(contains_indirect_reference)
+/// Visit nested owned COS values without using call-stack depth. Reference
+/// collection intentionally skips a stream's /Length entry (the writer
+/// regenerates it), but filter eligibility must inspect every nested value.
+fn owned_cos_values(
+    root: &OwnedObject,
+    skip_stream_length: bool,
+) -> impl Iterator<Item = &OwnedObject> {
+    // The usual shallow PDF object fits inline without per-scan heap allocation.
+    let mut pending = SmallVec::<[&OwnedObject; 8]>::new();
+    pending.push(root);
+    std::iter::from_fn(move || {
+        let value = pending.pop()?;
+        match value {
+            OwnedObject::Array(values) => pending.extend(values),
+            OwnedObject::Dictionary(dictionary) => pending.extend(dictionary.values()),
+            OwnedObject::Stream { dictionary, .. } => {
+                pending.extend(
+                    dictionary
+                        .iter()
+                        .filter(|(name, _)| !skip_stream_length || name.as_slice() != b"Length")
+                        .map(|(_, value)| value),
+                );
+            }
+            _ => {}
         }
-        _ => false,
-    }
+        Some(value)
+    })
+}
+
+fn contains_indirect_reference(value: &OwnedObject) -> bool {
+    owned_cos_values(value, false).any(|value| matches!(value, OwnedObject::Reference(_)))
 }
 
 fn stream_filter_configuration_is_direct(stream: &OwnedObject) -> bool {
@@ -1486,33 +1509,10 @@ fn collect_hayro_maybe_ref(value: MaybeRef<Object<'_>>, references: &mut BTreeSe
 }
 
 fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<ObjectHandle>) {
-    match object {
-        OwnedObject::Reference(reference) => {
+    for value in owned_cos_values(object, true) {
+        if let OwnedObject::Reference(reference) = value {
             references.insert(*reference);
         }
-        OwnedObject::Array(values) => {
-            for value in values {
-                collect_owned_references(value, references);
-            }
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            for value in dictionary.values() {
-                collect_owned_references(value, references);
-            }
-        }
-        OwnedObject::Stream { dictionary, .. } => {
-            for (name, value) in dictionary {
-                if name.as_slice() != b"Length" {
-                    collect_owned_references(value, references);
-                }
-            }
-        }
-        OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
     }
 }
 
@@ -1741,6 +1741,78 @@ mod tests {
         let second = document.decoded_content_stream_data(handle)?;
         assert_eq!(second, b"BT ET");
         Ok(())
+    }
+
+    #[test]
+    fn owned_reference_walk_handles_deep_cos_without_recursion() {
+        let target = ObjectHandle::Existing(ObjectId::new(42, 0));
+        let mut nested = OwnedObject::Reference(target);
+        // Deep enough to overflow recursive walks on normal test-thread stacks.
+        for _ in 0..20_000 {
+            nested = OwnedObject::Array(vec![nested]);
+        }
+        assert!(contains_indirect_reference(&nested));
+        assert_eq!(nested.references(), vec![target]);
+
+        // Iteratively dismantle the test fixture too: recursively dropping a
+        // 20,000-level owned array would otherwise obscure the traversal fix.
+        while let OwnedObject::Array(mut values) = nested {
+            let Some(child) = values.pop() else {
+                break;
+            };
+            nested = child;
+        }
+
+        let mut no_reference = OwnedObject::Integer(7);
+        for _ in 0..20_000 {
+            no_reference = OwnedObject::Array(vec![no_reference]);
+        }
+        assert!(!contains_indirect_reference(&no_reference));
+        assert_eq!(no_reference.references(), Vec::<ObjectHandle>::new());
+        while let OwnedObject::Array(mut values) = no_reference {
+            let Some(child) = values.pop() else {
+                break;
+            };
+            no_reference = child;
+        }
+    }
+
+    #[test]
+    fn owned_reference_walk_only_skips_stream_length_in_graph_collection() {
+        let length = ObjectHandle::Existing(ObjectId::new(41, 0));
+        let nested = ObjectHandle::Existing(ObjectId::new(42, 0));
+
+        let mut filter_dict = OwnedDictionary::new();
+        filter_dict.insert(b"Length".to_vec(), OwnedObject::Reference(nested));
+        let mut stream_dict = OwnedDictionary::new();
+        stream_dict.insert(b"Length".to_vec(), OwnedObject::Reference(length));
+        stream_dict.insert(
+            b"DecodeParms".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Dictionary(filter_dict)]),
+        );
+        let stream = OwnedObject::Stream {
+            dictionary: stream_dict,
+            data: StreamData::Owned(Vec::new()),
+        };
+
+        // Filter eligibility inspects all descendant entries, including
+        // /Length, whereas graph traversal excludes only stream /Length.
+        assert!(contains_indirect_reference(&stream));
+        assert_eq!(stream.references(), vec![nested]);
+        assert!(!stream_filter_configuration_is_direct(&stream));
+
+        let mut direct_dict = OwnedDictionary::new();
+        direct_dict.insert(
+            b"DecodeParms".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Dictionary(OwnedDictionary::new())]),
+        );
+        let direct = OwnedObject::Stream {
+            dictionary: direct_dict,
+            data: StreamData::Owned(Vec::new()),
+        };
+        assert!(stream_filter_configuration_is_direct(&direct));
+        assert!(!contains_indirect_reference(&direct));
+        assert_eq!(direct.references(), Vec::<ObjectHandle>::new());
     }
 
     #[test]
