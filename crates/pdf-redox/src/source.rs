@@ -612,6 +612,14 @@ struct DecodedContentCache {
     streams: BTreeMap<ObjectId, Arc<[u8]>>,
 }
 
+impl DecodedContentCache {
+    fn evict(&mut self, id: ObjectId) {
+        if let Some(bytes) = self.streams.remove(&id) {
+            self.bytes -= bytes.len();
+        }
+    }
+}
+
 /// A content reference is a fresh stream, a shared cached stream, or a COS value.
 /// Cached bytes are reference-counted so consumers can append them directly
 /// without copying or holding an active borrow of the document's cache.
@@ -777,6 +785,9 @@ impl EditDocument {
     /// Returns the copy-on-write object overlay for mutation and invalidates graph caches as required.
     pub fn overlay_mut(&mut self) -> &mut ObjectOverlay {
         self.mark_graph_maybe_mutated();
+        // Opaque callers can edit or delete any source stream. Discard all
+        // cached entries so unreachable decoded bytes cannot exhaust the budget.
+        *self.decoded_content_stream_cache.get_mut() = DecodedContentCache::default();
         &mut self.overlay
     }
 
@@ -832,7 +843,11 @@ impl EditDocument {
     /// or the object has been deleted from the overlay.
     pub fn edit_object(&mut self, id: ObjectId) -> Result<&mut OwnedObject> {
         self.mark_object_maybe_mutated(ObjectHandle::Existing(id))?;
-        self.overlay.edit(&self.source, id)
+        let object = self.overlay.edit(&self.source, id)?;
+        // A replaced source stream cannot use its old cache entry. Release
+        // its budget while leaving unrelated immutable source streams cached.
+        self.decoded_content_stream_cache.get_mut().evict(id);
+        Ok(object)
     }
 
     /// Materialize and return a mutable object regardless of whether it came
@@ -1725,6 +1740,79 @@ mod tests {
         *data = StreamData::Owned(b"BT ET".to_vec());
         let second = document.decoded_content_stream_data(handle)?;
         assert_eq!(second, b"BT ET");
+        Ok(())
+    }
+
+    #[test]
+    fn source_content_cache_reclaims_bytes_for_targeted_and_opaque_edits() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R 5 0 R] >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"", b"BT ET")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let first = ObjectHandle::Existing(ObjectId::new(4, 0));
+        let second = ObjectHandle::Existing(ObjectId::new(5, 0));
+        assert_eq!(document.decoded_content_stream_data(first)?, b"q Q");
+        assert_eq!(document.decoded_content_stream_data(second)?, b"BT ET");
+        let Some(ContentRead::Cached(first_snapshot)) = document.content_read(first)? else {
+            return Err(Error::Invalid("expected first cached stream".to_owned()));
+        };
+        let Some(ContentRead::Cached(second_snapshot)) = document.content_read(second)? else {
+            return Err(Error::Invalid("expected second cached stream".to_owned()));
+        };
+        {
+            let cache = document.decoded_content_stream_cache.borrow();
+            assert_eq!(cache.streams.len(), 2);
+            assert_eq!(cache.bytes, b"q Q".len() + b"BT ET".len());
+        }
+
+        // Editing a non-cached catalog object must preserve both entries.
+        let _ = document.edit_object(ObjectId::new(1, 0))?;
+        assert_eq!(
+            document.decoded_content_stream_cache.borrow().streams.len(),
+            2
+        );
+
+        let OwnedObject::Stream { data, .. } = document.edit_object(ObjectId::new(4, 0))? else {
+            return Err(Error::Invalid("expected first source stream".to_owned()));
+        };
+        *data = StreamData::Owned(b"q q Q".to_vec());
+        {
+            let cache = document.decoded_content_stream_cache.borrow();
+            assert_eq!(cache.streams.len(), 1);
+            assert!(!cache.streams.contains_key(&ObjectId::new(4, 0)));
+            assert_eq!(cache.bytes, b"BT ET".len());
+        }
+        assert_eq!(first_snapshot.as_ref(), b"q Q");
+        assert_eq!(document.decoded_content_stream_data(first)?, b"q q Q");
+        let Some(ContentRead::Cached(second_again)) = document.content_read(second)? else {
+            return Err(Error::Invalid("unrelated cache entry was lost".to_owned()));
+        };
+        assert!(Arc::ptr_eq(&second_snapshot, &second_again));
+
+        // The opaque overlay API can replace arbitrary source objects, so all
+        // remaining cache allocations and their byte accounting are dropped.
+        document.overlay_mut().replace(
+            ObjectId::new(5, 0),
+            OwnedObject::Stream {
+                dictionary: OwnedDictionary::new(),
+                data: StreamData::Owned(b"ET".to_vec()),
+            },
+        );
+        let cache = document.decoded_content_stream_cache.borrow();
+        assert!(cache.streams.is_empty());
+        assert_eq!(cache.bytes, 0);
+        drop(cache);
+        assert_eq!(second_snapshot.as_ref(), b"BT ET");
+        assert_eq!(document.decoded_content_stream_data(second)?, b"ET");
         Ok(())
     }
 
