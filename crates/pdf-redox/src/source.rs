@@ -628,12 +628,23 @@ impl<'a> CurrentValue<'a> {
         )
     }
 
-    pub fn is_name(&self, expected: &[u8]) -> bool {
+    pub const fn is_null(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(MaybeRef::NotRef(Object::Null(_)), _) | Self::Owned(OwnedObject::Null)
+        )
+    }
+
+    pub fn name(&self) -> Option<&[u8]> {
         match self {
-            Self::Source(MaybeRef::NotRef(Object::Name(name)), _) => name.as_ref() == expected,
-            Self::Owned(OwnedObject::Name(name)) => name == expected,
-            _ => false,
+            Self::Source(MaybeRef::NotRef(Object::Name(name)), _) => Some(name.as_ref()),
+            Self::Owned(OwnedObject::Name(name)) => Some(name),
+            _ => None,
         }
+    }
+
+    pub fn is_name(&self, expected: &[u8]) -> bool {
+        self.name() == Some(expected)
     }
 
     pub fn array_items(&self) -> Option<CurrentArrayIter<'a>> {
@@ -1361,7 +1372,7 @@ impl EditDocument {
         self.effective_page_value(key, CurrentValue::Owned(value))
     }
 
-    fn effective_page_value(&self, key: &[u8], value: CurrentValue<'_>) -> Result<bool> {
+    pub(crate) fn effective_page_value(&self, key: &[u8], value: CurrentValue<'_>) -> Result<bool> {
         let Some(value) = self.resolve_current_value(value)? else {
             return Ok(false);
         };
@@ -1413,12 +1424,12 @@ impl EditDocument {
 
     pub(crate) fn effective_page_inheritance_mask(
         &self,
-        dictionary: &OwnedDictionary,
+        dictionary: &CurrentValue<'_>,
     ) -> Result<[bool; PAGE_INHERITABLE_KEYS.len()]> {
         let mut mask = [false; PAGE_INHERITABLE_KEYS.len()];
         for (key, effective) in PAGE_INHERITABLE_KEYS.into_iter().zip(&mut mask) {
-            if let Some(value) = dictionary.get(key) {
-                *effective = self.effective_page_inherited_value(key, value)?;
+            if let Some(value) = dictionary.dictionary_entry(key) {
+                *effective = self.effective_page_value(key, value)?;
             }
         }
         Ok(mask)
