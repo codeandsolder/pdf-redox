@@ -92,9 +92,9 @@ fn append_decoded_content(out: &mut Vec<u8>, decoded: &[u8]) {
 }
 
 pub fn resolved_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(value),
-        Some(OwnedObject::Real(value)) => Some(value),
+    Ok(match document.resolve_owned_value_cow(value)?.as_deref() {
+        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(*value),
+        Some(OwnedObject::Real(value)) => Some(*value),
         _ => None,
     })
 }
@@ -114,7 +114,8 @@ pub fn resolved_number_array<const N: usize>(
     document: &EditDocument,
     value: &OwnedObject,
 ) -> Result<Option<[f64; N]>> {
-    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+    let resolved = document.resolve_owned_value_cow(value)?;
+    let Some(OwnedObject::Array(values)) = resolved.as_deref() else {
         return Ok(None);
     };
     if values.len() != N {
@@ -142,8 +143,8 @@ pub fn resolved_finite_number_array<const N: usize>(
 }
 
 pub fn resolved_bool_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Boolean(value)) => Some(value),
+    Ok(match document.resolve_owned_value_cow(value)?.as_deref() {
+        Some(OwnedObject::Boolean(value)) => Some(*value),
         _ => None,
     })
 }
@@ -175,7 +176,7 @@ pub fn resolved_non_null(document: &EditDocument, value: Option<&OwnedObject>) -
         return Ok(false);
     };
     Ok(!matches!(
-        document.resolve_owned_value(value)?,
+        document.resolve_owned_value_cow(value)?.as_deref(),
         None | Some(OwnedObject::Null)
     ))
 }
@@ -188,8 +189,8 @@ pub fn resolved_dictionary(
         return Ok(None);
     };
     Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|value| value.as_dictionary().cloned()))
+        .resolve_owned_value_cow(value)?
+        .and_then(crate::source::into_owned_dictionary))
 }
 
 /// Return decoded page contents only if a /Contents entry is present.
@@ -230,7 +231,7 @@ pub fn page_box_numbers_matching(
     mut accept: impl FnMut([f64; 4]) -> bool,
 ) -> Result<Option<[f64; 4]>> {
     for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        let Some(value) = document.inherited_page_value(page, key)? else {
+        let Some(value) = document.inherited_page_value_cow(page, key)? else {
             continue;
         };
         let Some(values) = resolved_number_array::<4>(document, &value)? else {
@@ -252,7 +253,7 @@ pub fn page_resources(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = document.inherited_page_value(page, b"Resources")? else {
+    let Some(value) = document.inherited_page_value_cow(page, b"Resources")? else {
         return Ok(None);
     };
     resolved_dictionary(document, Some(&value))

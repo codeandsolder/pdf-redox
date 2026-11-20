@@ -301,13 +301,9 @@ fn current_dictionary(
     document: &EditDocument,
     handle: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
-    Ok(match document.current_owned_object_cow(handle)? {
-        Some(std::borrow::Cow::Owned(
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. },
-        )) => Some(dictionary),
-        Some(std::borrow::Cow::Borrowed(object)) => object.as_dictionary().cloned(),
-        _ => None,
-    })
+    Ok(document
+        .current_owned_object_cow(handle)?
+        .and_then(crate::source::into_owned_dictionary))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -640,13 +636,11 @@ fn compact_page_tree(
         inherited.push((page, materialized));
     }
 
-    for (page, values) in &inherited {
-        let Some(dictionary) = document.edit_handle(*page)?.as_dictionary_mut() else {
+    for (page, values) in inherited {
+        let Some(dictionary) = document.edit_handle(page)?.as_dictionary_mut() else {
             return Ok(());
         };
-        for (key, value) in values {
-            dictionary.insert(key.clone(), value.clone());
-        }
+        dictionary.extend(values);
     }
 
     let level = rebuild_compact_page_tree_levels(document, &pages, root)?;
