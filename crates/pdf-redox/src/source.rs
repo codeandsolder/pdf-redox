@@ -2,7 +2,7 @@ use crate::stream_codec::decode_stream;
 use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
-    object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
+    object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream, dict::DictEntries},
 };
 use smallvec::SmallVec;
 use std::{
@@ -593,24 +593,32 @@ impl<'a> CurrentValue<'a> {
     }
 
     pub fn dictionary_keys(&self) -> Option<Vec<Vec<u8>>> {
+        Some(
+            self.dictionary_entries(matches!(self, Self::Source(..)))?
+                .map(|(key, _)| key.as_ref().to_vec())
+                .collect(),
+        )
+    }
+
+    fn dictionary_entries(&self, skip_stream_length: bool) -> Option<CurrentDictionaryIter<'a>> {
         match self {
-            Self::Source(MaybeRef::NotRef(Object::Dict(dictionary)), _) => Some(
-                dictionary
-                    .entries()
-                    .map(|(key, _)| key.as_ref().to_vec())
-                    .collect(),
-            ),
-            Self::Source(MaybeRef::NotRef(Object::Stream(stream)), _) => Some(
-                stream
-                    .dict()
-                    .entries()
-                    .filter(|(key, _)| key.as_ref() != b"Length")
-                    .map(|(key, _)| key.as_ref().to_vec())
-                    .collect(),
-            ),
-            Self::Owned(value) => Some(value.as_dictionary()?.keys().cloned().collect()),
-            Self::Source(..) => None,
+            Self::Source(MaybeRef::NotRef(object), _) => {
+                source_dictionary_entries(object, skip_stream_length)
+            }
+            Self::Owned(value) => Some(CurrentDictionaryIter {
+                entries: DictionaryEntries::Owned(value.as_dictionary()?.iter()),
+                skip_length: skip_stream_length && self.is_stream(),
+            }),
+            Self::Source(MaybeRef::Ref(_), _) => None,
         }
+    }
+
+    pub fn children(&self, skip_stream_length: bool) -> Option<CurrentChildren<'a>> {
+        if let Some(entries) = self.dictionary_entries(skip_stream_length) {
+            return Some(CurrentChildren::Dictionary(entries));
+        }
+        self.array_items()
+            .map(|items| CurrentChildren::Array(items.enumerate()))
     }
 
     pub const fn is_stream(&self) -> bool {
@@ -709,37 +717,135 @@ impl<'a> Iterator for CurrentArrayIter<'a> {
     }
 }
 
-/// Visit nested owned COS values without using call-stack depth. Reference
-/// collection intentionally skips a stream's /Length entry (the writer
-/// regenerates it), but filter eligibility must inspect every nested value.
-fn owned_cos_values(
-    root: &OwnedObject,
-    skip_stream_length: bool,
-) -> impl Iterator<Item = &OwnedObject> {
-    // The usual shallow PDF object fits inline without per-scan heap allocation.
-    let mut pending = SmallVec::<[&OwnedObject; 8]>::new();
-    pending.push(root);
-    std::iter::from_fn(move || {
-        let value = pending.pop()?;
-        match value {
-            OwnedObject::Array(values) => pending.extend(values),
-            OwnedObject::Dictionary(dictionary) => pending.extend(dictionary.values()),
-            OwnedObject::Stream { dictionary, .. } => {
-                pending.extend(
-                    dictionary
-                        .iter()
-                        .filter(|(name, _)| !skip_stream_length || name.as_slice() != b"Length")
-                        .map(|(_, value)| value),
-                );
-            }
-            _ => {}
+pub enum CurrentKey<'a> {
+    Source(Name<'a>),
+    Owned(&'a [u8]),
+}
+
+impl AsRef<[u8]> for CurrentKey<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Source(name) => name.as_ref(),
+            Self::Owned(name) => name,
         }
-        Some(value)
+    }
+}
+
+enum DictionaryEntries<'a> {
+    Source(DictEntries<'a>),
+    Owned(std::collections::btree_map::Iter<'a, Vec<u8>, OwnedObject>),
+}
+
+pub struct CurrentDictionaryIter<'a> {
+    entries: DictionaryEntries<'a>,
+    skip_length: bool,
+}
+
+impl<'a> Iterator for CurrentDictionaryIter<'a> {
+    type Item = (CurrentKey<'a>, CurrentValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (key, value) = match &mut self.entries {
+                DictionaryEntries::Source(entries) => {
+                    let (key, value) = entries.next()?;
+                    (CurrentKey::Source(key), CurrentValue::Source(value, None))
+                }
+                DictionaryEntries::Owned(entries) => {
+                    let (key, value) = entries.next()?;
+                    (CurrentKey::Owned(key), CurrentValue::Owned(value))
+                }
+            };
+            if !self.skip_length || key.as_ref() != b"Length" {
+                return Some((key, value));
+            }
+        }
+    }
+}
+
+fn source_dictionary_entries<'a>(
+    object: &Object<'a>,
+    skip_stream_length: bool,
+) -> Option<CurrentDictionaryIter<'a>> {
+    let (dictionary, skip_length) = match object {
+        Object::Dict(dictionary) => (dictionary, false),
+        Object::Stream(stream) => (stream.dict(), skip_stream_length),
+        _ => return None,
+    };
+    Some(CurrentDictionaryIter {
+        entries: DictionaryEntries::Source(dictionary.entries()),
+        skip_length,
+    })
+}
+
+pub enum CurrentChildKey<'a> {
+    Dictionary(CurrentKey<'a>),
+    Array(usize),
+}
+
+/// An ordered, lazy iterator over a single direct COS container.
+pub enum CurrentChildren<'a> {
+    Dictionary(CurrentDictionaryIter<'a>),
+    Array(std::iter::Enumerate<CurrentArrayIter<'a>>),
+}
+
+impl<'a> Iterator for CurrentChildren<'a> {
+    type Item = (CurrentChildKey<'a>, CurrentValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dictionary(entries) => entries
+                .next()
+                .map(|(key, value)| (CurrentChildKey::Dictionary(key), value)),
+            Self::Array(entries) => entries
+                .next()
+                .map(|(index, value)| (CurrentChildKey::Array(index), value)),
+        }
+    }
+}
+
+fn source_children<'a>(
+    object: &Object<'a>,
+    skip_stream_length: bool,
+) -> Option<CurrentChildren<'a>> {
+    if let Some(entries) = source_dictionary_entries(object, skip_stream_length) {
+        return Some(CurrentChildren::Dictionary(entries));
+    }
+    match object {
+        Object::Array(array) => Some(CurrentChildren::Array(
+            CurrentArrayIter::Source(array.raw_iter()).enumerate(),
+        )),
+        _ => None,
+    }
+}
+
+/// Walk direct descendants with one iterator per nesting level. No paths,
+/// payload materialization, reference resolution or broad sibling stack.
+fn current_descendants<'a>(
+    children: Option<CurrentChildren<'a>>,
+    skip_stream_length: bool,
+) -> impl Iterator<Item = CurrentValue<'a>> {
+    let mut frames = SmallVec::<[CurrentChildren<'a>; 4]>::new();
+    if let Some(children) = children {
+        frames.push(children);
+    }
+    std::iter::from_fn(move || {
+        loop {
+            if let Some((_, value)) = frames.last_mut()?.next() {
+                if let Some(children) = value.children(skip_stream_length) {
+                    frames.push(children);
+                }
+                return Some(value);
+            }
+            frames.pop();
+        }
     })
 }
 
 fn contains_indirect_reference(value: &OwnedObject) -> bool {
-    owned_cos_values(value, false).any(|value| matches!(value, OwnedObject::Reference(_)))
+    let root = CurrentValue::Owned(value);
+    root.reference().is_some()
+        || current_descendants(root.children(false), false).any(|value| value.reference().is_some())
 }
 
 fn stream_filter_configuration_is_direct(stream: &OwnedObject) -> bool {
@@ -1755,49 +1861,21 @@ impl EditDocument {
     }
 }
 
-/// Add immediate borrowed COS children to an explicit traversal stack.
-/// A stream's /Length is writer-owned, unlike a nested dictionary's /Length.
-fn push_hayro_children<'a>(object: &Object<'a>, pending: &mut SmallVec<[MaybeRef<Object<'a>>; 8]>) {
-    match object {
-        Object::Dict(dictionary) => pending.extend(dictionary.entries().map(|(_, value)| value)),
-        Object::Array(array) => pending.extend(array.raw_iter()),
-        Object::Stream(stream) => pending.extend(
-            stream
-                .dict()
-                .entries()
-                .filter(|(name, _)| name.as_ref() != b"Length")
-                .map(|(_, value)| value),
-        ),
-        Object::Null(_)
-        | Object::Boolean(_)
-        | Object::Number(_)
-        | Object::String(_)
-        | Object::Name(_) => {}
-    }
-}
-
 fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<ObjectId>) {
-    // Source COS references are never followed here: the resulting set is
-    // exactly one object's outgoing edges, not transitive reachability.
-    // Borrow the root to avoid cloning a potentially large decoded string.
-    let mut pending = SmallVec::<[MaybeRef<Object<'_>>; 8]>::new();
-    push_hayro_children(object, &mut pending);
-    while let Some(value) = pending.pop() {
-        match value {
-            MaybeRef::Ref(reference) => {
-                references.insert(reference.into());
-            }
-            MaybeRef::NotRef(object) => push_hayro_children(&object, &mut pending),
+    // Borrow the root: a source string may contain a large decoded buffer.
+    for value in current_descendants(source_children(object, true), true) {
+        if let Some(ObjectHandle::Existing(reference)) = value.reference() {
+            references.insert(reference);
         }
     }
 }
 
 fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<ObjectHandle>) {
-    for value in owned_cos_values(object, true) {
-        if let OwnedObject::Reference(reference) = value {
-            references.insert(*reference);
-        }
-    }
+    let root = CurrentValue::Owned(object);
+    references.extend(root.reference());
+    references.extend(
+        current_descendants(root.children(true), true).filter_map(|value| value.reference()),
+    );
 }
 
 #[expect(
