@@ -1,4 +1,7 @@
-use crate::{EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData};
+use crate::{
+    EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
+    source::{CurrentValue, into_owned_dictionary},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Default)]
@@ -202,17 +205,14 @@ pub fn page_content_if_present(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(page) = document.current_owned_object(page)? else {
+    let Some(page) = document.current_value(page)? else {
         return Ok(None);
     };
-    let Some(dictionary) = page.as_dictionary() else {
-        return Ok(None);
-    };
-    let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
+    let Some(contents) = page.dictionary_entry(b"Contents") else {
         return Ok(None);
     };
     let mut decoded = Vec::new();
-    decoded_content_value(document, contents, &mut decoded)?;
+    decoded_content_value(document, contents.into_cow().as_ref(), &mut decoded)?;
     Ok(Some(decoded))
 }
 
@@ -249,14 +249,40 @@ pub fn page_box_numbers(document: &EditDocument, page: ObjectHandle) -> Result<O
     page_box_numbers_matching(document, page, |_| true)
 }
 
+fn resolved_current_dictionary(
+    document: &EditDocument,
+    value: Option<CurrentValue<'_>>,
+) -> Result<Option<OwnedDictionary>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(value) = document.resolve_current_value(value)? else {
+        return Ok(None);
+    };
+    if !value.has_dictionary() {
+        return Ok(None);
+    }
+    Ok(into_owned_dictionary(value.into_cow()))
+}
+
 pub fn page_resources(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
-    let Some(value) = document.inherited_page_value_cow(page, b"Resources")? else {
-        return Ok(None);
-    };
-    resolved_dictionary(document, Some(&value))
+    resolved_current_dictionary(
+        document,
+        document.inherited_page_raw_value(page, b"Resources")?,
+    )
+}
+
+fn xobject_dictionary_handles(xobjects: OwnedDictionary) -> BTreeMap<Vec<u8>, ObjectHandle> {
+    xobjects
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            OwnedObject::Reference(handle) => Some((name, handle)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Resolve the name -> object handle mapping of referenced `XObjects`.
@@ -268,37 +294,36 @@ pub fn xobject_handles(
     else {
         return Ok(BTreeMap::new());
     };
-    Ok(xobjects
-        .into_iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(handle) => Some((name, handle)),
-            _ => None,
-        })
-        .collect())
+    Ok(xobject_dictionary_handles(xobjects))
 }
 
-/// Read an inherited page resource dictionary and resolve its `XObject` handles.
+/// Read only the inherited resource dictionary's `XObject` category.
 pub fn page_xobject_handles(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(resources) = page_resources(document, page)? else {
+    let Some(resources) = document.inherited_page_raw_value(page, b"Resources")? else {
         return Ok(BTreeMap::new());
     };
-    xobject_handles(document, &resources)
+    let Some(resources) = document.resolve_current_value(resources)? else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(xobjects) =
+        resolved_current_dictionary(document, resources.dictionary_entry(b"XObject"))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(xobject_dictionary_handles(xobjects))
 }
 
 pub fn form_resources(
     document: &EditDocument,
     form: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
-    let Some(object) = document.current_owned_object(form)? else {
+    let Some(object) = document.current_value(form)? else {
         return Ok(None);
     };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    resolved_dictionary(document, dictionary.get(b"Resources".as_slice()))
+    resolved_current_dictionary(document, object.dictionary_entry(b"Resources"))
 }
 
 pub fn effective_page_resources(
@@ -309,16 +334,16 @@ pub fn effective_page_resources(
 }
 
 pub fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Option<f64>> {
-    let Some(object) = document.current_owned_object(page)? else {
+    let Some(object) = document.current_value(page)? else {
         return Ok(None);
     };
-    let Some(dictionary) = object.as_dictionary() else {
+    if !object.has_dictionary() {
         return Ok(None);
-    };
-    let Some(value) = dictionary.get(b"UserUnit".as_slice()) else {
+    }
+    let Some(value) = object.dictionary_entry(b"UserUnit") else {
         return Ok(Some(1.0));
     };
-    let Some(value) = resolved_number_value(document, value)? else {
+    let Some(value) = resolved_number_value(document, value.into_cow().as_ref())? else {
         return Ok(None);
     };
     Ok((value.is_finite() && value > 0.0).then_some(value))
