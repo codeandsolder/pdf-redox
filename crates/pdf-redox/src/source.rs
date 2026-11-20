@@ -19,6 +19,8 @@ enum SourceStreamKind {
     Stream(Option<Vec<u8>>),
 }
 
+pub const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+
 /// Immutable, lazily parsed source PDF backed by Hayro.
 ///
 /// Hayro keeps the original bytes alive and parses objects on demand. Mutations
@@ -1227,6 +1229,62 @@ impl EditDocument {
             .collect())
     }
 
+    /// Determine whether a dictionary entry actually overrides an inherited
+    /// page property. Match the reader's typed fallback through null/invalid
+    /// values while retaining the raw value when inheritance is materialized.
+    pub(crate) fn effective_page_inherited_value(
+        &self,
+        key: &[u8],
+        value: &OwnedObject,
+    ) -> Result<bool> {
+        let resolved = self.resolve_owned_value_cow(value)?;
+        let Some(value) = resolved.as_deref() else {
+            return Ok(false);
+        };
+        Ok(match key {
+            b"Resources" => matches!(value, OwnedObject::Dictionary(_)),
+            b"MediaBox" | b"CropBox" => {
+                let OwnedObject::Array(values) = value else {
+                    return Ok(false);
+                };
+                if values.len() < 4 {
+                    return Ok(false);
+                }
+                for component in &values[..4] {
+                    if !matches!(
+                        self.resolve_owned_value_cow(component)?.as_deref(),
+                        Some(OwnedObject::Integer(_) | OwnedObject::Real(_))
+                    ) {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            b"Rotate" => match value {
+                OwnedObject::Integer(value) => i32::try_from(*value).is_ok(),
+                OwnedObject::Real(value) => {
+                    let integer = value.trunc();
+                    integer >= f64::from(i32::MIN) && integer <= f64::from(i32::MAX)
+                }
+                _ => false,
+            },
+            _ => !matches!(value, OwnedObject::Null),
+        })
+    }
+
+    pub(crate) fn effective_page_inheritance_mask(
+        &self,
+        dictionary: &OwnedDictionary,
+    ) -> Result<[bool; PAGE_INHERITABLE_KEYS.len()]> {
+        let mut mask = [false; PAGE_INHERITABLE_KEYS.len()];
+        for (key, effective) in PAGE_INHERITABLE_KEYS.into_iter().zip(&mut mask) {
+            if let Some(value) = dictionary.get(key) {
+                *effective = self.effective_page_inherited_value(key, value)?;
+            }
+        }
+        Ok(mask)
+    }
+
     /// Resolve one inheritable page-tree value from a current page dictionary.
     pub(crate) fn inherited_page_value(
         &self,
@@ -1263,7 +1321,9 @@ impl EditDocument {
             let Some(dictionary) = object.as_dictionary() else {
                 return Ok(None);
             };
-            if dictionary.contains_key(key) {
+            if let Some(value) = dictionary.get(key)
+                && self.effective_page_inherited_value(key, value)?
+            {
                 return Ok(match object {
                     Cow::Borrowed(value) => value
                         .as_dictionary()
@@ -1717,7 +1777,10 @@ mod tests {
         pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
         pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let value = OwnedObject::String(vec![42; 1024 * 1024]);
+        let value = OwnedObject::Dictionary(OwnedDictionary::from([(
+            b"Private".to_vec(),
+            OwnedObject::String(vec![42; 1024 * 1024]),
+        )]));
         let handle = ObjectHandle::New(document.add_object(value));
         let reference = OwnedObject::Reference(handle);
         let chain = ObjectHandle::New(document.add_object(reference.clone()));
