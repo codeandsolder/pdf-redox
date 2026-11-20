@@ -456,6 +456,25 @@ impl Config {
         }
     }
 
+    /// Apply the standard processing objective to an optimization profile.
+    ///
+    /// Prefer simpler display lists, preserve known functional document
+    /// semantics, normalize fragmented rasters and bake their masks. This
+    /// intentionally permits microstroke rasterization and eligible ICC
+    /// alternate substitution. Apply explicit preservation or color-policy
+    /// overrides after selecting the objective.
+    #[must_use]
+    pub const fn for_processing(mut self) -> Self {
+        self.optimization_goal = OptimizationGoal::Processing;
+        self.preservation = PreservationConfig::known_functional();
+        self.preservation.output_intents = false;
+        self.rasterize_excessive_small_vectors = true;
+        self.raster_layout.enabled = true;
+        self.raster_layout.bake_masks = true;
+        self.elide_icc_profiles_to_alternate = true;
+        self
+    }
+
     #[must_use]
     /// Returns the perceptual preset with size-gated JPEG optimization enabled.
     pub fn perceptual() -> Self {

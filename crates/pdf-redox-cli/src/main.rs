@@ -2,8 +2,8 @@ mod corpus;
 
 use clap::{Parser, ValueEnum};
 use pdf_redox::{
-    AnnotationPolicy, Config, OptimizationGoal, PrivacyLevel, analyze_microstroke_rasterization,
-    analyze_pdf, analyze_pdf_preflight, optimize_pdf, optimize_pdf_with_glyph_catalog,
+    AnnotationPolicy, Config, PrivacyLevel, analyze_microstroke_rasterization, analyze_pdf,
+    analyze_pdf_preflight, optimize_pdf, optimize_pdf_with_glyph_catalog,
 };
 use std::{
     io::{self, Write},
@@ -203,8 +203,15 @@ fn config_from_args(args: &Args) -> Config {
         ProfileArg::Perceptual => Config::perceptual(),
         ProfileArg::Print => Config::print(),
     };
-    if matches!(args.optimize_for, OptimizeForArg::Processing) && !args.preserve_authoring_data {
-        cfg.preservation = pdf_redox::PreservationConfig::known_functional();
+    if matches!(args.optimize_for, OptimizeForArg::Processing) {
+        let prior_preservation = cfg.preservation.clone();
+        cfg = cfg.for_processing();
+        if args.preserve_authoring_data {
+            cfg.preservation = pdf_redox::PreservationConfig {
+                output_intents: cfg.preservation.output_intents,
+                ..prior_preservation
+            };
+        }
     }
     cfg.preservation.private_authoring_data = args.preserve_authoring_data;
     if args.preserve_authoring_data || args.preserve_font_editing_support {
@@ -225,8 +232,8 @@ fn config_from_args(args: &Args) -> Config {
     if args.drop_structure {
         cfg.preservation.structure = false;
     }
-    cfg.preservation.output_intents = args.keep_output_intents
-        || (!args.drop_output_intents && !matches!(args.optimize_for, OptimizeForArg::Processing));
+    cfg.preservation.output_intents =
+        args.keep_output_intents || (!args.drop_output_intents && cfg.preservation.output_intents);
     if args.drop_viewer_preferences {
         cfg.preservation.viewer_preferences = false;
     }
@@ -260,21 +267,13 @@ fn config_from_args(args: &Args) -> Config {
     if let Some(max_image_ppi) = args.max_image_ppi {
         cfg.max_image_ppi = Some(max_image_ppi);
     }
-    cfg.optimization_goal = match args.optimize_for {
-        OptimizeForArg::Size => OptimizationGoal::Size,
-        OptimizeForArg::Processing => OptimizationGoal::Processing,
-    };
     if let Some(flate_workers) = args.flate_workers {
         cfg.flate_workers = flate_workers;
     }
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
-        && (cfg.rasterize_excessive_small_vectors
-            || args.rasterize_excessive_small_vectors
-            || matches!(args.optimize_for, OptimizeForArg::Processing));
-    cfg.raster_layout.enabled =
-        args.normalize_raster_layout || matches!(args.optimize_for, OptimizeForArg::Processing);
-    cfg.raster_layout.bake_masks =
-        args.bake_image_masks || matches!(args.optimize_for, OptimizeForArg::Processing);
+        && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
+    cfg.raster_layout.enabled |= args.normalize_raster_layout;
+    cfg.raster_layout.bake_masks |= args.bake_image_masks;
     cfg.raster_layout.exact_raster_rendering = args.exact_raster_rendering;
     cfg.remove_large_diagonal_text = args.remove_large_diagonal_text;
     cfg.remove_repeated_page_objects = args.remove_repeated_page_objects;
@@ -294,8 +293,7 @@ fn config_from_args(args: &Args) -> Config {
     cfg.privacy.remove_active_content = args.remove_active_content;
     cfg.privacy.remove_signatures = args.remove_signatures;
     cfg.elide_icc_profiles_to_alternate = args.elide_icc_to_alternate
-        || (matches!(args.optimize_for, OptimizeForArg::Processing)
-            && !args.keep_icc_color_management);
+        || (cfg.elide_icc_profiles_to_alternate && !args.keep_icc_color_management);
 
     cfg
 }
@@ -389,6 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pdf_redox::OptimizationGoal;
 
     #[test]
     fn glyph_catalog_flag_accepts_a_separate_processing_output() -> Result<(), clap::Error> {
@@ -431,6 +430,47 @@ mod tests {
                 .preservation
                 .private_authoring_data
         );
+        Ok(())
+    }
+
+    #[test]
+    fn processing_cli_uses_library_profile_and_explicit_overrides() -> Result<(), clap::Error> {
+        for (profile, base) in [
+            ("optimize", Config::optimize_only()),
+            ("perceptual", Config::perceptual()),
+            ("print", Config::print()),
+        ] {
+            let args = Args::try_parse_from([
+                "pdf-redox",
+                "input.pdf",
+                "--profile",
+                profile,
+                "--optimize-for",
+                "processing",
+            ])?;
+            assert_eq!(config_from_args(&args), base.clone().for_processing());
+            let keep = Args::try_parse_from([
+                "pdf-redox",
+                "input.pdf",
+                "--profile",
+                profile,
+                "--optimize-for",
+                "processing",
+                "--preserve-authoring-data",
+                "--keep-output-intents",
+                "--keep-icc-color-management",
+                "--keep-excessive-small-vectors",
+            ])?;
+            let config = config_from_args(&keep);
+            assert!(config.preservation.private_authoring_data);
+            assert!(config.preservation.font_editing_support);
+            assert!(config.preservation.metadata);
+            assert!(config.preservation.unknown_objects);
+            assert!(config.preservation.output_intents);
+            assert!(!config.elide_icc_profiles_to_alternate);
+            assert!(!config.rasterize_excessive_small_vectors);
+            assert_eq!(config.image_policy, base.image_policy);
+        }
         Ok(())
     }
 
