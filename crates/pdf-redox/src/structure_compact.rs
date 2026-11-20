@@ -193,78 +193,78 @@ fn current_dictionary(
         .and_then(|object| object.as_dictionary().cloned()))
 }
 
-fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
-    fn visit(
-        document: &EditDocument,
-        node: ObjectHandle,
-        seen: &mut BTreeSet<ObjectHandle>,
-        removals: &mut Vec<(ObjectHandle, Vec<Vec<u8>>)>,
-    ) -> Result<Option<[bool; PAGE_INHERITABLE_KEYS.len()]>> {
-        if !seen.insert(node) {
-            return Ok(None);
-        }
-        let Some(dictionary) = current_dictionary(document, node)? else {
-            return Ok(None);
-        };
+// A post-order traversal computes which inherited keys are defined on
+// every path beneath each /Pages node. Keep only the small per-node state
+// on the heap; recursive page-tree traversal can overflow the thread stack
+// even when the source parser accepts every individual dictionary.
+struct PageTreePruneFrame {
+    node: ObjectHandle,
+    defined: [bool; PAGE_INHERITABLE_KEYS.len()],
+    kids: Vec<ObjectHandle>,
+    next_child: usize,
+    covered_by_children: [bool; PAGE_INHERITABLE_KEYS.len()],
+}
+
+impl PageTreePruneFrame {
+    fn new(node: ObjectHandle, dictionary: &OwnedDictionary) -> Option<Self> {
         if !matches!(
             dictionary.get(b"Type".as_slice()),
             Some(OwnedObject::Name(name)) if name == b"Pages"
         ) {
-            return Ok(None);
+            return None;
         }
-        let Some(OwnedObject::Array(kids)) = dictionary.get(b"Kids".as_slice()) else {
-            return Ok(None);
+        let OwnedObject::Array(kids) = dictionary.get(b"Kids".as_slice())? else {
+            return None;
         };
-        if kids.is_empty() {
-            return Ok(Some(std::array::from_fn(|index| {
+        let kids = kids
+            .iter()
+            .map(|kid| match kid {
+                OwnedObject::Reference(handle) => Some(*handle),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            node,
+            defined: std::array::from_fn(|index| {
                 dictionary.contains_key(PAGE_INHERITABLE_KEYS[index])
-            })));
-        }
+            }),
+            kids,
+            next_child: 0,
+            covered_by_children: [true; PAGE_INHERITABLE_KEYS.len()],
+        })
+    }
 
-        let mut child_coverage = vec![[false; PAGE_INHERITABLE_KEYS.len()]; kids.len()];
-        for (kid_index, kid) in kids.iter().enumerate() {
-            let OwnedObject::Reference(kid) = kid else {
-                return Ok(None);
-            };
-            let Some(child) = current_dictionary(document, *kid)? else {
-                return Ok(None);
-            };
-            if matches!(
-                child.get(b"Type".as_slice()),
-                Some(OwnedObject::Name(name)) if name == b"Pages"
-            ) {
-                let Some(coverage) = visit(document, *kid, seen, removals)? else {
-                    return Ok(None);
-                };
-                child_coverage[kid_index] = coverage;
-            } else if matches!(
-                child.get(b"Type".as_slice()),
-                Some(OwnedObject::Name(name)) if name == b"Page"
-            ) {
-                child_coverage[kid_index] =
-                    std::array::from_fn(|index| child.contains_key(PAGE_INHERITABLE_KEYS[index]));
-            } else {
-                return Ok(None);
-            }
+    fn include_child(&mut self, coverage: [bool; PAGE_INHERITABLE_KEYS.len()]) {
+        for (covered, child) in self.covered_by_children.iter_mut().zip(coverage) {
+            *covered &= child;
         }
+    }
 
-        let covered_below: [bool; PAGE_INHERITABLE_KEYS.len()] =
-            std::array::from_fn(|index| child_coverage.iter().all(|coverage| coverage[index]));
+    fn finish(
+        self,
+        removals: &mut Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+    ) -> [bool; PAGE_INHERITABLE_KEYS.len()] {
+        // A /Pages node with no kids proves nothing about descendant
+        // coverage, and its own keys must not be pruned.
+        let covered_below = if self.kids.is_empty() {
+            [false; PAGE_INHERITABLE_KEYS.len()]
+        } else {
+            self.covered_by_children
+        };
         let remove = PAGE_INHERITABLE_KEYS
             .into_iter()
             .enumerate()
-            .filter(|(index, key)| dictionary.contains_key(*key) && covered_below[*index])
+            .filter(|(index, _)| self.defined[*index] && covered_below[*index])
             .map(|(_, key)| key.to_vec())
             .collect::<Vec<_>>();
         if !remove.is_empty() {
-            removals.push((node, remove));
+            removals.push((self.node, remove));
         }
-
-        Ok(Some(std::array::from_fn(|index| {
-            dictionary.contains_key(PAGE_INHERITABLE_KEYS[index]) || covered_below[index]
-        })))
+        std::array::from_fn(|index| self.defined[index] || covered_below[index])
     }
+}
 
+fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = current_dictionary(document, catalog)? else {
         return Ok(0);
@@ -272,12 +272,52 @@ fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<u
     let Some(root) = dictionary_reference(&catalog, b"Pages") else {
         return Ok(0);
     };
-    let mut seen = BTreeSet::new();
-    let mut removals = Vec::new();
-    if visit(document, root, &mut seen, &mut removals)?.is_none() {
+    let Some(root_dictionary) = current_dictionary(document, root)? else {
         return Ok(0);
+    };
+    let Some(root_frame) = PageTreePruneFrame::new(root, &root_dictionary) else {
+        return Ok(0);
+    };
+    let mut seen = BTreeSet::from([root]);
+    let mut pending = vec![root_frame];
+    let mut removals = Vec::new();
+
+    while let Some(frame) = pending.last_mut() {
+        if let Some(&kid) = frame.kids.get(frame.next_child) {
+            frame.next_child += 1;
+            let Some(child) = current_dictionary(document, kid)? else {
+                return Ok(0);
+            };
+            match child.get(b"Type".as_slice()) {
+                Some(OwnedObject::Name(kind)) if kind == b"Page" => {
+                    frame.include_child(std::array::from_fn(|index| {
+                        child.contains_key(PAGE_INHERITABLE_KEYS[index])
+                    }));
+                }
+                Some(OwnedObject::Name(kind)) if kind == b"Pages" => {
+                    if !seen.insert(kid) {
+                        return Ok(0);
+                    }
+                    let Some(child_frame) = PageTreePruneFrame::new(kid, &child) else {
+                        return Ok(0);
+                    };
+                    pending.push(child_frame);
+                }
+                _ => return Ok(0),
+            }
+        } else {
+            let Some(completed) = pending.pop() else {
+                break;
+            };
+            let coverage = completed.finish(&mut removals);
+            if let Some(parent) = pending.last_mut() {
+                parent.include_child(coverage);
+            }
+        }
     }
 
+    // No mutations happen until the entire tree is validated. A missing
+    // reference, invalid child, or repeated /Pages handle aborts everything.
     let mut removed = 0usize;
     for (node, keys) in removals {
         let Some(dictionary) = document.edit_handle(node)?.as_dictionary_mut() else {
@@ -974,6 +1014,88 @@ mod tests {
     }
 
     #[test]
+    fn empty_page_tree_does_not_vacuously_shadow_inherited_keys() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let root = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let Some(dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing page-tree root".to_owned()));
+        };
+        dictionary.insert(b"Kids".to_vec(), OwnedObject::Array(Vec::new()));
+
+        assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 0);
+        let Some(dictionary) = current_dictionary(&document, root)? else {
+            return Err(Error::Invalid("missing page-tree root".to_owned()));
+        };
+        assert_eq!(
+            dictionary.get(b"Rotate".as_slice()),
+            Some(&OwnedObject::Integer(90))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deep_page_tree_pruning_uses_bounded_call_stack() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Rotate 180 /MediaBox [0 0 10 10] >>",
+        )?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let root = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let leaf = ObjectHandle::Existing(crate::ObjectId::new(3, 0));
+
+        // Individual COS dictionaries remain shallow, but the indirect page
+        // tree can exceed the stack available to recursively visit each node.
+        let mut parent = root;
+        for _ in 0..20_000 {
+            let node = ObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+                OwnedDictionary::from([
+                    (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+                    (b"Kids".to_vec(), OwnedObject::Array(Vec::new())),
+                    (b"Count".to_vec(), OwnedObject::Integer(1)),
+                    (b"Parent".to_vec(), OwnedObject::Reference(parent)),
+                ]),
+            )));
+            let Some(dictionary) = document.edit_handle(parent)?.as_dictionary_mut() else {
+                return Err(Error::Invalid("missing page-tree parent".to_owned()));
+            };
+            dictionary.insert(
+                b"Kids".to_vec(),
+                OwnedObject::Array(vec![OwnedObject::Reference(node)]),
+            );
+            parent = node;
+        }
+        let Some(dictionary) = document.edit_handle(parent)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing page-tree tail".to_owned()));
+        };
+        dictionary.insert(
+            b"Kids".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Reference(leaf)]),
+        );
+        let Some(dictionary) = document.edit_handle(leaf)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing page-tree leaf".to_owned()));
+        };
+        dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(parent));
+
+        assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 1);
+        let Some(root_dictionary) = current_dictionary(&document, root)? else {
+            return Err(Error::Invalid("missing page-tree root".to_owned()));
+        };
+        assert!(!root_dictionary.contains_key(b"Rotate".as_slice()));
+        assert_eq!(
+            document.inherited_page_value(leaf, b"Rotate")?,
+            Some(OwnedObject::Integer(180))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_page_tree_aborts_shadow_pruning_transaction() -> Result<()> {
         let mut pdf = ClassicPdfBuilder::new();
         pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
@@ -1002,6 +1124,28 @@ mod tests {
             ObjectHandle::Existing(crate::ObjectId::new(3, 0)),
         )?
         .ok_or_else(|| Error::Invalid("page-tree child is missing".to_owned()))?;
+        assert!(child.contains_key(b"Resources".as_slice()));
+
+        // The sibling is now a /Pages node pointing back to the root. The
+        // first subtree would justify removing /Resources from its parent,
+        // but a later cycle must abort the entire batch without partial edits.
+        let cycle = ObjectHandle::Existing(crate::ObjectId::new(9, 0));
+        let root = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        *document.edit_handle(cycle)? = OwnedObject::Dictionary(OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+            (
+                b"Kids".to_vec(),
+                OwnedObject::Array(vec![OwnedObject::Reference(root)]),
+            ),
+        ]));
+        assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 0);
+        let Some(child) = current_dictionary(
+            &document,
+            ObjectHandle::Existing(crate::ObjectId::new(3, 0)),
+        )?
+        else {
+            return Err(Error::Invalid("page-tree child is missing".to_owned()));
+        };
         assert!(child.contains_key(b"Resources".as_slice()));
         Ok(())
     }
