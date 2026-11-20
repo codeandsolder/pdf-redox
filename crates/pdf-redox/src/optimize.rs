@@ -260,65 +260,34 @@ struct FontDedupPhaseResult {
     icc_alternate: IccAlternateElisionStats,
 }
 
-/// Keep font-table stripping, font program canonicalization, graph-dependent
-/// rewrites, and exact dictionary dedup in this order. In particular, font
-/// and `ToUnicode` reference mutations precede the source-uniqueness proof.
-fn run_font_dedup_phase(
+/// Deduplication of font-reference-bearing dictionaries observes the mutation
+/// counters from prior font/metadata stages, then rechecks ExtGState candidates
+/// against current document objects after sampled Functions are canonicalized.
+struct ReferenceDedupResult {
+    to_unicode_dedup: crate::dedup::TargetedDedupStats,
+    font_object_dedup: crate::dedup::ExactObjectDedupStats,
+    sampled_function_dedup: crate::dedup::TargetedDedupStats,
+    extgstate_object_dedup: crate::dedup::ExactObjectDedupStats,
+    structure_attribute_dedup: crate::dedup::ExactObjectDedupStats,
+    icc_dedup: crate::dedup::TargetedDedupStats,
+    icc_alternate: IccAlternateElisionStats,
+}
+
+fn run_reference_dedup_phase(
     document: &mut EditDocument,
     context: FontDedupContext<'_>,
+    metadata_dedup: &crate::dedup::TargetedDedupStats,
+    font_dedup: &crate::dedup::TargetedDedupStats,
     timings: &mut BTreeMap<String, f64>,
-) -> Result<FontDedupPhaseResult> {
+) -> Result<ReferenceDedupResult> {
     let FontDedupContext {
         cfg,
         before,
-        pages,
         preservation,
         scrub,
         ext_gstate_dictionary_handles,
+        ..
     } = context;
-    let flate_level = cfg.optimization_goal.flate_level();
-    // Strip rendering-irrelevant editing/layout state before font-program
-    // dedup so producer subsets can converge to the same program.
-    let mut font_rendering = timed(timings, "font-table-strip", || {
-        if cfg.preservation.font_editing_support
-            || before.font_rendering_table_inventory_complete
-                && before.font_rendering_table_candidate_count == 0
-        {
-            Ok(FontOptimizationStats::default())
-        } else {
-            strip_font_editing_tables(document, flate_level)
-        }
-    })?;
-    let metadata_dedup = timed(timings, "metadata-dedup", || {
-        if before.preservation_key_inventory_complete && before.authoring_metadata_key_count == 0 {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_metadata_streams(document)
-        }
-    })?;
-    let font_dedup = timed(timings, "font-dedup", || {
-        if before.font_raw_payload_inventory_version >= 1
-            && before.font_raw_duplicate_payload_groups == 0
-            && font_rendering.programs_optimized == 0
-        {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_font_program_streams(document)
-        }
-    })?;
-    let FontGraphPhaseResult {
-        font_dense,
-        post_dedup_font_graph,
-        cid_cmap_source_inventory_still_valid,
-    } = run_font_graph_phase(
-        document,
-        pages,
-        cfg,
-        before,
-        flate_level,
-        timings,
-        &mut font_rendering,
-    )?;
     let to_unicode_dedup = timed(timings, "to-unicode-dedup", || {
         if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
             || before.to_unicode_raw_payload_inventory_version >= 1
@@ -396,6 +365,85 @@ fn run_font_dedup_phase(
             Ok(IccAlternateElisionStats::default())
         }
     })?;
+    Ok(ReferenceDedupResult {
+        to_unicode_dedup,
+        font_object_dedup,
+        sampled_function_dedup,
+        extgstate_object_dedup,
+        structure_attribute_dedup,
+        icc_dedup,
+        icc_alternate,
+    })
+}
+
+/// Keep font-table stripping, font program canonicalization, graph-dependent
+/// rewrites, and exact dictionary dedup in this order. In particular, font
+/// and `ToUnicode` reference mutations precede the source-uniqueness proof.
+fn run_font_dedup_phase(
+    document: &mut EditDocument,
+    context: FontDedupContext<'_>,
+    timings: &mut BTreeMap<String, f64>,
+) -> Result<FontDedupPhaseResult> {
+    let FontDedupContext {
+        cfg,
+        before,
+        pages,
+        preservation,
+        scrub,
+        ext_gstate_dictionary_handles,
+    } = context;
+    let flate_level = cfg.optimization_goal.flate_level();
+    // Strip rendering-irrelevant editing/layout state before font-program
+    // dedup so producer subsets can converge to the same program.
+    let mut font_rendering = timed(timings, "font-table-strip", || {
+        if cfg.preservation.font_editing_support
+            || before.font_rendering_table_inventory_complete
+                && before.font_rendering_table_candidate_count == 0
+        {
+            Ok(FontOptimizationStats::default())
+        } else {
+            strip_font_editing_tables(document, flate_level)
+        }
+    })?;
+    let metadata_dedup = timed(timings, "metadata-dedup", || {
+        if before.preservation_key_inventory_complete && before.authoring_metadata_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_metadata_streams(document)
+        }
+    })?;
+    let font_dedup = timed(timings, "font-dedup", || {
+        if before.font_raw_payload_inventory_version >= 1
+            && before.font_raw_duplicate_payload_groups == 0
+            && font_rendering.programs_optimized == 0
+        {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_font_program_streams(document)
+        }
+    })?;
+    let FontGraphPhaseResult {
+        font_dense,
+        post_dedup_font_graph,
+        cid_cmap_source_inventory_still_valid,
+    } = run_font_graph_phase(
+        document,
+        pages,
+        cfg,
+        before,
+        flate_level,
+        timings,
+        &mut font_rendering,
+    )?;
+    let ReferenceDedupResult {
+        to_unicode_dedup,
+        font_object_dedup,
+        sampled_function_dedup,
+        extgstate_object_dedup,
+        structure_attribute_dedup,
+        icc_dedup,
+        icc_alternate,
+    } = run_reference_dedup_phase(document, context, &metadata_dedup, &font_dedup, timings)?;
     Ok(FontDedupPhaseResult {
         font_rendering,
         metadata_dedup,
