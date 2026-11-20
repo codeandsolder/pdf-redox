@@ -632,14 +632,80 @@ const MAX_DECODED_CONTENT_STREAM_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 struct DecodedContentCache {
     bytes: usize,
-    streams: BTreeMap<ObjectId, Arc<[u8]>>,
+    streams: BTreeMap<ObjectId, CachedContentStream>,
+    // Indexed by last access so capacity pressure evicts in O(log n), rather
+    // than scanning all cached streams to find an eviction candidate.
+    oldest_first: BTreeSet<(u64, ObjectId)>,
+    access_clock: u64,
+}
+
+struct CachedContentStream {
+    bytes: Arc<[u8]>,
+    last_access: u64,
 }
 
 impl DecodedContentCache {
-    fn evict(&mut self, id: ObjectId) {
-        if let Some(bytes) = self.streams.remove(&id) {
-            self.bytes -= bytes.len();
+    fn next_access(&mut self) -> u64 {
+        // Keep the LRU ordering correct even if the counter eventually wraps.
+        // This path is normally unreachable, and costs O(n log n) only once
+        // per 2^64 cache accesses.
+        if self.access_clock == u64::MAX {
+            let prior_order = std::mem::take(&mut self.oldest_first);
+            self.access_clock = 0;
+            for (_, id) in prior_order {
+                self.access_clock += 1;
+                if let Some(stream) = self.streams.get_mut(&id) {
+                    stream.last_access = self.access_clock;
+                    self.oldest_first.insert((self.access_clock, id));
+                }
+            }
         }
+        self.access_clock += 1;
+        self.access_clock
+    }
+
+    fn get(&mut self, id: ObjectId) -> Option<Arc<[u8]>> {
+        if !self.streams.contains_key(&id) {
+            return None;
+        }
+        let age = self.next_access();
+        let stream = self.streams.get_mut(&id)?;
+        self.oldest_first.remove(&(stream.last_access, id));
+        stream.last_access = age;
+        self.oldest_first.insert((age, id));
+        Some(Arc::clone(&stream.bytes))
+    }
+
+    fn evict(&mut self, id: ObjectId) {
+        if let Some(stream) = self.streams.remove(&id) {
+            self.oldest_first.remove(&(stream.last_access, id));
+            self.bytes -= stream.bytes.len();
+        }
+    }
+
+    fn insert(&mut self, id: ObjectId, decoded: &[u8], capacity: usize) {
+        // Replacement must invalidate an old entry even when the new data is
+        // too large to retain; otherwise the previous bytes could look fresh.
+        self.evict(id);
+        if decoded.len() > capacity {
+            return;
+        }
+        while capacity.saturating_sub(self.bytes) < decoded.len() {
+            let Some(&(_, oldest_id)) = self.oldest_first.first() else {
+                return;
+            };
+            self.evict(oldest_id);
+        }
+        let age = self.next_access();
+        self.streams.insert(
+            id,
+            CachedContentStream {
+                bytes: Arc::from(decoded),
+                last_access: age,
+            },
+        );
+        self.oldest_first.insert((age, id));
+        self.bytes += decoded.len();
     }
 }
 
@@ -934,9 +1000,9 @@ impl EditDocument {
             _ => None,
         };
         if let Some(id) = unchanged_source_id
-            && let Some(decoded) = self.decoded_content_stream_cache.borrow().streams.get(&id)
+            && let Some(decoded) = self.decoded_content_stream_cache.borrow_mut().get(id)
         {
-            return Ok(Some(ContentRead::Cached(Arc::clone(decoded))));
+            return Ok(Some(ContentRead::Cached(decoded)));
         }
 
         let Some(object) = self.current_owned_object_cow(handle)? else {
@@ -952,11 +1018,11 @@ impl EditDocument {
         if let Some(id) = cache_id
             && decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES
         {
-            let mut cache = self.decoded_content_stream_cache.borrow_mut();
-            if cache.bytes.saturating_add(decoded.len()) <= MAX_DECODED_CONTENT_CACHE_BYTES {
-                cache.bytes = cache.bytes.saturating_add(decoded.len());
-                cache.streams.insert(id, Arc::from(decoded.as_slice()));
-            }
+            self.decoded_content_stream_cache.borrow_mut().insert(
+                id,
+                &decoded,
+                MAX_DECODED_CONTENT_CACHE_BYTES,
+            );
         }
         Ok(Some(ContentRead::Decoded(decoded)))
     }
@@ -1816,6 +1882,72 @@ mod tests {
     }
 
     #[test]
+    fn decoded_content_cache_replaces_old_entries_with_recently_used_streams() -> Result<()> {
+        let one = ObjectId::new(1, 0);
+        let two = ObjectId::new(2, 0);
+        let three = ObjectId::new(3, 0);
+        let four = ObjectId::new(4, 0);
+        let mut cache = DecodedContentCache::default();
+        let capacity = 10;
+
+        cache.insert(one, b"one", capacity);
+        cache.insert(two, b"two", capacity);
+        cache.insert(three, b"four", capacity);
+        assert_eq!(cache.bytes, capacity);
+        assert_eq!(cache.oldest_first.len(), 3);
+
+        let Some(held) = cache.get(one) else {
+            return Err(Error::Invalid("initial cache entry missing".to_owned()));
+        };
+        let Some(again) = cache.get(one) else {
+            return Err(Error::Invalid("cache hit should be shared".to_owned()));
+        };
+        assert!(Arc::ptr_eq(&held, &again));
+        // The oldest entry is now two, not one.
+        cache.insert(four, b"xx", capacity);
+        assert!(cache.get(two).is_none());
+        assert!(cache.get(one).is_some());
+        assert!(cache.get(three).is_some());
+        assert!(cache.get(four).is_some());
+        assert_eq!(cache.bytes, 9);
+        assert_eq!(cache.oldest_first.len(), 3);
+
+        // Reinserting two evicts one (the least recently used after the reads).
+        cache.insert(two, b"long", capacity);
+        assert!(cache.get(one).is_none());
+        assert_eq!(held.as_ref(), b"one"); // Held snapshots outlive eviction.
+        assert_eq!(cache.bytes, 10);
+        assert_eq!(cache.oldest_first.len(), cache.streams.len());
+
+        // A payload larger than the total capacity is not retained or allowed
+        // to evict anything already useful.
+        cache.insert(one, b"larger than the capacity", capacity);
+        assert!(cache.get(one).is_none());
+        assert_eq!(cache.bytes, 10);
+
+        // A clock rollover must not reorder the live cache entries.
+        cache.access_clock = u64::MAX;
+        let Some(two_snapshot) = cache.get(two) else {
+            return Err(Error::Invalid(
+                "expected cached stream after clock rebase".to_owned(),
+            ));
+        };
+        assert_eq!(two_snapshot.as_ref(), b"long");
+        assert_eq!(cache.oldest_first.len(), cache.streams.len());
+        cache.evict(two);
+        assert_eq!(cache.bytes, 6);
+        assert!(!cache.oldest_first.iter().any(|(_, id)| *id == two));
+
+        // Replacing an already cached stream with an oversized payload must
+        // invalidate its previous data, not preserve a stale cache hit.
+        cache.insert(four, b"payload larger than ten", capacity);
+        assert!(cache.get(four).is_none());
+        assert_eq!(cache.bytes, 4);
+        assert_eq!(cache.oldest_first.len(), cache.streams.len());
+        Ok(())
+    }
+
+    #[test]
     fn source_content_cache_reclaims_bytes_for_targeted_and_opaque_edits() -> Result<()> {
         use crate::test_support::ClassicPdfBuilder;
 
@@ -1957,7 +2089,10 @@ mod tests {
             let cache = document.decoded_content_stream_cache.borrow();
             assert_eq!(cache.streams.len(), 1);
             assert_eq!(
-                cache.streams.get(&ObjectId::new(4, 0)).map(AsRef::as_ref),
+                cache
+                    .streams
+                    .get(&ObjectId::new(4, 0))
+                    .map(|entry| entry.bytes.as_ref()),
                 Some(b"q Q".as_slice())
             );
             assert!(!cache.streams.contains_key(&ObjectId::new(5, 0)));
