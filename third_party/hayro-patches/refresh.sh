@@ -16,6 +16,8 @@ trap 'rm -rf -- "$scratch"' EXIT
 git -C "$upstream" archive "$rev" hayro-syntax LICENSE-APACHE LICENSE-MIT | tar -x -C "$scratch"
 cp --remove-destination -- "$scratch/LICENSE-APACHE" "$scratch/hayro-syntax/LICENSE-APACHE"
 cp --remove-destination -- "$scratch/LICENSE-MIT" "$scratch/hayro-syntax/LICENSE-MIT"
+# The generated Rust operators are already checked in upstream; the Python generator is not needed.
+rm -- "$scratch/hayro-syntax/src/content/gen_ops.py"
 
 for patch in "$patches"/*.patch; do
     git -C "$scratch" apply --no-index "$patch"

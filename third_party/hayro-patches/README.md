@@ -4,6 +4,7 @@ The working source in `../hayro-syntax` is a generated vendor snapshot of the pi
 [upstream Hayro](https://github.com/LaurenzV/hayro) revision in `UPSTREAM_REV`.
 Only this crate is vendored. The sibling image codecs are obtained from the
 same exact revision of the upstream repository, not from our fork.
+The unused upstream Python operator generator is omitted; its generated Rust files are retained.
 
 The patch series retains source spans, trailer/object ID enumeration, standalone
 decoding, local xref recovery and decode resource limits. Upstream now has its
