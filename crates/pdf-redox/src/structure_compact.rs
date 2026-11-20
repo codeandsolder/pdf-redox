@@ -193,6 +193,35 @@ fn current_dictionary(
         .and_then(|object| object.as_dictionary().cloned()))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageTreeNodeKind {
+    Branch,
+    Leaf,
+}
+
+fn page_tree_node_kind(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<Option<PageTreeNodeKind>> {
+    let Some(kind) = dictionary.get(b"Type".as_slice()) else {
+        return Ok(None);
+    };
+    Ok(match document.resolve_owned_value(kind)? {
+        Some(OwnedObject::Name(name)) if name == b"Pages" => Some(PageTreeNodeKind::Branch),
+        Some(OwnedObject::Name(name)) if name == b"Page" => Some(PageTreeNodeKind::Leaf),
+        _ => None,
+    })
+}
+
+/// One validated view of the current page tree, used by both destructive
+/// structural passes. Never substitute the reader's recovery page list.
+struct PageTreePlan {
+    root: ObjectHandle,
+    internal_nodes: usize,
+    pages: Vec<ObjectHandle>,
+    shadowed_entries: Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+}
+
 // A post-order traversal computes which inherited keys are defined on
 // every path beneath each /Pages node. Keep only the small per-node state
 // on the heap; recursive page-tree traversal can overflow the thread stack
@@ -206,24 +235,28 @@ struct PageTreePruneFrame {
 }
 
 impl PageTreePruneFrame {
-    fn new(node: ObjectHandle, dictionary: &OwnedDictionary) -> Option<Self> {
-        if !matches!(
-            dictionary.get(b"Type".as_slice()),
-            Some(OwnedObject::Name(name)) if name == b"Pages"
-        ) {
-            return None;
-        }
-        let OwnedObject::Array(kids) = dictionary.get(b"Kids".as_slice())? else {
-            return None;
+    fn new(
+        document: &EditDocument,
+        node: ObjectHandle,
+        dictionary: &OwnedDictionary,
+    ) -> Result<Option<Self>> {
+        let Some(kids) = dictionary.get(b"Kids".as_slice()) else {
+            return Ok(None);
         };
-        let kids = kids
-            .iter()
+        let Some(OwnedObject::Array(kids)) = document.resolve_owned_value(kids)? else {
+            return Ok(None);
+        };
+        let Some(kids) = kids
+            .into_iter()
             .map(|kid| match kid {
-                OwnedObject::Reference(handle) => Some(*handle),
+                OwnedObject::Reference(handle) => Some(handle),
                 _ => None,
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             node,
             defined: std::array::from_fn(|index| {
                 dictionary.contains_key(PAGE_INHERITABLE_KEYS[index])
@@ -231,7 +264,7 @@ impl PageTreePruneFrame {
             kids,
             next_child: 0,
             covered_by_children: [true; PAGE_INHERITABLE_KEYS.len()],
-        })
+        }))
     }
 
     fn include_child(&mut self, coverage: [bool; PAGE_INHERITABLE_KEYS.len()]) {
@@ -264,60 +297,91 @@ impl PageTreePruneFrame {
     }
 }
 
-fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
+fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = current_dictionary(document, catalog)? else {
-        return Ok(0);
+        return Ok(None);
     };
     let Some(root) = dictionary_reference(&catalog, b"Pages") else {
-        return Ok(0);
+        return Ok(None);
     };
-    let Some(root_dictionary) = current_dictionary(document, root)? else {
-        return Ok(0);
+    let Some(root_object) = document.current_owned_object_cow(root)? else {
+        return Ok(None);
     };
-    let Some(root_frame) = PageTreePruneFrame::new(root, &root_dictionary) else {
-        return Ok(0);
+    let OwnedObject::Dictionary(root_dictionary) = root_object.as_ref() else {
+        return Ok(None);
+    };
+    if page_tree_node_kind(document, root_dictionary)? != Some(PageTreeNodeKind::Branch)
+        || !matches!(
+            root_dictionary.get(b"Parent".as_slice()),
+            None | Some(OwnedObject::Null)
+        )
+    {
+        return Ok(None);
+    }
+    let Some(root_frame) = PageTreePruneFrame::new(document, root, root_dictionary)? else {
+        return Ok(None);
     };
     let mut seen = BTreeSet::from([root]);
     let mut pending = vec![root_frame];
-    let mut removals = Vec::new();
+    let mut plan = PageTreePlan {
+        root,
+        internal_nodes: 1,
+        pages: Vec::new(),
+        shadowed_entries: Vec::new(),
+    };
 
     while let Some(frame) = pending.last_mut() {
         if let Some(&kid) = frame.kids.get(frame.next_child) {
             frame.next_child += 1;
-            let Some(child) = current_dictionary(document, kid)? else {
-                return Ok(0);
+            // The two directions of the page tree must agree before we can
+            // infer inheritance from /Kids or change a page's /Parent.
+            if !seen.insert(kid) {
+                return Ok(None);
+            }
+            let Some(child) = document.current_owned_object_cow(kid)? else {
+                return Ok(None);
             };
-            match child.get(b"Type".as_slice()) {
-                Some(OwnedObject::Name(kind)) if kind == b"Page" => {
+            let OwnedObject::Dictionary(child) = child.as_ref() else {
+                return Ok(None);
+            };
+            if dictionary_reference(child, b"Parent") != Some(frame.node) {
+                return Ok(None);
+            }
+            match page_tree_node_kind(document, child)? {
+                Some(PageTreeNodeKind::Leaf) => {
+                    plan.pages.push(kid);
                     frame.include_child(std::array::from_fn(|index| {
                         child.contains_key(PAGE_INHERITABLE_KEYS[index])
                     }));
                 }
-                Some(OwnedObject::Name(kind)) if kind == b"Pages" => {
-                    if !seen.insert(kid) {
-                        return Ok(0);
-                    }
-                    let Some(child_frame) = PageTreePruneFrame::new(kid, &child) else {
-                        return Ok(0);
+                Some(PageTreeNodeKind::Branch) => {
+                    let Some(child_frame) = PageTreePruneFrame::new(document, kid, child)? else {
+                        return Ok(None);
                     };
+                    plan.internal_nodes += 1;
                     pending.push(child_frame);
                 }
-                _ => return Ok(0),
+                None => return Ok(None),
             }
         } else {
             let Some(completed) = pending.pop() else {
                 break;
             };
-            let coverage = completed.finish(&mut removals);
+            let coverage = completed.finish(&mut plan.shadowed_entries);
             if let Some(parent) = pending.last_mut() {
                 parent.include_child(coverage);
             }
         }
     }
 
-    // No mutations happen until the entire tree is validated. A missing
-    // reference, invalid child, or repeated /Pages handle aborts everything.
+    Ok(Some(plan))
+}
+
+fn apply_shadowed_page_tree_entries(
+    document: &mut EditDocument,
+    removals: Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+) -> Result<usize> {
     let mut removed = 0usize;
     for (node, keys) in removals {
         let Some(dictionary) = document.edit_handle(node)?.as_dictionary_mut() else {
@@ -330,43 +394,6 @@ fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<u
         }
     }
     Ok(removed)
-}
-
-fn page_tree_node_count(document: &EditDocument, root: ObjectHandle) -> Result<Option<usize>> {
-    let mut seen = BTreeSet::new();
-    let mut pending = vec![root];
-    while let Some(handle) = pending.pop() {
-        if !seen.insert(handle) {
-            return Ok(None);
-        }
-        let Some(dictionary) = current_dictionary(document, handle)? else {
-            return Ok(None);
-        };
-        if !matches!(
-            dictionary.get(b"Type".as_slice()),
-            Some(OwnedObject::Name(name)) if name == b"Pages"
-        ) {
-            return Ok(None);
-        }
-        let Some(OwnedObject::Array(kids)) = dictionary.get(b"Kids".as_slice()) else {
-            return Ok(None);
-        };
-        for kid in kids {
-            let OwnedObject::Reference(kid) = kid else {
-                return Ok(None);
-            };
-            let Some(child) = current_dictionary(document, *kid)? else {
-                return Ok(None);
-            };
-            if matches!(
-                child.get(b"Type".as_slice()),
-                Some(OwnedObject::Name(name)) if name == b"Pages"
-            ) {
-                pending.push(*kid);
-            }
-        }
-    }
-    Ok(Some(seen.len()))
 }
 
 const fn page_tree_required_nodes(mut leaves: usize) -> usize {
@@ -453,19 +480,22 @@ fn compact_page_tree(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
 ) -> Result<()> {
-    let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
-    let Some(catalog) = current_dictionary(document, catalog_handle)? else {
-        return Ok(());
-    };
-    let Some(root) = dictionary_reference(&catalog, b"Pages") else {
-        return Ok(());
-    };
-    let Some(before_nodes) = page_tree_node_count(document, root)? else {
+    // A single strict traversal proves both pruning and page-tree rebuilding.
+    // Malformed trees remain intact, instead of using a recovery list that
+    // may omit invalid, duplicated, or disconnected page-tree entries.
+    let Some(PageTreePlan {
+        root,
+        internal_nodes: before_nodes,
+        pages,
+        shadowed_entries,
+    }) = plan_page_tree(document)?
+    else {
         return Ok(());
     };
     stats.page_tree_nodes_before = before_nodes;
+    stats.shadowed_page_tree_inherited_entries_removed =
+        apply_shadowed_page_tree_entries(document, shadowed_entries)?;
 
-    let pages = document.page_handles()?;
     if pages.is_empty() {
         stats.page_tree_nodes_after = before_nodes;
         return Ok(());
@@ -859,8 +889,6 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
         ..StructureCompactionStats::default()
     };
     compact_catalog_name_trees(document, &mut stats)?;
-    stats.shadowed_page_tree_inherited_entries_removed =
-        prune_shadowed_page_tree_inheritance(document)?;
     compact_page_tree(document, &mut stats)?;
     Ok(stats)
 }
@@ -869,6 +897,109 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
 mod tests {
     use super::*;
     use crate::{content::replace_page_content, test_support::ClassicPdfBuilder};
+
+    fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
+        let Some(plan) = plan_page_tree(document)? else {
+            return Ok(0);
+        };
+        apply_shadowed_page_tree_entries(document, plan.shadowed_entries)
+    }
+
+    fn ordered_page_tree_fixture() -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(
+            2,
+            b"<< /Type /Pages /Kids [5 0 R 3 0 R] /Count 2 /Rotate 0 >>",
+        )?;
+        pdf.object(
+            3,
+            b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Rotate 90 >>",
+        )?;
+        pdf.object(4, b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.object(
+            5,
+            b"<< /Type 7 0 R /Parent 2 0 R /Kids 8 0 R /Count 1 /Rotate 180 >>",
+        )?;
+        pdf.object(6, b"<< /Type /Page /Parent 5 0 R /MediaBox [0 0 20 20] >>")?;
+        pdf.object(7, b"/Pages")?;
+        pdf.object(8, b"[6 0 R]")?;
+        pdf.object(9, b"<< /Type /NotAPageTreeNode >>")?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    const fn existing(number: i32) -> ObjectHandle {
+        ObjectHandle::Existing(crate::ObjectId::new(number, 0))
+    }
+
+    #[test]
+    fn compaction_uses_validated_order_and_indirect_kids() -> Result<()> {
+        let mut document = ordered_page_tree_fixture()?;
+        let mut stats = StructureCompactionStats::default();
+        compact_page_tree(&mut document, &mut stats)?;
+        assert_eq!(stats.page_tree_nodes_before, 3);
+        assert_eq!(stats.page_tree_nodes_after, 1);
+        assert_eq!(stats.page_tree_nodes_removed, 2);
+        assert_eq!(stats.page_tree_pages_reparented, 2);
+        assert_eq!(stats.shadowed_page_tree_inherited_entries_removed, 1);
+        assert_eq!(document.page_handles()?, vec![existing(6), existing(4)]);
+        for (page, rotation) in [(existing(6), 180), (existing(4), 90)] {
+            let Some(dictionary) = current_dictionary(&document, page)? else {
+                return Err(Error::Invalid("compacted page missing".to_owned()));
+            };
+            assert_eq!(
+                dictionary_reference(&dictionary, b"Parent"),
+                Some(existing(2))
+            );
+            assert_eq!(
+                dictionary.get(b"Rotate".as_slice()),
+                Some(&OwnedObject::Integer(rotation))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_page_tree_never_prunes_or_rebuilds_from_recovery_pages() -> Result<()> {
+        let edits = [
+            (
+                2,
+                b"Kids".as_slice(),
+                OwnedObject::Array(
+                    [5, 3, 9]
+                        .map(|n| OwnedObject::Reference(existing(n)))
+                        .to_vec(),
+                ),
+            ),
+            (
+                3,
+                b"Kids".as_slice(),
+                OwnedObject::Array(vec![OwnedObject::Reference(existing(4)); 2]),
+            ),
+            (6, b"Parent".as_slice(), OwnedObject::Reference(existing(3))),
+            (
+                5,
+                b"Kids".as_slice(),
+                OwnedObject::Array(vec![OwnedObject::Reference(existing(2))]),
+            ),
+        ];
+        for (number, key, value) in edits {
+            let mut document = ordered_page_tree_fixture()?;
+            let Some(dictionary) = document.edit_handle(existing(number))?.as_dictionary_mut()
+            else {
+                return Err(Error::Invalid("fixture tree node missing".to_owned()));
+            };
+            dictionary.insert(key.to_vec(), value);
+            let before = [2, 3, 4, 5, 6].map(|n| document.current_owned_object(existing(n)));
+            let mut stats = StructureCompactionStats::default();
+            compact_page_tree(&mut document, &mut stats)?;
+            assert_eq!(stats, StructureCompactionStats::default());
+            for (n, before) in [2, 3, 4, 5, 6].into_iter().zip(before) {
+                assert_eq!(document.current_owned_object(existing(n))?, before?);
+            }
+        }
+        Ok(())
+    }
 
     fn stale_destination_fixture(ambiguous: bool, destination_mode: &[u8]) -> Result<EditDocument> {
         let mut pdf = ClassicPdfBuilder::new();
@@ -1133,6 +1264,7 @@ mod tests {
         let root = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
         *document.edit_handle(cycle)? = OwnedObject::Dictionary(OwnedDictionary::from([
             (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), OwnedObject::Reference(root)),
             (
                 b"Kids".to_vec(),
                 OwnedObject::Array(vec![OwnedObject::Reference(root)]),
