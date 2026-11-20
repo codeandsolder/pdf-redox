@@ -464,7 +464,7 @@ impl Config {
     /// alternate substitution. Apply explicit preservation or color-policy
     /// overrides after selecting the objective.
     #[must_use]
-    pub fn for_processing(mut self) -> Self {
+    pub const fn for_processing(mut self) -> Self {
         self.optimization_goal = OptimizationGoal::Processing;
         self.preservation = PreservationConfig::known_functional();
         self.preservation.output_intents = false;
