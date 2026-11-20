@@ -4,14 +4,13 @@ use crate::{
         DirectArrayView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
         object_at_direct_path_mut, walk_direct_object,
     },
-    source::{CurrentObject, owned_from_maybe_ref},
+    source::{CurrentObject, PAGE_INHERITABLE_KEYS, owned_from_maybe_ref},
 };
 use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject, Rect};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_TREE_FANOUT: usize = 256;
 const NAME_TREE_FANOUT: usize = 64;
-const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 const PAGE_LOCAL_IDENTITY_KEYS: [&[u8]; 6] = [
     b"Contents",
     b"UserUnit",
@@ -331,8 +330,15 @@ fn page_tree_node_kind(
 struct PageTreePlan {
     root: ObjectHandle,
     internal_nodes: usize,
-    pages: Vec<ObjectHandle>,
+    pages: Vec<PageTreeLeaf>,
     shadowed_entries: Vec<(ObjectHandle, Vec<Vec<u8>>)>,
+}
+
+type InheritedOwners = [Option<ObjectHandle>; PAGE_INHERITABLE_KEYS.len()];
+
+struct PageTreeLeaf {
+    handle: ObjectHandle,
+    inherited_from: InheritedOwners,
 }
 
 // A post-order traversal computes which inherited keys are defined on
@@ -342,6 +348,7 @@ struct PageTreePlan {
 struct PageTreePruneFrame {
     node: ObjectHandle,
     defined: [bool; PAGE_INHERITABLE_KEYS.len()],
+    nearest_owners: InheritedOwners,
     kids: Vec<ObjectHandle>,
     next_child: usize,
     covered_by_children: [bool; PAGE_INHERITABLE_KEYS.len()],
@@ -352,27 +359,35 @@ impl PageTreePruneFrame {
         document: &EditDocument,
         node: ObjectHandle,
         dictionary: &OwnedDictionary,
+        inherited_from: InheritedOwners,
     ) -> Result<Option<Self>> {
         let Some(kids) = dictionary.get(b"Kids".as_slice()) else {
             return Ok(None);
         };
-        let Some(OwnedObject::Array(kids)) = document.resolve_owned_value(kids)? else {
+        let resolved = document.resolve_owned_value_cow(kids)?;
+        let Some(OwnedObject::Array(kids)) = resolved.as_deref() else {
             return Ok(None);
         };
         let Some(kids) = kids
-            .into_iter()
+            .iter()
             .map(|kid| match kid {
-                OwnedObject::Reference(handle) => Some(handle),
+                OwnedObject::Reference(handle) => Some(*handle),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
         else {
             return Ok(None);
         };
+        let defined = document.effective_page_inheritance_mask(dictionary)?;
         Ok(Some(Self {
             node,
-            defined: std::array::from_fn(|index| {
-                dictionary.contains_key(PAGE_INHERITABLE_KEYS[index])
+            defined,
+            nearest_owners: std::array::from_fn(|index| {
+                if defined[index] {
+                    Some(node)
+                } else {
+                    inherited_from[index]
+                }
             }),
             kids,
             next_child: 0,
@@ -432,7 +447,13 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     {
         return Ok(None);
     }
-    let Some(root_frame) = PageTreePruneFrame::new(document, root, root_dictionary)? else {
+    let Some(root_frame) = PageTreePruneFrame::new(
+        document,
+        root,
+        root_dictionary,
+        [None; PAGE_INHERITABLE_KEYS.len()],
+    )?
+    else {
         return Ok(None);
     };
     let mut seen = BTreeSet::from([root]);
@@ -463,13 +484,23 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
             }
             match page_tree_node_kind(document, child)? {
                 Some(PageTreeNodeKind::Leaf) => {
-                    plan.pages.push(kid);
-                    frame.include_child(std::array::from_fn(|index| {
-                        child.contains_key(PAGE_INHERITABLE_KEYS[index])
-                    }));
+                    let defined = document.effective_page_inheritance_mask(child)?;
+                    plan.pages.push(PageTreeLeaf {
+                        handle: kid,
+                        inherited_from: std::array::from_fn(|index| {
+                            if defined[index] {
+                                None
+                            } else {
+                                frame.nearest_owners[index]
+                            }
+                        }),
+                    });
+                    frame.include_child(defined);
                 }
                 Some(PageTreeNodeKind::Branch) => {
-                    let Some(child_frame) = PageTreePruneFrame::new(document, kid, child)? else {
+                    let Some(child_frame) =
+                        PageTreePruneFrame::new(document, kid, child, frame.nearest_owners)?
+                    else {
                         return Ok(None);
                     };
                     plan.internal_nodes += 1;
@@ -589,6 +620,57 @@ fn rebuild_compact_page_tree_levels(
     Ok(level)
 }
 
+// The validated traversal already knows the nearest effective definitions.
+// Materialize each referenced ancestor once, before changing anything.
+fn materialize_page_inheritance(
+    document: &EditDocument,
+    pages: &[PageTreeLeaf],
+) -> Result<Vec<(ObjectHandle, OwnedDictionary)>> {
+    let mut cached = BTreeMap::<ObjectHandle, OwnedDictionary>::new();
+    let mut result = Vec::with_capacity(pages.len());
+    for page in pages {
+        let mut values = OwnedDictionary::new();
+        for (key, owner) in PAGE_INHERITABLE_KEYS.into_iter().zip(page.inherited_from) {
+            let Some(owner) = owner else {
+                continue;
+            };
+            let dictionary = match cached.entry(owner) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let Some(object) = document.current_owned_object_cow(owner)? else {
+                        return Err(Error::Invalid(
+                            "validated inheritance owner disappeared".to_owned(),
+                        ));
+                    };
+                    let Some(dictionary) = object.as_dictionary() else {
+                        return Err(Error::Invalid(
+                            "validated inheritance owner is not a dictionary".to_owned(),
+                        ));
+                    };
+                    entry.insert(
+                        PAGE_INHERITABLE_KEYS
+                            .into_iter()
+                            .filter_map(|key| {
+                                dictionary
+                                    .get(key)
+                                    .map(|value| (key.to_vec(), value.clone()))
+                            })
+                            .collect(),
+                    )
+                }
+            };
+            let Some(value) = dictionary.get(key) else {
+                return Err(Error::Invalid(
+                    "validated inherited value disappeared".to_owned(),
+                ));
+            };
+            values.insert(key.to_vec(), value.clone());
+        }
+        result.push((page.handle, values));
+    }
+    Ok(result)
+}
+
 fn compact_page_tree(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
@@ -606,43 +688,30 @@ fn compact_page_tree(
         return Ok(());
     };
     stats.page_tree_nodes_before = before_nodes;
+    let after_nodes = page_tree_required_nodes(pages.len());
+    if pages.is_empty() || after_nodes >= before_nodes {
+        stats.page_tree_nodes_after = before_nodes;
+        stats.shadowed_page_tree_inherited_entries_removed =
+            apply_shadowed_page_tree_entries(document, shadowed_entries)?;
+        return Ok(());
+    }
+
+    let inherited = materialize_page_inheritance(document, &pages)?;
     stats.shadowed_page_tree_inherited_entries_removed =
         apply_shadowed_page_tree_entries(document, shadowed_entries)?;
-
-    if pages.is_empty() {
-        stats.page_tree_nodes_after = before_nodes;
-        return Ok(());
-    }
-
-    let after_nodes = page_tree_required_nodes(pages.len());
     stats.page_tree_nodes_after = after_nodes;
-    if after_nodes >= before_nodes {
-        return Ok(());
-    }
-
-    let mut inherited = Vec::with_capacity(pages.len());
-    for &page in &pages {
-        let Some(page_dictionary) = current_dictionary(document, page)? else {
-            return Ok(());
-        };
-        let mut materialized = Vec::new();
-        for key in PAGE_INHERITABLE_KEYS {
-            if !page_dictionary.contains_key(key)
-                && let Some(value) = document.inherited_page_value(page, key)?
-            {
-                materialized.push((key.to_vec(), value));
-            }
-        }
-        inherited.push((page, materialized));
-    }
 
     for (page, values) in inherited {
         let Some(dictionary) = document.edit_handle(page)?.as_dictionary_mut() else {
-            return Ok(());
+            return Err(Error::Invalid("validated page disappeared".to_owned()));
         };
         dictionary.extend(values);
     }
 
+    let pages = pages
+        .into_iter()
+        .map(|page| page.handle)
+        .collect::<Vec<_>>();
     let level = rebuild_compact_page_tree_levels(document, &pages, root)?;
 
     let Some(root_dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
@@ -1045,6 +1114,80 @@ mod tests {
 
     const fn existing(number: u32) -> ObjectHandle {
         ObjectHandle::Existing(crate::ObjectId::new(number, 0))
+    }
+
+    fn malformed_inheritance_fixture(nested: bool, invalid: &str) -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        let kid = if nested { 5 } else { 3 };
+        pdf.object(2, format!("<< /Type /Pages /Kids [{kid} 0 R] /Count 1 /Resources << /Marker /Root >> /MediaBox [0 0 30 40] /CropBox [1 2 20 30] /Rotate 90 >>").as_bytes())?;
+        let parent = if nested { 5 } else { 2 };
+        pdf.object(3, format!("<< /Type /Page /Parent {parent} 0 R /Resources {invalid} /MediaBox {invalid} /CropBox {invalid} /Rotate {invalid} /Contents 4 0 R >>").as_bytes())?;
+        pdf.stream(4, b"", b"q Q")?;
+        if nested {
+            pdf.object(5, b"<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 /Rotate 180 /Resources null >>")?;
+        }
+        pdf.object(7, b"null")?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn page_tree_pruning_ignores_ineffective_local_inheritance_entries() -> Result<()> {
+        for invalid in ["null", "7 0 R", "/WrongType", "[null 0 1 1]"] {
+            let mut document = malformed_inheritance_fixture(false, invalid)?;
+            let before =
+                PAGE_INHERITABLE_KEYS.map(|key| document.inherited_page_value(existing(3), key));
+            let Some(plan) = plan_page_tree(&document)? else {
+                return Err(Error::Invalid("valid fixture topology rejected".to_owned()));
+            };
+            assert!(plan.shadowed_entries.is_empty(), "{invalid}");
+            assert_eq!(plan.pages[0].inherited_from, [Some(existing(2)); 4]);
+            let mut stats = StructureCompactionStats::default();
+            compact_page_tree(&mut document, &mut stats)?;
+            assert_eq!(stats.shadowed_page_tree_inherited_entries_removed, 0);
+            for (key, expected) in PAGE_INHERITABLE_KEYS.into_iter().zip(before) {
+                let expected = expected?;
+                assert!(expected.is_some());
+                assert_eq!(document.inherited_page_value(existing(3), key)?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn page_tree_rebuild_materializes_nearest_effective_owners() -> Result<()> {
+        let mut document = malformed_inheritance_fixture(true, "7 0 R")?;
+        let before =
+            PAGE_INHERITABLE_KEYS.map(|key| document.inherited_page_value(existing(3), key));
+        let Some(plan) = plan_page_tree(&document)? else {
+            return Err(Error::Invalid("valid fixture topology rejected".to_owned()));
+        };
+        assert_eq!(
+            plan.pages[0].inherited_from,
+            [
+                Some(existing(2)),
+                Some(existing(2)),
+                Some(existing(2)),
+                Some(existing(5))
+            ]
+        );
+        let mut stats = StructureCompactionStats::default();
+        compact_page_tree(&mut document, &mut stats)?;
+        assert_eq!(stats.page_tree_nodes_removed, 1);
+        assert_eq!(stats.shadowed_page_tree_inherited_entries_removed, 1);
+        let Some(leaf) = current_dictionary(&document, existing(3))? else {
+            return Err(Error::Invalid("missing rebuilt leaf".to_owned()));
+        };
+        for (key, expected) in PAGE_INHERITABLE_KEYS.into_iter().zip(before) {
+            let expected = expected?;
+            assert!(expected.is_some());
+            assert_eq!(leaf.get(key), expected.as_ref());
+        }
+        assert_eq!(
+            leaf.get(b"Rotate".as_slice()),
+            Some(&OwnedObject::Integer(180))
+        );
+        Ok(())
     }
 
     #[test]
