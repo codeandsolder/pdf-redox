@@ -261,7 +261,7 @@ struct FontDedupPhaseResult {
 }
 
 /// Deduplication of font-reference-bearing dictionaries observes the mutation
-/// counters from prior font/metadata stages, then rechecks ExtGState candidates
+/// counters from prior font/metadata stages, then rechecks `ExtGState` candidates
 /// against current document objects after sampled Functions are canonicalized.
 struct ReferenceDedupResult {
     to_unicode_dedup: crate::dedup::TargetedDedupStats,
@@ -385,12 +385,7 @@ fn run_font_dedup_phase(
     timings: &mut BTreeMap<String, f64>,
 ) -> Result<FontDedupPhaseResult> {
     let FontDedupContext {
-        cfg,
-        before,
-        pages,
-        preservation,
-        scrub,
-        ext_gstate_dictionary_handles,
+        cfg, before, pages, ..
     } = context;
     let flate_level = cfg.optimization_goal.flate_level();
     // Strip rendering-irrelevant editing/layout state before font-program
