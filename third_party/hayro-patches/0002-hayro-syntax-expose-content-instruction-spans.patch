@@ -1,0 +1,249 @@
+From 5812aa5e3300bf18bff14c996913e99853702e0d Mon Sep 17 00:00:00 2001
+From: Code and Solder <codeandsolder@gmail.com>
+Date: Mon, 5 Oct 2026 01:00:19 +0200
+Subject: [PATCH 2/7] hayro-syntax: expose content instruction spans
+
+---
+ hayro-syntax/src/content/mod.rs | 113 ++++++++++++++++++++++++++++----
+ 1 file changed, 100 insertions(+), 13 deletions(-)
+
+diff --git a/hayro-syntax/src/content/mod.rs b/hayro-syntax/src/content/mod.rs
+index afed5728..f62b89d4 100644
+--- a/hayro-syntax/src/content/mod.rs
++++ b/hayro-syntax/src/content/mod.rs
+@@ -14,7 +14,7 @@ use crate::trivia::{is_regular_character, is_white_space_character};
+ use crate::util::find_needle;
+ use alloc::vec::Vec;
+ use core::fmt::{Debug, Display, Formatter};
+-use core::ops::Deref;
++use core::ops::{Deref, Range};
+ use smallvec::SmallVec;
+ 
+ // `scn` with 32 DeviceN components and a pattern name.
+@@ -102,21 +102,42 @@ impl<'a> UntypedIter<'a> {
+         }
+     }
+ 
++    /// Whether the reader has reached the end of the content stream.
++    pub fn is_at_end(&self) -> bool {
++        self.reader.at_end()
++    }
++
++    /// Current byte offset in the original content stream.
++    pub fn offset(&self) -> usize {
++        self.reader.offset()
++    }
++
+     /// Return the next instruction.
+     #[allow(clippy::should_implement_trait)]
+     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
+         self.stack.clear();
+ 
+-        let operator = read_instruction(&mut self.reader, &mut self.stack)?;
++        let (operator, operator_span) = read_instruction(&mut self.reader, &mut self.stack)?;
++        let start = self
++            .stack
++            .spans
++            .first()
++            .map_or(operator_span.start, |span| span.start);
++        let span = start..self.reader.offset();
+         self.operator = Some(operator);
+         Some(Instruction {
+             operands: &self.stack,
+             operator: self.operator.as_ref().unwrap(),
++            operator_span,
++            span,
+         })
+     }
+ }
+ 
+-fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Operator<'a>> {
++fn read_instruction<'a>(
++    r: &mut Reader<'a>,
++    stack: &mut Stack<'a>,
++) -> Option<(Operator<'a>, Range<usize>)> {
+     // Keeps the read position in a register; must be written back before calling out.
+     let mut cur = r.clone();
+ 
+@@ -132,7 +153,10 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
+             let start = cur.offset();
+             match Number::read_simple(&mut cur) {
+                 Some(number) => {
+-                    if stack.push(Object::Number(number)).is_none() {
++                    if stack
++                        .push(Object::Number(number), start..cur.offset())
++                        .is_none()
++                    {
+                         *r = cur;
+                         return None;
+                     }
+@@ -150,16 +174,18 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
+             }
+             _ => {
+                 *r = cur;
++                let start = r.offset();
+                 let Some(operator) = r.read_without_context::<Operator<'a>>() else {
+                     r.jump_to_end();
+                     return None;
+                 };
+ 
++                let operator_span = start..r.offset();
+                 if operator.as_ref() == b"BI" {
+-                    read_inline_image(r, stack)?;
++                    read_inline_image(r, stack, start)?;
+                 }
+ 
+-                return Some(operator);
++                return Some((operator, operator_span));
+             }
+         }
+     }
+@@ -167,8 +193,9 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
+ 
+ fn read_operand<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<()> {
+     // A number glued to regular characters acts as an unknown operator; skip it (issue 994).
++    let start = r.offset();
+     if let Some(object) = r.read_without_context::<Object<'a>>() {
+-        stack.push(object)
++        stack.push(object, start..r.offset())
+     } else if r.read_without_context::<Operator<'a>>().is_some() {
+         stack.clear();
+         Some(())
+@@ -177,7 +204,11 @@ fn read_operand<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<()> {
+     }
+ }
+ 
+-fn read_inline_image<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<()> {
++fn read_inline_image<'a>(
++    r: &mut Reader<'a>,
++    stack: &mut Stack<'a>,
++    operator_start: usize,
++) -> Option<()> {
+     let inline_dict = r.read_without_context::<InlineImageDict<'_>>()?;
+     let dict = inline_dict.get_dict().clone();
+ 
+@@ -253,9 +284,8 @@ fn read_inline_image<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<()
+                 find_reader.read_byte()?;
+             }
+ 
+-            stack.push(Object::Stream(stream))?;
+-
+             r.read_bytes(2)?;
++            stack.push(Object::Stream(stream), operator_start..r.offset())?;
+             r.skip_white_spaces();
+ 
+             break;
+@@ -385,6 +415,8 @@ pub struct Instruction<'b, 'a> {
+     pub operands: &'b Stack<'a>,
+     /// The operator.
+     pub operator: &'b Operator<'a>,
++    operator_span: Range<usize>,
++    span: Range<usize>,
+ }
+ 
+ impl<'b, 'a> Instruction<'b, 'a> {
+@@ -392,14 +424,30 @@ impl<'b, 'a> Instruction<'b, 'a> {
+     pub fn operands(&self) -> OperandIterator<'b, 'a> {
+         OperandIterator::new(self.operands)
+     }
++
++    /// Byte span of the operator token in the original content stream.
++    pub fn operator_span(&self) -> Range<usize> {
++        self.operator_span.clone()
++    }
++
++    /// Byte span covering the operands and operator in the original content stream.
++    pub fn span(&self) -> Range<usize> {
++        self.span.clone()
++    }
++
++    /// Byte spans for each operand, in the same order as the operands.
++    pub fn operand_spans(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
++        self.operands.spans.iter().cloned()
++    }
+ }
+ 
+ /// A stack holding the arguments of an operator.
+-#[derive(Clone, PartialEq)]
++#[derive(Clone)]
+ pub struct Stack<'a> {
+     // TODO: Explore using an object pool to avoid repeatedly
+     // allocating/deallocating objects.
+     data: Vec<Object<'a>>,
++    spans: SmallVec<[Range<usize>; 6]>,
+ }
+ 
+ impl<'a> Default for Stack<'a> {
+@@ -411,20 +459,25 @@ impl<'a> Default for Stack<'a> {
+ impl<'a> Stack<'a> {
+     /// Create a new, empty stack.
+     pub fn new() -> Self {
+-        Self { data: Vec::new() }
++        Self {
++            data: Vec::new(),
++            spans: SmallVec::new(),
++        }
+     }
+ 
+-    fn push(&mut self, operand: Object<'a>) -> Option<()> {
++    fn push(&mut self, operand: Object<'a>, span: Range<usize>) -> Option<()> {
+         if self.data.len() >= OPERANDS_THRESHOLD {
+             return None;
+         }
+ 
+         self.data.push(operand);
++        self.spans.push(span);
+         Some(())
+     }
+ 
+     fn clear(&mut self) {
+         self.data.clear();
++        self.spans.clear();
+     }
+ 
+     fn len(&self) -> usize {
+@@ -457,6 +510,12 @@ impl<'a> Stack<'a> {
+     }
+ }
+ 
++impl PartialEq for Stack<'_> {
++    fn eq(&self, other: &Self) -> bool {
++        self.data == other.data
++    }
++}
++
+ impl Debug for Stack<'_> {
+     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+         f.debug_list().entries(self.as_slice()).finish()
+@@ -708,3 +767,31 @@ mod macros {
+     pub(crate) use op4;
+     pub(crate) use op6;
+ }
++
++#[cfg(test)]
++mod span_tests {
++    use super::UntypedIter;
++    use alloc::{vec, vec::Vec};
++
++    #[test]
++    fn exposes_instruction_and_operand_spans() {
++        let input = b"  12 -3.5 /Name  cm\nq";
++        let mut iter = UntypedIter::new(input);
++        let first = iter.next().unwrap();
++        assert_eq!(&first.operator[..], b"cm");
++        assert_eq!(first.span(), 2..19);
++        assert_eq!(first.operator_span(), 17..19);
++        assert_eq!(
++            first.operand_spans().collect::<Vec<_>>(),
++            vec![2..4, 5..9, 10..15]
++        );
++        let second = iter.next().unwrap();
++        assert_eq!(&second.operator[..], b"q");
++        assert_eq!(second.span(), 20..21);
++        assert_eq!(second.operator_span(), 20..21);
++        assert!(second.operand_spans().next().is_none());
++        assert!(iter.next().is_none());
++        assert!(iter.is_at_end());
++        assert_eq!(iter.offset(), input.len());
++    }
++}

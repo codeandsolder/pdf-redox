@@ -7,14 +7,11 @@ use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
-use crate::sync::FxHashMap;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
-use core::ops::Deref;
 
-/// A dictionary, which is a key-value map, keys being names, and values being any PDF object or
-/// objetc reference.
+/// A PDF dictionary.
 #[derive(Clone)]
 pub struct Dict<'a>(Inner<'a>);
 
@@ -30,8 +27,7 @@ impl Default for Dict<'_> {
     }
 }
 
-// Note that this is not structural equality, i.e. two dictionaries with the same
-// items are still considered different if they have different whitespaces.
+// Compares raw bytes, so white space matters.
 impl PartialEq for Dict<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.data() == other.data()
@@ -54,22 +50,20 @@ impl<'a> Dict<'a> {
 
     /// Returns the number of entries in the dictionary.
     pub fn len(&self) -> usize {
-        self.offsets().map_or(0, FxHashMap::len)
+        self.offsets().len()
     }
 
     /// Return whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.offsets().is_none_or(FxHashMap::is_empty)
+        self.offsets().is_empty()
     }
 
     /// Checks whether the dictionary contains an entry with a specific key.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> bool {
-        self.offsets()
-            .is_some_and(|offsets| offsets.contains_key(key.as_ref()))
+        self.offset(key.as_ref()).is_some()
     }
 
-    /// Returns the entry of a key as a specific object, or try to resolve it in case it's
-    /// an object reference.
+    /// Return the value of a key, resolving references.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
@@ -83,26 +77,24 @@ impl<'a> Dict<'a> {
 
     /// Get the object reference linked to a key.
     pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
-        let offset = *self.offsets()?.get(key.as_ref())?;
+        let offset = self.offset(key.as_ref())?;
 
         Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
     }
 
-    /// Returns an iterator over all keys in the dictionary.
+    /// Returns an iterator over all keys in the dictionary, in no particular order.
     pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
-        self.offsets()
-            .into_iter()
-            .flat_map(|offsets| offsets.keys().cloned())
+        self.offsets().iter().map(|(key, _)| key.clone())
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
     pub fn entries(&self) -> impl Iterator<Item = (Name<'a>, MaybeRef<Object<'a>>)> + '_ {
         let mut sorted_keys = self.keys().collect::<Vec<_>>();
         sorted_keys.sort_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
-        sorted_keys.into_iter().map(|k| {
-            let obj = self.get_raw(k.deref()).unwrap();
-            (k, obj)
-        })
+        sorted_keys.dedup_by(|n1, n2| n1.as_ref() == n2.as_ref());
+        sorted_keys
+            .into_iter()
+            .filter_map(|k| self.get_raw(k.as_ref()).map(|obj| (k, obj)))
     }
 
     /// Return the object identifier of the dict, if it's an indirect object.
@@ -116,7 +108,7 @@ impl<'a> Dict<'a> {
     where
         T: Readable<'a>,
     {
-        let offset = *self.offsets()?.get(key.as_ref())?;
+        let offset = self.offset(key.as_ref())?;
 
         Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
     }
@@ -128,10 +120,27 @@ impl<'a> Dict<'a> {
         }
     }
 
-    fn offsets(&self) -> Option<&FxHashMap<Name<'a>, usize>> {
+    fn offsets(&self) -> &[(Name<'a>, usize)] {
         match &self.0 {
-            Inner::Empty => None,
-            Inner::Some(repr) => Some(&repr.offsets),
+            Inner::Empty => &[],
+            Inner::Some(repr) => &repr.offsets,
+        }
+    }
+
+    fn offset(&self, key: &[u8]) -> Option<usize> {
+        let offsets = self.offsets();
+
+        if offsets.len() <= MAX_UNSORTED_LEN {
+            offsets
+                .iter()
+                .find(|(name, _)| name.as_ref() == key)
+                .map(|(_, offset)| *offset)
+        } else {
+            let idx = offsets
+                .binary_search_by(|(name, _)| name.as_ref().cmp(key))
+                .ok()?;
+
+            Some(offsets[idx].1)
         }
     }
 }
@@ -140,17 +149,8 @@ impl Debug for Dict<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let mut debug_struct = f.debug_struct("Dict");
 
-        if let Some(offsets) = self.offsets() {
-            let mut r = Reader::new(self.data());
-
-            for (key, val) in offsets {
-                r.jump(*val);
-                debug_struct.field(
-                    &format!("{:?}", key.as_str()),
-                    &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
-                        .unwrap(),
-                );
-            }
+        for (key, value) in self.entries() {
+            debug_struct.field(&format!("{:?}", key.as_str()), &value);
         }
 
         debug_struct.finish()
@@ -175,6 +175,14 @@ impl Display for Dict<'_> {
 
 impl Skippable for Dict<'_> {
     fn skip(r: &mut Reader<'_>, is_content_stream: bool) -> Option<()> {
+        Self::skip_with_depth(r, is_content_stream, 0)
+    }
+
+    fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
+        if depth >= super::MAX_OBJECT_NESTING_DEPTH {
+            return None;
+        }
+
         r.forward_tag(b"<<")?;
 
         loop {
@@ -185,16 +193,16 @@ impl Skippable for Dict<'_> {
             } else {
                 let Some(_) = r.skip::<Name<'_>>(is_content_stream) else {
                     // In case there is garbage in-between, be lenient and just try to skip it.
-                    r.skip::<Object<'_>>(is_content_stream)?;
+                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
                     continue;
                 };
 
                 r.skip_white_spaces_and_comments();
 
                 if is_content_stream {
-                    r.skip::<Object<'_>>(is_content_stream)?;
+                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
                 } else {
-                    r.skip::<MaybeRef<Object<'_>>>(is_content_stream)?;
+                    r.skip_with_depth::<MaybeRef<Object<'_>>>(is_content_stream, depth + 1)?;
                 }
             }
         }
@@ -207,20 +215,15 @@ impl<'a> Readable<'a> for Dict<'a> {
     }
 }
 
+const MAX_UNSORTED_LEN: usize = 16;
+
 fn read_inner<'a>(
     r: &mut Reader<'a>,
     ctx: &ReaderContext<'a>,
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
 ) -> Option<Dict<'a>> {
-    // TODO: Figure out how to
-    // 1) Make dictionaries easily cloneable without wrapping in Arc.
-    // 2) Maybe have an efficient per-document allocator pool for hashmaps
-    // that can be reused.
-    #[cfg(feature = "std")]
-    let mut offsets = FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
-    #[cfg(not(feature = "std"))]
-    let mut offsets = FxHashMap::new();
+    let mut offsets = Vec::with_capacity(8);
 
     let data = parse_dict_with(
         r,
@@ -229,10 +232,15 @@ fn read_inner<'a>(
         end_tag,
         #[inline]
         |name, offset, _| {
-            offsets.insert(name, offset);
+            offsets.push((name, offset));
             Some(())
         },
     )?;
+
+    if offsets.len() > MAX_UNSORTED_LEN {
+        offsets.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
+        offsets.dedup_by(|(a, _), (b, _)| a.as_ref() == b.as_ref());
+    }
 
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
@@ -247,9 +255,6 @@ pub(crate) struct DictProbe<'a> {
     pub(crate) has_type: bool,
 }
 
-// We use that method during fallback xref parsing, so that we can search for
-// the dictionaries we need without allocating the whole hash map.
-// If the above TODOs are ever resolved, we can probably remove this method.
 pub(crate) fn probe_dict<'a>(
     r: &mut Reader<'a>,
     ctx: &ReaderContext<'a>,
@@ -293,10 +298,10 @@ fn parse_dict_with<'a, F>(
 where
     F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
 {
+    let depth = usize::from(start_tag.is_some());
     let dict_data = r.tail()?;
     let start_offset = r.offset();
 
-    // Inline image dictionaries don't start with '<<'.
     if let Some(start_tag) = start_tag {
         r.forward_tag(start_tag)?;
     }
@@ -304,7 +309,6 @@ where
     loop {
         r.skip_white_spaces_and_comments();
 
-        // Normal dictionaries end with '>>', inline image dictionaries end with BD.
         if let Some(()) = r.peek_tag(end_tag) {
             r.forward_tag(end_tag)?;
             let end_offset = r.offset() - start_offset;
@@ -313,10 +317,8 @@ where
         } else {
             let Some(name) = r.read_without_context::<Name<'_>>() else {
                 if start_tag.is_some() {
-                    // In case there is garbage in-between, be lenient and just try to skip it.
-                    // But only do this if we are parsing a proper dictionary as opposed to an
-                    // inline dictionary.
-                    r.read::<Object<'_>>(ctx)?;
+                    // Lenient: skip garbage between entries (not in inline dicts).
+                    r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
                     continue;
                 } else {
                     return None;
@@ -325,19 +327,13 @@ where
             r.skip_white_spaces_and_comments();
 
             let offset = r.offset() - start_offset;
-            // Do note that we are including objects in our dictionary even if they
-            // are the null object, meaning that a call to `contains_key` will return `true`
-            // even if the object is the null object. The PDF reference in theory requires
-            // us to treat them as non-existing. Previously, we included a check to determine
-            // whether the object is `null` before inserting it, but that caused problems
-            // in some test cases where encryption + object streams are involved (as we would
-            // attempt to read an object stream before having resolved the encryption dictionary).
+            // Null entries are kept: checking for them would resolve references before decryption is set up.
             on_entry(name, offset, r)?;
 
             if ctx.in_content_stream() {
-                r.skip::<Object<'_>>(ctx.in_content_stream())?;
+                r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
             } else {
-                r.skip::<MaybeRef<Object<'_>>>(ctx.in_content_stream())?;
+                r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
             }
         }
     }
@@ -347,7 +343,7 @@ object!(Dict<'a>, Dict);
 
 struct Repr<'a> {
     data: &'a [u8],
-    offsets: FxHashMap<Name<'a>, usize>,
+    offsets: Vec<(Name<'a>, usize)>,
     ctx: ReaderContext<'a>,
 }
 
@@ -374,7 +370,6 @@ pub mod keys {
         };
     }
 
-    // A
     key!(A, b"A");
     key!(AA, b"AA");
     key!(ABSOLUTE_COLORIMETRIC, b"AbsoluteColorimetric");
@@ -418,7 +413,6 @@ pub mod keys {
     key!(AUTHOR, b"Author");
     key!(AVG_WIDTH, b"AvgWidth");
 
-    // B
     key!(B, b"B");
     key!(BACKGROUND, b"Background");
     key!(BASE_ENCODING, b"BaseEncoding");
@@ -447,7 +441,6 @@ pub mod keys {
     key!(BTN, b"Btn");
     key!(BYTERANGE, b"ByteRange");
 
-    // C
     key!(C, b"C");
     key!(C0, b"C0");
     key!(C1, b"C1");
@@ -516,7 +509,6 @@ pub mod keys {
     key!(CS, b"CS");
     key!(CYX, b"CYX");
 
-    // D
     key!(D, b"D");
     key!(DA, b"DA");
     key!(DARKEN, b"Darken");
@@ -570,7 +562,6 @@ pub mod keys {
     key!(DW, b"DW");
     key!(DW2, b"DW2");
 
-    // E
     key!(E, b"E");
     key!(EARLY_CHANGE, b"EarlyChange");
     key!(EF, b"EF");
@@ -601,7 +592,6 @@ pub mod keys {
     key!(EXTEND, b"Extend");
     key!(EXTENDS, b"Extends");
 
-    // F
     key!(F, b"F");
     key!(F_DECODE_PARMS, b"FDecodeParms");
     key!(F_FILTER, b"FFilter");
@@ -640,13 +630,11 @@ pub mod keys {
     key!(FUNCTION_TYPE, b"FunctionType");
     key!(FUNCTIONS, b"Functions");
 
-    // G
     key!(G, b"G");
     key!(GAMMA, b"Gamma");
     key!(GROUP, b"Group");
     key!(GTS_PDFA1, b"GTS_PDFA1");
 
-    // H
     key!(H, b"H");
     key!(HARD_LIGHT, b"HardLight");
     key!(HEIGHT, b"Height");
@@ -656,7 +644,6 @@ pub mod keys {
     key!(HIDE_WINDOWUI, b"HideWindowUI");
     key!(HUE, b"Hue");
 
-    // I
     key!(I, b"I");
     key!(IC, b"IC");
     key!(ICC_BASED, b"ICCBased");
@@ -682,20 +669,17 @@ pub mod keys {
     key!(ISSUER, b"Issuer");
     key!(IX, b"IX");
 
-    // J
     key!(JAVA_SCRIPT, b"JavaScript");
     key!(JBIG2_DECODE, b"JBIG2Decode");
     key!(JBIG2_GLOBALS, b"JBIG2Globals");
     key!(JPX_DECODE, b"JPXDecode");
     key!(JS, b"JS");
 
-    // K
     key!(K, b"K");
     key!(KEYWORDS, b"Keywords");
     key!(KEY_USAGE, b"KeyUsage");
     key!(KIDS, b"Kids");
 
-    // L
     key!(L, b"L");
     key!(LAB, b"Lab");
     key!(LANG, b"Lang");
@@ -723,7 +707,6 @@ pub mod keys {
     key!(LZW_DECODE, b"LZWDecode");
     key!(LZW_DECODE_ABBREVIATION, b"LZW");
 
-    // M
     key!(M, b"M");
     key!(MAC, b"Mac");
     key!(MAC_EXPERT_ENCODING, b"MacExpertEncoding");
@@ -747,7 +730,6 @@ pub mod keys {
     key!(MOD_DATE, b"ModDate");
     key!(MULTIPLY, b"Multiply");
 
-    // N
     key!(N, b"N");
     key!(NAME, b"Name");
     key!(NAMES, b"Names");
@@ -762,7 +744,6 @@ pub mod keys {
     key!(NORMAL, b"Normal");
     key!(NUMS, b"Nums");
 
-    // O
     key!(O, b"O");
     key!(OBJ, b"Obj");
     key!(OBJR, b"OBJR");
@@ -795,7 +776,6 @@ pub mod keys {
     key!(OUTPUT_INTENTS, b"OutputIntents");
     key!(OVERLAY, b"Overlay");
 
-    // P
     key!(P, b"P");
     key!(PA, b"PA");
     key!(PAGE, b"Page");
@@ -841,11 +821,9 @@ pub mod keys {
     key!(PUB_SEC, b"PubSec");
     key!(PV, b"PV");
 
-    // Q
     key!(Q, b"Q");
     key!(QUADPOINTS, b"QuadPoints");
 
-    // R
     key!(R, b"R");
     key!(RANGE, b"Range");
     key!(RC, b"RC");
@@ -874,7 +852,6 @@ pub mod keys {
     key!(RUN_LENGTH_DECODE_ABBREVIATION, b"RL");
     key!(RV, b"RV");
 
-    // S
     key!(S, b"S");
     key!(SA, b"SA");
     key!(SATURATION, b"Saturation");
@@ -957,7 +934,6 @@ pub mod keys {
     key!(TYPE1C, b"Type1C");
     key!(TYPE3, b"Type3");
 
-    // U
     key!(U, b"U");
     key!(UE, b"UE");
     key!(UF, b"UF");
@@ -970,7 +946,6 @@ pub mod keys {
     key!(USE_CMAP, b"UseCMap");
     key!(USER_UNIT, b"UserUnit");
 
-    // V
     key!(V, b"V");
     key!(VE, b"VE");
     key!(VERISIGN_PPKVS, b"VeriSign.PPKVS");
@@ -986,7 +961,6 @@ pub mod keys {
     key!(VP, b"VP");
     key!(VRI, b"VRI");
 
-    // W
     key!(W, b"W");
     key!(W2, b"W2");
     key!(WC, b"WC");
@@ -1000,7 +974,6 @@ pub mod keys {
     key!(WP, b"WP");
     key!(WS, b"WS");
 
-    // X
     key!(X, b"X");
     key!(XFA, b"XFA");
     key!(X_STEP, b"XStep");
@@ -1009,12 +982,10 @@ pub mod keys {
     key!(XREF, b"XRef");
     key!(XREF_STM, b"XRefStm");
 
-    // Y
     key!(Y, b"Y");
     key!(Y_STEP, b"YStep");
     key!(YES, b"Yes");
 
-    // Z
     key!(ZA_DB, b"ZaDb");
 }
 
@@ -1184,5 +1155,12 @@ mod tests {
 
         assert_eq!(format!("{dict}"), "<< /A << /X true >> /B [1 2] >>");
         assert_eq!(format!("{}", Dict::empty()), "<<>>");
+    }
+
+    #[test]
+    fn dict_with_unreadable_value() {
+        let dict = Dict::from_bytes(b"<< /A <<>>stream /B true >>").unwrap();
+        let _ = dict.entries().count();
+        let _ = format!("{dict:?}");
     }
 }

@@ -1,6 +1,6 @@
+use crate::Limits;
 use crate::bit_reader::BitWriter;
 use crate::filter::FilterResult;
-use crate::math::round_f32;
 use crate::object::stream::{ImageColorSpace, ImageData, ImageDecodeParams};
 use alloc::borrow::Cow;
 use alloc::vec;
@@ -18,20 +18,36 @@ impl ImageColorSpace {
     }
 }
 
-pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterResult<'static>> {
+pub(crate) fn decode(
+    data: &[u8],
+    params: &ImageDecodeParams,
+    limits: Limits,
+) -> Option<FilterResult<'static>> {
     use crate::object::stream::ImageColorSpace;
 
     let settings = DecodeSettings {
         resolve_palette_indices: false,
         strict: false,
         target_resolution: params.target_dimension,
+        cancel: None,
     };
 
-    let image = hayro_jpeg2000::Image::new(data, &settings).ok()?;
+    let image = params
+        .num_components
+        .filter(|_| !params.is_indexed)
+        .and_then(|channels| hayro_jpeg2000::Image::from_codestream(data, channels, &settings).ok())
+        .or_else(|| hayro_jpeg2000::Image::new(data, &settings).ok())?;
 
     let width = image.width();
     let height = image.height();
-    let bpc = params.bpc.unwrap_or(image.original_bit_depth());
+    if !limits.permits_image(width, height) {
+        return None;
+    }
+    let bpc = if params.is_indexed {
+        params.bpc.unwrap_or(image.original_bit_depth())
+    } else {
+        8
+    };
     let cs = match image.color_space() {
         ColorSpace::Gray => ImageColorSpace::Gray,
         ColorSpace::RGB => ImageColorSpace::Rgb,
@@ -49,12 +65,11 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
     };
     let has_alpha = image.has_alpha();
     let mut decoder_context = hayro_jpeg2000::DecoderContext::default();
-    let bitmap = image.decode(&mut decoder_context).ok()?.data_u8();
+    let bitmap = image.decode(&mut decoder_context).ok()?.data_u8().ok()?;
 
     let (mut data, mut alpha) = if !has_alpha {
         (bitmap, None)
     } else {
-        // Extract the alpha channel.
         let total_channels = cs.num_components() + 1;
         let mut color_channels = Vec::with_capacity(
             (bitmap.len() / total_channels as usize) * cs.num_components() as usize,
@@ -70,8 +85,7 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
         (color_channels, Some(alpha_channel))
     };
 
-    // The decoded image is always 8-bit, so if necessary we have to rescale
-    // ourselves.
+    // The decoder always outputs 8 bits.
     if bpc != 8 {
         data = scale(&data, bpc, cs.num_components(), width, height)?;
         alpha = alpha.and_then(|alpha| scale(&alpha, bpc, cs.num_components(), width, height));
@@ -113,7 +127,7 @@ fn scale(
 
     for bytes in data.chunks_exact(components_per_row) {
         for byte in bytes {
-            let scaled = round_f32((*byte as f32 / div_factor) * mul_factor) as u32;
+            let scaled = ((*byte as f32 / div_factor) * mul_factor + 0.5) as u32;
             writer.write(scaled)?;
         }
 

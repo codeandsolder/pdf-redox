@@ -1,12 +1,10 @@
-//! The starting point for reading PDF files.
-
-use crate::PdfData;
 use crate::object::Object;
 use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
 use crate::sync::Arc;
 use crate::xref::{XRef, XRefError, fallback, root_xref};
+use crate::{Limits, PdfData};
 
 pub use crate::crypto::DecryptionError;
 use crate::metadata::Metadata;
@@ -28,30 +26,69 @@ pub enum LoadPdfError {
     Invalid,
 }
 
+impl core::fmt::Display for LoadPdfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decryption(_) => write!(f, "failed to decrypt PDF"),
+            Self::Invalid => write!(f, "invalid PDF"),
+        }
+    }
+}
+
+impl core::error::Error for LoadPdfError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Decryption(e) => Some(e),
+            Self::Invalid => None,
+        }
+    }
+}
+
+/// Options for loading a PDF file.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct PdfOptions<'a> {
+    /// Password for decrypting the document.
+    pub password: &'a str,
+    /// Resource limits for decoding the document.
+    pub limits: Limits,
+}
+
 #[allow(clippy::len_without_is_empty)]
 impl Pdf {
     /// Try to read the given PDF file.
-    ///
-    /// Returns `Err` if it was unable to read it.
     pub fn new(data: impl Into<PdfData>) -> Result<Self, LoadPdfError> {
-        Self::new_with_password(data, "")
+        Self::new_with_options(data, PdfOptions::default())
     }
 
     /// Try to read the given PDF file with a password.
-    ///
-    /// Returns `Err` if it was unable to read it or if the password is incorrect.
     pub fn new_with_password(
         data: impl Into<PdfData>,
         password: &str,
     ) -> Result<Self, LoadPdfError> {
+        Self::new_with_options(
+            data,
+            PdfOptions {
+                password,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Read the given PDF file with the supplied options.
+    pub fn new_with_options(
+        data: impl Into<PdfData>,
+        options: PdfOptions<'_>,
+    ) -> Result<Self, LoadPdfError> {
         let data = data.into();
-        let password = password.as_bytes();
+        let password = options.password.as_bytes();
+        let limits = options.limits;
         let version = find_version(data.as_ref()).unwrap_or(PdfVersion::Pdf10);
-        let xref = match root_xref(data.clone(), password) {
+        let xref = match root_xref(data.clone(), password, limits) {
             Ok(x) => x,
             Err(e) => match e {
                 XRefError::Unknown => {
-                    fallback(data.clone(), password).ok_or(LoadPdfError::Invalid)?
+                    fallback(data.clone(), password, limits).ok_or(LoadPdfError::Invalid)?
                 }
                 XRefError::Encryption(e) => return Err(LoadPdfError::Decryption(e)),
             },
@@ -160,6 +197,7 @@ impl PdfVersion {
 
 #[cfg(test)]
 mod tests {
+    use crate::object::{ObjectIdentifier, Stream};
     use crate::pdf::{Pdf, PdfVersion};
 
     #[test]
@@ -169,7 +207,7 @@ mod tests {
 
     #[test]
     fn pdf_version_header() {
-        let data = std::fs::read("../hayro-tests/downloads/pdfjs/alphatrans.pdf").unwrap();
+        let data = std::fs::read("../tests/pdfs/other/version_header.pdf").unwrap();
         let pdf = Pdf::new(data).unwrap();
 
         assert_eq!(pdf.version(), PdfVersion::Pdf17);
@@ -177,9 +215,21 @@ mod tests {
 
     #[test]
     fn pdf_version_catalog() {
-        let data = std::fs::read("../hayro-tests/downloads/pdfbox/2163.pdf").unwrap();
+        let data = std::fs::read("../tests/pdfs/other/version_catalog.pdf").unwrap();
         let pdf = Pdf::new(data).unwrap();
 
-        assert_eq!(pdf.version(), PdfVersion::Pdf14);
+        assert_eq!(pdf.version(), PdfVersion::Pdf17);
+    }
+
+    #[test]
+    fn xref_stream_in_encrypted_pdf() {
+        let data = std::fs::read("../tests/pdfs/custom/catalog-in-objstm-aes.pdf").unwrap();
+        let pdf = Pdf::new(data).unwrap();
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(13, 0))
+            .unwrap();
+
+        assert_eq!(stream.decoded().unwrap().len(), 98);
     }
 }

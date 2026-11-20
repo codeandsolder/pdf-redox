@@ -299,20 +299,20 @@ const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
 /// Stable identifier of an existing indirect PDF object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId {
-    number: i32,
+    number: u32,
     generation: i32,
 }
 
 impl ObjectId {
     #[must_use]
     /// Creates an identifier from a PDF object number and generation number.
-    pub const fn new(number: i32, generation: i32) -> Self {
+    pub const fn new(number: u32, generation: i32) -> Self {
         Self { number, generation }
     }
 
     #[must_use]
     /// Returns the PDF indirect-object number.
-    pub const fn number(self) -> i32 {
+    pub const fn number(self) -> u32 {
         self.number
     }
 
