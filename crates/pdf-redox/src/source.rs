@@ -1537,26 +1537,19 @@ impl EditDocument {
     }
 }
 
-fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<ObjectId>) {
+/// Add immediate borrowed COS children to an explicit traversal stack.
+/// A stream's /Length is writer-owned, unlike a nested dictionary's /Length.
+fn push_hayro_children<'a>(object: &Object<'a>, pending: &mut SmallVec<[MaybeRef<Object<'a>>; 8]>) {
     match object {
-        Object::Dict(dictionary) => {
-            for (_, value) in dictionary.entries() {
-                collect_hayro_maybe_ref(value, references);
-            }
-        }
-        Object::Array(array) => {
-            for value in array.raw_iter() {
-                collect_hayro_maybe_ref(value, references);
-            }
-        }
-        Object::Stream(stream) => {
-            for (name, value) in stream.dict().entries() {
-                if name.as_ref() == b"Length" {
-                    continue;
-                }
-                collect_hayro_maybe_ref(value, references);
-            }
-        }
+        Object::Dict(dictionary) => pending.extend(dictionary.entries().map(|(_, value)| value)),
+        Object::Array(array) => pending.extend(array.raw_iter()),
+        Object::Stream(stream) => pending.extend(
+            stream
+                .dict()
+                .entries()
+                .filter(|(name, _)| name.as_ref() != b"Length")
+                .map(|(_, value)| value),
+        ),
         Object::Null(_)
         | Object::Boolean(_)
         | Object::Number(_)
@@ -1565,12 +1558,19 @@ fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<Objec
     }
 }
 
-fn collect_hayro_maybe_ref(value: MaybeRef<Object<'_>>, references: &mut BTreeSet<ObjectId>) {
-    match value {
-        MaybeRef::Ref(reference) => {
-            references.insert(reference.into());
+fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<ObjectId>) {
+    // Source COS references are never followed here: the resulting set is
+    // exactly one object's outgoing edges, not transitive reachability.
+    // Borrow the root to avoid cloning a potentially large decoded string.
+    let mut pending = SmallVec::<[MaybeRef<Object<'_>>; 8]>::new();
+    push_hayro_children(object, &mut pending);
+    while let Some(value) = pending.pop() {
+        match value {
+            MaybeRef::Ref(reference) => {
+                references.insert(reference.into());
+            }
+            MaybeRef::NotRef(object) => push_hayro_children(&object, &mut pending),
         }
-        MaybeRef::NotRef(object) => collect_hayro_references(&object, references),
     }
 }
 
@@ -1806,6 +1806,48 @@ mod tests {
         *data = StreamData::Owned(b"BT ET".to_vec());
         let second = document.decoded_content_stream_data(handle)?;
         assert_eq!(second, b"BT ET");
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_source_reference_walk_preserves_nested_and_stream_length_rules() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        // Stream /Length is an output-writer detail and must not be counted
+        // as an outgoing reference; a nested ordinary dictionary /Length is.
+        pdf.object(
+            4,
+            b"<< /Length 5 0 R /Custom [6 0 R << /Length 7 0 R >>] >>\nstream\nq Q\nendstream",
+        )?;
+        pdf.object(5, b"3")?;
+        pdf.object(6, b"null")?;
+        pdf.object(7, b"null")?;
+
+        // This direct array would create dozens of recursive calls under the
+        // previous collector; duplicate indirect references must be deduped.
+        let mut nested = vec![b'['; 48];
+        nested.extend_from_slice(b"6 0 R [7 0 R 6 0 R]");
+        nested.extend(std::iter::repeat_n(b']', 48));
+        pdf.object(8, &nested)?;
+
+        let source = SourcePdf::from_bytes(pdf.finish(1)?)?;
+        let stream_id = ObjectId::new(4, 0);
+        let array_id = ObjectId::new(8, 0);
+        let expected = vec![ObjectId::new(6, 0), ObjectId::new(7, 0)];
+        assert!(matches!(source.object(stream_id)?, Object::Stream(_)));
+        assert_eq!(source.references(stream_id)?, expected);
+        assert_eq!(source.references(array_id)?, expected);
+        let (_, first) = source.object_with_references(array_id)?;
+        assert_eq!(first, expected);
+        assert_eq!(source.references(array_id)?, expected);
+        // Source graph walking must not resolve or traverse either reference:
+        // direct adjacency is separate from transitive reachability.
+        assert_eq!(source.references(ObjectId::new(6, 0))?, Vec::new());
         Ok(())
     }
 
