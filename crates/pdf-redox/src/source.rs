@@ -579,6 +579,98 @@ impl CurrentObject<'_> {
     }
 }
 
+/// A direct value or unresolved reference in either current COS representation.
+/// Source children remain lazy until explicitly materialized; owned children
+/// borrow the overlay. Reference resolution must always use the current graph.
+pub enum CurrentValue<'a> {
+    Source(MaybeRef<Object<'a>>, Option<ObjectId>),
+    Owned(&'a OwnedObject),
+}
+
+impl<'a> CurrentValue<'a> {
+    pub fn reference(&self) -> Option<ObjectHandle> {
+        match self {
+            Self::Source(MaybeRef::Ref(reference), _) => {
+                Some(ObjectHandle::Existing((*reference).into()))
+            }
+            Self::Owned(OwnedObject::Reference(reference)) => Some(*reference),
+            _ => None,
+        }
+    }
+
+    pub fn dictionary_entry(&self, key: &[u8]) -> Option<Self> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Dict(dictionary)), _) => dictionary
+                .get_raw(key)
+                .map(|value| Self::Source(value, None)),
+            Self::Source(MaybeRef::NotRef(Object::Stream(stream)), _) if key != b"Length" => stream
+                .dict()
+                .get_raw(key)
+                .map(|value| Self::Source(value, None)),
+            Self::Owned(value) => value.as_dictionary()?.get(key).map(Self::Owned),
+            _ => None,
+        }
+    }
+
+    pub const fn has_dictionary(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(MaybeRef::NotRef(Object::Dict(_) | Object::Stream(_)), _)
+                | Self::Owned(OwnedObject::Dictionary(_) | OwnedObject::Stream { .. })
+        )
+    }
+
+    pub const fn is_dictionary(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(MaybeRef::NotRef(Object::Dict(_)), _)
+                | Self::Owned(OwnedObject::Dictionary(_))
+        )
+    }
+
+    pub fn is_name(&self, expected: &[u8]) -> bool {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Name(name)), _) => name.as_ref() == expected,
+            Self::Owned(OwnedObject::Name(name)) => name == expected,
+            _ => false,
+        }
+    }
+
+    pub fn array_items(&self) -> Option<CurrentArrayIter<'a>> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Array(array)), _) => {
+                Some(CurrentArrayIter::Source(array.raw_iter()))
+            }
+            Self::Owned(OwnedObject::Array(array)) => Some(CurrentArrayIter::Owned(array.iter())),
+            _ => None,
+        }
+    }
+
+    pub fn into_cow(self) -> Cow<'a, OwnedObject> {
+        match self {
+            Self::Source(MaybeRef::NotRef(value), id) => Cow::Owned(owned_from_hayro(value, id)),
+            Self::Source(value, _) => Cow::Owned(owned_from_maybe_ref(value)),
+            Self::Owned(value) => Cow::Borrowed(value),
+        }
+    }
+}
+
+pub enum CurrentArrayIter<'a> {
+    Source(hayro_syntax::object::array::ArrayIter<'a>),
+    Owned(std::slice::Iter<'a, OwnedObject>),
+}
+
+impl<'a> Iterator for CurrentArrayIter<'a> {
+    type Item = CurrentValue<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Source(iter) => iter.next().map(|value| CurrentValue::Source(value, None)),
+            Self::Owned(iter) => iter.next().map(CurrentValue::Owned),
+        }
+    }
+}
+
 /// Visit nested owned COS values without using call-stack depth. Reference
 /// collection intentionally skips a stream's /Length entry (the writer
 /// regenerates it), but filter eligibility must inspect every nested value.
@@ -1092,6 +1184,36 @@ impl EditDocument {
         )
     }
 
+    pub(crate) fn current_value(&self, handle: ObjectHandle) -> Result<Option<CurrentValue<'_>>> {
+        self.current_object_with(
+            handle,
+            |id| {
+                self.source
+                    .object(id)
+                    .map(|value| CurrentValue::Source(MaybeRef::NotRef(value), Some(id)))
+            },
+            CurrentValue::Owned,
+        )
+    }
+
+    /// Resolve only the reference chain, not the selected object's children.
+    pub(crate) fn resolve_current_value<'a>(
+        &'a self,
+        mut value: CurrentValue<'a>,
+    ) -> Result<Option<CurrentValue<'a>>> {
+        let mut seen = BTreeSet::new();
+        while let Some(handle) = value.reference() {
+            if !seen.insert(handle) {
+                return Ok(None);
+            }
+            let Some(next) = self.current_value(handle)? else {
+                return Ok(None);
+            };
+            value = next;
+        }
+        Ok(Some(value))
+    }
+
     /// Borrow an already-owned overlay object, materializing only untouched
     /// source objects. Useful for reading large overlay streams without cloning
     /// their payload merely to inspect the stream dictionary.
@@ -1117,20 +1239,9 @@ impl EditDocument {
         &'a self,
         value: &'a OwnedObject,
     ) -> Result<Option<Cow<'a, OwnedObject>>> {
-        let mut value = Cow::Borrowed(value);
-        let mut seen = BTreeSet::new();
-        loop {
-            let OwnedObject::Reference(handle) = value.as_ref() else {
-                return Ok(Some(value));
-            };
-            if !seen.insert(*handle) {
-                return Ok(None);
-            }
-            let Some(next) = self.current_owned_object_cow(*handle)? else {
-                return Ok(None);
-            };
-            value = next;
-        }
+        Ok(self
+            .resolve_current_value(CurrentValue::Owned(value))?
+            .map(CurrentValue::into_cow))
     }
 
     pub(crate) fn resolve_owned_value(&self, value: &OwnedObject) -> Result<Option<OwnedObject>> {
@@ -1155,62 +1266,72 @@ impl EditDocument {
         // traversal, and that fallback cannot preserve page order. Stable page
         // numbers are part of hidden-text finding IDs and per-page policy.
         let catalog_handle = ObjectHandle::Existing(self.source.catalog_id());
-        let Some(catalog) = self.current_owned_object(catalog_handle)? else {
+        let Some(catalog) = self.current_value(catalog_handle)? else {
             return Ok(Vec::new());
         };
-        let Some(catalog) = catalog.as_dictionary() else {
-            return Ok(Vec::new());
-        };
-        let Some(root) = catalog.get(b"Pages".as_slice()).cloned() else {
+        let Some(root) = catalog.dictionary_entry(b"Pages") else {
             return Ok(Vec::new());
         };
 
         let mut pages = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut pending = vec![root];
-        while let Some(value) = pending.pop() {
-            let (handle, object) = match value {
-                OwnedObject::Reference(handle) => {
-                    if !seen.insert(handle) {
-                        continue;
+        // Keep one ordered iterator per active /Kids array, avoiding copies
+        // of child dictionaries and large, broad arrays.
+        let mut arrays = Vec::<CurrentArrayIter<'_>>::new();
+        let mut next = Some(root);
+        loop {
+            let Some(value) = next.take().or_else(|| {
+                loop {
+                    match arrays.last_mut()?.next() {
+                        Some(value) => break Some(value),
+                        None => {
+                            arrays.pop();
+                        }
                     }
-                    let Some(object) = self.current_owned_object(handle)? else {
-                        continue;
-                    };
-                    (Some(handle), object)
                 }
-                object => (None, object),
+            }) else {
+                break;
             };
-            let Some(dictionary) = object.as_dictionary() else {
+            let handle = value.reference();
+            let object = if let Some(handle) = handle {
+                if !seen.insert(handle) {
+                    continue;
+                }
+                let Some(object) = self.current_value(handle)? else {
+                    continue;
+                };
+                object
+            } else {
+                value
+            };
+            if !object.has_dictionary() {
                 continue;
-            };
+            }
 
-            let kind = match dictionary.get(b"Type".as_slice()) {
-                Some(value) => self.resolve_owned_value(value)?,
+            let kind = match object.dictionary_entry(b"Type") {
+                Some(value) => self.resolve_current_value(value)?,
                 None => None,
             };
-            if matches!(kind, Some(OwnedObject::Name(name)) if name == b"Page") {
+            if kind.is_some_and(|value| value.is_name(b"Page")) {
                 if let Some(handle) = handle {
                     pages.push(handle);
                 }
                 continue;
             }
 
-            let Some(kids) = dictionary.get(b"Kids".as_slice()) else {
-                // Be lenient with damaged leaf page dictionaries that omit
-                // `/Type /Page`, matching PDF readers' common recovery path.
+            let Some(kids) = object.dictionary_entry(b"Kids") else {
+                // Retain the existing damaged-leaf recovery policy.
                 if let Some(handle) = handle
-                    && dictionary.contains_key(b"Parent".as_slice())
+                    && object.dictionary_entry(b"Parent").is_some()
                 {
                     pages.push(handle);
                 }
                 continue;
             };
-            let Some(OwnedObject::Array(kids)) = self.resolve_owned_value(kids)? else {
-                continue;
-            };
-            for kid in kids.into_iter().rev() {
-                pending.push(kid);
+            if let Some(kids) = self.resolve_current_value(kids)?
+                && let Some(iter) = kids.array_items()
+            {
+                arrays.push(iter);
             }
         }
 
@@ -1237,23 +1358,31 @@ impl EditDocument {
         key: &[u8],
         value: &OwnedObject,
     ) -> Result<bool> {
-        let resolved = self.resolve_owned_value_cow(value)?;
-        let Some(value) = resolved.as_deref() else {
+        self.effective_page_value(key, CurrentValue::Owned(value))
+    }
+
+    fn effective_page_value(&self, key: &[u8], value: CurrentValue<'_>) -> Result<bool> {
+        let Some(value) = self.resolve_current_value(value)? else {
             return Ok(false);
         };
         Ok(match key {
-            b"Resources" => matches!(value, OwnedObject::Dictionary(_)),
+            b"Resources" => value.is_dictionary(),
             b"MediaBox" | b"CropBox" => {
-                let OwnedObject::Array(values) = value else {
+                let Some(mut values) = value.array_items() else {
                     return Ok(false);
                 };
-                if values.len() < 4 {
-                    return Ok(false);
-                }
-                for component in &values[..4] {
+                for _ in 0..4 {
+                    let Some(component) = values.next() else {
+                        return Ok(false);
+                    };
                     if !matches!(
-                        self.resolve_owned_value_cow(component)?.as_deref(),
-                        Some(OwnedObject::Integer(_) | OwnedObject::Real(_))
+                        self.resolve_current_value(component)?,
+                        Some(
+                            CurrentValue::Source(MaybeRef::NotRef(Object::Number(_)), _)
+                                | CurrentValue::Owned(
+                                    OwnedObject::Integer(_) | OwnedObject::Real(_)
+                                )
+                        )
                     ) {
                         return Ok(false);
                     }
@@ -1261,14 +1390,24 @@ impl EditDocument {
                 true
             }
             b"Rotate" => match value {
-                OwnedObject::Integer(value) => i32::try_from(*value).is_ok(),
-                OwnedObject::Real(value) => {
-                    let integer = value.trunc();
-                    integer >= f64::from(i32::MIN) && integer <= f64::from(i32::MAX)
+                CurrentValue::Source(MaybeRef::NotRef(Object::Number(_)), _)
+                | CurrentValue::Owned(OwnedObject::Integer(_) | OwnedObject::Real(_)) => {
+                    match value.into_cow().as_ref() {
+                        OwnedObject::Integer(value) => i32::try_from(*value).is_ok(),
+                        OwnedObject::Real(value) => {
+                            let integer = value.trunc();
+                            integer >= f64::from(i32::MIN) && integer <= f64::from(i32::MAX)
+                        }
+                        _ => false,
+                    }
                 }
                 _ => false,
             },
-            _ => !matches!(value, OwnedObject::Null),
+            _ => !matches!(
+                value,
+                CurrentValue::Source(MaybeRef::NotRef(Object::Null(_)), _)
+                    | CurrentValue::Owned(OwnedObject::Null)
+            ),
         })
     }
 
@@ -1301,50 +1440,77 @@ impl EditDocument {
         page: ObjectHandle,
         key: &[u8],
     ) -> Result<Option<Cow<'_, OwnedObject>>> {
-        let Some(object) = self.current_owned_object_cow(page)? else {
+        let Some(value) = self.inherited_page_raw_value(page, key)? else {
             return Ok(None);
         };
-        self.inherited_page_value_from_object(object, key)
+        Ok(Some(value.into_cow()))
     }
 
-    /// Resolve inheritance from a direct or indirect page dictionary snapshot.
-    /// Borrow overlay ancestors; move only the selected property out of an
-    /// owned source dictionary. The visited set handles arbitrary depth and
-    /// malformed cyclic graphs.
-    pub(crate) fn inherited_page_value_from_object<'a>(
-        &'a self,
-        mut object: Cow<'a, OwnedObject>,
+    pub(crate) fn inherited_page_raw_value(
+        &self,
+        page: ObjectHandle,
         key: &[u8],
-    ) -> Result<Option<Cow<'a, OwnedObject>>> {
+    ) -> Result<Option<CurrentValue<'_>>> {
+        let Some(object) = self.current_value(page)? else {
+            return Ok(None);
+        };
+        self.inherited_page_value_from_view(object, key)
+    }
+
+    fn inherited_page_value_from_view<'a>(
+        &'a self,
+        mut object: CurrentValue<'a>,
+        key: &[u8],
+    ) -> Result<Option<CurrentValue<'a>>> {
         let mut seen = BTreeSet::new();
         loop {
-            let Some(dictionary) = object.as_dictionary() else {
-                return Ok(None);
-            };
-            if let Some(value) = dictionary.get(key)
-                && self.effective_page_inherited_value(key, value)?
+            if let Some(value) = object.dictionary_entry(key)
+                && self.effective_page_value(key, value)?
             {
-                return Ok(match object {
-                    Cow::Borrowed(value) => value
-                        .as_dictionary()
-                        .and_then(|dictionary| dictionary.get(key))
-                        .map(Cow::Borrowed),
-                    Cow::Owned(mut value) => value
-                        .as_dictionary_mut()
-                        .and_then(|dictionary| dictionary.remove(key))
-                        .map(Cow::Owned),
-                });
+                return Ok(object.dictionary_entry(key));
             }
-            let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice()) else {
+            let Some(parent) = object
+                .dictionary_entry(b"Parent")
+                .and_then(|value| value.reference())
+            else {
                 return Ok(None);
             };
-            if !seen.insert(*parent) {
+            if !seen.insert(parent) {
                 return Ok(None);
             }
-            let Some(parent_object) = self.current_owned_object_cow(*parent)? else {
+            let Some(parent_object) = self.current_value(parent)? else {
                 return Ok(None);
             };
             object = parent_object;
+        }
+    }
+
+    /// The preservation pass can start from a materialized direct subtree.
+    /// Inspect that root once, then use the same selective ancestor reader.
+    pub(crate) fn inherited_page_value_from_object<'a>(
+        &'a self,
+        object: Cow<'a, OwnedObject>,
+        key: &[u8],
+    ) -> Result<Option<Cow<'a, OwnedObject>>> {
+        match object {
+            Cow::Borrowed(object) => Ok(self
+                .inherited_page_value_from_view(CurrentValue::Owned(object), key)?
+                .map(CurrentValue::into_cow)),
+            Cow::Owned(mut object) => {
+                let Some(dictionary) = object.as_dictionary_mut() else {
+                    return Ok(None);
+                };
+                if let Some(value) = dictionary.get(key)
+                    && self.effective_page_inherited_value(key, value)?
+                {
+                    return Ok(dictionary.remove(key).map(Cow::Owned));
+                }
+                let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice())
+                else {
+                    return Ok(None);
+                };
+                self.inherited_page_value_cow(*parent, key)
+            }
         }
     }
 
@@ -1811,6 +1977,100 @@ mod tests {
         assert!(
             matches!(document.resolve_owned_value_cow(inherited)?, Some(Cow::Borrowed(resolved)) if std::ptr::eq(resolved, original))
         );
+        Ok(())
+    }
+
+    fn selective_page_fixture() -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids 8 0 R /Count 2 /Resources << /XObject << /Root 4 0 R >> >> /Rotate 90 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type 7 0 R /Parent 2 0 R /Resources 9 0 R /Contents 4 0 R /Rotate 10 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Type /Page /Parent 2 0 R /Resources 9 0 R >>")?;
+        pdf.object(7, b"/Page")?;
+        pdf.object(8, b"[5 0 R 3 0 R]")?;
+        pdf.object(
+            9,
+            b"<< /XObject << /Local 4 0 R >> /Font << /Private (irrelevant) >> >>",
+        )?;
+        pdf.object(10, b"180")?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn selective_current_values_resolve_overlay_replacements() -> Result<()> {
+        let mut document = selective_page_fixture()?;
+        let existing = |n| ObjectHandle::Existing(ObjectId::new(n, 0));
+        assert_eq!(document.page_handles()?, vec![existing(5), existing(3)]);
+        assert_eq!(
+            document.inherited_page_value(existing(3), b"Rotate")?,
+            Some(OwnedObject::Reference(existing(10)))
+        );
+        let Some(raw) = document.inherited_page_raw_value(existing(3), b"Resources")? else {
+            return Err(Error::Invalid("missing raw resources".to_owned()));
+        };
+        assert_eq!(raw.reference(), Some(existing(9)));
+        let Some(resources) = document.resolve_current_value(raw)? else {
+            return Err(Error::Invalid("missing resource dictionary".to_owned()));
+        };
+        assert!(matches!(
+            resources,
+            CurrentValue::Source(MaybeRef::NotRef(Object::Dict(_)), _)
+        ));
+        assert!(
+            resources
+                .dictionary_entry(b"XObject")
+                .is_some_and(|value| value.is_dictionary())
+        );
+        *document.edit_handle(existing(8))? = OwnedObject::Array(vec![
+            OwnedObject::Reference(existing(3)),
+            OwnedObject::Reference(existing(5)),
+            OwnedObject::Reference(existing(3)),
+        ]);
+        *document.edit_handle(existing(9))? = OwnedObject::Null;
+        *document.edit_handle(existing(10))? = OwnedObject::Null;
+        assert_eq!(document.page_handles()?, vec![existing(3), existing(5)]);
+        assert_eq!(
+            document.inherited_page_value(existing(3), b"Rotate")?,
+            Some(OwnedObject::Integer(90))
+        );
+        assert!(matches!(
+            document.inherited_page_raw_value(existing(3), b"Resources")?,
+            Some(CurrentValue::Source(MaybeRef::NotRef(Object::Dict(_)), _))
+        ));
+        *document.edit_handle(existing(7))? = OwnedObject::Name(b"Pages".to_vec());
+        // Recovery still recognizes the damaged leaf with Parent and no Kids.
+        assert_eq!(document.page_handles()?, vec![existing(3), existing(5)]);
+        assert_eq!(
+            crate::content::page_content(&document, existing(3))?,
+            b"q Q"
+        );
+        assert_eq!(
+            crate::content::page_xobject_handles(&document, existing(3))?,
+            BTreeMap::from([(b"Root".to_vec(), existing(4))])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_reference_resolution_keeps_source_stream_identity() -> Result<()> {
+        let document = selective_page_fixture()?;
+        let id = ObjectId::new(4, 0);
+        let reference = OwnedObject::Reference(ObjectHandle::Existing(id));
+        let Some(value) = document.resolve_owned_value_cow(&reference)? else {
+            return Err(Error::Invalid("missing content stream".to_owned()));
+        };
+        assert!(
+            matches!(value.as_ref(), OwnedObject::Stream { data: StreamData::Source(source), .. } if *source == id)
+        );
+        let Some(view) = document.current_value(ObjectHandle::Existing(id))? else {
+            return Err(Error::Invalid("missing stream".to_owned()));
+        };
+        assert!(view.has_dictionary());
+        assert!(view.dictionary_entry(b"Length").is_none());
         Ok(())
     }
 
