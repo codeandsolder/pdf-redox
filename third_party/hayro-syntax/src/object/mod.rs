@@ -15,6 +15,8 @@ use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use core::fmt::{Debug, Display, Formatter};
 
+const MAX_OBJECT_NESTING_DEPTH: usize = 512;
+
 mod bool;
 mod date;
 mod null;
@@ -31,10 +33,8 @@ pub mod array;
 pub mod dict;
 pub mod stream;
 
-/// A trait for PDF objects.
 pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {}
 
-/// A trait for PDF objects that can be borrowed directly from an [`Object`].
 pub(crate) trait ObjectRefLike<'a>: Sized {
     fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self>;
 }
@@ -57,8 +57,6 @@ pub enum Object<'a> {
     /// An array object.
     Array(Array<'a>),
     /// A stream object.
-    // Can only be an indirect object in theory and thus comes with some caveats,
-    // but we just treat it the same.
     Stream(Stream<'a>),
 }
 
@@ -78,7 +76,6 @@ impl Display for Object<'_> {
 }
 
 impl<'a> Object<'a> {
-    /// Try casting the object to a specific subtype.
     pub(crate) fn cast<T>(self) -> Option<T>
     where
         T: ObjectLike<'a>,
@@ -86,7 +83,6 @@ impl<'a> Object<'a> {
         self.try_into().ok()
     }
 
-    /// Try casting the object to a reference of the specific type.
     pub(crate) fn cast_ref<T>(&self) -> Option<&T>
     where
         T: ObjectRefLike<'a>,
@@ -176,20 +172,22 @@ impl<'a> ObjectRefLike<'a> for Object<'a> {
 
 impl Skippable for Object<'_> {
     fn skip(r: &mut Reader<'_>, is_content_stream: bool) -> Option<()> {
+        Self::skip_with_depth(r, is_content_stream, 0)
+    }
+
+    fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
         match r.peek_byte()? {
             b'n' => Null::skip(r, is_content_stream),
             b't' | b'f' => bool::skip(r, is_content_stream),
             b'/' => Name::skip(r, is_content_stream),
             b'<' => match r.peek_bytes(2)? {
-                // A stream can never appear in a dict/array, so it should never be skipped.
-                b"<<" => Dict::skip(r, is_content_stream),
+                b"<<" => Dict::skip_with_depth(r, is_content_stream, depth),
                 _ => String::skip(r, is_content_stream),
             },
             b'(' => String::skip(r, is_content_stream),
             b'.' | b'+' | b'-' | b'0'..=b'9' => Number::skip(r, is_content_stream),
-            b'[' => Array::skip(r, is_content_stream),
-            // See test case operator-in-TJ-array-0: Be lenient and skip content operators in
-            // array
+            b'[' => Array::skip_with_depth(r, is_content_stream, depth),
+            // Lenient: skip content operators inside arrays.
             _ => skip_name_like(r, false),
         }
     }
@@ -202,19 +200,7 @@ impl<'a> Readable<'a> for Object<'a> {
             b't' | b'f' => Self::Boolean(bool::read(r, ctx)?),
             b'/' => Self::Name(Name::read(r, ctx)?),
             b'<' => match r.peek_bytes(2)? {
-                b"<<" => {
-                    let mut cloned = r.clone();
-                    let dict = Dict::read(&mut cloned, ctx)?;
-                    cloned.skip_white_spaces_and_comments();
-
-                    if cloned.forward_tag(b"stream").is_some() {
-                        Object::Stream(Stream::read(r, ctx)?)
-                    } else {
-                        r.jump(cloned.offset());
-
-                        Object::Dict(dict)
-                    }
-                }
+                b"<<" => Self::Dict(Dict::read(r, ctx)?),
                 _ => Self::String(String::read(r, ctx)?),
             },
             b'(' => Self::String(String::read(r, ctx)?),
@@ -228,6 +214,24 @@ impl<'a> Readable<'a> for Object<'a> {
         };
 
         Some(object)
+    }
+
+    fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        if r.peek_bytes(2) == Some(b"<<") {
+            let mut cloned = r.clone();
+            let dict = Dict::read(&mut cloned, ctx)?;
+            cloned.skip_white_spaces_and_comments();
+
+            if cloned.forward_tag(b"stream").is_some() {
+                return Some(Self::Stream(Stream::read_indirect(r, ctx)?));
+            }
+
+            r.jump(cloned.offset());
+
+            return Some(Self::Dict(dict));
+        }
+
+        Self::read(r, ctx)
     }
 }
 
@@ -247,14 +251,14 @@ impl<'a, T: Readable<'a>> FromBytes<'a> for T {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct ObjectIdentifier {
     /// The object number.
-    pub obj_number: i32,
+    pub obj_number: u32,
     /// The generation number.
     pub gen_number: i32,
 }
 
 impl ObjectIdentifier {
     /// Create a new `ObjectIdentifier`.
-    pub fn new(obj_number: i32, gen_number: i32) -> Self {
+    pub fn new(obj_number: u32, gen_number: i32) -> Self {
         Self {
             obj_number,
             gen_number,
@@ -264,7 +268,7 @@ impl ObjectIdentifier {
 
 impl Readable<'_> for ObjectIdentifier {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        let obj_number = r.read_without_context::<i32>()?;
+        let obj_number = r.read_without_context::<u32>()?;
         r.skip_white_spaces_and_comments();
         let gen_number = r.read_without_context::<i32>()?;
         r.skip_white_spaces_and_comments();
@@ -279,7 +283,7 @@ impl Readable<'_> for ObjectIdentifier {
 
 impl Skippable for ObjectIdentifier {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        r.skip::<i32>(false)?;
+        r.skip::<u32>(false)?;
         r.skip_white_spaces_and_comments();
         r.skip::<i32>(false)?;
         r.skip_white_spaces_and_comments();
@@ -289,10 +293,7 @@ impl Skippable for ObjectIdentifier {
     }
 }
 
-/// A convenience function that extracts a dict and a stream from an object.
-/// If the object is just a dictionary, it will return `None` for the stream.
-/// If the object is a stream, it will return its dictionary as well as the stream
-/// itself.
+/// Return the dictionary of an object, and the stream if it is one.
 pub fn dict_or_stream<'a, 'b>(
     obj: &'b Object<'a>,
 ) -> Option<(&'b Dict<'a>, Option<&'b Stream<'a>>)> {
@@ -335,13 +336,25 @@ mod macros {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::{Array, Dict, Name, Null, Number, Object, Stream, String};
+    use crate::object::{Array, Dict, FromBytes, Name, Null, Number, Object, Stream, String};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
 
     fn object_impl(data: &[u8]) -> Option<Object<'_>> {
         let mut r = Reader::new(data);
-        r.read_with_context::<Object<'_>>(&ReaderContext::dummy())
+        r.read_indirect::<Object<'_>>(&ReaderContext::dummy())
+    }
+
+    #[test]
+    fn deeply_nested_arrays() {
+        let data = format!("{}0{}", "[".repeat(5000), "]".repeat(5000));
+        assert!(object_impl(data.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn deeply_nested_dictionaries() {
+        let data = format!("{}0{}", "<< /X ".repeat(5000), " >>".repeat(5000));
+        assert!(object_impl(data.as_bytes()).is_none());
     }
 
     #[test]
@@ -396,6 +409,13 @@ mod tests {
     }
 
     #[test]
+    fn stream_in_dict() {
+        let dict = Dict::from_bytes(b"<< /A << /Length 3 >> stream\nabc\nendstream >>").unwrap();
+
+        assert!(dict.get::<Stream<'_>>(b"A").is_none());
+    }
+
+    #[test]
     fn display() {
         let cases: &[(&[u8], &str)] = &[
             (b"null", "null"),
@@ -416,13 +436,17 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn object_sizes() {
-        assert_eq!(size_of::<Object<'_>>(), 40);
+        // TODO: Other crates in the workspace enable `smallvec`'s `union` feature, which
+        // removes the niche that `Name` and `String` rely on and grows them from 32 to 40
+        // bytes and `Object` from 40 to 48 bytes. Replace their `SmallVec` with a type of
+        // our own so that the sizes no longer depend on that feature.
+        assert!(size_of::<Object<'_>>() <= 48);
         assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
-        assert_eq!(size_of::<Name<'_>>(), 32);
+        assert!(size_of::<Name<'_>>() <= 40);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
         assert_eq!(size_of::<Stream<'_>>(), 24);
-        assert_eq!(size_of::<String<'_>>(), 32);
+        assert!(size_of::<String<'_>>() <= 40);
     }
 }

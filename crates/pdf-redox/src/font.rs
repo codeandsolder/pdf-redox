@@ -2818,7 +2818,7 @@ mod tests {
     use super::*;
     use crate::ObjectId;
 
-    fn overlay_with_owned_font_streams(input: &[u8], ids: &[i32]) -> Result<EditDocument> {
+    fn overlay_with_owned_font_streams(input: &[u8], ids: &[u32]) -> Result<EditDocument> {
         let mut overlay = EditDocument::from_bytes(input.to_vec())?;
         for &id in ids {
             let object_id = ObjectId::new(id, 0);
@@ -4511,7 +4511,7 @@ mod tests {
         // first program; the pre-union usage graph must remain a valid subtype
         // proof for the outline pass that follows. Glyph usage itself is
         // intentionally rescanned after the redirect.
-        for (object_number, live_gid) in [(5_i32, 1_u16), (10_i32, 2_u16)] {
+        for (object_number, live_gid) in [(5_u32, 1_u16), (10_u32, 2_u16)] {
             let program = CowObjectHandle::Existing(ObjectId::new(object_number, 0));
             let decoded = document.decoded_stream_data(program)?;
             let Some((sparse, _)) =

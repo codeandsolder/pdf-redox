@@ -1,17 +1,17 @@
 //! Streams.
 
+use crate::Limits;
 use crate::crypto::DecryptionTarget;
 use crate::filter::Filter;
-use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
-use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, LENGTH, TYPE};
+use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
-use crate::util::{OptionLog, find_needle};
+use crate::util::find_needle;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -29,6 +29,38 @@ pub struct Stream<'a> {
     data: &'a [u8],
 }
 
+/// Decode standalone stream bytes using a serialized stream dictionary.
+///
+/// This is intended for copy-on-write/editing layers that already own the
+/// encoded payload and filter dictionary but do not have a source [`Pdf`](crate::Pdf)
+/// stream object. The dictionary must be a complete PDF dictionary object such
+/// as `<< /Filter /FlateDecode >>`.
+pub fn decode_standalone_stream(dictionary: &[u8], data: &[u8]) -> Result<Vec<u8>, DecodeFailure> {
+    let dict = Reader::new(dictionary)
+        .read_without_context::<Dict<'_>>()
+        .ok_or(DecodeFailure::Unknown)?;
+    Stream::new(data, dict).decoded().map(Cow::into_owned)
+}
+
+/// Decode standalone image-stream bytes with explicit image metadata.
+///
+/// Image filters such as DCT, JPX, JBIG2, and CCITT need dimensions and
+/// component information that are normally supplied by the containing image
+/// XObject. Copy-on-write callers can provide that metadata here without
+/// constructing a complete [`Pdf`](crate::Pdf).
+pub fn decode_standalone_image_stream(
+    dictionary: &[u8],
+    data: &[u8],
+    image_params: &ImageDecodeParams,
+) -> Result<Vec<u8>, DecodeFailure> {
+    let dict = Reader::new(dictionary)
+        .read_without_context::<Dict<'_>>()
+        .ok_or(DecodeFailure::Unknown)?;
+    Stream::new(data, dict)
+        .decoded_image(image_params)
+        .map(|result| result.data.into_owned())
+}
+
 impl PartialEq for Stream<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.dict == other.dict && self.data == other.data
@@ -44,9 +76,7 @@ pub struct ImageDecodeParams {
     pub bpc: Option<u8>,
     /// The components per channel of the image, if that information is available.
     pub num_components: Option<u8>,
-    /// A target resolution for the image. Note that this is only a hint so that
-    /// in case it's possible, a version of the image will be extracted that
-    /// is as close as possible to the hinted dimension.
+    /// A hint for the desired image dimensions.
     pub target_dimension: Option<(u32, u32)>,
     /// The width of the image as indicated by the image dictionary.
     pub width: u32,
@@ -109,25 +139,28 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// Return the raw, decrypted data of the stream.
-    ///
-    /// Stream filters will not be applied.
+    /// Return the decrypted but undecoded data of the stream.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
         let ctx = self.dict.ctx();
 
         if ctx.xref().needs_decryption(ctx)
-            && self
-                .dict
-                .get::<object::String<'_>>(TYPE)
-                .map(|t| t.as_ref() != b"XRef")
-                .unwrap_or(true)
+            && self.dict.get::<Name<'_>>(TYPE).as_deref() != Some(XREF)
         {
-            Cow::Owned(
-                ctx.xref()
-                    .decrypt(self.obj_id(), self.data, DecryptionTarget::Stream)
-                    // TODO: MAybe an error would be better?
-                    .unwrap_or_default(),
-            )
+            let crypt_filter = self.crypt_filter();
+            let target = match &crypt_filter {
+                Some(name) => DecryptionTarget::Named(name),
+                None => DecryptionTarget::Stream,
+            };
+
+            match self.dict.obj_id() {
+                Some(obj_id) => Cow::Owned(
+                    ctx.xref()
+                        .decrypt(obj_id, self.data, target)
+                        // TODO: MAybe an error would be better?
+                        .unwrap_or_default(),
+                ),
+                None => Cow::Borrowed(self.data),
+            }
         } else {
             Cow::Borrowed(self.data)
         }
@@ -140,11 +173,9 @@ impl<'a> Stream<'a> {
 
     /// Return the object identifier of the stream.
     pub fn obj_id(&self) -> ObjectIdentifier {
-        self.dict.obj_id().unwrap_or_else(|| {
-            // In theory shouldn't ever happen, but could theoretically be
-            // triggered in a crafted PDF.
-            ObjectIdentifier::new(0, 0)
-        })
+        self.dict
+            .obj_id()
+            .unwrap_or_else(|| ObjectIdentifier::new(0, 0))
     }
 
     /// Return the filters that are applied to the stream.
@@ -152,43 +183,90 @@ impl<'a> Stream<'a> {
         self.filters_and_params().filters
     }
 
+    /// Resource limits governing this stream.
+    pub fn limits(&self) -> Limits {
+        self.dict.ctx().xref().limits()
+    }
+
     /// Return the decoded data of the stream.
-    ///
-    /// Note that the result of this method will not be cached, so calling it multiple
-    /// times is expensive.
     pub fn decoded(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         self.decoded_image(&ImageDecodeParams::default())
             .map(|r| r.data)
     }
 
-    /// Return the decoded data of the stream, and return image metadata
-    /// if available.
+    /// Return the decoded data of a stream that doesn't use an image filter.
+    pub fn decoded_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        if self.filters().iter().any(|filter| {
+            matches!(
+                filter,
+                Filter::DctDecode
+                    | Filter::JpxDecode
+                    | Filter::Jbig2Decode
+                    | Filter::CcittFaxDecode
+            )
+        }) {
+            return Err(DecodeFailure::ImageDecode);
+        }
+
+        self.decoded()
+    }
+
+    /// Return the decoded data of the stream, with image metadata if available.
     pub fn decoded_image(
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
+        if matches!(
+            self.dict.get::<Object<'_>>(F),
+            Some(Object::String(_) | Object::Dict(_))
+        ) {
+            return Err(DecodeFailure::StreamDecode);
+        }
+
         let data = self.raw_data();
         let filters_and_params = self.filters_and_params();
+        let limits = self.limits();
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, params) in filters_and_params
+        for (i, (filter, params)) in filters_and_params
             .filters
             .iter()
             .zip(filters_and_params.params.iter())
+            .enumerate()
         {
+            if i == 0 && *filter == Filter::Crypt {
+                continue;
+            }
+
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                limits,
             )?;
             current = Some(new);
         }
 
-        Ok(current.unwrap_or(FilterResult {
+        let decoded = current.unwrap_or(FilterResult {
             data,
             image_data: None,
-        }))
+        });
+        if !limits.max_decoded_stream_size.permits(decoded.data.len()) {
+            return Err(DecodeFailure::StreamDecode);
+        }
+        Ok(decoded)
+    }
+
+    fn crypt_filter(&self) -> Option<Name<'a>> {
+        let FiltersAndParams { filters, params } = self.filters_and_params();
+
+        (filters.first() == Some(&Filter::Crypt)).then(|| {
+            params
+                .first()
+                .and_then(|params| params.get::<Name<'a>>(NAME))
+                .unwrap_or(Name::new_unescaped(IDENTITY))
+        })
     }
 }
 
@@ -207,31 +285,23 @@ impl Display for Stream<'_> {
 impl Skippable for Stream<'_> {
     fn skip(_: &mut Reader<'_>, _: bool) -> Option<()> {
         // A stream can never appear in a dict/array, so it should never be skipped.
-        warn!("attempted to skip a stream object");
 
         None
     }
 }
 
 impl<'a> Readable<'a> for Stream<'a> {
-    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+    fn read(_: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
+        None
+    }
+
+    fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let dict = r.read_with_context::<Dict<'_>>(ctx)?;
-
-        if dict.contains_key(F) {
-            warn!("encountered stream referencing external file, which is unsupported");
-
-            return None;
-        }
-
         let offset = r.offset();
-        parse_proper(r, &dict)
-            .or_else(|| {
-                warn!("failed to parse stream, trying to parse it manually");
-
-                r.jump(offset);
-                parse_fallback(r, &dict)
-            })
-            .error_none("was unable to manually parse the stream")
+        parse_proper(r, &dict).or_else(|| {
+            r.jump(offset);
+            parse_fallback(r, &dict)
+        })
     }
 }
 
@@ -308,8 +378,7 @@ fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
 }
 
 fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
-    let stream_offset = find_needle(r.tail()?, b"stream")?;
-    r.read_bytes(stream_offset)?;
+    r.skip_white_spaces_and_comments();
     r.forward_tag(b"stream")?;
 
     r.forward_tag(b"\n")
@@ -317,6 +386,8 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
         // Technically not allowed, but no reason to not try it.
         .or_else(|| r.forward_tag(b"\r"))?;
 
+    // TODO: This search can take quadratic time in total when many streams with a wrong length
+    // have no `endstream` after them, or only a distant one.
     let tail = r.tail()?;
     let endstream_offset = find_needle(tail, b"endstream")?;
     let data_end = trim_trailing_ascii_whitespace(&tail[..endstream_offset]);
@@ -374,7 +445,7 @@ mod tests {
     fn display() {
         let mut reader = Reader::new(b"<< /Length 3 >> stream\nabc\nendstream");
         let stream = reader
-            .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
             .unwrap();
 
         assert_eq!(format!("{stream}"), "Stream (len: 3)");
@@ -385,7 +456,7 @@ mod tests {
         let data = b"<< /Length 10 >> stream\nabcdefghij\nendstream";
         let mut r = Reader::new(data);
         let stream = r
-            .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
@@ -396,9 +467,64 @@ mod tests {
         let data = b"<< /Length 999 >> stream\nabcdefghij\nendstream";
         let mut r = Reader::new(data);
         let stream = r
-            .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    #[test]
+    fn stream_with_external_file() {
+        let data = b"<< /Length 3 /F (data.bin) >> stream\nabc\nendstream";
+        let mut r = Reader::new(data);
+        let stream = r
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
+            .unwrap();
+
+        assert_eq!(stream.data, b"abc");
+        assert!(stream.dict().contains_key(crate::object::dict::keys::F));
+        assert!(stream.decoded().is_err());
+    }
+
+    #[test]
+    fn standalone_stream_decodes_filter_chain() {
+        let result = super::decode_standalone_stream(
+            b"<< /Filter [/ASCIIHexDecode /RunLengthDecode] >>",
+            b"0241424380>",
+        )
+        .unwrap();
+        assert_eq!(result, b"ABC");
+        assert!(super::decode_standalone_stream(b"not a dictionary", b"").is_err());
+    }
+
+    #[test]
+    fn standalone_image_accepts_explicit_metadata() {
+        let params = super::ImageDecodeParams {
+            width: 3,
+            height: 1,
+            bpc: Some(8),
+            num_components: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::decode_standalone_image_stream(
+                b"<< /Filter /ASCIIHexDecode >>",
+                b"010203>",
+                &params,
+            )
+            .unwrap(),
+            [1, 2, 3],
+        );
+    }
+
+    #[test]
+    fn inline_filter_abbreviation_still_decodes() {
+        let mut r = Reader::new(b"<< /F /AHx >>");
+        let dict = r
+            .read_with_context::<crate::object::Dict<'_>>(&ReaderContext::dummy())
+            .unwrap();
+        let stream = Stream::new(b"41>", dict);
+
+        assert_eq!(stream.decoded().unwrap().as_ref(), b"A");
     }
 }

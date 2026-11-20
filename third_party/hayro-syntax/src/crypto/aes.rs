@@ -369,11 +369,11 @@ impl<const KEY_SIZE: usize, const ROUNDS: usize> AESCipher<KEY_SIZE, ROUNDS> {
         AESCore::add_round_key(&mut state, &self.round_keys[0]);
 
         let main_rounds = ROUNDS - 1;
-        for round in 1..main_rounds {
+        for round_key in &self.round_keys[1..main_rounds] {
             AESCore::sub_bytes(&mut state);
             AESCore::shift_rows(&mut state);
             AESCore::mix_columns(&mut state);
-            AESCore::add_round_key(&mut state, &self.round_keys[round]);
+            AESCore::add_round_key(&mut state, round_key);
         }
 
         AESCore::sub_bytes(&mut state);
@@ -432,7 +432,7 @@ impl<const KEY_SIZE: usize, const ROUNDS: usize> AESCipher<KEY_SIZE, ROUNDS> {
         let mut result = Vec::new();
         let mut prev_block = *iv;
 
-        for chunk in data.chunks_exact(16) {
+        for chunk in data.as_chunks::<16>().0 {
             let mut block = [0_u8; 16];
             block.copy_from_slice(chunk);
 

@@ -1,3 +1,4 @@
+use crate::Limits;
 use crate::object::Dict;
 use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
@@ -6,30 +7,57 @@ use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecod
 use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::iter;
-use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
+use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode};
 
 pub(crate) fn decode(
     data: &[u8],
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
+    limits: Limits,
 ) -> Option<FilterResult<'static>> {
     let k = params.get::<i32>(K).unwrap_or(0);
 
-    let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
-    // In case `Rows` is smaller than image height, take the image height.
-    // Seems to match what Chromium does.
-    let rows = params
-        .get::<u32>(ROWS)
-        .unwrap_or(0)
-        .max(image_params.height);
-    let output_len = (columns as usize).checked_mul(rows as usize)?;
-    let end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
+    let columns = params.get::<u32>(COLUMNS).unwrap_or(1728);
+    // The image height takes precedence over `Rows`.
+    let rows = if image_params.height > 0 {
+        image_params.height
+    } else {
+        params.get::<u32>(ROWS).unwrap_or(0)
+    };
+    if columns == 0 || !limits.permits_image(columns, rows) {
+        return None;
+    }
+    let stride = if image_params.is_indexed {
+        (columns as usize).div_ceil(8)
+    } else {
+        columns as usize
+    };
+    let row_limit = limits
+        .max_image_dimension
+        .bound()
+        .unwrap_or(u32::MAX)
+        .min(
+            u32::try_from(limits.max_image_pixels.bound().unwrap_or(u64::MAX) / u64::from(columns))
+                .unwrap_or(u32::MAX),
+        )
+        .min(
+            u32::try_from(limits.max_decoded_stream_size.bound().unwrap_or(usize::MAX) / stride)
+                .unwrap_or(u32::MAX),
+        );
+    if rows > row_limit {
+        return None;
+    }
+    let output_len = stride.checked_mul(rows as usize)?;
 
     let settings = DecodeSettings {
         columns,
-        rows,
-        end_of_block,
+        // One sentinel row detects overflow when the image height is unspecified.
+        rows: if rows == 0 {
+            row_limit.checked_add(1).unwrap_or(0)
+        } else {
+            rows
+        },
+        end_of_block: params.get::<bool>(END_OF_BLOCK).unwrap_or(true),
         end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),
         rows_are_byte_aligned: params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false),
         encoding: if k < 0 {
@@ -37,132 +65,140 @@ pub(crate) fn decode(
         } else if k == 0 {
             EncodingMode::Group3_1D
         } else {
-            EncodingMode::Group3_2D { k: k as u32 }
+            EncodingMode::Group3_2D
         },
-        invert_black: params.get::<bool>(BLACK_IS_1).unwrap_or(false),
+        strict: false,
+        cancel: None,
+    };
+    let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
+        0x00
+    } else {
+        0xFF
     };
 
-    // Whenever possible (if we don't have an indexed color space), we convert
-    // the data as 8-bit instead of 1-bit, so that it can be easier converted
-    // into an RGBA8 image.
-
-    let (decoded, bpc) = if image_params.is_indexed {
+    // Expand to 8 bpc unless indexed, for easier RGBA8 conversion.
+    let (decoded, bpc, decoded_rows) = if image_params.is_indexed {
         struct BitPackDecoder {
             output: Vec<u8>,
+            columns: u32,
+            stride: usize,
+            white: u8,
+            last_byte_mask: u8,
             decoded_rows: u32,
-            buffer: u8,
-            bit_count: u8,
-        }
-
-        impl BitPackDecoder {
-            fn flush(&mut self) {
-                if self.bit_count > 0 {
-                    let padded = self.buffer << (8 - self.bit_count);
-                    self.output.push(padded);
-                    self.buffer = 0;
-                    self.bit_count = 0;
-                }
-            }
+            row_limit: u32,
         }
 
         impl Decoder for BitPackDecoder {
-            fn push_pixels(&mut self, white: bool, mut count: u32) {
-                if self.bit_count > 0 {
-                    let head = count.min(u32::from(8 - self.bit_count)) as u8;
-                    self.buffer <<= head;
-                    if white {
-                        self.buffer |= ((1_u16 << head) - 1) as u8;
-                    }
-                    self.bit_count += head;
-                    count -= u32::from(head);
+            fn push_row(&mut self, changes: &[u32]) {
+                if self.decoded_rows >= self.row_limit {
+                    self.decoded_rows = self.decoded_rows.saturating_add(1);
+                    return;
+                }
+                let start = self.decoded_rows as usize * self.stride;
+                let end = start + self.stride;
 
-                    if self.bit_count == 8 {
-                        self.output.push(self.buffer);
-                        self.buffer = 0;
-                        self.bit_count = 0;
-                    }
+                if self.output.len() < end {
+                    self.output.resize(end, self.white);
                 }
 
-                let full_bytes = count / 8;
-                if full_bytes > 0 {
-                    let byte = if white { 0xFF } else { 0x00 };
-                    self.output
-                        .extend(iter::repeat_n(byte, full_bytes as usize));
-                    count %= 8;
-                }
+                let row = &mut self.output[start..end];
 
-                if count > 0 {
-                    self.buffer = if white {
-                        ((1_u16 << count) - 1) as u8
+                // Rows are prefilled with white, so flipping a span makes it black.
+                for (start, end) in black_spans(changes, self.columns) {
+                    let (first, last) = (start / 8, (end - 1) / 8);
+                    let first_mask = 0xFF_u8 >> (start % 8);
+                    let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
+
+                    if first == last {
+                        row[first] ^= first_mask & last_mask;
                     } else {
-                        0
-                    };
-                    self.bit_count = count as u8;
+                        row[first] ^= first_mask;
+                        fill_short(&mut row[first + 1..last], !self.white);
+                        row[last] ^= last_mask;
+                    }
                 }
-            }
 
-            fn next_line(&mut self) {
+                if let Some(last) = row.last_mut() {
+                    *last &= self.last_byte_mask;
+                }
+
                 self.decoded_rows += 1;
-                self.flush();
             }
         }
 
         let mut decoder = BitPackDecoder {
-            output: Vec::new(),
+            output: vec![white; output_len],
+            columns,
+            stride,
+            white,
+            last_byte_mask: 0xFF_u8 << ((8 - columns % 8) % 8),
             decoded_rows: 0,
-            buffer: 0,
-            bit_count: 0,
+            row_limit,
         };
-        let mut context = DecoderContext::new(settings);
-        let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
+        let result = hayro_ccitt::decode(data, &mut decoder, &settings);
 
-        // If we decoded at least one row, let's be lenient and return what we got.
-        // See also 0001763.pdf.
-        if result.is_err() && decoder.decoded_rows == 0 {
+        // Lenient: return partial output if at least one row decoded (0001763.pdf).
+        if decoder.decoded_rows > row_limit || (result.is_err() && decoder.decoded_rows == 0) {
             return None;
         }
 
-        (decoder.output, 1)
+        decoder
+            .output
+            .truncate(decoder.decoded_rows as usize * stride);
+
+        (decoder.output, 1, decoder.decoded_rows)
     } else {
         struct Luma8Decoder {
             output: Vec<u8>,
-            idx: usize,
+            columns: u32,
+            white: u8,
             decoded_rows: u32,
+            row_limit: u32,
         }
 
         impl Decoder for Luma8Decoder {
-            fn push_pixels(&mut self, white: bool, count: u32) {
-                let len = count as usize;
+            fn push_row(&mut self, changes: &[u32]) {
+                if self.decoded_rows >= self.row_limit {
+                    self.decoded_rows = self.decoded_rows.saturating_add(1);
+                    return;
+                }
+                let start = self.decoded_rows as usize * self.columns as usize;
+                let end = start + self.columns as usize;
 
-                if !white {
-                    self.output[self.idx..self.idx + len].fill(0x00);
+                if self.output.len() < end {
+                    self.output.resize(end, self.white);
                 }
 
-                self.idx += len;
-            }
+                let row = &mut self.output[start..end];
 
-            fn next_line(&mut self) {
+                for (start, end) in black_spans(changes, self.columns) {
+                    fill_short(&mut row[start..end], !self.white);
+                }
+
                 self.decoded_rows += 1;
             }
         }
 
         let mut decoder = Luma8Decoder {
-            output: vec![0xFF; output_len],
-            idx: 0,
+            output: vec![white; output_len],
+            columns,
+            white,
             decoded_rows: 0,
+            row_limit,
         };
-        let mut context = DecoderContext::new(settings);
-        let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
+        let result = hayro_ccitt::decode(data, &mut decoder, &settings);
 
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if decoder.decoded_rows > row_limit || (result.is_err() && decoder.decoded_rows == 0) {
             return None;
         }
 
-        if result.is_err() {
-            decoder.output.truncate(decoder.idx);
+        if result.is_err() || rows == 0 {
+            decoder
+                .output
+                .truncate(decoder.decoded_rows as usize * columns as usize);
         }
 
-        (decoder.output, 8)
+        (decoder.output, 8, decoder.decoded_rows)
     };
 
     Some(FilterResult {
@@ -171,15 +207,51 @@ pub(crate) fn decode(
             alpha: None,
             color_space: Some(ImageColorSpace::Gray),
             bits_per_component: bpc,
-            width: settings.columns,
-            height: rows,
+            width: columns,
+            height: if rows == 0 { decoded_rows } else { rows },
         }),
     })
+}
+
+fn black_spans(changes: &[u32], columns: u32) -> impl Iterator<Item = (usize, usize)> + '_ {
+    changes.chunks(2).map(move |span| {
+        let end = span.get(1).copied().unwrap_or(columns);
+        (span[0] as usize, end as usize)
+    })
+}
+
+#[inline(always)]
+fn fill_short<T: Copy>(slice: &mut [T], value: T) {
+    let len = slice.len();
+
+    // Overlapping fixed-size stores beat `memset` for spans up to 32.
+    match len {
+        0 => {}
+        1..4 => {
+            slice[0] = value;
+            slice[len / 2] = value;
+            slice[len - 1] = value;
+        }
+        4..8 => {
+            slice[..4].copy_from_slice(&[value; 4]);
+            slice[len - 4..].copy_from_slice(&[value; 4]);
+        }
+        8..16 => {
+            slice[..8].copy_from_slice(&[value; 8]);
+            slice[len - 8..].copy_from_slice(&[value; 8]);
+        }
+        16..=32 => {
+            slice[..16].copy_from_slice(&[value; 16]);
+            slice[len - 16..].copy_from_slice(&[value; 16]);
+        }
+        _ => slice.fill(value),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::decode;
+    use crate::Limits;
     use crate::object::FromBytes;
     use crate::object::dict::Dict;
     use crate::object::stream::ImageDecodeParams;
@@ -188,9 +260,81 @@ mod tests {
     fn issue1258() {
         let params = Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap();
 
-        let decoded = decode(&[0x35, 0x14], &params, &ImageDecodeParams::default()).unwrap();
+        let decoded = decode(
+            &[0x35, 0x14],
+            &params,
+            &ImageDecodeParams::default(),
+            Limits::DEFAULT,
+        )
+        .unwrap();
 
         assert_eq!(decoded.data.as_ref(), &[0; 8]);
+        assert_eq!(decoded.image_data.unwrap().height, 1);
+    }
+
+    #[test]
+    fn image_dimensions_are_checked_before_decoding() {
+        let params = Dict::from_bytes(b"<< /K 0 /Columns 100000 /Rows 100000 >>").unwrap();
+        assert!(
+            decode(
+                &[0],
+                &params,
+                &ImageDecodeParams::default(),
+                Limits::DEFAULT
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_rows_obey_pixel_budget() {
+        let params = Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap();
+        let mut limits = Limits::DEFAULT;
+        limits.max_image_pixels = crate::Limit::AtMost(7);
+        assert!(
+            decode(
+                &[0x35, 0x14],
+                &params,
+                &ImageDecodeParams::default(),
+                limits
+            )
+            .is_none()
+        );
+        limits.max_image_pixels = crate::Limit::AtMost(8);
+        assert_eq!(
+            decode(
+                &[0x35, 0x14],
+                &params,
+                &ImageDecodeParams::default(),
+                limits
+            )
+            .unwrap()
+            .data
+            .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn unknown_rows() {
+        let params = Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap();
+
+        let decoded = decode(
+            &[0x35, 0x14],
+            &params,
+            &ImageDecodeParams::default(),
+            Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(decoded.data.as_ref(), &[0; 8]);
+        assert_eq!(decoded.image_data.unwrap().height, 1);
+
+        let image_params = ImageDecodeParams {
+            is_indexed: true,
+            ..Default::default()
+        };
+        let decoded = decode(&[0x35, 0x14], &params, &image_params, Limits::DEFAULT).unwrap();
+        assert_eq!(decoded.data.as_ref(), &[0]);
         assert_eq!(decoded.image_data.unwrap().height, 1);
     }
 }

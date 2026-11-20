@@ -7012,7 +7012,7 @@ mod tests {
     use super::*;
     use crate::ObjectId;
 
-    fn test_draw(object: i32, x: f64) -> RasterDraw {
+    fn test_draw(object: u32, x: f64) -> RasterDraw {
         let ctm = Matrix::new(1.0, 0.0, 0.0, 1.0, x, 0.0);
         RasterDraw {
             target: ObjectHandle::Existing(ObjectId::new(object, 0)),

@@ -9,9 +9,8 @@ This crate does not provide more high-level functionality, such as parsing fonts
 Such functionality is out-of-scope for `hayro-syntax`, since this crate is supposed to be
 as *light-weight* and *application-agnostic* as possible.
 
-Functionality-wise, this crate is therefore close to feature-complete. The main missing feature
-is support for password-protected documents. In addition to that, more low-level APIs might be
-added in the future.
+Functionality-wise, this crate is therefore close to feature-complete, though more low-level
+APIs might be added in the future.
 
 The crate is `no_std` compatible but requires an allocator to be available.
 
@@ -24,7 +23,7 @@ use std::path::PathBuf;
 
 // First load the data that constitutes the PDF file.
 let data = std::fs::read(
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hayro-tests/pdfs/custom/text_with_rise.pdf"),
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/pdfs/custom/text_with_rise.pdf"),
 )
 .unwrap();
 
@@ -47,13 +46,13 @@ for page in pages.iter() {
 ```
 
 # Safety
-When the `unsafe` feature is disabled, there is only use of `unsafe` in `hayro-syntax`.
+When the `unsafe` feature is disabled, there is only one use of `unsafe` in `hayro-syntax`.
 We also unconditionally use the `smallvec` crate which uses unsafe internally, but that's
 it.
 
 For better performance, it is strongly recommended to enable the `unsafe` feature,
-which does result in slightly more unsafe code being, but does give better performance:
-- We will use the `flate2` crate for decoding flate streams.
+which results in slightly more unsafe code but gives better performance:
+- We will use `zlib-rs` instead of `miniz_oxide` for decoding flate streams.
 - SIMD will be enabled to accelerate decoding of images.
 - `memchr` will be used to accelerate some of the fallback parsing code.
 
@@ -67,9 +66,7 @@ The supported features include:
 - The crate is very lightweight, especially in comparison to other PDF crates.
 
 # Limitations
-- There are still a few features missing, for example, support for
-  password-protected PDFs. In addition to that, many properties (like page annotations) are
-  currently not exposed.
+- Many properties (like page annotations) are currently not exposed.
 - This crate is for read-only processing, you cannot directly use it to manipulate PDF files.
   If you need to do that, there are other crates in the Rust ecosystem that are suitable for this.
 */
@@ -79,14 +76,11 @@ The supported features include:
 
 extern crate alloc;
 
-#[macro_use]
-mod log;
-
-pub(crate) mod math;
 pub(crate) mod sync;
 
 mod data;
 pub(crate) mod filter;
+mod limits;
 pub(crate) mod pdf;
 pub(crate) mod trivia;
 pub(crate) mod util;
@@ -99,8 +93,7 @@ pub mod page;
 pub mod transform;
 pub mod xref;
 
-// We only expose them so hayro-interpret can use them, but they are not intended
-// to be used by others
+// Public only for hayro-interpret.
 #[doc(hidden)]
 pub mod bit_reader;
 #[doc(hidden)]
@@ -110,4 +103,5 @@ pub mod reader;
 
 pub use data::PdfData;
 pub use filter::*;
+pub use limits::{Limit, Limits};
 pub use pdf::*;
