@@ -1509,6 +1509,24 @@ struct PagePathData {
     decoded: Vec<u8>,
 }
 
+// Semantic grouping needs only the first occurrence's source offset until a
+// key repeats. Materialize a body once per *repeated candidate*, not once per
+// scanned block (or even once per otherwise-unique semantic group).
+type FormGroups = BTreeMap<SemanticKey, (usize, Vec<PathOccurrence>)>;
+type FormCandidate = (Vec<u8>, usize, Vec<PathOccurrence>);
+
+fn repeated_form_candidates(groups: FormGroups, pages: &[PagePathData]) -> Vec<FormCandidate> {
+    groups
+        .into_values()
+        .filter(|(_, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
+        .map(|(operator_count, occurrences)| {
+            let first = &occurrences[0];
+            let body = pages[first.page_index].decoded[first.start..first.end].to_vec();
+            (body, operator_count, occurrences)
+        })
+        .collect()
+}
+
 fn path_form_name(index: usize, occupied: &mut BTreeSet<Vec<u8>>) -> Vec<u8> {
     let mut serial = index;
     loop {
@@ -1743,7 +1761,7 @@ fn factor_repeated_path_forms(
     let mut page_data = Vec::with_capacity(pages.len());
     let mut page_blocks =
         Vec::<(Vec<PathBlock>, Vec<TransformedBlock>)>::with_capacity(pages.len());
-    let mut groups = BTreeMap::<SemanticKey, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
+    let mut groups = FormGroups::new();
     let mut occupied_names = BTreeSet::new();
     let mut scanned_blocks = 0usize;
     let mut cached_transformed = BTreeMap::new();
@@ -1807,11 +1825,10 @@ fn factor_repeated_path_forms(
             if nested_in_preferred {
                 continue;
             }
-            let bytes = page_data[page_index].decoded[block.start..block.end].to_vec();
             let entry = groups
                 .entry(block.semantic_key)
-                .or_insert_with(|| (bytes, block.operator_count, Vec::new()));
-            entry.2.push(PathOccurrence {
+                .or_insert_with(|| (block.operator_count, Vec::new()));
+            entry.1.push(PathOccurrence {
                 page_index,
                 start: block.start,
                 end: block.end,
@@ -1822,10 +1839,7 @@ fn factor_repeated_path_forms(
     }
 
     let semantic_groups = groups.len();
-    let mut candidates = groups
-        .into_values()
-        .filter(|(_, _, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
-        .collect::<Vec<_>>();
+    let mut candidates = repeated_form_candidates(groups, &page_data);
     if *DEBUG_VECTOR {
         let candidate_count = candidates.len();
         eprintln!(
@@ -2034,7 +2048,7 @@ fn factor_repeated_transformed_blocks(
     flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut page_data = Vec::with_capacity(pages.len());
-    let mut groups = BTreeMap::<SemanticKey, (Vec<u8>, usize, Vec<PathOccurrence>)>::new();
+    let mut groups = FormGroups::new();
     let mut occupied_names = BTreeSet::new();
     let mut scanned_blocks = 0usize;
 
@@ -2051,11 +2065,10 @@ fn factor_repeated_transformed_blocks(
         };
         for block in blocks {
             scanned_blocks = scanned_blocks.saturating_add(1);
-            let bytes = decoded[block.body_start..block.body_end].to_vec();
             let entry = groups
                 .entry(block.semantic_key)
-                .or_insert_with(|| (bytes, block.operator_count, Vec::new()));
-            entry.2.push(PathOccurrence {
+                .or_insert_with(|| (block.operator_count, Vec::new()));
+            entry.1.push(PathOccurrence {
                 page_index: page_data.len(),
                 start: block.body_start,
                 end: block.body_end,
@@ -2071,10 +2084,7 @@ fn factor_repeated_transformed_blocks(
     }
 
     let semantic_groups = groups.len();
-    let mut candidates = groups
-        .into_values()
-        .filter(|(_, _, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
-        .collect::<Vec<_>>();
+    let mut candidates = repeated_form_candidates(groups, &page_data);
     if *DEBUG_VECTOR {
         let candidate_count = candidates.len();
         eprintln!(
@@ -3713,6 +3723,52 @@ pub fn compact_vector_paths_with_flate_cache(
 mod tests {
     use super::*;
     use crate::ObjectId;
+
+    #[test]
+    fn repeated_form_candidates_materialize_only_repeated_first_occurrence() {
+        let bounds = Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 10.0,
+        };
+        let pages = vec![
+            PagePathData {
+                page: ObjectHandle::Existing(ObjectId::new(3, 0)),
+                decoded: b"prefix 0 0 10 10 re f suffix".to_vec(),
+            },
+            PagePathData {
+                page: ObjectHandle::Existing(ObjectId::new(4, 0)),
+                decoded: b"prefix 0 0 10 10 re f suffix".to_vec(),
+            },
+        ];
+        let occurrence = |page_index, start, end| PathOccurrence {
+            page_index,
+            start,
+            end,
+            bounds,
+        };
+        let groups = BTreeMap::from([
+            // A unique key must never be materialized, even if its stale span
+            // cannot be indexed. No Form will be created from that group.
+            (
+                semantic_fingerprint(b"unique"),
+                (1, vec![occurrence(99, 0, 999)]),
+            ),
+            (
+                semantic_fingerprint(b"repeated"),
+                (4, vec![occurrence(0, 7, 21), occurrence(1, 7, 21)]),
+            ),
+        ]);
+        let candidates = repeated_form_candidates(groups, &pages);
+        assert_eq!(candidates.len(), 1);
+        let (body, operators, occurrences) = &candidates[0];
+        assert_eq!(body, b"0 0 10 10 re f");
+        assert_eq!(*operators, 4);
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(occurrences[0].page_index, 0);
+        assert_eq!(occurrences[1].page_index, 1);
+    }
 
     #[test]
     fn vector_flate_length_memo_preserves_exact_lengths_and_bounds_entries() -> Result<()> {
