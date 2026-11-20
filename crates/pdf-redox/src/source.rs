@@ -1646,7 +1646,7 @@ fn owned_from_hayro(object: Object<'_>, stream_id: Option<ObjectId>) -> OwnedObj
     }
 }
 
-pub(crate) fn owned_from_maybe_ref(value: MaybeRef<Object<'_>>) -> OwnedObject {
+pub fn owned_from_maybe_ref(value: MaybeRef<Object<'_>>) -> OwnedObject {
     match value {
         MaybeRef::Ref(reference) => {
             OwnedObject::Reference(ObjectHandle::Existing(reference.into()))
