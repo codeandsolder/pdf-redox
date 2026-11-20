@@ -186,25 +186,22 @@ impl LivePageIdentityIndex {
     }
 }
 
-fn stale_page_destination_map(
+fn stale_page_destination_map_from_plan(
     document: &EditDocument,
+    plan: &PageTreePlan,
 ) -> Result<BTreeMap<ObjectHandle, ObjectHandle>> {
-    let live_pages = document
-        .page_handles()?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
     let stale_pages = reachable_page_dictionaries(document)?
         .into_iter()
-        .filter(|handle| !live_pages.contains(handle))
+        .filter(|handle| !plan.owners.contains_key(handle))
         .collect::<Vec<_>>();
     if stale_pages.is_empty() {
         return Ok(BTreeMap::new());
     }
 
     let mut live_identities = LivePageIdentityIndex::default();
-    for &page in &live_pages {
-        if let Some(identity) = source_page_identity(document, page)? {
-            live_identities.insert(page, identity)?;
+    for page in &plan.pages {
+        if let Some(identity) = source_page_identity(document, page.handle)? {
+            live_identities.insert(page.handle, identity)?;
         }
     }
 
@@ -295,8 +292,11 @@ fn apply_destination_edits(
     Ok(rewritten)
 }
 
-fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<usize> {
-    let redirects = stale_page_destination_map(document)?;
+fn canonicalize_stale_page_destinations_from_plan(
+    document: &mut EditDocument,
+    plan: &PageTreePlan,
+) -> Result<usize> {
+    let redirects = stale_page_destination_map_from_plan(document, plan)?;
     if redirects.is_empty() {
         return Ok(0);
     }
@@ -918,16 +918,11 @@ fn remove_unprotected_inheritance(
     apply_shadowed_page_tree_entries(document, removals)
 }
 
-fn compact_page_tree(
+fn compact_page_tree_from_plan(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
+    plan: PageTreePlan,
 ) -> Result<()> {
-    // A single strict traversal proves both pruning and page-tree rebuilding.
-    // Malformed trees remain intact, instead of using a recovery list that
-    // may omit invalid, duplicated, or disconnected page-tree entries.
-    let Some(plan) = plan_page_tree(document)? else {
-        return Ok(());
-    };
     let before_nodes = plan.branches.len();
     let after_nodes = page_tree_required_nodes(plan.pages.len());
     stats.page_tree_nodes_before = before_nodes;
@@ -1268,16 +1263,16 @@ fn apply_leaf_inlining(document: &mut EditDocument, snapshot: NameTreeSnapshot) 
 fn compact_catalog_name_trees(
     document: &mut EditDocument,
     stats: &mut StructureCompactionStats,
-) -> Result<()> {
+) -> Result<bool> {
     let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog) = current_dictionary(document, catalog_handle)? else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(names_handle) = dictionary_reference(&catalog, b"Names") else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(names_dictionary) = current_dictionary(document, names_handle)? else {
-        return Ok(());
+        return Ok(false);
     };
 
     let roots = names_dictionary
@@ -1288,6 +1283,7 @@ fn compact_catalog_name_trees(
         })
         .collect::<Vec<_>>();
 
+    let mut changed = false;
     for (kind, root) in roots {
         let Some(mut snapshot) = collect_name_tree(document, root)? else {
             continue;
@@ -1313,6 +1309,7 @@ fn compact_catalog_name_trees(
 
         if required < before {
             let after = replace_name_tree(document, snapshot)?;
+            changed = true;
             stats.name_trees_repacked = stats.name_trees_repacked.saturating_add(1);
             stats.name_tree_nodes_after = stats.name_tree_nodes_after.saturating_add(after);
             stats.name_tree_nodes_removed = stats
@@ -1321,22 +1318,34 @@ fn compact_catalog_name_trees(
         } else {
             if wrappers_inlined != 0 || arrays_inlined != 0 {
                 apply_leaf_inlining(document, snapshot)?;
+                changed = true;
             }
             stats.name_tree_nodes_after = stats.name_tree_nodes_after.saturating_add(before);
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompactionStats> {
-    let mut stats = StructureCompactionStats {
-        stale_page_destination_references_rewritten: canonicalize_stale_page_destinations(
-            document,
-        )?,
-        ..StructureCompactionStats::default()
-    };
-    compact_catalog_name_trees(document, &mut stats)?;
-    compact_page_tree(document, &mut stats)?;
+    // Destructive destination rewrites and page compaction use the same
+    // strictly validated membership evidence, never reader recovery pages.
+    let mut plan = plan_page_tree(document)?;
+    let mut stats = StructureCompactionStats::default();
+    if let Some(plan) = &plan {
+        stats.stale_page_destination_references_rewritten =
+            canonicalize_stale_page_destinations_from_plan(document, plan)?;
+    }
+
+    let names_changed = compact_catalog_name_trees(document, &mut stats)?;
+    if names_changed || stats.stale_page_destination_references_rewritten != 0 {
+        // Name trees may alias other COS objects. Revalidate after an actual
+        // intervening mutation, including changes that keep reference edges
+        // stable; the reachability cache generation alone is insufficient.
+        plan = plan_page_tree(document)?;
+    }
+    if let Some(plan) = plan {
+        compact_page_tree_from_plan(document, &mut stats, plan)?;
+    }
     Ok(stats)
 }
 
@@ -1344,6 +1353,32 @@ pub fn compact_structure(document: &mut EditDocument) -> Result<StructureCompact
 mod tests {
     use super::*;
     use crate::{content::replace_page_content, test_support::ClassicPdfBuilder};
+
+    fn stale_page_destination_map(
+        document: &EditDocument,
+    ) -> Result<BTreeMap<ObjectHandle, ObjectHandle>> {
+        match plan_page_tree(document)? {
+            Some(plan) => stale_page_destination_map_from_plan(document, &plan),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<usize> {
+        match plan_page_tree(document)? {
+            Some(plan) => canonicalize_stale_page_destinations_from_plan(document, &plan),
+            None => Ok(0),
+        }
+    }
+
+    fn compact_page_tree(
+        document: &mut EditDocument,
+        stats: &mut StructureCompactionStats,
+    ) -> Result<()> {
+        if let Some(plan) = plan_page_tree(document)? {
+            compact_page_tree_from_plan(document, stats, plan)?;
+        }
+        Ok(())
+    }
 
     fn prune_shadowed_page_tree_inheritance(document: &mut EditDocument) -> Result<usize> {
         let Some(plan) = plan_page_tree(document)? else {
@@ -2086,6 +2121,36 @@ mod tests {
                 .pop()
                 .ok_or_else(|| Error::Invalid("missing fixture child".to_owned()))?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_destination_rewrite_requires_validated_live_membership() -> Result<()> {
+        let mut document = stale_destination_fixture(false, b"Fit")?;
+        let Some(root) = document.edit_handle(existing(2))?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture root".to_owned()));
+        };
+        root.insert(
+            b"Kids".to_vec(),
+            OwnedObject::Array(vec![
+                OwnedObject::Reference(existing(3)),
+                OwnedObject::Reference(existing(3)),
+            ]),
+        );
+        // The reader recovers one page, but duplicated membership is not
+        // proof sufficient for redirecting a detached page to that target.
+        assert_eq!(document.page_handles()?, vec![existing(3)]);
+        assert!(plan_page_tree(&document)?.is_none());
+        assert!(stale_page_destination_map(&document)?.is_empty());
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats, StructureCompactionStats::default());
+        assert!(document.reachable_objects()?.contains(&existing(9)));
+        assert!(
+            document
+                .overlay()
+                .change(crate::ObjectId::new(1, 0))
+                .is_none()
+        );
         Ok(())
     }
 
