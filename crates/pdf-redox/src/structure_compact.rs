@@ -337,6 +337,20 @@ struct PageTreePlan {
 
 type InheritedOwners = [Option<ObjectHandle>; PAGE_INHERITABLE_KEYS.len()];
 
+fn nearest_page_tree_owners(
+    node: ObjectHandle,
+    defined: [bool; PAGE_INHERITABLE_KEYS.len()],
+    inherited_from: InheritedOwners,
+) -> InheritedOwners {
+    std::array::from_fn(|index| {
+        if defined[index] {
+            Some(node)
+        } else {
+            inherited_from[index]
+        }
+    })
+}
+
 struct PageTreeLeaf {
     handle: ObjectHandle,
     inherited_from: InheritedOwners,
@@ -383,13 +397,7 @@ impl PageTreePruneFrame {
         Ok(Some(Self {
             node,
             defined,
-            nearest_owners: std::array::from_fn(|index| {
-                if defined[index] {
-                    Some(node)
-                } else {
-                    inherited_from[index]
-                }
-            }),
+            nearest_owners: nearest_page_tree_owners(node, defined, inherited_from),
             kids,
             next_child: 0,
             covered_by_children: [true; PAGE_INHERITABLE_KEYS.len()],
@@ -457,7 +465,6 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     else {
         return Ok(None);
     };
-    let mut seen = BTreeSet::from([root]);
     let mut plan = PageTreePlan {
         root,
         branches: BTreeSet::from([root]),
@@ -472,7 +479,7 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
             frame.next_child += 1;
             // The two directions of the page tree must agree before we can
             // infer inheritance from /Kids or change a page's /Parent.
-            if !seen.insert(kid) {
+            if plan.owners.contains_key(&kid) {
                 return Ok(None);
             }
             let Some(child) = document.current_owned_object_cow(kid)? else {
@@ -499,13 +506,7 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
                     });
                     plan.owners.insert(
                         kid,
-                        std::array::from_fn(|index| {
-                            if defined[index] {
-                                Some(kid)
-                            } else {
-                                frame.nearest_owners[index]
-                            }
-                        }),
+                        nearest_page_tree_owners(kid, defined, frame.nearest_owners),
                     );
                     frame.include_child(defined);
                 }
