@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    source::CurrentValue,
+    source::{CurrentChildKey, CurrentChildren, CurrentValue},
 };
 use hayro_syntax::object::{
     Array as HayroArray, Dict as HayroDict, MaybeRef as HayroMaybeRef, Object as HayroObject,
@@ -210,169 +210,83 @@ pub trait DirectObjectVisitor {
     }
 }
 
-fn walk_source_direct_dictionary(
+fn visit_current_object<'a>(
     document: &EditDocument,
     root: CowObjectHandle,
-    dictionary: &HayroDict<'_>,
-    skip_length: bool,
-    path: &mut Vec<DirectPathStep>,
-    visitor: &mut impl DirectObjectVisitor,
-) -> Result<()> {
-    if visitor.visit_dictionary(
-        document,
-        root,
-        path,
-        DirectDictionaryView::Source(dictionary),
-    )? == DirectWalkControl::SkipChildren
-    {
-        return Ok(());
-    }
-    for (name, value) in dictionary.entries() {
-        let key = name.as_ref();
-        if skip_length && key == b"Length" {
-            continue;
-        }
-        path.push(DirectPathStep::DictKey(key.to_vec()));
-        match value {
-            HayroMaybeRef::Ref(target) => {
-                visitor.visit_reference(root, path, CowObjectHandle::Existing(target.into()))?;
-            }
-            HayroMaybeRef::NotRef(value) if visitor.descend_dictionary_value(key) => {
-                walk_source_direct_object(document, root, &value, path, visitor)?;
-            }
-            HayroMaybeRef::NotRef(_) => {}
-        }
-        path.pop();
-    }
-    Ok(())
-}
-
-fn walk_source_direct_object(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: &HayroObject<'_>,
-    path: &mut Vec<DirectPathStep>,
-    visitor: &mut impl DirectObjectVisitor,
-) -> Result<()> {
-    match object {
-        HayroObject::Dict(dictionary) => {
-            walk_source_direct_dictionary(document, root, dictionary, false, path, visitor)?;
-        }
-        HayroObject::Stream(stream) => {
-            walk_source_direct_dictionary(
-                document,
-                root,
-                stream.dict(),
-                !visitor.visit_source_stream_length(),
-                path,
-                visitor,
-            )?;
-        }
-        HayroObject::Array(array) => {
-            if visitor.visit_array(document, root, path, DirectArrayView::Source(array))?
-                == DirectWalkControl::SkipChildren
-            {
-                return Ok(());
-            }
-            for (index, value) in array.raw_iter().enumerate() {
-                path.push(DirectPathStep::ArrayIndex(index));
-                match value {
-                    HayroMaybeRef::Ref(target) => visitor.visit_reference(
-                        root,
-                        path,
-                        CowObjectHandle::Existing(target.into()),
-                    )?,
-                    HayroMaybeRef::NotRef(value) => {
-                        walk_source_direct_object(document, root, &value, path, visitor)?;
-                    }
-                }
-                path.pop();
-            }
-        }
-        HayroObject::Null(_)
-        | HayroObject::Boolean(_)
-        | HayroObject::Number(_)
-        | HayroObject::String(_)
-        | HayroObject::Name(_) => {}
-    }
-    Ok(())
-}
-
-// Keep only an iterator per active container, not a stack of all of
-// its children. The shared path tracks the exact pre-order traversal.
-enum OwnedDirectChildren<'a> {
-    Dictionary(std::collections::btree_map::Iter<'a, Vec<u8>, OwnedObject>),
-    Array(std::iter::Enumerate<std::slice::Iter<'a, OwnedObject>>),
-}
-
-impl<'a> OwnedDirectChildren<'a> {
-    fn next_child(
-        &mut self,
-        visitor: &impl DirectObjectVisitor,
-    ) -> Option<(DirectPathStep, &'a OwnedObject)> {
-        match self {
-            Self::Dictionary(entries) => entries
-                .find(|(name, value)| {
-                    matches!(value, OwnedObject::Reference(_))
-                        || visitor.descend_dictionary_value(name)
-                })
-                .map(|(name, value)| (DirectPathStep::DictKey(name.clone()), value)),
-            Self::Array(entries) => entries
-                .next()
-                .map(|(index, value)| (DirectPathStep::ArrayIndex(index), value)),
-        }
-    }
-}
-
-fn visit_owned_direct_object<'a>(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: &'a OwnedObject,
+    object: &CurrentValue<'a>,
     path: &[DirectPathStep],
     visitor: &mut impl DirectObjectVisitor,
-) -> Result<Option<OwnedDirectChildren<'a>>> {
-    match object {
-        OwnedObject::Reference(target) => visitor.visit_reference(root, path, *target)?,
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if visitor.visit_dictionary(
+) -> Result<Option<CurrentChildren<'a>>> {
+    if let Some(target) = object.reference() {
+        visitor.visit_reference(root, path, target)?;
+        return Ok(None);
+    }
+    let control = match object {
+        CurrentValue::Source(HayroMaybeRef::NotRef(HayroObject::Dict(dictionary)), _) => visitor
+            .visit_dictionary(
                 document,
                 root,
                 path,
-                DirectDictionaryView::Owned(dictionary),
-            )? == DirectWalkControl::Descend
-            {
-                return Ok(Some(OwnedDirectChildren::Dictionary(dictionary.iter())));
-            }
+                DirectDictionaryView::Source(dictionary),
+            )?,
+        CurrentValue::Source(HayroMaybeRef::NotRef(HayroObject::Stream(stream)), _) => visitor
+            .visit_dictionary(
+                document,
+                root,
+                path,
+                DirectDictionaryView::Source(stream.dict()),
+            )?,
+        CurrentValue::Owned(
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. },
+        ) => visitor.visit_dictionary(
+            document,
+            root,
+            path,
+            DirectDictionaryView::Owned(dictionary),
+        )?,
+        CurrentValue::Source(HayroMaybeRef::NotRef(HayroObject::Array(array)), _) => {
+            visitor.visit_array(document, root, path, DirectArrayView::Source(array))?
         }
-        OwnedObject::Array(values) => {
-            if visitor.visit_array(document, root, path, DirectArrayView::Owned(values))?
-                == DirectWalkControl::Descend
-            {
-                return Ok(Some(OwnedDirectChildren::Array(values.iter().enumerate())));
-            }
+        CurrentValue::Owned(OwnedObject::Array(array)) => {
+            visitor.visit_array(document, root, path, DirectArrayView::Owned(array))?
         }
-        _ => {}
-    }
-    Ok(None)
+        _ => return Ok(None),
+    };
+    let skip_length = matches!(
+        object,
+        CurrentValue::Source(HayroMaybeRef::NotRef(HayroObject::Stream(_)), _)
+    ) && !visitor.visit_source_stream_length();
+    Ok((control == DirectWalkControl::Descend)
+        .then(|| object.children(skip_length))
+        .flatten())
 }
 
-fn walk_owned_direct_object(
+pub fn walk_direct_object(
     document: &EditDocument,
     root: CowObjectHandle,
-    object: &OwnedObject,
+    object: &CurrentValue<'_>,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {
     let mut path = Vec::new();
-    let Some(children) = visit_owned_direct_object(document, root, object, &path, visitor)? else {
+    let Some(children) = visit_current_object(document, root, object, &path, visitor)? else {
         return Ok(());
     };
     let mut frames = vec![children];
     while let Some(frame) = frames.last_mut() {
-        if let Some((step, child)) = frame.next_child(visitor) {
+        if let Some((key, child)) = frame.next() {
+            let step = match key {
+                CurrentChildKey::Dictionary(key) => {
+                    if child.reference().is_none()
+                        && !visitor.descend_dictionary_value(key.as_ref())
+                    {
+                        continue;
+                    }
+                    DirectPathStep::DictKey(key.as_ref().to_vec())
+                }
+                CurrentChildKey::Array(index) => DirectPathStep::ArrayIndex(index),
+            };
             path.push(step);
-            if let Some(children) =
-                visit_owned_direct_object(document, root, child, &path, visitor)?
-            {
+            if let Some(children) = visit_current_object(document, root, &child, &path, visitor)? {
                 frames.push(children);
             } else {
                 path.pop();
@@ -385,34 +299,145 @@ fn walk_owned_direct_object(
     Ok(())
 }
 
-pub fn walk_direct_object(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: CurrentValue<'_>,
-    visitor: &mut impl DirectObjectVisitor,
-) -> Result<()> {
-    match object {
-        CurrentValue::Source(HayroMaybeRef::NotRef(object), _) => {
-            walk_source_direct_object(document, root, &object, &mut Vec::new(), visitor)
-        }
-        CurrentValue::Source(HayroMaybeRef::Ref(reference), _) => {
-            visitor.visit_reference(root, &[], CowObjectHandle::Existing(reference.into()))
-        }
-        CurrentValue::Owned(object) => walk_owned_direct_object(document, root, object, visitor),
-    }
-}
-
 pub fn walk_direct_output_objects(
     document: &EditDocument,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {
-    document.walk_output_objects(|root, object| walk_direct_object(document, root, object, visitor))
+    document
+        .walk_output_objects(|root, object| walk_direct_object(document, root, &object, visitor))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Error, ObjectId, test_support::ClassicPdfBuilder};
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Visit {
+        Dictionary(Vec<DirectPathStep>),
+        Array(Vec<DirectPathStep>),
+        Reference(Vec<DirectPathStep>, CowObjectHandle),
+    }
+
+    #[derive(Default)]
+    struct Trace {
+        events: Vec<Visit>,
+        include_source_length: bool,
+    }
+
+    impl DirectObjectVisitor for Trace {
+        fn visit_dictionary(
+            &mut self,
+            _: &EditDocument,
+            _: CowObjectHandle,
+            path: &[DirectPathStep],
+            _: DirectDictionaryView<'_, '_>,
+        ) -> Result<DirectWalkControl> {
+            self.events.push(Visit::Dictionary(path.to_vec()));
+            if matches!(path.last(), Some(DirectPathStep::DictKey(key)) if key == b"Stop") {
+                Ok(DirectWalkControl::SkipChildren)
+            } else {
+                Ok(DirectWalkControl::Descend)
+            }
+        }
+
+        fn visit_array(
+            &mut self,
+            _: &EditDocument,
+            _: CowObjectHandle,
+            path: &[DirectPathStep],
+            _: DirectArrayView<'_, '_>,
+        ) -> Result<DirectWalkControl> {
+            self.events.push(Visit::Array(path.to_vec()));
+            Ok(DirectWalkControl::Descend)
+        }
+
+        fn visit_reference(
+            &mut self,
+            _: CowObjectHandle,
+            path: &[DirectPathStep],
+            target: CowObjectHandle,
+        ) -> Result<()> {
+            self.events.push(Visit::Reference(path.to_vec(), target));
+            Ok(())
+        }
+
+        fn visit_source_stream_length(&self) -> bool {
+            self.include_source_length
+        }
+
+        fn descend_dictionary_value(&self, key: &[u8]) -> bool {
+            key != b"Ignore"
+        }
+    }
+
+    #[test]
+    fn current_traversal_preserves_paths_filters_and_source_length_policy() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>")?;
+        pdf.object(4, b"<< /Length 5 0 R /Z [<< /Length 7 0 R /Ignore [8 0 R] >> 6 0 R] /A << /Stop << /Ref 9 0 R >> /Ignore 6 0 R >> >>
+stream
+q Q
+endstream")?;
+        pdf.object(5, b"3")?;
+        for id in 6..=9 {
+            pdf.object(id, b"null")?;
+        }
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let id = ObjectId::new(4, 0);
+        let handle = CowObjectHandle::Existing(id);
+        let Some(source) = document.current_value(handle)? else {
+            return Err(Error::Invalid("missing source stream fixture".to_owned()));
+        };
+        let owned = document.source().materialize(id)?;
+        let mut source_trace = Trace::default();
+        walk_direct_object(&document, handle, &source, &mut source_trace)?;
+        let mut owned_trace = Trace::default();
+        walk_direct_object(
+            &document,
+            handle,
+            &CurrentValue::Owned(&owned),
+            &mut owned_trace,
+        )?;
+        let key = |key: &[u8]| DirectPathStep::DictKey(key.to_vec());
+        let reference = |id| CowObjectHandle::Existing(ObjectId::new(id, 0));
+        let expected = vec![
+            Visit::Dictionary(vec![]),
+            Visit::Dictionary(vec![key(b"A")]),
+            Visit::Reference(vec![key(b"A"), key(b"Ignore")], reference(6)),
+            Visit::Dictionary(vec![key(b"A"), key(b"Stop")]),
+            Visit::Array(vec![key(b"Z")]),
+            Visit::Dictionary(vec![key(b"Z"), DirectPathStep::ArrayIndex(0)]),
+            Visit::Reference(
+                vec![key(b"Z"), DirectPathStep::ArrayIndex(0), key(b"Length")],
+                reference(7),
+            ),
+            Visit::Reference(vec![key(b"Z"), DirectPathStep::ArrayIndex(1)], reference(6)),
+        ];
+        assert_eq!(source_trace.events, expected);
+        assert_eq!(source_trace.events, owned_trace.events);
+        let mut inclusive = Trace {
+            include_source_length: true,
+            ..Trace::default()
+        };
+        let Some(source) = document.current_value(handle)? else {
+            return Err(Error::Invalid("missing source stream fixture".to_owned()));
+        };
+        walk_direct_object(&document, handle, &source, &mut inclusive)?;
+        assert_eq!(
+            inclusive.events.remove(4),
+            Visit::Reference(vec![key(b"Length")], reference(5))
+        );
+        assert_eq!(inclusive.events, expected);
+        assert_eq!(
+            document.source().references(id)?,
+            [6, 7, 8, 9].map(|id| ObjectId::new(id, 0))
+        );
+        assert_eq!(owned.references(), [6, 7, 8, 9].map(reference));
+        Ok(())
+    }
 
     #[test]
     fn direct_views_resolve_overlay_names_without_changing_raw_reference_semantics() -> Result<()> {

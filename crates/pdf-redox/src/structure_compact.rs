@@ -310,7 +310,7 @@ fn canonicalize_stale_page_destinations_from_plan(
             redirects: &redirects,
             edits: Vec::new(),
         };
-        walk_direct_object(document, handle, object, &mut visitor)?;
+        walk_direct_object(document, handle, &object, &mut visitor)?;
         rewritten =
             rewritten.saturating_add(apply_destination_edits(document, handle, visitor.edits)?);
     }
@@ -850,7 +850,7 @@ fn external_parent_dependencies(
             walk_direct_object(
                 document,
                 handle,
-                object,
+                &object,
                 &mut ExternalParentVisitor {
                     owners: &plan.owners,
                     protected: &mut protected,
@@ -924,7 +924,7 @@ fn retained_page_tree_branches(
                     replaced_key,
                     references: Vec::new(),
                 };
-                walk_direct_object(document, handle, object, &mut visitor)?;
+                walk_direct_object(document, handle, &object, &mut visitor)?;
                 pending.extend(visitor.references);
             }
         } else {
@@ -2243,7 +2243,7 @@ mod tests {
         walk_direct_object(
             &document,
             existing(1),
-            crate::source::CurrentValue::Owned(&value),
+            &crate::source::CurrentValue::Owned(&value),
             &mut visitor,
         )?;
         assert_eq!(visitor.edits.len(), 1);
