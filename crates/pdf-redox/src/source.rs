@@ -1226,11 +1226,24 @@ impl EditDocument {
         page: ObjectHandle,
         key: &[u8],
     ) -> Result<Option<OwnedObject>> {
-        let Some(mut object) = self.current_owned_object(page)? else {
+        let Some(object) = self.current_owned_object(page)? else {
             return Ok(None);
         };
+        self.inherited_page_value_from_object(object, key)
+    }
+
+    /// Resolve inheritance from a direct or indirect page dictionary snapshot.
+    ///
+    /// The page-tree depth is not fixed by the PDF format. Walk until a value,
+    /// missing parent, or repeated parent is found; the visited set bounds the
+    /// traversal even for malformed cyclic graphs.
+    pub(crate) fn inherited_page_value_from_object(
+        &self,
+        mut object: OwnedObject,
+        key: &[u8],
+    ) -> Result<Option<OwnedObject>> {
         let mut seen = BTreeSet::new();
-        for _ in 0..=100 {
+        loop {
             let Some(dictionary) = object.as_dictionary() else {
                 return Ok(None);
             };
@@ -1248,7 +1261,6 @@ impl EditDocument {
             };
             object = parent_object;
         }
-        Ok(None)
     }
 
     /// Collect all objects reachable from the document catalog after applying
