@@ -232,6 +232,187 @@ fn run_font_graph_phase(
     })
 }
 
+/// Source-negative hints can skip exact dedup only while the upstream phases
+/// that affect their object identities or references have not invalidated them.
+#[derive(Clone, Copy)]
+struct FontDedupContext<'a> {
+    cfg: &'a Config,
+    before: &'a PdfAnalysis,
+    pages: &'a [crate::ObjectHandle],
+    preservation: &'a PreservationStats,
+    scrub: &'a crate::scrub::ScrubStats,
+    ext_gstate_dictionary_handles: Option<&'a [crate::ObjectHandle]>,
+}
+
+struct FontDedupPhaseResult {
+    font_rendering: FontOptimizationStats,
+    metadata_dedup: crate::dedup::TargetedDedupStats,
+    font_dedup: crate::dedup::TargetedDedupStats,
+    font_dense: FontOptimizationStats,
+    post_dedup_font_graph: Option<FontUsageGraph>,
+    cid_cmap_source_inventory_still_valid: bool,
+    to_unicode_dedup: crate::dedup::TargetedDedupStats,
+    font_object_dedup: crate::dedup::ExactObjectDedupStats,
+    sampled_function_dedup: crate::dedup::TargetedDedupStats,
+    extgstate_object_dedup: crate::dedup::ExactObjectDedupStats,
+    structure_attribute_dedup: crate::dedup::ExactObjectDedupStats,
+    icc_dedup: crate::dedup::TargetedDedupStats,
+    icc_alternate: IccAlternateElisionStats,
+}
+
+/// Keep font-table stripping, font program canonicalization, graph-dependent
+/// rewrites, and exact dictionary dedup in this order. In particular, font
+/// and `ToUnicode` reference mutations precede the source-uniqueness proof.
+fn run_font_dedup_phase(
+    document: &mut EditDocument,
+    context: FontDedupContext<'_>,
+    timings: &mut BTreeMap<String, f64>,
+) -> Result<FontDedupPhaseResult> {
+    let FontDedupContext {
+        cfg,
+        before,
+        pages,
+        preservation,
+        scrub,
+        ext_gstate_dictionary_handles,
+    } = context;
+    let flate_level = cfg.optimization_goal.flate_level();
+    // Strip rendering-irrelevant editing/layout state before font-program
+    // dedup so producer subsets can converge to the same program.
+    let mut font_rendering = timed(timings, "font-table-strip", || {
+        if cfg.preservation.font_editing_support
+            || before.font_rendering_table_inventory_complete
+                && before.font_rendering_table_candidate_count == 0
+        {
+            Ok(FontOptimizationStats::default())
+        } else {
+            strip_font_editing_tables(document, flate_level)
+        }
+    })?;
+    let metadata_dedup = timed(timings, "metadata-dedup", || {
+        if before.preservation_key_inventory_complete && before.authoring_metadata_key_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_metadata_streams(document)
+        }
+    })?;
+    let font_dedup = timed(timings, "font-dedup", || {
+        if before.font_raw_payload_inventory_version >= 1
+            && before.font_raw_duplicate_payload_groups == 0
+            && font_rendering.programs_optimized == 0
+        {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_font_program_streams(document)
+        }
+    })?;
+    let FontGraphPhaseResult {
+        font_dense,
+        post_dedup_font_graph,
+        cid_cmap_source_inventory_still_valid,
+    } = run_font_graph_phase(
+        document,
+        pages,
+        cfg,
+        before,
+        flate_level,
+        timings,
+        &mut font_rendering,
+    )?;
+    let to_unicode_dedup = timed(timings, "to-unicode-dedup", || {
+        if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
+            || before.to_unicode_raw_payload_inventory_version >= 1
+                && before.to_unicode_raw_duplicate_payload_groups == 0
+        {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_to_unicode_cmaps(document)
+        }
+    })?;
+    let font_object_dedup = timed(timings, "font-object-dedup", || {
+        let source_uniqueness_still_exact = before.font_dictionary_fingerprint_inventory_version
+            >= 1
+            && before.font_dictionary_duplicate_fingerprint_groups == 0
+            && preservation.dropped_authoring_keys.is_empty()
+            && scrub.removed.is_empty()
+            && metadata_dedup.references_canonicalized == 0
+            && font_dedup.references_canonicalized == 0
+            && to_unicode_dedup.references_canonicalized == 0;
+        if source_uniqueness_still_exact {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_font_dictionaries(document)
+        }
+    })?;
+    // Sampled Functions can be dependencies of ExtGState, tint transforms, and
+    // shadings. Intern them before higher-level exact dedup so containers that
+    // differed only by duplicate Function references can converge this pass.
+    let sampled_function_dedup = timed(timings, "sampled-function-dedup", || {
+        canonicalize_sampled_function_streams(document)
+    })?;
+    let extgstate_object_dedup = timed(timings, "extgstate-object-dedup", || {
+        let source_candidates_still_prove_uniqueness = match ext_gstate_dictionary_handles {
+            Some(handles) => !has_exact_duplicate_extgstate_dictionaries(document, handles)?,
+            None => false,
+        };
+        // No earlier optimizer stage synthesizes `/ExtGState` resource entries.
+        // Re-checking the source candidates in their current state therefore
+        // catches convergence caused by earlier reference canonicalization;
+        // deletions can only leave conservative stale candidates. Cached analyses
+        // deliberately lack this non-serialized handle inventory and fall back.
+        if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0
+            || source_candidates_still_prove_uniqueness
+        {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_extgstate_dictionaries(document)
+        }
+    })?;
+    let structure_attribute_dedup = timed(timings, "structure-attribute-dedup", || {
+        if before.targeted_dedup_key_inventory_version >= 2
+            && before.structure_attribute_ref_count == 0
+        {
+            Ok(crate::dedup::ExactObjectDedupStats::default())
+        } else {
+            canonicalize_exact_structure_attribute_dictionaries(document)
+        }
+    })?;
+    let icc_dedup = timed(timings, "icc-dedup", || {
+        if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0 {
+            Ok(crate::dedup::TargetedDedupStats::default())
+        } else {
+            canonicalize_icc_profiles(document)
+        }
+    })?;
+    let icc_alternate = timed(timings, "icc-alternate-elision", || {
+        if cfg.elide_icc_profiles_to_alternate {
+            if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0
+            {
+                Ok(IccAlternateElisionStats::default())
+            } else {
+                elide_icc_profiles_to_alternates(document)
+            }
+        } else {
+            Ok(IccAlternateElisionStats::default())
+        }
+    })?;
+    Ok(FontDedupPhaseResult {
+        font_rendering,
+        metadata_dedup,
+        font_dedup,
+        font_dense,
+        post_dedup_font_graph,
+        cid_cmap_source_inventory_still_valid,
+        to_unicode_dedup,
+        font_object_dedup,
+        sampled_function_dedup,
+        extgstate_object_dedup,
+        structure_attribute_dedup,
+        icc_dedup,
+        icc_alternate,
+    })
+}
+
 fn signed_size_delta(before: usize, after: usize) -> isize {
     if before >= after {
         isize::try_from(before - after).unwrap_or(isize::MAX)
@@ -922,125 +1103,32 @@ fn optimize_pdf_with_document(
         scrub_edit_document_cos_privacy(&mut document, &cfg.privacy)
     })?;
 
-    // Strip rendering-irrelevant editing/layout state before font-program
-    // dedup so producer subsets can converge to the same program.
-    let mut font_rendering = timed(&mut timings, "font-table-strip", || {
-        if cfg.preservation.font_editing_support
-            || before.font_rendering_table_inventory_complete
-                && before.font_rendering_table_candidate_count == 0
-        {
-            Ok(FontOptimizationStats::default())
-        } else {
-            strip_font_editing_tables(&mut document, flate_level)
-        }
-    })?;
-    let metadata_dedup = timed(&mut timings, "metadata-dedup", || {
-        if before.preservation_key_inventory_complete && before.authoring_metadata_key_count == 0 {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_metadata_streams(&mut document)
-        }
-    })?;
-    let font_dedup = timed(&mut timings, "font-dedup", || {
-        if before.font_raw_payload_inventory_version >= 1
-            && before.font_raw_duplicate_payload_groups == 0
-            && font_rendering.programs_optimized == 0
-        {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_font_program_streams(&mut document)
-        }
-    })?;
-    let FontGraphPhaseResult {
+    let FontDedupPhaseResult {
+        font_rendering,
+        metadata_dedup,
+        font_dedup,
         font_dense,
         post_dedup_font_graph,
         cid_cmap_source_inventory_still_valid,
-    } = run_font_graph_phase(
+        to_unicode_dedup,
+        font_object_dedup,
+        sampled_function_dedup,
+        extgstate_object_dedup,
+        structure_attribute_dedup,
+        icc_dedup,
+        icc_alternate,
+    } = run_font_dedup_phase(
         &mut document,
-        &stable_pages,
-        cfg,
-        &before,
-        flate_level,
+        FontDedupContext {
+            cfg,
+            before: &before,
+            pages: &stable_pages,
+            preservation: &preservation,
+            scrub: &scrub,
+            ext_gstate_dictionary_handles,
+        },
         &mut timings,
-        &mut font_rendering,
     )?;
-    let to_unicode_dedup = timed(&mut timings, "to-unicode-dedup", || {
-        if before.targeted_dedup_key_inventory_version >= 1 && before.to_unicode_key_count == 0
-            || before.to_unicode_raw_payload_inventory_version >= 1
-                && before.to_unicode_raw_duplicate_payload_groups == 0
-        {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_to_unicode_cmaps(&mut document)
-        }
-    })?;
-    let font_object_dedup = timed(&mut timings, "font-object-dedup", || {
-        let source_uniqueness_still_exact = before.font_dictionary_fingerprint_inventory_version
-            >= 1
-            && before.font_dictionary_duplicate_fingerprint_groups == 0
-            && preservation.dropped_authoring_keys.is_empty()
-            && scrub.removed.is_empty()
-            && metadata_dedup.references_canonicalized == 0
-            && font_dedup.references_canonicalized == 0
-            && to_unicode_dedup.references_canonicalized == 0;
-        if source_uniqueness_still_exact {
-            Ok(crate::dedup::ExactObjectDedupStats::default())
-        } else {
-            canonicalize_exact_font_dictionaries(&mut document)
-        }
-    })?;
-    // Sampled Functions can be dependencies of ExtGState, tint transforms, and
-    // shadings. Intern them before higher-level exact dedup so containers that
-    // differed only by duplicate Function references can converge this pass.
-    let sampled_function_dedup = timed(&mut timings, "sampled-function-dedup", || {
-        canonicalize_sampled_function_streams(&mut document)
-    })?;
-    let extgstate_object_dedup = timed(&mut timings, "extgstate-object-dedup", || {
-        let source_candidates_still_prove_uniqueness = match ext_gstate_dictionary_handles {
-            Some(handles) => !has_exact_duplicate_extgstate_dictionaries(&document, handles)?,
-            None => false,
-        };
-        // No earlier optimizer stage synthesizes `/ExtGState` resource entries.
-        // Re-checking the source candidates in their current state therefore
-        // catches convergence caused by earlier reference canonicalization;
-        // deletions can only leave conservative stale candidates. Cached analyses
-        // deliberately lack this non-serialized handle inventory and fall back.
-        if before.targeted_dedup_key_inventory_version >= 1 && before.ext_gstate_key_count == 0
-            || source_candidates_still_prove_uniqueness
-        {
-            Ok(crate::dedup::ExactObjectDedupStats::default())
-        } else {
-            canonicalize_exact_extgstate_dictionaries(&mut document)
-        }
-    })?;
-    let structure_attribute_dedup = timed(&mut timings, "structure-attribute-dedup", || {
-        if before.targeted_dedup_key_inventory_version >= 2
-            && before.structure_attribute_ref_count == 0
-        {
-            Ok(crate::dedup::ExactObjectDedupStats::default())
-        } else {
-            canonicalize_exact_structure_attribute_dictionaries(&mut document)
-        }
-    })?;
-    let icc_dedup = timed(&mut timings, "icc-dedup", || {
-        if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0 {
-            Ok(crate::dedup::TargetedDedupStats::default())
-        } else {
-            canonicalize_icc_profiles(&mut document)
-        }
-    })?;
-    let icc_alternate = timed(&mut timings, "icc-alternate-elision", || {
-        if cfg.elide_icc_profiles_to_alternate {
-            if before.targeted_dedup_key_inventory_version >= 2 && before.icc_based_array_count == 0
-            {
-                Ok(IccAlternateElisionStats::default())
-            } else {
-                elide_icc_profiles_to_alternates(&mut document)
-            }
-        } else {
-            Ok(IccAlternateElisionStats::default())
-        }
-    })?;
     let RasterPreflight {
         layout: raster_layout,
         evidence: mut raster_evidence,
@@ -1323,6 +1411,80 @@ fn optimize_pdf_with_document(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn font_dedup_proofs_preserve_fresh_and_cached_results_in_both_goals() -> Result<()> {
+        for (label, input) in [
+            ("font dictionaries", duplicate_font_dictionary_fixture()?),
+            ("ToUnicode streams", duplicate_to_unicode_fixture()?),
+            (
+                "ExtGState convergence after font dedup",
+                extgstate_converges_after_font_dedup_fixture()?,
+            ),
+        ] {
+            let analysis = analyze_document_for_optimization(
+                &input,
+                &EditDocument::from_bytes(input.clone())?,
+            )?
+            .report;
+            for goal in [
+                crate::OptimizationGoal::Size,
+                crate::OptimizationGoal::Processing,
+            ] {
+                let mut cfg = Config::optimize_only();
+                cfg.optimization_goal = goal;
+                let (fresh, fresh_report) = optimize_pdf(&input, &cfg)?;
+                let (cached, cached_report) = optimize_pdf_with_analysis(&input, &cfg, &analysis)?;
+                assert_eq!(
+                    fresh, cached,
+                    "{label}, {goal:?}: cached and fresh output differ"
+                );
+                for stage in [
+                    "font-table-strip",
+                    "metadata-dedup",
+                    "font-dedup",
+                    "font-sparse-union",
+                    "font-outline-opportunity",
+                    "font-outline-subset",
+                    "font-dense-gid",
+                    "to-unicode-dedup",
+                    "font-object-dedup",
+                    "sampled-function-dedup",
+                    "extgstate-object-dedup",
+                    "structure-attribute-dedup",
+                    "icc-dedup",
+                    "icc-alternate-elision",
+                ] {
+                    assert!(
+                        fresh_report.stage_timings_ms.contains_key(stage)
+                            && cached_report.stage_timings_ms.contains_key(stage),
+                        "{label}, {goal:?}: missing font/dedup timing {stage}"
+                    );
+                }
+                match label {
+                    "font dictionaries" => {
+                        assert_eq!(fresh_report.font_dictionary_references_canonicalized, 1);
+                        assert_eq!(cached_report.font_dictionary_references_canonicalized, 1);
+                    }
+                    "ToUnicode streams" => {
+                        assert_eq!(fresh_report.to_unicode_references_canonicalized, 1);
+                        assert_eq!(cached_report.to_unicode_references_canonicalized, 1);
+                    }
+                    _ => {
+                        assert_eq!(
+                            fresh_report.extgstate_dictionary_references_canonicalized,
+                            1
+                        );
+                        assert_eq!(
+                            cached_report.extgstate_dictionary_references_canonicalized,
+                            1
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn font_editing_policy_is_orthogonal_to_preservation_fast_path() {
         let mut policy = crate::PreservationConfig::functional();
