@@ -729,6 +729,128 @@ fn run_vector_optimization_phase(
     })
 }
 
+/// Late mutations must stay in this order: prune resources, apply microstroke
+/// changes, establish Flate policy, canonicalize page content/graph, compress
+/// remaining raw streams, remove safe CID `CMaps`, and serialize.
+#[derive(Clone, Copy)]
+struct FinalizationContext<'a> {
+    cfg: &'a Config,
+    before: &'a PdfAnalysis,
+    pages: &'a [crate::ObjectHandle],
+    raster_evidence: &'a RasterPhaseEvidence,
+    generated_page_xobjects: &'a BTreeMap<crate::ObjectHandle, BTreeSet<Vec<u8>>>,
+    font_usage_hint: Option<&'a FontUsageGraph>,
+    cid_cmap_source_inventory_still_valid: bool,
+}
+
+/// The result groups the late-stage counters with the final serialized bytes.
+/// The Flate reuse cache is consumed here, after vector factoring, and cannot
+/// outlive the document generation it was created for.
+struct FinalizationResult {
+    resource_prune: crate::prune::ResourcePruneStats,
+    microstroke_raster: MicrostrokeRasterStats,
+    flate: crate::flate::FlateOptimizationStats,
+    page_content_dedup: crate::dedup::TargetedDedupStats,
+    structure_compaction: crate::structure_compact::StructureCompactionStats,
+    unfiltered_flate: crate::flate::FlateOptimizationStats,
+    font_cid_cmap_strip: FontOptimizationStats,
+    output: Vec<u8>,
+}
+
+fn finalize_document(
+    document: &mut EditDocument,
+    mut flate_reuse_cache: FlateReuseCache,
+    context: FinalizationContext<'_>,
+    timings: &mut BTreeMap<String, f64>,
+) -> Result<FinalizationResult> {
+    let FinalizationContext {
+        cfg,
+        before,
+        pages,
+        raster_evidence,
+        generated_page_xobjects,
+        font_usage_hint,
+        cid_cmap_source_inventory_still_valid,
+    } = context;
+    let flate_level = cfg.optimization_goal.flate_level();
+    let resource_prune = timed(timings, "resource-prune", || {
+        raster_evidence.prune_resources(document, pages, generated_page_xobjects)
+    })?;
+    let microstroke_raster = timed(timings, "microstroke-raster", || {
+        if cfg.rasterize_excessive_small_vectors {
+            rasterize_pathological_microstrokes(document, pages, cfg.optimization_goal)
+        } else {
+            Ok(MicrostrokeRasterStats::default())
+        }
+    })?;
+    let flate_encoder = timed(timings, "flate-executor-init", || {
+        FlateBatchEncoder::new(cfg.flate_workers)
+    })?;
+    let flate = timed(timings, "flate-policy", || {
+        optimize_flate_streams_with_cache(
+            document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
+    })?;
+    timed(timings, "content-normalize", || -> Result<()> {
+        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
+            normalize_page_contents(document, pages)?;
+        }
+        Ok(())
+    })?;
+    // Content streams are canonicalized only after every pass that can mutate
+    // them, including lexical normalization.
+    let page_content_dedup = timed(timings, "page-content-dedup", || {
+        canonicalize_page_contents(document, pages)
+    })?;
+    let structure_compaction = timed(timings, "structure-compaction", || {
+        compact_structure(document)
+    })?;
+
+    // Match the historical writer's StreamDataMode::Compress policy explicitly
+    // before handing the graph to the deliberately-simple fresh writer.
+    let unfiltered_flate = timed(timings, "compress-unfiltered", || {
+        compress_unfiltered_streams(
+            document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
+    })?;
+    // Cmap removal is deliberately the final graph transform. By this point
+    // resource pruning has removed dead fonts and Flate policy has established
+    // the stream bytes against which the rewrite's actual size win is gated.
+    let cid_cmap_possible = !cfg.preservation.font_editing_support
+        && (before.font_opportunity_inventory_version < 1
+            || !cid_cmap_source_inventory_still_valid
+            || before.font_material_cid_cmap_decoded_bytes
+                >= crate::font::MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT);
+    let font_cid_cmap_strip = if cid_cmap_possible {
+        timed(timings, "font-cid-cmap-strip", || {
+            strip_cidfont_type2_cmaps_after_dedup(document, flate_level, font_usage_hint)
+        })?
+    } else {
+        timings.insert("font-cid-cmap-strip".to_owned(), 0.0);
+        FontOptimizationStats::default()
+    };
+    let output = timed(timings, "writer", || {
+        crate::writer::write_pdf_with_object_streams(document, flate_level)
+    })?;
+
+    Ok(FinalizationResult {
+        resource_prune,
+        microstroke_raster,
+        flate,
+        page_content_dedup,
+        structure_compaction,
+        unfiltered_flate,
+        font_cid_cmap_strip,
+        output,
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the optimization pipeline intentionally keeps ordered mutations and their shared document state together"
@@ -1112,7 +1234,7 @@ fn optimize_pdf_with_document(
         paint_batch,
         stroke_forms,
         polyline_simplification,
-        mut flate_reuse_cache,
+        flate_reuse_cache,
     } = run_vector_optimization_phase(
         &mut document,
         &stable_pages,
@@ -1123,79 +1245,29 @@ fn optimize_pdf_with_document(
         catalog,
     )?;
 
-    let resource_prune = timed(&mut timings, "resource-prune", || {
-        raster_evidence.prune_resources(
-            &mut document,
-            &stable_pages,
-            &vector_compaction.generated_page_xobjects,
-        )
-    })?;
-    let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
-        if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(&mut document, &stable_pages, cfg.optimization_goal)
-        } else {
-            Ok(MicrostrokeRasterStats::default())
-        }
-    })?;
-    let flate_encoder = timed(&mut timings, "flate-executor-init", || {
-        FlateBatchEncoder::new(cfg.flate_workers)
-    })?;
-    let flate = timed(&mut timings, "flate-policy", || {
-        optimize_flate_streams_with_cache(
-            &mut document,
-            flate_level,
-            &mut flate_reuse_cache,
-            &flate_encoder,
-        )
-    })?;
-    timed(&mut timings, "content-normalize", || -> Result<()> {
-        if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            normalize_page_contents(&mut document, &stable_pages)?;
-        }
-        Ok(())
-    })?;
-    // Content streams are canonicalized only after every pass that can mutate
-    // them, including lexical normalization.
-    let page_content_dedup = timed(&mut timings, "page-content-dedup", || {
-        canonicalize_page_contents(&mut document, &stable_pages)
-    })?;
-    let structure_compaction = timed(&mut timings, "structure-compaction", || {
-        compact_structure(&mut document)
-    })?;
-
-    // Match the historical writer's StreamDataMode::Compress policy explicitly
-    // before handing the graph to the deliberately-simple fresh writer.
-    let unfiltered_flate = timed(&mut timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(
-            &mut document,
-            flate_level,
-            &mut flate_reuse_cache,
-            &flate_encoder,
-        )
-    })?;
-    // Cmap removal is deliberately the final graph transform. By this point
-    // resource pruning has removed dead fonts and Flate policy has established
-    // the stream bytes against which the rewrite's actual size win is gated.
-    let cid_cmap_possible = !cfg.preservation.font_editing_support
-        && (before.font_opportunity_inventory_version < 1
-            || !cid_cmap_source_inventory_still_valid
-            || before.font_material_cid_cmap_decoded_bytes
-                >= crate::font::MIN_CID_CMAP_DECODED_BYTES_PER_DOCUMENT);
-    let font_cid_cmap_strip = if cid_cmap_possible {
-        timed(&mut timings, "font-cid-cmap-strip", || {
-            strip_cidfont_type2_cmaps_after_dedup(
-                &mut document,
-                flate_level,
-                post_dedup_font_graph.as_ref(),
-            )
-        })?
-    } else {
-        timings.insert("font-cid-cmap-strip".to_owned(), 0.0);
-        FontOptimizationStats::default()
-    };
-    let output = timed(&mut timings, "writer", || {
-        crate::writer::write_pdf_with_object_streams(&document, flate_level)
-    })?;
+    let FinalizationResult {
+        resource_prune,
+        microstroke_raster,
+        flate,
+        page_content_dedup,
+        structure_compaction,
+        unfiltered_flate,
+        font_cid_cmap_strip,
+        output,
+    } = finalize_document(
+        &mut document,
+        flate_reuse_cache,
+        FinalizationContext {
+            cfg,
+            before: &before,
+            pages: &stable_pages,
+            raster_evidence: &raster_evidence,
+            generated_page_xobjects: &vector_compaction.generated_page_xobjects,
+            font_usage_hint: post_dedup_font_graph.as_ref(),
+            cid_cmap_source_inventory_still_valid,
+        },
+        &mut timings,
+    )?;
 
     let run_stats = OptimizationRunStats {
         preservation_fast_path,
@@ -1268,6 +1340,57 @@ mod tests {
 
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn finalization_preserves_stage_timing_contract_in_both_goals() -> Result<()> {
+        let input = duplicate_extgstate_fixture()?;
+        let analysis =
+            analyze_document_for_optimization(&input, &EditDocument::from_bytes(input.clone())?)?
+                .report;
+        for goal in [
+            crate::OptimizationGoal::Size,
+            crate::OptimizationGoal::Processing,
+        ] {
+            let mut cfg = Config::optimize_only();
+            cfg.optimization_goal = goal;
+            let (output, report) = optimize_pdf(&input, &cfg)?;
+            let (cached_output, cached_report) =
+                optimize_pdf_with_analysis(&input, &cfg, &analysis)?;
+            assert_eq!(
+                output, cached_output,
+                "{goal:?} changed with cached analysis"
+            );
+            // Only a fresh optimization performs the initial analysis stage.
+            assert_eq!(
+                report
+                    .stage_timings_ms
+                    .keys()
+                    .filter(|stage| stage.as_str() != "analysis")
+                    .collect::<Vec<_>>(),
+                cached_report.stage_timings_ms.keys().collect::<Vec<_>>(),
+                "{goal:?} omitted timing keys when using cached analysis"
+            );
+            assert_eq!(SourcePdf::from_bytes(output)?.page_count(), 1);
+            for stage in [
+                "resource-prune",
+                "microstroke-raster",
+                "flate-executor-init",
+                "flate-policy",
+                "content-normalize",
+                "page-content-dedup",
+                "structure-compaction",
+                "compress-unfiltered",
+                "font-cid-cmap-strip",
+                "writer",
+            ] {
+                assert!(
+                    report.stage_timings_ms.contains_key(stage),
+                    "{goal:?} omitted finalization timing {stage}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn raster_phase_evidence_invalidates_only_affected_observations() -> Result<()> {
