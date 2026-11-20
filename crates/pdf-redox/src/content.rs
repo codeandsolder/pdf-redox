@@ -297,7 +297,7 @@ pub fn xobject_handles(
     Ok(xobject_dictionary_handles(xobjects))
 }
 
-/// Read only the inherited resource dictionary's XObject category.
+/// Read only the inherited resource dictionary's `XObject` category.
 pub fn page_xobject_handles(
     document: &EditDocument,
     page: ObjectHandle,

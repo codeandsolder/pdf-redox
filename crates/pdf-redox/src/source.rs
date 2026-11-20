@@ -608,7 +608,7 @@ impl<'a> CurrentValue<'a> {
                 .get_raw(key)
                 .map(|value| Self::Source(value, None)),
             Self::Owned(value) => value.as_dictionary()?.get(key).map(Self::Owned),
-            _ => None,
+            Self::Source(..) => None,
         }
     }
 
