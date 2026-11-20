@@ -594,13 +594,21 @@ impl<'a> CurrentValue<'a> {
 
     pub fn dictionary_keys(&self) -> Option<Vec<Vec<u8>>> {
         Some(
-            self.dictionary_entries(matches!(self, Self::Source(..)))?
+            self.dictionary_entries()?
                 .map(|(key, _)| key.as_ref().to_vec())
                 .collect(),
         )
     }
 
-    fn dictionary_entries(&self, skip_stream_length: bool) -> Option<CurrentDictionaryIter<'a>> {
+    /// Iterate the editable dictionary view, omitting writer-owned source Length.
+    pub fn dictionary_entries(&self) -> Option<CurrentDictionaryIter<'a>> {
+        self.raw_dictionary_entries(matches!(self, Self::Source(..)))
+    }
+
+    fn raw_dictionary_entries(
+        &self,
+        skip_stream_length: bool,
+    ) -> Option<CurrentDictionaryIter<'a>> {
         match self {
             Self::Source(MaybeRef::NotRef(object), _) => {
                 source_dictionary_entries(object, skip_stream_length)
@@ -614,7 +622,7 @@ impl<'a> CurrentValue<'a> {
     }
 
     pub fn children(&self, skip_stream_length: bool) -> Option<CurrentChildren<'a>> {
-        if let Some(entries) = self.dictionary_entries(skip_stream_length) {
+        if let Some(entries) = self.raw_dictionary_entries(skip_stream_length) {
             return Some(CurrentChildren::Dictionary(entries));
         }
         self.array_items()

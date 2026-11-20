@@ -113,11 +113,6 @@ impl<'a, 'pdf: 'a> DirectDictionaryView<'a, 'pdf> {
         }
         dictionary.dictionary_entry(reference_key)?.reference()
     }
-
-    pub fn has_direct_dictionary(self, key: &[u8]) -> bool {
-        self.raw_value(key)
-            .is_some_and(|value| value.is_dictionary())
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +160,9 @@ impl<'a, 'pdf: 'a> DirectArrayView<'a, 'pdf> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectWalkControl {
     Descend,
+    /// Omit direct subtrees under these keys for this dictionary only.
+    /// Raw references are still reported.
+    DescendExcept(&'static [&'static [u8]]),
     SkipChildren,
 }
 
@@ -210,13 +208,18 @@ pub trait DirectObjectVisitor {
     }
 }
 
+struct DirectFrame<'a> {
+    children: CurrentChildren<'a>,
+    excluded_keys: &'static [&'static [u8]],
+}
+
 fn visit_current_object<'a>(
     document: &EditDocument,
     root: CowObjectHandle,
     object: &CurrentValue<'a>,
     path: &[DirectPathStep],
     visitor: &mut impl DirectObjectVisitor,
-) -> Result<Option<CurrentChildren<'a>>> {
+) -> Result<Option<DirectFrame<'a>>> {
     if let Some(target) = object.reference() {
         visitor.visit_reference(root, path, target)?;
         return Ok(None);
@@ -256,9 +259,15 @@ fn visit_current_object<'a>(
         object,
         CurrentValue::Source(HayroMaybeRef::NotRef(HayroObject::Stream(_)), _)
     ) && !visitor.visit_source_stream_length();
-    Ok((control == DirectWalkControl::Descend)
-        .then(|| object.children(skip_length))
-        .flatten())
+    let excluded_keys = match control {
+        DirectWalkControl::Descend => &[][..],
+        DirectWalkControl::DescendExcept(keys) => keys,
+        DirectWalkControl::SkipChildren => return Ok(None),
+    };
+    Ok(object.children(skip_length).map(|children| DirectFrame {
+        children,
+        excluded_keys,
+    }))
 }
 
 pub fn walk_direct_object(
@@ -273,11 +282,12 @@ pub fn walk_direct_object(
     };
     let mut frames = vec![children];
     while let Some(frame) = frames.last_mut() {
-        if let Some((key, child)) = frame.next() {
+        if let Some((key, child)) = frame.children.next() {
             let step = match key {
                 CurrentChildKey::Dictionary(key) => {
                     if child.reference().is_none()
-                        && !visitor.descend_dictionary_value(key.as_ref())
+                        && (frame.excluded_keys.contains(&key.as_ref())
+                            || !visitor.descend_dictionary_value(key.as_ref()))
                     {
                         continue;
                     }

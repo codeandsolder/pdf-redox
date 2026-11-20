@@ -429,7 +429,7 @@ pub fn canonicalize_font_program_streams(
 
 use crate::direct_object::{
     DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
-    object_at_direct_path, object_at_direct_path_mut, walk_direct_output_objects,
+    object_at_direct_path_mut, value_at_direct_path, walk_direct_output_objects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,6 +626,45 @@ struct DirectDictionaryTarget {
     path: Vec<DirectPathStep>,
 }
 
+impl DirectDictionaryTarget {
+    fn from_property(
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+        key: &[u8],
+    ) -> Option<Self> {
+        let value = dictionary.raw_value(key)?;
+        if let Some(target) = value.reference() {
+            Some(Self {
+                root: target,
+                path: Vec::new(),
+            })
+        } else if value.is_dictionary() {
+            let mut path = path.to_vec();
+            path.push(DirectPathStep::DictKey(key.to_vec()));
+            Some(Self { root, path })
+        } else {
+            None
+        }
+    }
+
+    fn current<'a>(&self, document: &'a EditDocument) -> Result<Option<CurrentValue<'a>>> {
+        Ok(document
+            .current_value(self.root)?
+            .and_then(|root| value_at_direct_path(root, &self.path))
+            .filter(CurrentValue::has_dictionary))
+    }
+
+    fn entries<'a>(
+        &self,
+        document: &'a EditDocument,
+    ) -> Result<Option<crate::source::CurrentDictionaryIter<'a>>> {
+        Ok(self
+            .current(document)?
+            .and_then(|dictionary| dictionary.dictionary_entries()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HayroType3GlyphHolder {
     target: DirectDictionaryTarget,
@@ -645,20 +684,11 @@ impl DirectObjectVisitor for Type3TargetVisitor<'_> {
         path: &[DirectPathStep],
         dictionary: DirectDictionaryView<'_, '_>,
     ) -> Result<DirectWalkControl> {
-        if dictionary.resolved_name_is(document, b"Subtype", b"Type3")? {
-            if let Some(charprocs) = dictionary.reference(b"CharProcs") {
-                self.targets.insert(DirectDictionaryTarget {
-                    root: charprocs,
-                    path: Vec::new(),
-                });
-            } else if dictionary.has_direct_dictionary(b"CharProcs") {
-                let mut target_path = path.to_vec();
-                target_path.push(DirectPathStep::DictKey(b"CharProcs".to_vec()));
-                self.targets.insert(DirectDictionaryTarget {
-                    root,
-                    path: target_path,
-                });
-            }
+        if dictionary.resolved_name_is(document, b"Subtype", b"Type3")?
+            && let Some(target) =
+                DirectDictionaryTarget::from_property(root, path, dictionary, b"CharProcs")
+        {
+            self.targets.insert(target);
         }
         Ok(DirectWalkControl::Descend)
     }
@@ -682,23 +712,17 @@ fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDict
 fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
     let mut holders = Vec::new();
     for target in type3_charproc_targets(document)? {
-        let Some(root) = document.current_owned_object_cow(target.root)? else {
+        let Some(entries) = target.entries(document)? else {
             continue;
         };
-        let Some(charprocs) = object_at_direct_path(&root, &target.path) else {
-            continue;
-        };
-        let Some(dictionary) = charprocs.as_dictionary() else {
-            continue;
-        };
-        for (name, glyph) in dictionary {
-            let OwnedObject::Reference(glyph) = glyph else {
+        for (name, glyph) in entries {
+            let Some(glyph) = glyph.reference() else {
                 continue;
             };
             holders.push(HayroType3GlyphHolder {
                 target: target.clone(),
-                name: name.clone(),
-                glyph: *glyph,
+                name: name.as_ref().to_vec(),
+                glyph,
             });
         }
     }
@@ -826,35 +850,15 @@ fn rewrite_dictionary_reference_keys(
     keys: &[&[u8]],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
-    let Some(object) = document.current_owned_object_cow(handle)? else {
-        return Ok(0);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(0);
-    };
-    let mut changes = Vec::new();
-    for &key in keys {
-        let Some(OwnedObject::Reference(target)) = dictionary.get(key) else {
-            continue;
-        };
-        let canonical = canonical_cow_redirect(*target, redirects);
-        if canonical != *target {
-            changes.push((key.to_vec(), canonical));
-        }
-    }
-    if changes.is_empty() {
-        return Ok(0);
-    }
-    drop(object);
-    let object = document.edit_handle(handle)?;
-    let Some(dictionary) = object.as_dictionary_mut() else {
-        return Ok(0);
-    };
-    let count = changes.len();
-    for (key, target) in changes {
-        dictionary.insert(key, OwnedObject::Reference(target));
-    }
-    Ok(count)
+    rewrite_dictionary_target(
+        document,
+        &DirectDictionaryTarget {
+            root: handle,
+            path: Vec::new(),
+        },
+        Some(keys),
+        redirects,
+    )
 }
 
 struct DictionaryTargetVisitor<'a> {
@@ -870,18 +874,10 @@ impl DirectObjectVisitor for DictionaryTargetVisitor<'_> {
         path: &[DirectPathStep],
         dictionary: DirectDictionaryView<'_, '_>,
     ) -> Result<DirectWalkControl> {
-        if let Some(target) = dictionary.reference(self.key) {
-            self.targets.insert(DirectDictionaryTarget {
-                root: target,
-                path: Vec::new(),
-            });
-        } else if dictionary.has_direct_dictionary(self.key) {
-            let mut target_path = path.to_vec();
-            target_path.push(DirectPathStep::DictKey(self.key.to_vec()));
-            self.targets.insert(DirectDictionaryTarget {
-                root,
-                path: target_path,
-            });
+        if let Some(target) =
+            DirectDictionaryTarget::from_property(root, path, dictionary, self.key)
+        {
+            self.targets.insert(target);
         }
         Ok(DirectWalkControl::Descend)
     }
@@ -927,33 +923,48 @@ fn apply_dictionary_redirect_changes(
     Ok(count)
 }
 
+fn rewrite_dictionary_target(
+    document: &mut EditDocument,
+    target: &DirectDictionaryTarget,
+    selected_keys: Option<&[&[u8]]>,
+    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+) -> Result<usize> {
+    let Some(dictionary) = target.current(document)? else {
+        return Ok(0);
+    };
+    let mut changes = Vec::new();
+    let mut inspect = |key: &[u8], value: CurrentValue<'_>| {
+        if let Some(reference) = value.reference() {
+            let canonical = canonical_cow_redirect(reference, redirects);
+            if canonical != reference {
+                changes.push((key.to_vec(), canonical));
+            }
+        }
+    };
+    if let Some(keys) = selected_keys {
+        for &key in keys {
+            if let Some(value) = dictionary.dictionary_entry(key) {
+                inspect(key, value);
+            }
+        }
+    } else if let Some(entries) = dictionary.dictionary_entries() {
+        for (key, value) in entries {
+            inspect(key.as_ref(), value);
+        }
+    }
+    drop(dictionary);
+    apply_dictionary_redirect_changes(document, target, changes)
+}
+
 fn rewrite_dictionary_target_entries(
     document: &mut EditDocument,
     targets: &BTreeSet<DirectDictionaryTarget>,
+    selected_keys: Option<&[&[u8]]>,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
     let mut rewritten = 0;
     for target in targets {
-        let Some(root_snapshot) = document.current_owned_object_cow(target.root)? else {
-            continue;
-        };
-        let Some(dictionary) = object_at_direct_path(&root_snapshot, &target.path)
-            .and_then(OwnedObject::as_dictionary)
-        else {
-            continue;
-        };
-        let changes = dictionary
-            .iter()
-            .filter_map(|(name, value)| {
-                let OwnedObject::Reference(reference) = value else {
-                    return None;
-                };
-                let canonical = canonical_cow_redirect(*reference, redirects);
-                (canonical != *reference).then(|| (name.clone(), canonical))
-            })
-            .collect::<Vec<_>>();
-        drop(root_snapshot);
-        rewritten += apply_dictionary_redirect_changes(document, target, changes)?;
+        rewritten += rewrite_dictionary_target(document, target, selected_keys, redirects)?;
     }
     Ok(rewritten)
 }
@@ -1295,7 +1306,7 @@ pub fn canonicalize_image_xobjects(document: &mut EditDocument) -> Result<Target
     )?;
     let xobject_targets = dictionary_targets(document, b"XObject")?;
     references_canonicalized +=
-        rewrite_dictionary_target_entries(document, &xobject_targets, &redirects)?;
+        rewrite_dictionary_target_entries(document, &xobject_targets, None, &redirects)?;
     Ok(TargetedDedupStats {
         duplicate_streams_detected: duplicate_refs.len(),
         duplicate_raw_bytes,
@@ -1610,19 +1621,10 @@ pub fn canonicalize_exact_extgstate_dictionaries(
     let targets = dictionary_targets(document, b"ExtGState")?;
     let mut handles = BTreeSet::new();
     for target in &targets {
-        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
+        let Some(entries) = target.entries(document)? else {
             continue;
         };
-        let Some(dictionary) =
-            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
-        else {
-            continue;
-        };
-        for value in dictionary.values() {
-            if let OwnedObject::Reference(handle) = value {
-                handles.insert(*handle);
-            }
-        }
+        handles.extend(entries.filter_map(|(_, value)| value.reference()));
     }
 
     let redirects = exact_dictionary_redirects(
@@ -1631,7 +1633,7 @@ pub fn canonicalize_exact_extgstate_dictionaries(
         b"exact-extgstate-dictionary",
     )?;
     let references_canonicalized =
-        rewrite_dictionary_target_entries(document, &targets, &redirects)?;
+        rewrite_dictionary_target_entries(document, &targets, None, &redirects)?;
     Ok(ExactObjectDedupStats {
         duplicate_objects_detected: redirects.len(),
         references_canonicalized,
@@ -1929,105 +1931,45 @@ fn fixed_point_form_redirects(
     Ok(redirects)
 }
 
-fn inspect_widget_mk_targets(
-    document: &EditDocument,
-    root: CowObjectHandle,
-    object: &OwnedObject,
-    path: &mut Vec<DirectPathStep>,
-    targets: &mut BTreeSet<DirectDictionaryTarget>,
-) -> Result<()> {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            let is_widget = dictionary.get(b"Subtype".as_slice()).is_some_and(|value| {
-                matches!(document.resolve_owned_value(value), Ok(Some(OwnedObject::Name(name))) if name == b"Widget")
-            });
-            if is_widget && let Some(mk) = dictionary.get(b"MK".as_slice()) {
-                match mk {
-                    OwnedObject::Reference(handle) => {
-                        targets.insert(DirectDictionaryTarget {
-                            root: *handle,
-                            path: Vec::new(),
-                        });
-                    }
-                    OwnedObject::Dictionary(_) => {
-                        let mut target_path = path.clone();
-                        target_path.push(DirectPathStep::DictKey(b"MK".to_vec()));
-                        targets.insert(DirectDictionaryTarget {
-                            root,
-                            path: target_path,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            for (name, value) in dictionary {
-                if is_widget && name.as_slice() == b"MK" {
-                    continue;
-                }
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::DictKey(name.clone()));
-                inspect_widget_mk_targets(document, root, value, path, targets)?;
-                path.pop();
-            }
+struct WidgetMkVisitor<'a> {
+    targets: &'a mut BTreeSet<DirectDictionaryTarget>,
+}
+
+impl DirectObjectVisitor for WidgetMkVisitor<'_> {
+    fn visit_dictionary(
+        &mut self,
+        document: &EditDocument,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        // Preserve the permissive classification of malformed/missing subtype.
+        if !dictionary
+            .resolved_name_is(document, b"Subtype", b"Widget")
+            .unwrap_or(false)
+        {
+            return Ok(DirectWalkControl::Descend);
         }
-        OwnedObject::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::ArrayIndex(index));
-                inspect_widget_mk_targets(document, root, value, path, targets)?;
-                path.pop();
-            }
+        if let Some(target) = DirectDictionaryTarget::from_property(root, path, dictionary, b"MK") {
+            self.targets.insert(target);
         }
-        _ => {}
+        Ok(DirectWalkControl::DescendExcept(&[b"MK"]))
     }
-    Ok(())
+
+    fn visit_source_stream_length(&self) -> bool {
+        false
+    }
 }
 
 fn widget_mk_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
     let mut targets = BTreeSet::new();
-    for root in document.reachable_output_objects()? {
-        let Some(object) = document.current_owned_object_cow(root)? else {
-            continue;
-        };
-        inspect_widget_mk_targets(document, root, &object, &mut Vec::new(), &mut targets)?;
-    }
+    walk_direct_output_objects(
+        document,
+        &mut WidgetMkVisitor {
+            targets: &mut targets,
+        },
+    )?;
     Ok(targets)
-}
-
-fn rewrite_selected_dictionary_entries(
-    document: &mut EditDocument,
-    targets: &BTreeSet<DirectDictionaryTarget>,
-    keys: &[&[u8]],
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-) -> Result<usize> {
-    let mut rewritten = 0;
-    for target in targets {
-        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
-            continue;
-        };
-        let Some(dictionary) =
-            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
-        else {
-            continue;
-        };
-        let mut changes = Vec::new();
-        for &key in keys {
-            let Some(OwnedObject::Reference(reference)) = dictionary.get(key) else {
-                continue;
-            };
-            let canonical = canonical_cow_redirect(*reference, redirects);
-            if canonical != *reference {
-                changes.push((key.to_vec(), canonical));
-            }
-        }
-        drop(snapshot);
-        rewritten += apply_dictionary_redirect_changes(document, target, changes)?;
-    }
-    Ok(rewritten)
 }
 
 struct FormDependencyRedirects {
@@ -2248,12 +2190,12 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
     }
     let xobject_targets = dictionary_targets(document, b"XObject")?;
     let mut references_canonicalized =
-        rewrite_dictionary_target_entries(document, &xobject_targets, &dependencies.forms)?;
+        rewrite_dictionary_target_entries(document, &xobject_targets, None, &dependencies.forms)?;
     let icon_targets = widget_mk_targets(document)?;
-    references_canonicalized += rewrite_selected_dictionary_entries(
+    references_canonicalized += rewrite_dictionary_target_entries(
         document,
         &icon_targets,
-        &[b"I", b"RI", b"IX"],
+        Some(&[b"I", b"RI", b"IX"]),
         &dependencies.forms,
     )?;
     Ok(TargetedDedupStats {
@@ -2269,39 +2211,30 @@ fn appearance_dictionary_targets(
     let mut targets = dictionary_targets(document, b"AP")?;
     let initial = targets.iter().cloned().collect::<Vec<_>>();
     for target in initial {
-        let Some(snapshot) = document.current_owned_object_cow(target.root)? else {
-            continue;
-        };
-        let Some(dictionary) =
-            object_at_direct_path(&snapshot, &target.path).and_then(OwnedObject::as_dictionary)
-        else {
+        let Some(dictionary) = target.current(document)? else {
             continue;
         };
         for key in [b"N".as_slice(), b"R".as_slice(), b"D".as_slice()] {
-            let Some(value) = dictionary.get(key) else {
+            let Some(value) = dictionary.dictionary_entry(key) else {
                 continue;
             };
-            match value {
-                OwnedObject::Reference(handle) => {
-                    if document
-                        .current_value(*handle)?
-                        .is_some_and(|object| object.is_dictionary())
-                    {
-                        targets.insert(DirectDictionaryTarget {
-                            root: *handle,
-                            path: Vec::new(),
-                        });
-                    }
-                }
-                OwnedObject::Dictionary(_) => {
-                    let mut path = target.path.clone();
-                    path.push(DirectPathStep::DictKey(key.to_vec()));
+            if let Some(handle) = value.reference() {
+                if document
+                    .current_value(handle)?
+                    .is_some_and(|object| object.is_dictionary())
+                {
                     targets.insert(DirectDictionaryTarget {
-                        root: target.root,
-                        path,
+                        root: handle,
+                        path: Vec::new(),
                     });
                 }
-                _ => {}
+            } else if value.is_dictionary() {
+                let mut path = target.path.clone();
+                path.push(DirectPathStep::DictKey(key.to_vec()));
+                targets.insert(DirectDictionaryTarget {
+                    root: target.root,
+                    path,
+                });
             }
         }
     }
@@ -2316,21 +2249,16 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
     let dependencies = form_dependency_redirects(document, &[])?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
-        let Some(snapshot) = document.current_owned_object_cow(holder.root)? else {
+        let Some(entries) = holder.entries(document)? else {
             continue;
         };
-        let Some(dictionary) =
-            object_at_direct_path(&snapshot, &holder.path).and_then(OwnedObject::as_dictionary)
-        else {
-            continue;
-        };
-        for appearance in dictionary.values() {
-            let OwnedObject::Reference(appearance_ref) = appearance else {
+        for (_, appearance) in entries {
+            let Some(appearance_ref) = appearance.reference() else {
                 continue;
             };
             let Some((fingerprint, raw_bytes)) = source_form_fingerprint(
                 document,
-                *appearance_ref,
+                appearance_ref,
                 &[],
                 &dependencies.exact,
                 &dependencies.fonts,
@@ -2340,11 +2268,11 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
             else {
                 continue;
             };
-            plan.observe_stream(*appearance_ref, *appearance_ref, fingerprint, raw_bytes);
+            plan.observe_stream(appearance_ref, appearance_ref, fingerprint, raw_bytes);
         }
     }
     let references_canonicalized =
-        rewrite_dictionary_target_entries(document, &holders, &plan.redirects)?;
+        rewrite_dictionary_target_entries(document, &holders, None, &plan.redirects)?;
     Ok(plan.targeted_stats(references_canonicalized))
 }
 
@@ -2380,71 +2308,51 @@ fn page_content_holders(
 ) -> Result<Vec<PageContentHolder>> {
     let mut holders = Vec::new();
     for &page in pages {
-        let Some(object) = document.current_owned_object_cow(page)? else {
+        let Some(contents) = document
+            .current_value(page)?
+            .and_then(|object| object.dictionary_entry(b"Contents"))
+        else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        match contents {
-            OwnedObject::Reference(target) => {
-                let Some(resolved) = document.current_owned_object_cow(*target)? else {
-                    continue;
-                };
-                match resolved.as_ref() {
-                    OwnedObject::Stream { .. } => {
-                        holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
-                            root: page,
-                            path: Vec::new(),
-                            key: b"Contents".to_vec(),
-                            target: *target,
-                        }));
-                    }
-                    OwnedObject::Array(values) => {
-                        for (index, value) in values.iter().enumerate() {
-                            let OwnedObject::Reference(stream) = value else {
-                                continue;
-                            };
-                            if document
-                                .current_value(*stream)?
-                                .is_some_and(|object| object.is_stream())
-                            {
-                                holders.push(PageContentHolder::Array(
-                                    DirectArrayReferenceHolder {
-                                        root: *target,
-                                        path: Vec::new(),
-                                        index,
-                                        target: *stream,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+        let (root, path, contents) = if let Some(target) = contents.reference() {
+            let Some(resolved) = document.current_value(target)? else {
+                continue;
+            };
+            if resolved.is_stream() {
+                holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
+                    root: page,
+                    path: Vec::new(),
+                    key: b"Contents".to_vec(),
+                    target,
+                }));
+                continue;
             }
-            OwnedObject::Array(values) => {
-                for (index, value) in values.iter().enumerate() {
-                    let OwnedObject::Reference(stream) = value else {
-                        continue;
-                    };
-                    if document
-                        .current_value(*stream)?
-                        .is_some_and(|object| object.is_stream())
-                    {
-                        holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
-                            root: page,
-                            path: vec![DirectPathStep::DictKey(b"Contents".to_vec())],
-                            index,
-                            target: *stream,
-                        }));
-                    }
-                }
+            (target, Vec::new(), resolved)
+        } else {
+            (
+                page,
+                vec![DirectPathStep::DictKey(b"Contents".to_vec())],
+                contents,
+            )
+        };
+        let Some(values) = contents.array_items() else {
+            continue;
+        };
+        for (index, value) in values.enumerate() {
+            let Some(target) = value.reference() else {
+                continue;
+            };
+            if document
+                .current_value(target)?
+                .is_some_and(|object| object.is_stream())
+            {
+                holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
+                    root,
+                    path: path.clone(),
+                    index,
+                    target,
+                }));
             }
-            _ => {}
         }
     }
     Ok(holders)
@@ -2581,6 +2489,126 @@ mod tests {
                 .ok_or_else(|| crate::Error::Invalid("missing fixture child".to_owned()))?;
         }
         assert_eq!(value, OwnedObject::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_widget_targets_keep_per_dictionary_mk_exclusion() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Extra 4 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R >>")?;
+        pdf.object(4, b"<< /Widget [<< /Subtype 8 0 R /MK << /I 5 0 R /Nested << /Subtype /Widget /MK << /I 6 0 R >> >> >> /Sibling << /Subtype /Widget /MK 7 0 R >> >>] /NonWidget << /MK [<< /Subtype /Widget /MK << /I 6 0 R >> >>] >> >>")?;
+        pdf.object(5, b"null")?;
+        pdf.object(6, b"null")?;
+        pdf.object(7, b"<< /I 5 0 R /IX 5 0 R >>")?;
+        pdf.object(8, b"/Text")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| CowObjectHandle::Existing(crate::ObjectId::new(number, 0));
+        *document.edit_handle(existing(8))? = OwnedObject::Name(b"Widget".to_vec());
+        let key = |key: &[u8]| DirectPathStep::DictKey(key.to_vec());
+        let widget = DirectDictionaryTarget {
+            root: existing(4),
+            path: vec![key(b"Widget"), DirectPathStep::ArrayIndex(0), key(b"MK")],
+        };
+        let nested_nonwidget = DirectDictionaryTarget {
+            root: existing(4),
+            path: vec![
+                key(b"NonWidget"),
+                key(b"MK"),
+                DirectPathStep::ArrayIndex(0),
+                key(b"MK"),
+            ],
+        };
+        let indirect = DirectDictionaryTarget {
+            root: existing(7),
+            path: Vec::new(),
+        };
+        assert_eq!(
+            widget_mk_targets(&document)?,
+            BTreeSet::from([widget.clone(), nested_nonwidget, indirect.clone()])
+        );
+        let redirects = HashMap::from([(existing(5), existing(6))]);
+        assert_eq!(
+            rewrite_dictionary_target(&mut document, &widget, Some(&[b"RI"]), &redirects)?,
+            0
+        );
+        assert!(
+            document
+                .overlay()
+                .change(crate::ObjectId::new(4, 0))
+                .is_none()
+        );
+        assert_eq!(
+            rewrite_dictionary_target(&mut document, &widget, Some(&[b"I"]), &redirects)?,
+            1
+        );
+        assert_eq!(
+            widget
+                .current(&document)?
+                .and_then(|value| value.dictionary_entry(b"I"))
+                .and_then(|value| value.reference()),
+            Some(existing(6))
+        );
+        assert_eq!(
+            rewrite_dictionary_target(&mut document, &indirect, None, &redirects)?,
+            2
+        );
+        assert_eq!(
+            rewrite_dictionary_target(&mut document, &indirect, None, &redirects)?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_page_contents_holders_preserve_array_positions_and_overlay_identity() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 9 0 R] /Count 3 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Contents [5 0 R 7 0 R 6 0 R 5 0 R null] >>",
+        )?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>")?;
+        pdf.stream(5, b"", b"q Q")?;
+        pdf.stream(6, b"", b"q Q")?;
+        pdf.object(7, b"null")?;
+        pdf.object(8, b"[5 0 R 6 0 R]")?;
+        pdf.object(9, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| CowObjectHandle::Existing(crate::ObjectId::new(number, 0));
+        let pages = [existing(3), existing(4), existing(9)];
+        let holders = page_content_holders(&document, &pages)?;
+        let array = |root, path, index, target| {
+            PageContentHolder::Array(DirectArrayReferenceHolder {
+                root,
+                path,
+                index,
+                target,
+            })
+        };
+        let contents_path = vec![DirectPathStep::DictKey(b"Contents".to_vec())];
+        assert_eq!(
+            holders,
+            vec![
+                array(existing(3), contents_path.clone(), 0, existing(5)),
+                array(existing(3), contents_path.clone(), 2, existing(6)),
+                array(existing(3), contents_path, 3, existing(5)),
+                array(existing(8), Vec::new(), 0, existing(5)),
+                array(existing(8), Vec::new(), 1, existing(6)),
+                PageContentHolder::Dictionary(DirectReferenceHolder {
+                    root: existing(9),
+                    path: Vec::new(),
+                    key: b"Contents".to_vec(),
+                    target: existing(6)
+                }),
+            ]
+        );
+        for number in [3, 4, 8, 9] {
+            let _ = document.edit_handle(existing(number))?;
+        }
+        assert_eq!(page_content_holders(&document, &pages)?, holders);
         Ok(())
     }
 
