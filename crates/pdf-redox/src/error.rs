@@ -54,7 +54,7 @@ pub enum Error {
     #[error("source object {number} {generation} is missing")]
     MissingSourceObject {
         /// PDF object number.
-        number: i32,
+        number: u32,
         /// PDF generation number.
         generation: i32,
     },
@@ -62,7 +62,7 @@ pub enum Error {
     #[error("source object {number} {generation} is not a stream")]
     ExpectedSourceStream {
         /// PDF object number.
-        number: i32,
+        number: u32,
         /// PDF generation number.
         generation: i32,
     },
@@ -70,7 +70,7 @@ pub enum Error {
     #[error("source object {number} {generation} was deleted from the overlay")]
     DeletedSourceObject {
         /// PDF object number.
-        number: i32,
+        number: u32,
         /// PDF generation number.
         generation: i32,
     },
@@ -78,7 +78,7 @@ pub enum Error {
     #[error("reachable object {number} {generation} was deleted from the overlay")]
     DeletedReferencedObject {
         /// PDF object number.
-        number: i32,
+        number: u32,
         /// PDF generation number.
         generation: i32,
     },
@@ -92,7 +92,7 @@ pub enum Error {
     #[error("output plan has no mapping for source object {number} {generation}")]
     MissingOutputSourceMapping {
         /// PDF object number.
-        number: i32,
+        number: u32,
         /// PDF generation number.
         generation: i32,
     },

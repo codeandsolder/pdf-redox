@@ -1,5 +1,3 @@
-//! Names.
-
 use crate::filter::ascii_hex::decode_hex_digit;
 use crate::object::Object;
 use crate::object::macros::object;
@@ -95,9 +93,14 @@ impl<'a> Name<'a> {
         let mut r = Reader::new(data);
 
         while let Some(b) = r.read_byte() {
-            if b == b'#' {
-                let hex = r.read_bytes(2)?;
-                result.push(decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?);
+            // Before PDF 1.2, `#` was a regular character in names.
+            if b == b'#'
+                && let Some(hex) = r.peek_bytes(2)
+                && let (Some(high), Some(low)) =
+                    (decode_hex_digit(hex[0]), decode_hex_digit(hex[1]))
+            {
+                r.skip_bytes(2)?;
+                result.push(high << 4 | low);
             } else {
                 result.push(b);
             }
@@ -106,9 +109,7 @@ impl<'a> Name<'a> {
         Some(Self(NameInner::Owned(result)))
     }
 
-    /// Return a string representation of the name.
-    ///
-    /// Returns a placeholder in case the name is not UTF-8 encoded.
+    /// Return the name as a string, or a placeholder if it isn't UTF-8.
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_ref()).unwrap_or("{non-ascii key}")
     }
@@ -143,19 +144,13 @@ impl<'a> Readable<'a> for Name<'a> {
         skip_name_like(r, true)?;
         let end = r.offset();
 
-        // Exclude leading solidus.
         let data = r.range(start + 1..end)?;
         Self::new(data)
     }
 }
 
-// This method is shared by `Name` and the parser for content stream operators (which behave like
-// names, except that they aren't preceded by a solidus.
 pub(crate) fn skip_name_like(r: &mut Reader<'_>, solidus: bool) -> Option<()> {
-    // Note that we are not validating hex escape sequences here
-    // (since this method can lie on the hot path), so it's possible
-    // this method will yield invalid names. Validation needs to happen during actual
-    // actual reading.
+    // Escapes aren't validated here; reading validates them.
     if solidus {
         r.forward_tag(b"/")?;
         r.forward_while(is_regular_character);
@@ -204,10 +199,12 @@ mod tests {
 
     #[test]
     fn name_3() {
-        assert!(
+        assert_eq!(
             Reader::new("/AB#FG".as_bytes())
                 .read_without_context::<Name<'_>>()
-                .is_none()
+                .unwrap()
+                .deref(),
+            b"AB#FG"
         );
     }
 
@@ -362,6 +359,39 @@ mod tests {
                 .unwrap()
                 .deref(),
             b"k1"
+        );
+    }
+
+    #[test]
+    fn name_18() {
+        assert_eq!(
+            Reader::new("/#".as_bytes())
+                .read_without_context::<Name<'_>>()
+                .unwrap()
+                .deref(),
+            b"#"
+        );
+    }
+
+    #[test]
+    fn name_19() {
+        assert_eq!(
+            Reader::new("/A#4".as_bytes())
+                .read_without_context::<Name<'_>>()
+                .unwrap()
+                .deref(),
+            b"A#4"
+        );
+    }
+
+    #[test]
+    fn name_20() {
+        assert_eq!(
+            Reader::new("/#2#23".as_bytes())
+                .read_without_context::<Name<'_>>()
+                .unwrap()
+                .deref(),
+            b"#2#"
         );
     }
 }

@@ -410,7 +410,7 @@ mod tests {
     use crate::ObjectId;
     use crate::test_support::ClassicPdfBuilder;
 
-    fn content_reference(number: i32) -> OwnedObject {
+    fn content_reference(number: u32) -> OwnedObject {
         OwnedObject::Reference(ObjectHandle::Existing(ObjectId::new(number, 0)))
     }
 

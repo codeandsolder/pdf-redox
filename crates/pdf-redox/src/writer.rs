@@ -327,12 +327,11 @@ pub fn write_pdf_real(output: &mut Vec<u8>, value: f64) -> Result<()> {
         return Err(Error::InvalidReal);
     }
 
-    // Project generated/owned binary64 values through the same decimal parser
-    // used for source PDF numbers. Otherwise arithmetic such as -2.361 can
-    // serialize as -2.3609999999999998 on the first write, then shorten only
-    // after Hayro reparses it, making an otherwise-stable rewrite non-idempotent.
-    // Expand Rust's scientific notation first because PDF real syntax has no
-    // exponent form; then reuse the source-number writer for the canonical form.
+    // Use the source-number formatter for generated values too, so the first
+    // serialization and subsequent source rewrites agree. Hayro parses decimal
+    // reals with correct binary64 rounding; do not shorten neighboring values
+    // by silently rounding them to a different number.
+    // PDF numbers cannot contain scientific notation.
     let representation = value.to_string();
     let decimal = if representation.contains('e') || representation.contains('E') {
         expand_scientific(&representation)?
@@ -1269,9 +1268,9 @@ mod tests {
     #[test]
     fn owned_reals_use_source_number_canonicalization() -> crate::Result<()> {
         for (value, expected) in [
-            (-2.360_999_999_999_999_8, b"-2.361".as_slice()),
-            (-1.511_000_000_000_000_1, b"-1.511".as_slice()),
-            (-1.710_999_999_999_999_9, b"-1.711".as_slice()),
+            (-2.360_999_999_999_999_8, b"-2.3609999999999998".as_slice()),
+            (-1.511_000_000_000_000_1, b"-1.5110000000000001".as_slice()),
+            (-1.710_999_999_999_999_9, b"-1.7109999999999999".as_slice()),
             (1.684_000_000_000_000_2, b"1.6840000000000002".as_slice()),
             (-0.0, b"0".as_slice()),
         ] {
@@ -1281,6 +1280,14 @@ mod tests {
 
             let number = Number::from_bytes(&output)
                 .ok_or_else(|| crate::Error::Invalid("written real should parse".to_owned()))?;
+            assert_eq!(
+                number.as_f64().to_bits(),
+                if value == 0.0 {
+                    0.0_f64.to_bits()
+                } else {
+                    value.to_bits()
+                }
+            );
             let mut rewritten = Vec::new();
             write_source_number(&mut rewritten, &number)?;
             assert_eq!(rewritten, output);

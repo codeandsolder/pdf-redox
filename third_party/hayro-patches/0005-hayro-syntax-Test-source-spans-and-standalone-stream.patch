@@ -1,0 +1,106 @@
+From b782b5f3dfbd701e7f08669a318b111072dd32dd Mon Sep 17 00:00:00 2001
+From: codeandsolder <codeandsolder@gmail.com>
+Date: Fri, 20 Nov 2026 11:40:06 +0100
+Subject: [PATCH 5/7] hayro-syntax: Test source spans and standalone stream
+ decoding
+
+---
+ hayro-syntax/src/content/mod.rs   | 13 +++++++++++++
+ hayro-syntax/src/object/stream.rs | 31 +++++++++++++++++++++++++++++++
+ hayro-syntax/src/xref.rs          | 10 ++++++++++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/hayro-syntax/src/content/mod.rs b/hayro-syntax/src/content/mod.rs
+index f62b89d4..dc748a28 100644
+--- a/hayro-syntax/src/content/mod.rs
++++ b/hayro-syntax/src/content/mod.rs
+@@ -773,6 +773,19 @@ mod span_tests {
+     use super::UntypedIter;
+     use alloc::{vec, vec::Vec};
+ 
++    #[test]
++    fn exposes_inline_image_spans() {
++        let input = b"q BI /W 1 /H 1 /BPC 8 /CS /G ID x EI Q";
++        let mut iter = UntypedIter::new(input);
++        assert_eq!(iter.next().unwrap().operator_span(), 0..1);
++        let image = iter.next().unwrap();
++        assert_eq!(&input[image.operator_span()], b"BI");
++        let operand = image.operand_spans().next().unwrap();
++        assert_eq!(&input[operand], b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI");
++        let last = iter.next().unwrap();
++        assert_eq!(&input[last.operator_span()], b"Q");
++    }
++
+     #[test]
+     fn exposes_instruction_and_operand_spans() {
+         let input = b"  12 -3.5 /Name  cm\nq";
+diff --git a/hayro-syntax/src/object/stream.rs b/hayro-syntax/src/object/stream.rs
+index 81adc00b..de606aad 100644
+--- a/hayro-syntax/src/object/stream.rs
++++ b/hayro-syntax/src/object/stream.rs
+@@ -474,6 +474,37 @@ mod tests {
+         assert!(stream.decoded().is_err());
+     }
+ 
++    #[test]
++    fn standalone_stream_decodes_filter_chain() {
++        let result = super::decode_standalone_stream(
++            b"<< /Filter [/ASCIIHexDecode /RunLengthDecode] >>",
++            b"0241424380>",
++        )
++        .unwrap();
++        assert_eq!(result, b"ABC");
++        assert!(super::decode_standalone_stream(b"not a dictionary", b"").is_err());
++    }
++
++    #[test]
++    fn standalone_image_accepts_explicit_metadata() {
++        let params = super::ImageDecodeParams {
++            width: 3,
++            height: 1,
++            bpc: Some(8),
++            num_components: Some(1),
++            ..Default::default()
++        };
++        assert_eq!(
++            super::decode_standalone_image_stream(
++                b"<< /Filter /ASCIIHexDecode >>",
++                b"010203>",
++                &params,
++            )
++            .unwrap(),
++            [1, 2, 3],
++        );
++    }
++
+     #[test]
+     fn inline_filter_abbreviation_still_decodes() {
+         let mut r = Reader::new(b"<< /F /AHx >>");
+diff --git a/hayro-syntax/src/xref.rs b/hayro-syntax/src/xref.rs
+index 51bb2655..a4031d45 100644
+--- a/hayro-syntax/src/xref.rs
++++ b/hayro-syntax/src/xref.rs
+@@ -1169,6 +1169,11 @@ mod tests {
+         );
+ 
+         let parsed = crate::Pdf::new(pdf).unwrap();
++        let mut ids = parsed.xref().object_ids();
++        ids.sort_by_key(|id| id.obj_number);
++        assert!(ids.contains(&ObjectIdentifier::new(1, 0)));
++        assert!(ids.contains(&ObjectIdentifier::new(2, 0)));
++        assert!(ids.contains(&ObjectIdentifier::new(3, 0)));
+         let trailer = parsed.xref().trailer().unwrap();
+         assert_eq!(trailer.get_ref(INFO), Some(object::ObjRef::new(3, 0)));
+         assert_eq!(
+@@ -1218,6 +1223,11 @@ mod tests {
+         pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+ 
+         let parsed = crate::Pdf::new(pdf).unwrap();
++        let mut ids = parsed.xref().object_ids();
++        ids.sort_by_key(|id| id.obj_number);
++        assert!(ids.contains(&ObjectIdentifier::new(1, 0)));
++        assert!(ids.contains(&ObjectIdentifier::new(2, 0)));
++        assert!(ids.contains(&ObjectIdentifier::new(3, 0)));
+         let trailer = parsed.xref().trailer().unwrap();
+         assert_eq!(trailer.get_ref(INFO), Some(object::ObjRef::new(3, 0)));
+         assert_eq!(

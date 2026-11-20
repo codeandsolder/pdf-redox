@@ -2717,7 +2717,7 @@ mod tests {
         );
     }
 
-    fn overlay_with_owned_streams(input: &[u8], stream_ids: &[i32]) -> Result<EditDocument> {
+    fn overlay_with_owned_streams(input: &[u8], stream_ids: &[u32]) -> Result<EditDocument> {
         let mut overlay = EditDocument::from_bytes(input.to_vec())?;
         for &id in stream_ids {
             let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
@@ -2749,7 +2749,7 @@ mod tests {
 
     fn dedup_source_overlay_pair<T: std::fmt::Debug + PartialEq>(
         input: Vec<u8>,
-        stream_ids: &[i32],
+        stream_ids: &[u32],
         pass: impl Fn(&mut EditDocument) -> Result<T>,
     ) -> Result<()> {
         let mut overlay = overlay_with_owned_streams(&input, stream_ids)?;
@@ -3095,7 +3095,7 @@ mod tests {
         let mut original_bodies = 0usize;
         let mut wrappers = 0usize;
         let mut last_modified = Vec::new();
-        for id in [5_i32, 6] {
+        for id in [5_u32, 6] {
             let object = document
                 .current_owned_object(CowObjectHandle::Existing(crate::ObjectId::new(id, 0)))?
                 .ok_or_else(|| crate::Error::Invalid("form is missing".to_owned()))?;

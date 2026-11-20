@@ -1,32 +1,42 @@
 // Keep in sync with `hayro-postscript/src/string/ascii_hex.rs`.
 
+use crate::Limit;
 use crate::trivia::is_white_space_character;
 use crate::util::ByteBuf;
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-    decode_into(data)
+pub(crate) fn decode(data: &[u8], limit: Limit<usize>) -> Option<Vec<u8>> {
+    decode_with_limit(data, limit)
 }
 
 pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
-    // Find end (at `>` or end of data) and check for whitespace.
+    decode_with_limit(data, Limit::Unlimited)
+}
+
+fn decode_with_limit<B: ByteBuf>(data: &[u8], limit: Limit<usize>) -> Option<B> {
     let mut has_whitespace = false;
     let mut end = data.len();
+    let mut digits = 0usize;
 
     for (idx, byte) in data.iter().enumerate() {
-        has_whitespace |= is_white_space_character(*byte);
+        let whitespace = is_white_space_character(*byte);
+        has_whitespace |= whitespace;
 
         if *byte == b'>' {
             end = idx;
             break;
         }
+        digits += usize::from(!whitespace);
     }
 
     let data = &data[..end];
-    let mut decoded = B::with_capacity(data.len().div_ceil(2));
+    let len = digits.div_ceil(2);
+    if !limit.permits(len) {
+        return None;
+    }
+    let mut decoded = B::with_capacity(len);
 
     if !has_whitespace {
-        // Fast path, don't need to worry about white spaces.
         let (chunks, remainder) = data.as_chunks::<2>();
 
         for &[hi, lo] in chunks {
@@ -37,7 +47,6 @@ pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
             decoded.push(decode_hex_digit(*hi)? << 4);
         }
     } else {
-        // Slow path, need to strip white spaces.
         let mut iter = data.iter().copied();
         let mut read_byte = || -> Option<u8> {
             loop {
@@ -78,31 +87,47 @@ pub(crate) fn decode_hex_digit(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::ascii_hex::decode;
+    use crate::{Limit, filter::ascii_hex::decode};
+
+    #[test]
+    fn ascii_hex_limit_counts_digits_not_whitespace() {
+        assert!(decode(b"  41 42  >", Limit::AtMost(1)).is_none());
+        assert_eq!(decode(b"  41 42  >", Limit::AtMost(2)).unwrap(), b"AB");
+    }
 
     #[test]
     fn decode_simple() {
         let input = b"AF3E2901>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode(input, Limit::Unlimited).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
     fn decode_whitespaces() {
         let input = b"AF3   E2   901>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode(input, Limit::Unlimited).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
-    // Not valid for ASCII hex streams since they require a trailing >,
-    // but used by PDF hex strings as well.
     fn decode_without_gt() {
         let input = b"AF3E2901";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode(input, Limit::Unlimited).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
     fn decode_with_padding() {
         let input = b"AF3E291>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x10]);
+        assert_eq!(
+            decode(input, Limit::Unlimited).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x10]
+        );
     }
 }

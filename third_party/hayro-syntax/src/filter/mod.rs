@@ -1,5 +1,3 @@
-//! Results from decoding filtered data streams.
-
 mod ascii_85;
 pub(crate) mod ascii_hex;
 #[cfg(feature = "images")]
@@ -12,8 +10,10 @@ mod jbig2;
 mod jpx;
 mod lzw_flate;
 mod png;
+mod predictor;
 mod run_length;
 
+use crate::Limits;
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::*;
@@ -46,21 +46,6 @@ pub enum Filter {
 }
 
 impl Filter {
-    fn debug_name(&self) -> &'static str {
-        match self {
-            Self::AsciiHexDecode => "ascii_hex",
-            Self::Ascii85Decode => "ascii_85",
-            Self::LzwDecode => "lzw",
-            Self::FlateDecode => "flate",
-            Self::RunLengthDecode => "run-length",
-            Self::CcittFaxDecode => "ccit_fax",
-            Self::Jbig2Decode => "jbig2",
-            Self::DctDecode => "dct",
-            Self::JpxDecode => "jpx",
-            Self::Crypt => "crypt",
-        }
-    }
-
     pub(crate) fn from_name(name: Name<'_>) -> Option<Self> {
         match name.deref() {
             ASCII_HEX_DECODE | ASCII_HEX_DECODE_ABBREVIATION => Some(Self::AsciiHexDecode),
@@ -73,11 +58,7 @@ impl Filter {
             DCT_DECODE | DCT_DECODE_ABBREVIATION => Some(Self::DctDecode),
             JPX_DECODE => Some(Self::JpxDecode),
             CRYPT => Some(Self::Crypt),
-            _ => {
-                warn!("unknown filter: {}", name.as_str());
-
-                None
-            }
+            _ => None,
         }
     }
 
@@ -86,49 +67,48 @@ impl Filter {
         data: &[u8],
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
+        limits: Limits,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
-        let res = match self {
-            Self::AsciiHexDecode => ascii_hex::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::Ascii85Decode => ascii_85::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::RunLengthDecode => run_length::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::LzwDecode => lzw_flate::lzw::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::FlateDecode => lzw_flate::flate::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            #[cfg(feature = "images")]
-            Self::DctDecode => {
-                dct::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::CcittFaxDecode => {
-                ccitt::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::Jbig2Decode => {
-                jbig2::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::JpxDecode => jpx::decode(data, image_params).ok_or(DecodeFailure::ImageDecode),
-            #[cfg(not(feature = "images"))]
-            Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode => {
-                warn!("image decoding is not supported (enable the `images` feature)");
-                Err(DecodeFailure::ImageDecode)
-            }
-            _ => Err(DecodeFailure::StreamDecode),
-        };
-
-        if res.is_err() {
-            warn!("failed to apply filter {}", self.debug_name());
+        let limit = limits.max_decoded_stream_size;
+        let result =
+            match self {
+                Self::AsciiHexDecode => ascii_hex::decode(data, limit)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::Ascii85Decode => ascii_85::decode(data, limit)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::RunLengthDecode => run_length::decode(data, limit)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::LzwDecode => lzw_flate::lzw::decode(data, params, limit)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::FlateDecode => lzw_flate::flate::decode(data, params, limit)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                #[cfg(feature = "images")]
+                Self::DctDecode => dct::decode(data, params, image_params, limits)
+                    .ok_or(DecodeFailure::ImageDecode),
+                #[cfg(feature = "images")]
+                Self::CcittFaxDecode => ccitt::decode(data, params, image_params, limits)
+                    .ok_or(DecodeFailure::ImageDecode),
+                #[cfg(feature = "images")]
+                Self::Jbig2Decode => jbig2::decode(data, params, image_params, limits)
+                    .ok_or(DecodeFailure::ImageDecode),
+                #[cfg(feature = "images")]
+                Self::JpxDecode => {
+                    jpx::decode(data, image_params, limits).ok_or(DecodeFailure::ImageDecode)
+                }
+                #[cfg(not(feature = "images"))]
+                Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode => {
+                    Err(DecodeFailure::ImageDecode)
+                }
+                _ => Err(DecodeFailure::StreamDecode),
+            }?;
+        if !limit.permits(result.data.len()) {
+            return Err(DecodeFailure::StreamDecode);
         }
-
-        res
+        Ok(result)
     }
 }

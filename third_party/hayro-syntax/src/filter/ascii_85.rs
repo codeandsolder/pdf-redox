@@ -1,10 +1,9 @@
-// Keep in sync with `hayro-postscript/src/string/ascii_85.rs`.
-
+use crate::Limit;
 use crate::reader::Reader;
 use crate::trivia::is_white_space_character;
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode(data: &[u8], limit: Limit<usize>) -> Option<Vec<u8>> {
     const POW_85: [u32; 5] = [52200625, 614125, 7225, 85, 1];
 
     let mut reader = Reader::new(data);
@@ -13,7 +12,6 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
         loop {
             let b = reader.read_byte()?;
 
-            // White space characters should be ignored.
             if !is_white_space_character(b) {
                 return Some(b);
             }
@@ -23,7 +21,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let flush_group = |group: &mut Vec<u8>, decoded: &mut Vec<u8>| -> Option<()> {
         let (digits, output_len): ([u32; 5], usize) = match group.len() {
             0 => return Some(()),
-            1 => return None, // A single character is not valid.
+            1 => return None,
             2 => (
                 [group[0], group[1], b'u', b'u', b'u'].map(|b| (b - b'!') as u32),
                 1,
@@ -50,12 +48,16 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
             .checked_add(digits[3].checked_mul(POW_85[3])?)?
             .checked_add(digits[4])?;
 
+        if !limit.permits(decoded.len().checked_add(output_len)?) {
+            return None;
+        }
         decoded.extend_from_slice(&value.to_be_bytes()[..output_len]);
         group.clear();
         Some(())
     };
 
-    let mut decoded = Vec::with_capacity(data.len() * 4 / 5);
+    let capacity = data.len().saturating_mul(4) / 5;
+    let mut decoded = Vec::with_capacity(capacity.min(limit.bound().unwrap_or(usize::MAX)));
     let mut group = Vec::with_capacity(5);
 
     loop {
@@ -76,16 +78,30 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
             }
             b'z' => {
                 flush_group(&mut group, &mut decoded)?;
+                if !limit.permits(decoded.len().checked_add(4)?) {
+                    return None;
+                }
                 decoded.extend_from_slice(&[0, 0, 0, 0]);
             }
             b'~' => {
-                // Technically requires a '>', but there is a PDF where it isn't
-                // appended and decodes fine in other viewers.
+                // Lenient: accept a missing `>`.
                 flush_group(&mut group, &mut decoded)?;
 
                 return Some(decoded);
             }
-            _ => return None, // Invalid character.
+            _ => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode;
+    use crate::Limit;
+
+    #[test]
+    fn ascii85_zero_group_expansion_limit() {
+        assert!(decode(b"zz~>", Limit::AtMost(7)).is_none());
+        assert_eq!(decode(b"zz~>", Limit::AtMost(8)).unwrap(), [0; 8]);
     }
 }

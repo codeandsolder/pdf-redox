@@ -936,7 +936,7 @@ mod tests {
         EditDocument::from_bytes(pdf.finish(1)?)
     }
 
-    const fn existing(number: i32) -> ObjectHandle {
+    const fn existing(number: u32) -> ObjectHandle {
         ObjectHandle::Existing(crate::ObjectId::new(number, 0))
     }
 

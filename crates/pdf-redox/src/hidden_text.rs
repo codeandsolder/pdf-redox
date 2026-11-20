@@ -16,7 +16,7 @@ const ALPHA_INVISIBLE: f64 = 0.001;
 const ALPHA_OPAQUE: f64 = 0.995;
 const COVERAGE_THRESHOLD: f64 = 0.97;
 
-type ObjectKey = (i32, i32);
+type ObjectKey = (u32, i32);
 
 const fn content_object_key(reference: ObjectRef) -> ObjectKey {
     (reference.number, reference.generation)
@@ -236,7 +236,7 @@ struct MarkedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ObjectRef {
-    number: i32,
+    number: u32,
     generation: i32,
 }
 
