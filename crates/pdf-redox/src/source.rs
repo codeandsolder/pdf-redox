@@ -2,7 +2,7 @@ use crate::stream_codec::decode_stream;
 use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
-    object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream},
+    object::{Dict, MaybeRef, Object, ObjectIdentifier, Stream},
 };
 use smallvec::SmallVec;
 use std::{
@@ -12,11 +12,17 @@ use std::{
     sync::Arc,
 };
 
-/// Cached classification of a source object as a non-stream or a stream with an optional resolved subtype.
+/// Immutable evidence about a stream subtype, without resolving references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceStreamSubtype {
+    Name(Vec<u8>),
+    Reference(ObjectHandle),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceStreamKind {
     NotStream,
-    Stream(Option<Vec<u8>>),
+    Stream(Option<SourceStreamSubtype>),
 }
 
 pub const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
@@ -126,12 +132,19 @@ impl SourcePdf {
 
     fn source_stream_kind_from_object(object: &Object<'_>) -> SourceStreamKind {
         match object {
-            Object::Stream(stream) => SourceStreamKind::Stream(
-                stream
-                    .dict()
-                    .get::<Name<'_>>(b"Subtype")
-                    .map(|name| name.as_ref().to_vec()),
-            ),
+            Object::Stream(stream) => {
+                SourceStreamKind::Stream(stream.dict().get_raw::<Object<'_>>(b"Subtype").and_then(
+                    |value| match value {
+                        MaybeRef::Ref(reference) => Some(SourceStreamSubtype::Reference(
+                            ObjectHandle::Existing(reference.into()),
+                        )),
+                        MaybeRef::NotRef(Object::Name(name)) => {
+                            Some(SourceStreamSubtype::Name(name.as_ref().to_vec()))
+                        }
+                        MaybeRef::NotRef(_) => None,
+                    },
+                ))
+            }
             _ => SourceStreamKind::NotStream,
         }
     }
@@ -456,7 +469,7 @@ impl OwnedObject {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewObjectCheckpoint(usize);
 
 /// Mutation applied to an object that already exists in the source PDF.
@@ -546,39 +559,6 @@ impl ObjectOverlay {
     }
 }
 
-// Resolve the source-vs-overlay decision only once for both Hayro's borrowed
-// COS view and the optional owned COS representation.
-enum CurrentObjectStorage<'a> {
-    Source(ObjectId),
-    Overlay(&'a OwnedObject),
-}
-
-/// Borrowed view of one object encountered while walking the current COW graph.
-pub enum CurrentObject<'a> {
-    /// Object parsed lazily from the immutable Hayro source.
-    Source(Object<'a>),
-    /// Object already materialized in the overlay.
-    Owned(&'a OwnedObject),
-}
-
-impl CurrentObject<'_> {
-    /// Returns whether this current object is a stream in either representation.
-    pub(crate) const fn is_stream(&self) -> bool {
-        matches!(
-            self,
-            Self::Source(Object::Stream(_)) | Self::Owned(OwnedObject::Stream { .. })
-        )
-    }
-
-    /// Returns whether this current object is a plain dictionary in either representation.
-    pub(crate) const fn is_dictionary(&self) -> bool {
-        matches!(
-            self,
-            Self::Source(Object::Dict(_)) | Self::Owned(OwnedObject::Dictionary(_))
-        )
-    }
-}
-
 /// A direct value or unresolved reference in either current COS representation.
 /// Source children remain lazy until explicitly materialized; owned children
 /// borrow the overlay. Reference resolution must always use the current graph.
@@ -631,6 +611,32 @@ impl<'a> CurrentValue<'a> {
             Self::Owned(value) => Some(value.as_dictionary()?.keys().cloned().collect()),
             Self::Source(..) => None,
         }
+    }
+
+    pub const fn is_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::Source(MaybeRef::NotRef(Object::Stream(_)), _)
+                | Self::Owned(OwnedObject::Stream { .. })
+        )
+    }
+
+    pub fn resolved_entry(&self, document: &'a EditDocument, key: &[u8]) -> Result<Option<Self>> {
+        let Some(value) = self.dictionary_entry(key) else {
+            return Ok(None);
+        };
+        document.resolve_current_value(value)
+    }
+
+    pub fn resolved_name_is(
+        &self,
+        document: &'a EditDocument,
+        key: &[u8],
+        expected: &[u8],
+    ) -> Result<bool> {
+        Ok(self
+            .resolved_entry(document, key)?
+            .is_some_and(|value| value.is_name(expected)))
     }
 
     pub const fn has_dictionary(&self) -> bool {
@@ -1168,64 +1174,33 @@ impl EditDocument {
         }
     }
 
-    fn current_object_storage(&self, handle: ObjectHandle) -> Result<CurrentObjectStorage<'_>> {
+    /// Inspect a current object without materializing untouched source data.
+    pub(crate) fn current_value(&self, handle: ObjectHandle) -> Result<Option<CurrentValue<'_>>> {
         match handle {
             ObjectHandle::Existing(id) => match self.overlay.change(id) {
                 Some(ExistingObjectChange::Replace(object)) => {
-                    Ok(CurrentObjectStorage::Overlay(object))
+                    Ok(Some(CurrentValue::Owned(object)))
                 }
                 Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
                     number: id.number,
                     generation: id.generation,
                 }),
-                None => Ok(CurrentObjectStorage::Source(id)),
+                None => match self.source.object(id) {
+                    Ok(object) => Ok(Some(CurrentValue::Source(
+                        MaybeRef::NotRef(object),
+                        Some(id),
+                    ))),
+                    Err(Error::MissingSourceObject { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                },
             },
             ObjectHandle::New(id) => self
                 .overlay
                 .added(id)
-                .map(CurrentObjectStorage::Overlay)
+                .map(CurrentValue::Owned)
+                .map(Some)
                 .ok_or_else(|| Error::MissingNewObject { index: id.index() }),
         }
-    }
-
-    /// Resolve an existing-source object or borrow an overlay object using one
-    /// shared missing/deleted/new-object policy, independently of representation.
-    fn current_object_with<'a, T>(
-        &'a self,
-        handle: ObjectHandle,
-        source_view: impl FnOnce(ObjectId) -> Result<T>,
-        overlay_view: impl FnOnce(&'a OwnedObject) -> T,
-    ) -> Result<Option<T>> {
-        match self.current_object_storage(handle)? {
-            CurrentObjectStorage::Overlay(object) => Ok(Some(overlay_view(object))),
-            CurrentObjectStorage::Source(id) => match source_view(id) {
-                Ok(object) => Ok(Some(object)),
-                Err(Error::MissingSourceObject { .. }) => Ok(None),
-                Err(error) => Err(error),
-            },
-        }
-    }
-
-    /// Borrow the current value of an object handle without materializing an
-    /// untouched source object into the owned COS representation.
-    pub(crate) fn current_object(&self, handle: ObjectHandle) -> Result<Option<CurrentObject<'_>>> {
-        self.current_object_with(
-            handle,
-            |id| self.source.object(id).map(CurrentObject::Source),
-            CurrentObject::Owned,
-        )
-    }
-
-    pub(crate) fn current_value(&self, handle: ObjectHandle) -> Result<Option<CurrentValue<'_>>> {
-        self.current_object_with(
-            handle,
-            |id| {
-                self.source
-                    .object(id)
-                    .map(|value| CurrentValue::Source(MaybeRef::NotRef(value), Some(id)))
-            },
-            CurrentValue::Owned,
-        )
     }
 
     /// Resolve only the reference chain, not the selected object's children.
@@ -1253,11 +1228,7 @@ impl EditDocument {
         &self,
         handle: ObjectHandle,
     ) -> Result<Option<Cow<'_, OwnedObject>>> {
-        self.current_object_with(
-            handle,
-            |id| self.source.materialize(id).map(Cow::Owned),
-            Cow::Borrowed,
-        )
+        Ok(self.current_value(handle)?.map(CurrentValue::into_cow))
     }
 
     pub(crate) fn current_owned_object(&self, handle: ObjectHandle) -> Result<Option<OwnedObject>> {
@@ -1609,42 +1580,31 @@ impl EditDocument {
     }
 
     pub(crate) fn stream_subtype_is(&self, handle: ObjectHandle, subtype: &[u8]) -> Result<bool> {
-        match handle {
-            ObjectHandle::Existing(id) => match self.overlay.change(id) {
-                Some(ExistingObjectChange::Replace(OwnedObject::Stream { dictionary, .. })) => {
-                    let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
-                        return Ok(false);
-                    };
-                    Ok(matches!(
-                        self.resolve_owned_value(value)?,
-                        Some(OwnedObject::Name(name)) if name == subtype
-                    ))
+        // Immutable source evidence stores only raw names/references. Any
+        // indirect name is resolved through the current overlay each time.
+        if let ObjectHandle::Existing(id) = handle
+            && self.overlay.change(id).is_none()
+        {
+            return match self.source.source_stream_kind(id) {
+                Ok(SourceStreamKind::Stream(Some(SourceStreamSubtype::Name(name)))) => {
+                    Ok(name == subtype)
                 }
-                Some(ExistingObjectChange::Replace(_)) => Ok(false),
-                Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
-                    number: id.number,
-                    generation: id.generation,
-                }),
-                None => match self.source.source_stream_kind(id) {
-                    Ok(SourceStreamKind::Stream(Some(name))) => Ok(name.as_slice() == subtype),
-                    Ok(SourceStreamKind::NotStream | SourceStreamKind::Stream(None))
-                    | Err(Error::MissingSourceObject { .. }) => Ok(false),
-                    Err(error) => Err(error),
-                },
-            },
-            ObjectHandle::New(id) => {
-                let Some(OwnedObject::Stream { dictionary, .. }) = self.overlay.added(id) else {
-                    return Ok(false);
-                };
-                let Some(value) = dictionary.get(b"Subtype".as_slice()) else {
-                    return Ok(false);
-                };
-                Ok(matches!(
-                    self.resolve_owned_value(value)?,
-                    Some(OwnedObject::Name(name)) if name == subtype
-                ))
-            }
+                Ok(SourceStreamKind::Stream(Some(SourceStreamSubtype::Reference(reference)))) => {
+                    Ok(self
+                        .resolve_current_value(CurrentValue::Owned(&OwnedObject::Reference(
+                            reference,
+                        )))?
+                        .is_some_and(|value| value.is_name(subtype)))
+                }
+                Ok(SourceStreamKind::NotStream | SourceStreamKind::Stream(None))
+                | Err(Error::MissingSourceObject { .. }) => Ok(false),
+                Err(error) => Err(error),
+            };
         }
+        let Some(object) = self.current_value(handle)? else {
+            return Ok(false);
+        };
+        Ok(object.is_stream() && object.resolved_name_is(self, b"Subtype", subtype)?)
     }
 
     pub(crate) fn reachable_streams(&self) -> Result<Vec<ObjectHandle>> {
@@ -1721,10 +1681,10 @@ impl EditDocument {
     /// object semantics instead of open-coding the COW traversal repeatedly.
     pub(crate) fn walk_output_objects<F>(&self, mut visit: F) -> Result<()>
     where
-        F: for<'a> FnMut(ObjectHandle, CurrentObject<'a>) -> Result<()>,
+        F: for<'a> FnMut(ObjectHandle, CurrentValue<'a>) -> Result<()>,
     {
         for handle in self.reachable_output_traversal()? {
-            if let Some(object) = self.current_object(handle)? {
+            if let Some(object) = self.current_value(handle)? {
                 visit(handle, object)?;
             }
         }
@@ -2150,12 +2110,26 @@ mod tests {
         pdf.object(5, b"/Form")?;
         pdf.stream(6, b"", b"q Q")?;
 
-        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let form = ObjectHandle::Existing(ObjectId::new(4, 0));
         assert!(document.stream_subtype_is(form, b"Form")?);
         assert!(
             document
                 .reachable_streams_with_subtype(b"Form")?
+                .contains(&form)
+        );
+        *document.edit_handle(ObjectHandle::Existing(ObjectId::new(5, 0)))? =
+            OwnedObject::Name(b"Image".to_vec());
+        assert!(!document.stream_subtype_is(form, b"Form")?);
+        assert!(document.stream_subtype_is(form, b"Image")?);
+        assert!(
+            !document
+                .reachable_streams_with_subtype(b"Form")?
+                .contains(&form)
+        );
+        assert!(
+            document
+                .reachable_streams_with_subtype(b"Image")?
                 .contains(&form)
         );
         Ok(())

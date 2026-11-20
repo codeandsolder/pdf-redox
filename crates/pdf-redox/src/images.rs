@@ -1680,10 +1680,10 @@ mod tests {
     }
 
     fn assert_image_overlay_borrowed(document: &EditDocument, handle: ObjectHandle) -> Result<()> {
-        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+        let Some(crate::source::CurrentValue::Owned(OwnedObject::Stream {
             data: StreamData::Owned(bytes),
             ..
-        })) = document.current_object(handle)?
+        })) = document.current_value(handle)?
         else {
             return Err(Error::Invalid("expected overlay-owned image stream".into()));
         };

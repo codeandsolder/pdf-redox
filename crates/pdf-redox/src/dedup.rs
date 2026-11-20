@@ -1,11 +1,8 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    StreamData, content::resolved_dictionary, source::CurrentObject,
+    StreamData, content::resolved_dictionary, source::CurrentValue,
 };
-use hayro_syntax::{
-    PdfVersion,
-    object::{Name as HayroName, Object as HayroObject},
-};
+use hayro_syntax::PdfVersion;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -765,22 +762,8 @@ fn reachable_streams_with_type(
 ) -> Result<Vec<CowObjectHandle>> {
     let mut handles = Vec::new();
     document.walk_output_objects(|handle, object| {
-        let matches_type = match object {
-            CurrentObject::Source(HayroObject::Stream(stream)) => stream
-                .dict()
-                .get::<HayroName<'_>>(b"Type")
-                .is_some_and(|name| name.as_ref() == object_type),
-            CurrentObject::Owned(OwnedObject::Stream { dictionary, .. }) => {
-                let Some(value) = dictionary.get(b"Type".as_slice()) else {
-                    return Ok(());
-                };
-                matches!(
-                    document.resolve_owned_value(value)?,
-                    Some(OwnedObject::Name(name)) if name == object_type
-                )
-            }
-            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
-        };
+        let matches_type =
+            object.is_stream() && object.resolved_name_is(document, b"Type", object_type)?;
         if matches_type {
             handles.push(handle);
         }
@@ -1443,21 +1426,14 @@ impl DirectObjectVisitor for RedirectReferenceVisitor<'_> {
 fn reachable_sampled_function_streams(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
     let mut handles = Vec::new();
     document.walk_output_objects(|handle, object| {
-        let sampled = match object {
-            CurrentObject::Source(HayroObject::Stream(stream)) => {
-                stream.dict().get::<i32>(b"FunctionType") == Some(0)
-            }
-            CurrentObject::Owned(OwnedObject::Stream { dictionary, .. }) => {
-                let Some(value) = dictionary.get(b"FunctionType".as_slice()) else {
-                    return Ok(());
-                };
-                matches!(
-                    document.resolve_owned_value(value)?,
-                    Some(OwnedObject::Integer(0))
-                )
-            }
-            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
-        };
+        let sampled = object.is_stream()
+            && matches!(
+                object
+                    .resolved_entry(document, b"FunctionType")?
+                    .map(CurrentValue::into_cow)
+                    .as_deref(),
+                Some(OwnedObject::Integer(0))
+            );
         if sampled {
             handles.push(handle);
         }
@@ -1643,46 +1619,12 @@ pub fn canonicalize_exact_structure_attribute_dictionaries(
     let mut holders = Vec::new();
     let mut handles = BTreeSet::new();
     document.walk_output_objects(|root, object| {
-        let target = match object {
-            CurrentObject::Source(HayroObject::Dict(dictionary)) => {
-                let is_struct_elem = dictionary
-                    .get::<HayroName<'_>>(b"Type")
-                    .is_some_and(|name| name.as_ref() == b"StructElem");
-                is_struct_elem
-                    .then(|| dictionary.get_ref(b"A"))
-                    .flatten()
-                    .map(|target| CowObjectHandle::Existing(target.into()))
-            }
-            CurrentObject::Source(HayroObject::Stream(stream)) => {
-                let dictionary = stream.dict();
-                let is_struct_elem = dictionary
-                    .get::<HayroName<'_>>(b"Type")
-                    .is_some_and(|name| name.as_ref() == b"StructElem");
-                is_struct_elem
-                    .then(|| dictionary.get_ref(b"A"))
-                    .flatten()
-                    .map(|target| CowObjectHandle::Existing(target.into()))
-            }
-            CurrentObject::Owned(object) => {
-                let Some(dictionary) = object.as_dictionary() else {
-                    return Ok(());
-                };
-                let Some(object_type) = dictionary.get(b"Type".as_slice()) else {
-                    return Ok(());
-                };
-                if !matches!(
-                    document.resolve_owned_value(object_type)?,
-                    Some(OwnedObject::Name(name)) if name == b"StructElem"
-                ) {
-                    return Ok(());
-                }
-                match dictionary.get(b"A".as_slice()) {
-                    Some(OwnedObject::Reference(target)) => Some(*target),
-                    _ => None,
-                }
-            }
-            CurrentObject::Source(_) => None,
-        };
+        if !object.resolved_name_is(document, b"Type", b"StructElem")? {
+            return Ok(());
+        }
+        let target = object
+            .dictionary_entry(b"A")
+            .and_then(|value| value.reference());
 
         let Some(target) = target else {
             return Ok(());
@@ -1723,21 +1665,8 @@ fn reachable_dictionaries_with_type(
 ) -> Result<Vec<CowObjectHandle>> {
     let mut handles = Vec::new();
     document.walk_output_objects(|handle, object| {
-        let matches_type = match object {
-            CurrentObject::Source(HayroObject::Dict(dictionary)) => dictionary
-                .get::<HayroName<'_>>(b"Type")
-                .is_some_and(|name| name.as_ref() == object_type),
-            CurrentObject::Owned(OwnedObject::Dictionary(dictionary)) => {
-                let Some(value) = dictionary.get(b"Type".as_slice()) else {
-                    return Ok(());
-                };
-                matches!(
-                    document.resolve_owned_value(value)?,
-                    Some(OwnedObject::Name(name)) if name == object_type
-                )
-            }
-            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
-        };
+        let matches_type =
+            object.is_dictionary() && object.resolved_name_is(document, b"Type", object_type)?;
         if matches_type {
             handles.push(handle);
         }
@@ -2340,7 +2269,7 @@ fn appearance_dictionary_targets(
             match value {
                 OwnedObject::Reference(handle) => {
                     if document
-                        .current_object(*handle)?
+                        .current_value(*handle)?
                         .is_some_and(|object| object.is_dictionary())
                     {
                         targets.insert(DirectDictionaryTarget {
@@ -2465,7 +2394,7 @@ fn page_content_holders(
                                 continue;
                             };
                             if document
-                                .current_object(*stream)?
+                                .current_value(*stream)?
                                 .is_some_and(|object| object.is_stream())
                             {
                                 holders.push(PageContentHolder::Array(
@@ -2488,7 +2417,7 @@ fn page_content_holders(
                         continue;
                     };
                     if document
-                        .current_object(*stream)?
+                        .current_value(*stream)?
                         .is_some_and(|object| object.is_stream())
                     {
                         holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
@@ -2703,10 +2632,10 @@ mod tests {
             else {
                 return Err(crate::Error::Invalid("stream data was cloned".into()));
             };
-            let Some(CurrentObject::Owned(OwnedObject::Stream {
+            let Some(CurrentValue::Owned(OwnedObject::Stream {
                 data: StreamData::Owned(original),
                 ..
-            })) = overlay.current_object(handle)?
+            })) = overlay.current_value(handle)?
             else {
                 return Err(crate::Error::Invalid("missing overlay stream".into()));
             };
@@ -2761,7 +2690,7 @@ mod tests {
             else {
                 return Err(crate::Error::Invalid("expected borrowed dictionary".into()));
             };
-            let Some(CurrentObject::Owned(original)) = overlay.current_object(handle)? else {
+            let Some(CurrentValue::Owned(original)) = overlay.current_value(handle)? else {
                 return Err(crate::Error::Invalid("missing owned dictionary".into()));
             };
             assert!(std::ptr::eq(borrowed, original));
