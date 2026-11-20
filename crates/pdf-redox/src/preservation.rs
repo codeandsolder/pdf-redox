@@ -186,22 +186,40 @@ fn preservation_page_tree_targets(
     Ok((pages.into_iter().collect(), nodes.into_iter().collect()))
 }
 
-fn page_annotations(
-    document: &EditDocument,
+enum AnnotationEntries<'a> {
+    Array(CurrentArrayIter<'a>),
+    Malformed,
+}
+
+fn page_annotation_entries<'a>(
+    document: &'a EditDocument,
     page: &PreservationDictionaryTarget,
-) -> Result<Option<Vec<OwnedObject>>> {
+) -> Result<Option<AnnotationEntries<'a>>> {
     let Some(page_object) = preservation_target_view(document, page)? else {
         return Ok(None);
     };
     let Some(annots) = page_object.dictionary_entry(b"Annots") else {
         return Ok(None);
     };
-    let values = document
+    let entries = document
         .resolve_current_value(annots)?
         .and_then(|value| value.array_items())
-        .map(|items| items.map(|value| value.into_cow().into_owned()).collect())
-        .unwrap_or_default();
-    Ok(Some(values))
+        .map_or(AnnotationEntries::Malformed, AnnotationEntries::Array);
+    Ok(Some(entries))
+}
+
+fn page_annotations(
+    document: &EditDocument,
+    page: &PreservationDictionaryTarget,
+) -> Result<Option<Vec<OwnedObject>>> {
+    Ok(
+        page_annotation_entries(document, page)?.map(|entries| match entries {
+            AnnotationEntries::Array(items) => {
+                items.map(|value| value.into_cow().into_owned()).collect()
+            }
+            AnnotationEntries::Malformed => Vec::new(),
+        }),
+    )
 }
 
 fn replace_page_annotations(
@@ -220,11 +238,11 @@ fn replace_page_annotations(
     Ok(())
 }
 
-fn annotation_subtype(
+fn current_annotation_subtype(
     document: &EditDocument,
-    annotation: &OwnedObject,
+    annotation: CurrentValue<'_>,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(annotation) = document.resolve_current_value(CurrentValue::Owned(annotation))? else {
+    let Some(annotation) = document.resolve_current_value(annotation)? else {
         return Ok(None);
     };
     let Some(subtype) = annotation.dictionary_entry(b"Subtype") else {
@@ -233,6 +251,13 @@ fn annotation_subtype(
     Ok(document
         .resolve_current_value(subtype)?
         .and_then(|value| value.name().map(<[u8]>::to_vec)))
+}
+
+fn annotation_subtype(
+    document: &EditDocument,
+    annotation: &OwnedObject,
+) -> Result<Option<Vec<u8>>> {
+    current_annotation_subtype(document, CurrentValue::Owned(annotation))
 }
 
 fn annotation_is_protected(
@@ -253,16 +278,15 @@ fn annotation_subtypes(
 ) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for page in pages {
-        let Some(annotations) = page_annotations(document, page)? else {
+        let Some(entries) = page_annotation_entries(document, page)? else {
             continue;
         };
-        if annotations.is_empty() {
-            // A present Annots entry was already established above.
+        let AnnotationEntries::Array(annotations) = entries else {
             *counts.entry("(non-array /Annots)".to_owned()).or_default() += 1;
             continue;
-        }
+        };
         for annotation in annotations {
-            let label = annotation_subtype(document, &annotation)?.map_or_else(
+            let label = current_annotation_subtype(document, annotation)?.map_or_else(
                 || "(missing/non-name subtype)".to_owned(),
                 |name| format!("/{}", String::from_utf8_lossy(&name)),
             );
@@ -1209,8 +1233,8 @@ pub fn drop_page_thumbnails(
             root: CowObjectHandle::Existing(id),
             path: Vec::new(),
         };
-        if !preservation_target_view(document, &page)?
-            .is_some_and(|value| value.dictionary_entry(b"Thumb").is_some())
+        if preservation_target_view(document, &page)?
+            .is_none_or(|value| value.dictionary_entry(b"Thumb").is_none())
         {
             continue;
         }
@@ -1363,6 +1387,29 @@ mod tests {
         assert!(!dictionary.contains_key(b"Ignored".as_slice()));
         assert_eq!(spliced.get("/Wrapper -> /MediaBox"), Some(&1));
         assert_eq!(removed.get("/Wrapper"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn annotation_statistics_distinguish_empty_arrays_and_malformed_values() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /Annots [] >>")?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /Annots null >>")?;
+        pdf.object(
+            5,
+            b"<< /Type /Page /Parent 2 0 R /Annots [<< /Subtype /Text >>] >>",
+        )?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let (pages, _) = preservation_page_tree_targets(&document)?;
+        assert_eq!(
+            annotation_subtypes(&document, &pages)?,
+            BTreeMap::from([
+                ("(non-array /Annots)".to_owned(), 1),
+                ("/Text".to_owned(), 1),
+            ])
+        );
         Ok(())
     }
 
