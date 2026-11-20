@@ -1,5 +1,9 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+    direct_object::{
+        DirectArrayView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
+        object_at_direct_path_mut, walk_direct_object,
+    },
     source::{CurrentObject, owned_from_maybe_ref},
 };
 use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject, Rect};
@@ -182,36 +186,72 @@ const fn is_destination_mode(name: &[u8]) -> bool {
     )
 }
 
-fn rewrite_stale_page_destinations(
-    value: &mut OwnedObject,
-    redirects: &BTreeMap<ObjectHandle, ObjectHandle>,
-) -> usize {
-    let mut rewritten = 0usize;
-    match value {
-        OwnedObject::Array(values) => {
-            if values.len() >= 2
-                && let OwnedObject::Reference(target) = values[0]
-                && let OwnedObject::Name(mode) = &values[1]
-                && is_destination_mode(mode)
-                && let Some(canonical) = redirects.get(&target).copied()
-            {
-                values[0] = OwnedObject::Reference(canonical);
-                rewritten = rewritten.saturating_add(1);
-            }
-            for item in values {
-                rewritten =
-                    rewritten.saturating_add(rewrite_stale_page_destinations(item, redirects));
-            }
-        }
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            for item in dictionary.values_mut() {
-                rewritten =
-                    rewritten.saturating_add(rewrite_stale_page_destinations(item, redirects));
-            }
-        }
-        _ => {}
+struct DestinationEdit {
+    path: Vec<DirectPathStep>,
+    target: ObjectHandle,
+    canonical: ObjectHandle,
+}
+
+struct StaleDestinationVisitor<'a> {
+    redirects: &'a BTreeMap<ObjectHandle, ObjectHandle>,
+    edits: Vec<DestinationEdit>,
+}
+
+impl DirectObjectVisitor for StaleDestinationVisitor<'_> {
+    fn visit_source_stream_length(&self) -> bool {
+        false
     }
-    rewritten
+
+    fn visit_array(
+        &mut self,
+        _document: &EditDocument,
+        _root: ObjectHandle,
+        path: &[DirectPathStep],
+        array: DirectArrayView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        if let Some(target) = array.reference(0)
+            && let Some(&canonical) = self.redirects.get(&target)
+            && array.direct_name_matches(1, is_destination_mode)
+        {
+            self.edits.push(DestinationEdit {
+                path: path.to_vec(),
+                target,
+                canonical,
+            });
+        }
+        Ok(DirectWalkControl::Descend)
+    }
+}
+
+fn apply_destination_edits(
+    document: &mut EditDocument,
+    handle: ObjectHandle,
+    edits: Vec<DestinationEdit>,
+) -> Result<usize> {
+    if edits.is_empty() {
+        return Ok(0);
+    }
+    let object = document.edit_handle(handle)?;
+    let mut rewritten = 0usize;
+    for edit in edits {
+        let Some(OwnedObject::Array(values)) = object_at_direct_path_mut(object, &edit.path) else {
+            return Err(Error::Invalid(
+                "validated destination array disappeared".to_owned(),
+            ));
+        };
+        if let [OwnedObject::Reference(target), OwnedObject::Name(mode), ..] = values.as_mut_slice()
+            && *target == edit.target
+            && is_destination_mode(mode)
+        {
+            *target = edit.canonical;
+            rewritten += 1;
+        } else {
+            return Err(Error::Invalid(
+                "validated destination array changed".to_owned(),
+            ));
+        }
+    }
+    Ok(rewritten)
 }
 
 fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<usize> {
@@ -222,15 +262,30 @@ fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<u
     let handles = document.reachable_objects()?;
     let mut rewritten = 0usize;
     for handle in handles {
-        let Some(mut object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let count = rewrite_stale_page_destinations(&mut object, &redirects);
-        if count == 0 {
+        // The preceding reachability traversal already populated source
+        // adjacency. Skip unchanged source objects that cannot contain a
+        // candidate; owned objects are inspected directly, including their
+        // existing stream dictionary values.
+        if let ObjectHandle::Existing(id) = handle
+            && document.overlay().change(id).is_none()
+            && !document
+                .source()
+                .references(id)?
+                .into_iter()
+                .any(|reference| redirects.contains_key(&ObjectHandle::Existing(reference)))
+        {
             continue;
         }
-        *document.edit_handle(handle)? = object;
-        rewritten = rewritten.saturating_add(count);
+        let Some(object) = document.current_object(handle)? else {
+            continue;
+        };
+        let mut visitor = StaleDestinationVisitor {
+            redirects: &redirects,
+            edits: Vec::new(),
+        };
+        walk_direct_object(document, handle, object, &mut visitor)?;
+        rewritten =
+            rewritten.saturating_add(apply_destination_edits(document, handle, visitor.edits)?);
     }
     Ok(rewritten)
 }
@@ -1371,6 +1426,165 @@ mod tests {
         assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(8, 0))));
         assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0))));
         assert!(!reachable.contains(&ObjectHandle::Existing(crate::ObjectId::new(4, 0))));
+        Ok(())
+    }
+
+    fn mixed_destination_fixture() -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /OpenAction [9 0 R /Fit] /Private 5 0 R /Other 6 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Nested [[9 0 R /FitH 1] [9 0 R 7 0 R]] /NonDest [9 0 R /Other] /Length [9 0 R /Fit] >>")?;
+        pdf.object(6, b"<< /NonDest [9 0 R /Other] >>")?;
+        pdf.object(7, b"/Fit")?;
+        pdf.object(8, b"<< /Type /Pages /Kids [9 0 R] /Count 1 >>")?;
+        pdf.object(
+            9,
+            b"<< /Type /Page /Parent 8 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn stale_destination_edits_preserve_stream_payload_and_nonmatching_arrays() -> Result<()> {
+        let mut document = mixed_destination_fixture()?;
+
+        let payload = vec![42; 1024 * 1024];
+        let payload_ptr = payload.as_ptr();
+        let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary: OwnedDictionary::from([
+                (
+                    b"Dest".to_vec(),
+                    OwnedObject::Array(vec![
+                        OwnedObject::Reference(existing(9)),
+                        OwnedObject::Name(b"XYZ".to_vec()),
+                    ]),
+                ),
+                (b"Unchanged".to_vec(), OwnedObject::String(vec![1; 4096])),
+            ]),
+            data: crate::StreamData::Owned(payload),
+        }));
+        let Some(catalog) = document.edit_handle(existing(1))?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture catalog".to_owned()));
+        };
+        catalog.insert(b"Stream".to_vec(), OwnedObject::Reference(stream));
+        assert_eq!(canonicalize_stale_page_destinations(&mut document)?, 4);
+        let Some(object) = document.current_owned_object_cow(stream)? else {
+            return Err(Error::Invalid("missing fixture stream".to_owned()));
+        };
+        let OwnedObject::Stream {
+            dictionary,
+            data: crate::StreamData::Owned(bytes),
+        } = object.as_ref()
+        else {
+            return Err(Error::Invalid("wrong fixture stream".to_owned()));
+        };
+        assert_eq!(bytes.as_ptr(), payload_ptr);
+        assert!(matches!(
+            dictionary.get(b"Dest".as_slice()),
+            Some(OwnedObject::Array(values)) if values.first() == Some(&OwnedObject::Reference(existing(3)))
+        ));
+        let Some(private) = document.current_owned_object(existing(5))? else {
+            return Err(Error::Invalid("missing fixture private object".to_owned()));
+        };
+        let destination =
+            |path: &[DirectPathStep]| crate::direct_object::object_at_direct_path(&private, path);
+        for (path, target) in [
+            (
+                vec![
+                    DirectPathStep::DictKey(b"Nested".to_vec()),
+                    DirectPathStep::ArrayIndex(0),
+                    DirectPathStep::ArrayIndex(0),
+                ],
+                3,
+            ),
+            (
+                vec![
+                    DirectPathStep::DictKey(b"Nested".to_vec()),
+                    DirectPathStep::ArrayIndex(1),
+                    DirectPathStep::ArrayIndex(0),
+                ],
+                9,
+            ),
+            (
+                vec![
+                    DirectPathStep::DictKey(b"NonDest".to_vec()),
+                    DirectPathStep::ArrayIndex(0),
+                ],
+                9,
+            ),
+            (
+                vec![
+                    DirectPathStep::DictKey(b"Length".to_vec()),
+                    DirectPathStep::ArrayIndex(0),
+                ],
+                3,
+            ),
+        ] {
+            assert_eq!(
+                destination(&path),
+                Some(&OwnedObject::Reference(existing(target)))
+            );
+        }
+        assert!(
+            document
+                .overlay()
+                .change(crate::ObjectId::new(6, 0))
+                .is_none()
+        );
+        assert!(
+            document
+                .overlay()
+                .change(crate::ObjectId::new(4, 0))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_destination_visitor_handles_deep_owned_containers() -> Result<()> {
+        let document = stale_destination_fixture(false, b"Fit")?;
+        let redirects = BTreeMap::from([(existing(9), existing(3))]);
+        let mut visitor = StaleDestinationVisitor {
+            redirects: &redirects,
+            edits: Vec::new(),
+        };
+        let depth = 20_000;
+        let mut value = OwnedObject::Array(vec![
+            OwnedObject::Reference(existing(9)),
+            OwnedObject::Name(b"Fit".to_vec()),
+        ]);
+        for _ in 0..depth {
+            value = OwnedObject::Array(vec![value]);
+        }
+        walk_direct_object(
+            &document,
+            existing(1),
+            CurrentObject::Owned(&value),
+            &mut visitor,
+        )?;
+        assert_eq!(visitor.edits.len(), 1);
+        assert_eq!(visitor.edits[0].path.len(), depth);
+        assert!(
+            visitor.edits[0]
+                .path
+                .iter()
+                .all(|step| *step == DirectPathStep::ArrayIndex(0))
+        );
+        // Dismantle the synthetic deep value iteratively as well: its
+        // derived destructor is independent of the visitor's stack use.
+        for _ in 0..depth {
+            let OwnedObject::Array(mut children) = value else {
+                return Err(Error::Invalid("unexpected fixture shape".to_owned()));
+            };
+            value = children
+                .pop()
+                .ok_or_else(|| Error::Invalid("missing fixture child".to_owned()))?;
+        }
         Ok(())
     }
 

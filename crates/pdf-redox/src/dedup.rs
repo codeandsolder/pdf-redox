@@ -363,7 +363,7 @@ pub fn canonicalize_font_program_streams(
 
 use crate::direct_object::{
     DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
-    walk_direct_output_objects,
+    object_at_direct_path, object_at_direct_path_mut, walk_direct_output_objects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,22 +544,6 @@ pub fn canonicalize_icc_profiles(document: &mut EditDocument) -> Result<Targeted
     )
 }
 
-fn object_at_direct_path_mut<'a>(
-    mut object: &'a mut OwnedObject,
-    path: &[DirectPathStep],
-) -> Option<&'a mut OwnedObject> {
-    for step in path {
-        object = match step {
-            DirectPathStep::DictKey(key) => object.as_dictionary_mut()?.get_mut(key.as_slice())?,
-            DirectPathStep::ArrayIndex(index) => match object {
-                OwnedObject::Array(values) => values.get_mut(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(object)
-}
-
 /// Hayro/COW `ToUnicode` canonicalization.
 ///
 /// This deliberately walks the reachable Hayro graph rather than reproducing
@@ -581,22 +565,6 @@ struct HayroType3GlyphHolder {
     target: DirectDictionaryTarget,
     name: Vec<u8>,
     glyph: CowObjectHandle,
-}
-
-fn object_at_direct_path<'a>(
-    mut object: &'a OwnedObject,
-    path: &[DirectPathStep],
-) -> Option<&'a OwnedObject> {
-    for step in path {
-        object = match step {
-            DirectPathStep::DictKey(key) => object.as_dictionary()?.get(key.as_slice())?,
-            DirectPathStep::ArrayIndex(index) => match object {
-                OwnedObject::Array(values) => values.get(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(object)
 }
 
 struct Type3TargetVisitor<'a> {

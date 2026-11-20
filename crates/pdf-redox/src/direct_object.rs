@@ -13,6 +13,38 @@ pub enum DirectPathStep {
     ArrayIndex(usize),
 }
 
+pub fn object_at_direct_path_mut<'a>(
+    mut object: &'a mut OwnedObject,
+    path: &[DirectPathStep],
+) -> Option<&'a mut OwnedObject> {
+    for step in path {
+        object = match step {
+            DirectPathStep::DictKey(key) => object.as_dictionary_mut()?.get_mut(key.as_slice())?,
+            DirectPathStep::ArrayIndex(index) => match object {
+                OwnedObject::Array(values) => values.get_mut(*index)?,
+                _ => return None,
+            },
+        };
+    }
+    Some(object)
+}
+
+pub fn object_at_direct_path<'a>(
+    mut object: &'a OwnedObject,
+    path: &[DirectPathStep],
+) -> Option<&'a OwnedObject> {
+    for step in path {
+        object = match step {
+            DirectPathStep::DictKey(key) => object.as_dictionary()?.get(key.as_slice())?,
+            DirectPathStep::ArrayIndex(index) => match object {
+                OwnedObject::Array(values) => values.get(*index)?,
+                _ => return None,
+            },
+        };
+    }
+    Some(object)
+}
+
 #[derive(Clone, Copy)]
 pub enum DirectDictionaryView<'a, 'pdf> {
     Source(&'a HayroDict<'pdf>),
@@ -126,6 +158,20 @@ impl DirectArrayView<'_, '_> {
         }
     }
 
+    /// Match a directly stored name without resolving indirect references.
+    pub fn direct_name_matches(self, index: usize, predicate: impl FnOnce(&[u8]) -> bool) -> bool {
+        match self {
+            Self::Source(array) => match array.raw_iter().nth(index) {
+                Some(HayroMaybeRef::NotRef(HayroObject::Name(name))) => predicate(name.as_ref()),
+                _ => false,
+            },
+            Self::Owned(values) => match values.get(index) {
+                Some(OwnedObject::Name(name)) => predicate(name),
+                _ => false,
+            },
+        }
+    }
+
     pub fn reference(self, index: usize) -> Option<CowObjectHandle> {
         match self {
             Self::Source(array) => match array.raw_iter().nth(index) {
@@ -178,6 +224,13 @@ pub trait DirectObjectVisitor {
         Ok(())
     }
 
+    // The owned stream representation omits source /Length, which the
+    // writer generates. Visitors planning edits to that representation
+    // can opt out of visiting this source-only entry.
+    fn visit_source_stream_length(&self) -> bool {
+        true
+    }
+
     fn descend_dictionary_value(&self, _key: &[u8]) -> bool {
         true
     }
@@ -187,6 +240,7 @@ fn walk_source_direct_dictionary(
     document: &EditDocument,
     root: CowObjectHandle,
     dictionary: &HayroDict<'_>,
+    skip_length: bool,
     path: &mut Vec<DirectPathStep>,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {
@@ -201,6 +255,9 @@ fn walk_source_direct_dictionary(
     }
     for (name, value) in dictionary.entries() {
         let key = name.as_ref();
+        if skip_length && key == b"Length" {
+            continue;
+        }
         path.push(DirectPathStep::DictKey(key.to_vec()));
         match value {
             HayroMaybeRef::Ref(target) => {
@@ -225,10 +282,17 @@ fn walk_source_direct_object(
 ) -> Result<()> {
     match object {
         HayroObject::Dict(dictionary) => {
-            walk_source_direct_dictionary(document, root, dictionary, path, visitor)?;
+            walk_source_direct_dictionary(document, root, dictionary, false, path, visitor)?;
         }
         HayroObject::Stream(stream) => {
-            walk_source_direct_dictionary(document, root, stream.dict(), path, visitor)?;
+            walk_source_direct_dictionary(
+                document,
+                root,
+                stream.dict(),
+                !visitor.visit_source_stream_length(),
+                path,
+                visitor,
+            )?;
         }
         HayroObject::Array(array) => {
             if visitor.visit_array(document, root, path, DirectArrayView::Source(array))?
@@ -260,13 +324,39 @@ fn walk_source_direct_object(
     Ok(())
 }
 
-fn walk_owned_direct_object(
+// Keep only an iterator per active container, not a stack of all of
+// its children. The shared path tracks the exact pre-order traversal.
+enum OwnedDirectChildren<'a> {
+    Dictionary(std::collections::btree_map::Iter<'a, Vec<u8>, OwnedObject>),
+    Array(std::iter::Enumerate<std::slice::Iter<'a, OwnedObject>>),
+}
+
+impl<'a> OwnedDirectChildren<'a> {
+    fn next_child(
+        &mut self,
+        visitor: &impl DirectObjectVisitor,
+    ) -> Option<(DirectPathStep, &'a OwnedObject)> {
+        match self {
+            Self::Dictionary(entries) => entries
+                .find(|(name, value)| {
+                    matches!(value, OwnedObject::Reference(_))
+                        || visitor.descend_dictionary_value(name)
+                })
+                .map(|(name, value)| (DirectPathStep::DictKey(name.clone()), value)),
+            Self::Array(entries) => entries
+                .next()
+                .map(|(index, value)| (DirectPathStep::ArrayIndex(index), value)),
+        }
+    }
+}
+
+fn visit_owned_direct_object<'a>(
     document: &EditDocument,
     root: CowObjectHandle,
-    object: &OwnedObject,
-    path: &mut Vec<DirectPathStep>,
+    object: &'a OwnedObject,
+    path: &[DirectPathStep],
     visitor: &mut impl DirectObjectVisitor,
-) -> Result<()> {
+) -> Result<Option<OwnedDirectChildren<'a>>> {
     match object {
         OwnedObject::Reference(target) => visitor.visit_reference(root, path, *target)?,
         OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
@@ -275,55 +365,69 @@ fn walk_owned_direct_object(
                 root,
                 path,
                 DirectDictionaryView::Owned(dictionary),
-            )? == DirectWalkControl::SkipChildren
+            )? == DirectWalkControl::Descend
             {
-                return Ok(());
-            }
-            for (name, value) in dictionary {
-                path.push(DirectPathStep::DictKey(name.clone()));
-                if matches!(value, OwnedObject::Reference(_))
-                    || visitor.descend_dictionary_value(name)
-                {
-                    walk_owned_direct_object(document, root, value, path, visitor)?;
-                }
-                path.pop();
+                return Ok(Some(OwnedDirectChildren::Dictionary(dictionary.iter())));
             }
         }
         OwnedObject::Array(values) => {
             if visitor.visit_array(document, root, path, DirectArrayView::Owned(values))?
-                == DirectWalkControl::SkipChildren
+                == DirectWalkControl::Descend
             {
-                return Ok(());
-            }
-            for (index, value) in values.iter().enumerate() {
-                path.push(DirectPathStep::ArrayIndex(index));
-                walk_owned_direct_object(document, root, value, path, visitor)?;
-                path.pop();
+                return Ok(Some(OwnedDirectChildren::Array(values.iter().enumerate())));
             }
         }
-        OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn walk_owned_direct_object(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    object: &OwnedObject,
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
+    let mut path = Vec::new();
+    let Some(children) = visit_owned_direct_object(document, root, object, &path, visitor)? else {
+        return Ok(());
+    };
+    let mut frames = vec![children];
+    while let Some(frame) = frames.last_mut() {
+        if let Some((step, child)) = frame.next_child(visitor) {
+            path.push(step);
+            if let Some(children) =
+                visit_owned_direct_object(document, root, child, &path, visitor)?
+            {
+                frames.push(children);
+            } else {
+                path.pop();
+            }
+        } else {
+            frames.pop();
+            path.pop();
+        }
     }
     Ok(())
+}
+
+pub fn walk_direct_object(
+    document: &EditDocument,
+    root: CowObjectHandle,
+    object: CurrentObject<'_>,
+    visitor: &mut impl DirectObjectVisitor,
+) -> Result<()> {
+    match object {
+        CurrentObject::Source(object) => {
+            walk_source_direct_object(document, root, &object, &mut Vec::new(), visitor)
+        }
+        CurrentObject::Owned(object) => walk_owned_direct_object(document, root, object, visitor),
+    }
 }
 
 pub fn walk_direct_output_objects(
     document: &EditDocument,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {
-    document.walk_output_objects(|root, object| {
-        match object {
-            CurrentObject::Source(object) => {
-                walk_source_direct_object(document, root, &object, &mut Vec::new(), visitor)?;
-            }
-            CurrentObject::Owned(object) => {
-                walk_owned_direct_object(document, root, object, &mut Vec::new(), visitor)?;
-            }
-        }
-        Ok(())
-    })
+    document.walk_output_objects(|root, object| walk_direct_object(document, root, object, visitor))
 }
