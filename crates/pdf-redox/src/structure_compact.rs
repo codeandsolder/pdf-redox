@@ -5,9 +5,9 @@ use crate::{
         DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep,
         DirectWalkControl, object_at_direct_path_mut, walk_direct_object,
     },
-    source::{CurrentObject, PAGE_INHERITABLE_KEYS, owned_from_maybe_ref},
+    source::{CurrentArrayIter, CurrentValue, PAGE_INHERITABLE_KEYS, owned_from_maybe_ref},
 };
-use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject, Rect};
+use hayro_syntax::object::{Dict as HayroDict, Object as HayroObject, Rect};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_TREE_FANOUT: usize = 256;
@@ -112,27 +112,13 @@ fn source_page_identity(
 
 fn reachable_page_dictionaries(document: &EditDocument) -> Result<Vec<ObjectHandle>> {
     let mut pages = Vec::new();
-    document.walk_output_objects(|handle, object| {
-        let is_page = match object {
-            CurrentObject::Source(HayroObject::Dict(dictionary)) => dictionary
-                .get::<HayroName<'_>>(b"Type")
-                .is_some_and(|name| name.as_ref() == b"Page"),
-            CurrentObject::Owned(OwnedObject::Dictionary(dictionary)) => {
-                let Some(kind) = dictionary.get(b"Type".as_slice()) else {
-                    return Ok(());
-                };
-                matches!(
-                    document.resolve_owned_value(kind)?,
-                    Some(OwnedObject::Name(name)) if name == b"Page"
-                )
-            }
-            CurrentObject::Source(_) | CurrentObject::Owned(_) => false,
-        };
-        if is_page {
+    for handle in document.reachable_output_objects()? {
+        if let Some(object) = document.current_value(handle)?
+            && page_tree_node_kind(document, &object)? == Some(PageTreeNodeKind::Leaf)
+        {
             pages.push(handle);
         }
-        Ok(())
-    })?;
+    }
     Ok(pages)
 }
 
@@ -355,14 +341,20 @@ enum PageTreeNodeKind {
 
 fn page_tree_node_kind(
     document: &EditDocument,
-    dictionary: &OwnedDictionary,
+    dictionary: &CurrentValue<'_>,
 ) -> Result<Option<PageTreeNodeKind>> {
-    let Some(kind) = dictionary.get(b"Type".as_slice()) else {
+    if !dictionary.is_dictionary() {
+        return Ok(None);
+    }
+    let Some(kind) = dictionary.dictionary_entry(b"Type") else {
         return Ok(None);
     };
-    Ok(match document.resolve_owned_value(kind)? {
-        Some(OwnedObject::Name(name)) if name == b"Pages" => Some(PageTreeNodeKind::Branch),
-        Some(OwnedObject::Name(name)) if name == b"Page" => Some(PageTreeNodeKind::Leaf),
+    let Some(kind) = document.resolve_current_value(kind)? else {
+        return Ok(None);
+    };
+    Ok(match kind.name() {
+        Some(b"Pages") => Some(PageTreeNodeKind::Branch),
+        Some(b"Page") => Some(PageTreeNodeKind::Leaf),
         _ => None,
     })
 }
@@ -402,37 +394,29 @@ struct PageTreeLeaf {
 // every path beneath each /Pages node. Keep only the small per-node state
 // on the heap; recursive page-tree traversal can overflow the thread stack
 // even when the source parser accepts every individual dictionary.
-struct PageTreePruneFrame {
+struct PageTreePruneFrame<'a> {
     node: ObjectHandle,
     defined: [bool; PAGE_INHERITABLE_KEYS.len()],
     nearest_owners: InheritedOwners,
-    kids: Vec<ObjectHandle>,
-    next_child: usize,
+    kids: CurrentArrayIter<'a>,
+    has_children: bool,
     covered_by_children: [bool; PAGE_INHERITABLE_KEYS.len()],
 }
 
-impl PageTreePruneFrame {
+impl<'a> PageTreePruneFrame<'a> {
     fn new(
-        document: &EditDocument,
+        document: &'a EditDocument,
         node: ObjectHandle,
-        dictionary: &OwnedDictionary,
+        dictionary: &CurrentValue<'a>,
         inherited_from: InheritedOwners,
     ) -> Result<Option<Self>> {
-        let Some(kids) = dictionary.get(b"Kids".as_slice()) else {
+        let Some(kids) = dictionary.dictionary_entry(b"Kids") else {
             return Ok(None);
         };
-        let resolved = document.resolve_owned_value_cow(kids)?;
-        let Some(OwnedObject::Array(kids)) = resolved.as_deref() else {
+        let Some(kids) = document.resolve_current_value(kids)? else {
             return Ok(None);
         };
-        let Some(kids) = kids
-            .iter()
-            .map(|kid| match kid {
-                OwnedObject::Reference(handle) => Some(*handle),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
+        let Some(kids) = kids.array_items() else {
             return Ok(None);
         };
         let defined = document.effective_page_inheritance_mask(dictionary)?;
@@ -441,7 +425,7 @@ impl PageTreePruneFrame {
             defined,
             nearest_owners: nearest_page_tree_owners(node, defined, inherited_from),
             kids,
-            next_child: 0,
+            has_children: false,
             covered_by_children: [true; PAGE_INHERITABLE_KEYS.len()],
         }))
     }
@@ -458,10 +442,10 @@ impl PageTreePruneFrame {
     ) -> [bool; PAGE_INHERITABLE_KEYS.len()] {
         // A /Pages node with no kids proves nothing about descendant
         // coverage, and its own keys must not be pruned.
-        let covered_below = if self.kids.is_empty() {
-            [false; PAGE_INHERITABLE_KEYS.len()]
-        } else {
+        let covered_below = if self.has_children {
             self.covered_by_children
+        } else {
+            [false; PAGE_INHERITABLE_KEYS.len()]
         };
         let remove = PAGE_INHERITABLE_KEYS
             .into_iter()
@@ -478,30 +462,29 @@ impl PageTreePruneFrame {
 
 fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     let catalog = ObjectHandle::Existing(document.source().catalog_id());
-    let Some(catalog) = current_dictionary(document, catalog)? else {
+    let Some(catalog) = document.current_value(catalog)? else {
         return Ok(None);
     };
-    let Some(root) = dictionary_reference(&catalog, b"Pages") else {
+    let Some(root) = catalog
+        .dictionary_entry(b"Pages")
+        .and_then(|value| value.reference())
+    else {
         return Ok(None);
     };
-    let Some(root_object) = document.current_owned_object_cow(root)? else {
+    let Some(root_dictionary) = document.current_value(root)? else {
         return Ok(None);
     };
-    let OwnedObject::Dictionary(root_dictionary) = root_object.as_ref() else {
-        return Ok(None);
-    };
-    if page_tree_node_kind(document, root_dictionary)? != Some(PageTreeNodeKind::Branch)
-        || !matches!(
-            root_dictionary.get(b"Parent".as_slice()),
-            None | Some(OwnedObject::Null)
-        )
+    if page_tree_node_kind(document, &root_dictionary)? != Some(PageTreeNodeKind::Branch)
+        || root_dictionary
+            .dictionary_entry(b"Parent")
+            .is_some_and(|value| !value.is_null())
     {
         return Ok(None);
     }
     let Some(root_frame) = PageTreePruneFrame::new(
         document,
         root,
-        root_dictionary,
+        &root_dictionary,
         [None; PAGE_INHERITABLE_KEYS.len()],
     )?
     else {
@@ -517,25 +500,29 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
     let mut pending = vec![root_frame];
 
     while let Some(frame) = pending.last_mut() {
-        if let Some(&kid) = frame.kids.get(frame.next_child) {
-            frame.next_child += 1;
+        if let Some(kid) = frame.kids.next() {
+            let Some(kid) = kid.reference() else {
+                return Ok(None);
+            };
+            frame.has_children = true;
             // The two directions of the page tree must agree before we can
             // infer inheritance from /Kids or change a page's /Parent.
             if plan.owners.contains_key(&kid) {
                 return Ok(None);
             }
-            let Some(child) = document.current_owned_object_cow(kid)? else {
+            let Some(child) = document.current_value(kid)? else {
                 return Ok(None);
             };
-            let OwnedObject::Dictionary(child) = child.as_ref() else {
-                return Ok(None);
-            };
-            if dictionary_reference(child, b"Parent") != Some(frame.node) {
+            if child
+                .dictionary_entry(b"Parent")
+                .and_then(|value| value.reference())
+                != Some(frame.node)
+            {
                 return Ok(None);
             }
-            match page_tree_node_kind(document, child)? {
+            match page_tree_node_kind(document, &child)? {
                 Some(PageTreeNodeKind::Leaf) => {
-                    let defined = document.effective_page_inheritance_mask(child)?;
+                    let defined = document.effective_page_inheritance_mask(&child)?;
                     plan.pages.push(PageTreeLeaf {
                         handle: kid,
                         inherited_from: std::array::from_fn(|index| {
@@ -554,7 +541,7 @@ fn plan_page_tree(document: &EditDocument) -> Result<Option<PageTreePlan>> {
                 }
                 Some(PageTreeNodeKind::Branch) => {
                     let Some(child_frame) =
-                        PageTreePruneFrame::new(document, kid, child, frame.nearest_owners)?
+                        PageTreePruneFrame::new(document, kid, &child, frame.nearest_owners)?
                     else {
                         return Ok(None);
                     };
@@ -676,51 +663,51 @@ fn rebuild_compact_page_tree_levels(
     Ok(level)
 }
 
-// The validated traversal already knows the nearest effective definitions.
-// Materialize each referenced ancestor once, before changing anything.
+// The validated traversal established each leaf's effective owners. Cache a
+// lazy ancestor view and materialize only keys that will actually be copied.
+struct InheritanceOwner<'a> {
+    object: CurrentValue<'a>,
+    values: [Option<std::borrow::Cow<'a, OwnedObject>>; PAGE_INHERITABLE_KEYS.len()],
+}
+
 fn materialize_page_inheritance(
     document: &EditDocument,
     pages: &[PageTreeLeaf],
 ) -> Result<Vec<(ObjectHandle, OwnedDictionary)>> {
-    let mut cached = BTreeMap::<ObjectHandle, OwnedDictionary>::new();
+    let mut cached = BTreeMap::<ObjectHandle, InheritanceOwner<'_>>::new();
     let mut result = Vec::with_capacity(pages.len());
     for page in pages {
         let mut values = OwnedDictionary::new();
-        for (key, owner) in PAGE_INHERITABLE_KEYS.into_iter().zip(page.inherited_from) {
+        for (index, owner) in page.inherited_from.into_iter().enumerate() {
             let Some(owner) = owner else {
                 continue;
             };
-            let dictionary = match cached.entry(owner) {
+            let ancestor = match cached.entry(owner) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    let Some(object) = document.current_owned_object_cow(owner)? else {
+                    let Some(object) = document.current_value(owner)? else {
                         return Err(Error::Invalid(
                             "validated inheritance owner disappeared".to_owned(),
                         ));
                     };
-                    let Some(dictionary) = object.as_dictionary() else {
-                        return Err(Error::Invalid(
-                            "validated inheritance owner is not a dictionary".to_owned(),
-                        ));
-                    };
-                    entry.insert(
-                        PAGE_INHERITABLE_KEYS
-                            .into_iter()
-                            .filter_map(|key| {
-                                dictionary
-                                    .get(key)
-                                    .map(|value| (key.to_vec(), value.clone()))
-                            })
-                            .collect(),
-                    )
+                    entry.insert(InheritanceOwner {
+                        object,
+                        values: std::array::from_fn(|_| None),
+                    })
                 }
             };
-            let Some(value) = dictionary.get(key) else {
-                return Err(Error::Invalid(
-                    "validated inherited value disappeared".to_owned(),
-                ));
+            let key = PAGE_INHERITABLE_KEYS[index];
+            let value = if let Some(value) = &ancestor.values[index] {
+                value
+            } else {
+                let Some(value) = ancestor.object.dictionary_entry(key) else {
+                    return Err(Error::Invalid(
+                        "validated inherited value disappeared".to_owned(),
+                    ));
+                };
+                ancestor.values[index].insert(value.into_cow())
             };
-            values.insert(key.to_vec(), value.clone());
+            values.insert(key.to_vec(), value.as_ref().clone());
         }
         result.push((page.handle, values));
     }
@@ -767,18 +754,9 @@ impl DirectObjectVisitor for ExternalParentVisitor<'_> {
                 if needed[index].is_none() {
                     continue;
                 }
-                let effective = match dictionary {
-                    DirectDictionaryView::Owned(dictionary) => match dictionary.get(key) {
-                        Some(value) => document.effective_page_inherited_value(key, value)?,
-                        None => false,
-                    },
-                    DirectDictionaryView::Source(dictionary) => match dictionary
-                        .get_raw::<HayroObject<'_>>(key)
-                    {
-                        Some(value) => document
-                            .effective_page_inherited_value(key, &owned_from_maybe_ref(value))?,
-                        None => false,
-                    },
+                let effective = match dictionary.raw_value(key) {
+                    Some(value) => document.effective_page_value(key, value)?,
+                    None => false,
                 };
                 if effective {
                     needed[index] = None;
@@ -2099,7 +2077,7 @@ mod tests {
         walk_direct_object(
             &document,
             existing(1),
-            CurrentObject::Owned(&value),
+            crate::source::CurrentObject::Owned(&value),
             &mut visitor,
         )?;
         assert_eq!(visitor.edits.len(), 1);
@@ -2120,6 +2098,32 @@ mod tests {
                 .pop()
                 .ok_or_else(|| Error::Invalid("missing fixture child".to_owned()))?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_plan_reads_current_indirect_branch_type_and_kids() -> Result<()> {
+        let mut document = ordered_page_tree_fixture()?;
+        assert!(plan_page_tree(&document)?.is_some());
+        *document.edit_handle(existing(8))? =
+            OwnedObject::Array(vec![OwnedObject::Reference(existing(6)), OwnedObject::Null]);
+        assert!(plan_page_tree(&document)?.is_none());
+        *document.edit_handle(existing(8))? =
+            OwnedObject::Array(vec![OwnedObject::Reference(existing(6))]);
+        assert!(plan_page_tree(&document)?.is_some());
+        *document.edit_handle(existing(7))? = OwnedObject::Name(b"Page".to_vec());
+        let Some(plan) = plan_page_tree(&document)? else {
+            return Err(Error::Invalid(
+                "missing plan for changed branch type".to_owned(),
+            ));
+        };
+        assert_eq!(
+            plan.pages
+                .iter()
+                .map(|page| page.handle)
+                .collect::<Vec<_>>(),
+            vec![existing(5), existing(4)]
+        );
         Ok(())
     }
 
