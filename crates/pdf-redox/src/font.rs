@@ -10,9 +10,9 @@ use crate::{
         DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
         walk_direct_output_objects,
     },
-    source::CurrentObject,
+    source::CurrentValue,
 };
-use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Name as HayroName, Object as HayroObject};
+use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Object as HayroObject};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -415,28 +415,11 @@ struct IncomingReferenceOwners {
 fn incoming_reference_owners(document: &EditDocument) -> Result<IncomingReferenceOwners> {
     let roots = document.output_roots().into_iter().collect::<BTreeSet<_>>();
     let mut incoming = HashMap::<CowObjectHandle, BTreeSet<CowObjectHandle>>::new();
-    document.walk_output_objects(|owner, object| {
-        let references = match object {
-            CurrentObject::Source(_) => {
-                let CowObjectHandle::Existing(id) = owner else {
-                    return Err(Error::Invalid(
-                        "source object unexpectedly has a new-object handle".to_owned(),
-                    ));
-                };
-                document
-                    .source()
-                    .references(id)?
-                    .into_iter()
-                    .map(CowObjectHandle::Existing)
-                    .collect::<Vec<_>>()
-            }
-            CurrentObject::Owned(object) => object.references(),
-        };
-        for target in references {
+    for owner in document.reachable_output_objects()? {
+        for target in document.references_for_handle(owner)? {
             incoming.entry(target).or_default().insert(owner);
         }
-        Ok(())
-    })?;
+    }
     Ok(IncomingReferenceOwners {
         owners: incoming,
         roots,
@@ -1497,42 +1480,24 @@ impl FontUsageAccumulator {
 }
 
 fn form_xobject_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
-    let mut forms = Vec::new();
-    document.walk_output_objects(|handle, object| {
-        let subtype = match object {
-            CurrentObject::Source(HayroObject::Stream(stream)) => stream
-                .dict()
-                .get::<HayroName<'_>>(b"Subtype")
-                .map(|name| name.as_ref().to_vec()),
-            CurrentObject::Owned(OwnedObject::Stream { dictionary, .. }) => {
-                resolved_name(document, dictionary.get(b"Subtype".as_slice()))?
-            }
-            _ => None,
-        };
-        if subtype.as_deref() == Some(b"Form") {
-            forms.push(handle);
-        }
-        Ok(())
-    })?;
-    Ok(forms)
+    document.reachable_streams_with_subtype(b"Form")
 }
 
 fn tiling_pattern_handles(document: &EditDocument) -> Result<Vec<CowObjectHandle>> {
     let mut patterns = Vec::new();
     for handle in document.reachable_streams()? {
-        let Some(object) = document.current_owned_object_cow(handle)? else {
+        let Some(object) = document.current_value(handle)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
-            continue;
-        };
-        let Some(pattern_type) = dictionary.get(b"PatternType".as_slice()) else {
-            continue;
-        };
-        if matches!(
-            document.resolve_owned_value(pattern_type)?,
-            Some(OwnedObject::Integer(1))
-        ) {
+        if object.is_stream()
+            && matches!(
+                object
+                    .resolved_entry(document, b"PatternType")?
+                    .map(CurrentValue::into_cow)
+                    .as_deref(),
+                Some(OwnedObject::Integer(1))
+            )
+        {
             patterns.push(handle);
         }
     }
@@ -1862,7 +1827,7 @@ impl DirectObjectVisitor for FontUsageGraphVisitor<'_> {
             match dictionary.reference(b"CIDToGIDMap") {
                 Some(map)
                     if document
-                        .current_object(map)?
+                        .current_value(map)?
                         .is_some_and(|object| object.is_stream()) =>
                 {
                     entry.maps.insert(map);
@@ -1983,7 +1948,7 @@ fn collect_dense_cidfont_users_from_object(
                 match dictionary.get(b"CIDToGIDMap".as_slice()) {
                     Some(OwnedObject::Reference(map))
                         if document
-                            .current_object(*map)?
+                            .current_value(*map)?
                             .is_some_and(|object| object.is_stream()) =>
                     {
                         entry.maps.insert(*map);
@@ -2835,10 +2800,10 @@ mod tests {
             else {
                 return Err(Error::Invalid("font stream was cloned".into()));
             };
-            let Some(CurrentObject::Owned(OwnedObject::Stream {
+            let Some(CurrentValue::Owned(OwnedObject::Stream {
                 data: StreamData::Owned(original),
                 ..
-            })) = overlay.current_object(handle)?
+            })) = overlay.current_value(handle)?
             else {
                 return Err(Error::Invalid("overlay font stream missing".into()));
             };

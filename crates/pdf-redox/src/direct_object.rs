@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    source::{CurrentObject, CurrentValue},
+    source::CurrentValue,
 };
 use hayro_syntax::object::{
     Array as HayroArray, Dict as HayroDict, MaybeRef as HayroMaybeRef, Object as HayroObject,
@@ -388,14 +388,17 @@ fn walk_owned_direct_object(
 pub fn walk_direct_object(
     document: &EditDocument,
     root: CowObjectHandle,
-    object: CurrentObject<'_>,
+    object: CurrentValue<'_>,
     visitor: &mut impl DirectObjectVisitor,
 ) -> Result<()> {
     match object {
-        CurrentObject::Source(object) => {
+        CurrentValue::Source(HayroMaybeRef::NotRef(object), _) => {
             walk_source_direct_object(document, root, &object, &mut Vec::new(), visitor)
         }
-        CurrentObject::Owned(object) => walk_owned_direct_object(document, root, object, visitor),
+        CurrentValue::Source(HayroMaybeRef::Ref(reference), _) => {
+            visitor.visit_reference(root, &[], CowObjectHandle::Existing(reference.into()))
+        }
+        CurrentValue::Owned(object) => walk_owned_direct_object(document, root, object, visitor),
     }
 }
 

@@ -172,8 +172,8 @@ impl UnfilteredFlateCandidate {
         match &self.raw {
             UnfilteredFlateInput::Source(id) => document.source().stream_data(*id),
             UnfilteredFlateInput::Decrypted(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
-            UnfilteredFlateInput::Overlay(handle) => match document.current_object(*handle)? {
-                Some(crate::source::CurrentObject::Owned(crate::OwnedObject::Stream {
+            UnfilteredFlateInput::Overlay(handle) => match document.current_value(*handle)? {
+                Some(crate::source::CurrentValue::Owned(crate::OwnedObject::Stream {
                     data,
                     ..
                 })) => data.bytes(document.source()),
@@ -705,10 +705,10 @@ mod tests {
         assert!(
             matches!(&candidate.raw, UnfilteredFlateInput::Overlay(raw_handle) if *raw_handle == handle)
         );
-        let Some(crate::source::CurrentObject::Owned(OwnedObject::Stream {
+        let Some(crate::source::CurrentValue::Owned(OwnedObject::Stream {
             data: StreamData::Owned(bytes),
             ..
-        })) = document.current_object(handle)?
+        })) = document.current_value(handle)?
         else {
             return Err(crate::Error::Invalid("missing owned overlay bytes".into()));
         };
