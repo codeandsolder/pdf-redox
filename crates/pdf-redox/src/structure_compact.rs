@@ -1357,17 +1357,16 @@ mod tests {
     fn stale_page_destination_map(
         document: &EditDocument,
     ) -> Result<BTreeMap<ObjectHandle, ObjectHandle>> {
-        match plan_page_tree(document)? {
-            Some(plan) => stale_page_destination_map_from_plan(document, &plan),
-            None => Ok(BTreeMap::new()),
-        }
+        plan_page_tree(document)?.map_or_else(
+            || Ok(BTreeMap::new()),
+            |plan| stale_page_destination_map_from_plan(document, &plan),
+        )
     }
 
     fn canonicalize_stale_page_destinations(document: &mut EditDocument) -> Result<usize> {
-        match plan_page_tree(document)? {
-            Some(plan) => canonicalize_stale_page_destinations_from_plan(document, &plan),
-            None => Ok(0),
-        }
+        plan_page_tree(document)?.map_or(Ok(0), |plan| {
+            canonicalize_stale_page_destinations_from_plan(document, &plan)
+        })
     }
 
     fn compact_page_tree(
@@ -2402,12 +2401,14 @@ mod tests {
     fn name_tree_inlining_edits_only_changed_leaves() -> Result<()> {
         let mut document = destination_tree_fixture(&[33, 32])?;
         let mut stats = StructureCompactionStats::default();
-        compact_catalog_name_trees(&mut document, &mut stats)?;
+        assert!(compact_catalog_name_trees(&mut document, &mut stats)?);
         assert_eq!(stats.name_tree_nodes_before, 3);
         assert_eq!(stats.name_tree_nodes_after, 3);
         assert_eq!(stats.name_trees_repacked, 0);
         assert_eq!(stats.named_destination_arrays_inlined, 1);
         assert_eq!(stats.named_destination_wrappers_inlined, 1);
+        let mut second = StructureCompactionStats::default();
+        assert!(!compact_catalog_name_trees(&mut document, &mut second)?);
         assert!(
             document
                 .overlay()
