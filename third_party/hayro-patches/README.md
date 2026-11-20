@@ -18,11 +18,16 @@ third_party/hayro-patches/refresh.sh /path/to/hayro
 third_party/hayro-patches/refresh.sh /path/to/hayro --check
 ```
 
-Update the pin, rebase the numbered patches, and update the sibling codec revisions
+Update the pin (including the workspace's Git dependency), rebase the numbered patches, and update the sibling codec revisions
 in the standalone manifest patch together. Do not hand-edit generated files without
 updating the corresponding patch. Run the Hayro syntax regressions in the rebased
 upstream checkout and pdf-redox's native and WASM checks before committing an update.
-The Cargo build needs no patch application step.
+The root manifest declares Hayro directly from upstream at the pinned revision.
+Cargo's `[patch."https://github.com/LaurenzV/hayro"]` selects the local
+syntax snapshot instead. The independent fuzz workspace declares the same
+override, since Cargo does not propagate patches from dependencies. Any external
+workspace consuming pdf-redox must likewise declare the override until upstream
+provides the required APIs. The Cargo build needs no patch application step.
 
 The reusable API series is published at
 https://github.com/codeandsolder/hayro/tree/upstream/pdf-redox-apis-20261120
