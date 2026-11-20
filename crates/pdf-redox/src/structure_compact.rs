@@ -1,18 +1,15 @@
 use crate::{
-    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, source::CurrentObject,
+    EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
+    source::{CurrentObject, owned_from_maybe_ref},
 };
-use hayro_syntax::object::{Name as HayroName, Object as HayroObject};
+use hayro_syntax::object::{Dict as HayroDict, Name as HayroName, Object as HayroObject, Rect};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_TREE_FANOUT: usize = 256;
 const NAME_TREE_FANOUT: usize = 64;
 const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
-const PAGE_IDENTITY_KEYS: [&[u8]; 10] = [
+const PAGE_LOCAL_IDENTITY_KEYS: [&[u8]; 6] = [
     b"Contents",
-    b"Resources",
-    b"MediaBox",
-    b"CropBox",
-    b"Rotate",
     b"UserUnit",
     b"Group",
     b"BleedBox",
@@ -36,23 +33,79 @@ pub struct StructureCompactionStats {
     pub stale_page_destination_references_rewritten: usize,
 }
 
+#[derive(PartialEq)]
+struct SourcePageIdentity {
+    local: [Option<OwnedObject>; PAGE_LOCAL_IDENTITY_KEYS.len()],
+    inherited: [Option<OwnedObject>; PAGE_INHERITABLE_KEYS.len()],
+}
+
+fn take_inherited_page_keys(
+    dictionary: &HayroDict<'_>,
+    inherited: &mut [Option<OwnedObject>; PAGE_INHERITABLE_KEYS.len()],
+) {
+    for (key, value) in PAGE_INHERITABLE_KEYS.into_iter().zip(inherited) {
+        if value.is_some() {
+            continue;
+        }
+        // Match the source reader's typed lookups, including inheritance
+        // past direct/indirect nulls and invalid values. Retain the raw COS
+        // value for conservative identity comparison, not its dereferenced
+        // object graph (in particular, resource dictionaries).
+        let valid = match key {
+            b"Resources" => dictionary.get::<HayroDict<'_>>(key).is_some(),
+            b"MediaBox" | b"CropBox" => dictionary.get::<Rect>(key).is_some(),
+            b"Rotate" => dictionary.get::<i32>(key).is_some(),
+            _ => false,
+        };
+        if valid {
+            *value = dictionary
+                .get_raw::<HayroObject<'_>>(key)
+                .map(owned_from_maybe_ref);
+        }
+    }
+}
+
 fn source_page_identity(
     document: &EditDocument,
     page: ObjectHandle,
-) -> Result<Option<Vec<Option<OwnedObject>>>> {
+) -> Result<Option<SourcePageIdentity>> {
     let ObjectHandle::Existing(id) = page else {
         return Ok(None);
     };
-    let object = document.source().materialize(id)?;
-    let Some(dictionary) = object.as_dictionary() else {
+    let HayroObject::Dict(mut dictionary) = document.source().object(id)? else {
         return Ok(None);
     };
-    Ok(Some(
-        PAGE_IDENTITY_KEYS
-            .into_iter()
-            .map(|key| dictionary.get(key).cloned())
-            .collect(),
-    ))
+    // Compare the original page appearance, not the edited overlay: earlier
+    // optimization passes may already have changed its contents or resources.
+    // Read only identity keys rather than materializing full page dictionaries.
+    let local = PAGE_LOCAL_IDENTITY_KEYS.map(|key| {
+        dictionary
+            .get_raw::<HayroObject<'_>>(key)
+            .map(owned_from_maybe_ref)
+    });
+    let mut inherited = std::array::from_fn(|_| None);
+    let mut seen = BTreeSet::from([id]);
+    loop {
+        take_inherited_page_keys(&dictionary, &mut inherited);
+        if inherited.iter().all(Option::is_some) {
+            break;
+        }
+
+        let parent = match dictionary.get_raw::<HayroObject<'_>>(b"Parent") {
+            None | Some(hayro_syntax::object::MaybeRef::NotRef(HayroObject::Null(_))) => break,
+            Some(hayro_syntax::object::MaybeRef::Ref(parent)) => <crate::ObjectId>::from(parent),
+            _ => return Ok(None),
+        };
+        if !seen.insert(parent) {
+            return Ok(None);
+        }
+        dictionary = match document.source().object(parent) {
+            Ok(HayroObject::Dict(dictionary)) => dictionary,
+            Ok(_) | Err(Error::MissingSourceObject { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(Some(SourcePageIdentity { local, inherited }))
 }
 
 fn reachable_page_dictionaries(document: &EditDocument) -> Result<Vec<ObjectHandle>> {
@@ -88,6 +141,14 @@ fn stale_page_destination_map(
         .page_handles()?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let stale_pages = reachable_page_dictionaries(document)?
+        .into_iter()
+        .filter(|handle| !live_pages.contains(handle))
+        .collect::<Vec<_>>();
+    if stale_pages.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
     let mut live_identities = Vec::new();
     for &page in &live_pages {
         if let Some(identity) = source_page_identity(document, page)? {
@@ -96,10 +157,7 @@ fn stale_page_destination_map(
     }
 
     let mut redirects = BTreeMap::new();
-    for handle in reachable_page_dictionaries(document)? {
-        if live_pages.contains(&handle) {
-            continue;
-        }
+    for handle in stale_pages {
         let Some(identity) = source_page_identity(document, handle)? else {
             continue;
         };
@@ -1326,6 +1384,107 @@ mod tests {
                 .reachable_objects()?
                 .contains(&ObjectHandle::Existing(crate::ObjectId::new(9, 0)))
         );
+        Ok(())
+    }
+
+    fn inherited_destination_fixture(
+        live_parent: &str,
+        stale_parent: &str,
+        live_leaf: &str,
+        stale_leaf: &str,
+    ) -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /OpenAction [9 0 R /Fit] >>",
+        )?;
+        pdf.object(
+            2,
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {live_parent} >>").as_bytes(),
+        )?;
+        pdf.object(
+            3,
+            format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R {live_leaf} >>").as_bytes(),
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(
+            8,
+            format!("<< /Type /Pages /Kids [9 0 R] /Count 1 {stale_parent} >>").as_bytes(),
+        )?;
+        pdf.object(
+            9,
+            format!("<< /Type /Page /Parent 8 0 R /Contents 4 0 R {stale_leaf} >>").as_bytes(),
+        )?;
+        pdf.object(10, b"<< /Type /Pages /Parent 8 0 R >>")?;
+        pdf.object(11, b"null")?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn stale_destination_identity_checks_every_inherited_key() -> Result<()> {
+        for (live_parent, stale_parent) in [
+            (
+                "/Resources << /Font <<>> >>",
+                "/Resources << /XObject <<>> >>",
+            ),
+            ("/MediaBox [0 0 10 20]", "/MediaBox [0 0 20 10]"),
+            ("/CropBox [0 0 5 5]", "/CropBox [0 0 9 9]"),
+            ("/Rotate 90", "/Rotate 180"),
+        ] {
+            let document = inherited_destination_fixture(live_parent, stale_parent, "", "")?;
+            assert!(
+                stale_page_destination_map(&document)?.is_empty(),
+                "different inherited values must not match: {live_parent}, {stale_parent}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_destination_identity_follows_inheritance_past_invalid_local_values() -> Result<()> {
+        for local in ["/Rotate null", "/Rotate 11 0 R", "/Rotate /Invalid"] {
+            let document =
+                inherited_destination_fixture("/Rotate 90", "/Rotate 180", local, local)?;
+            assert!(
+                stale_page_destination_map(&document)?.is_empty(),
+                "invalid local rotation must not hide different inherited rotations: {local}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_destination_identity_uses_nearest_original_inheritance() -> Result<()> {
+        let attributes = "/Resources <<>> /MediaBox [0 0 10 20] /CropBox [0 0 5 5] /Rotate 90";
+        let mut document = inherited_destination_fixture(
+            attributes,
+            "/Resources <<>> /MediaBox [0 0 10 20] /CropBox [0 0 5 5] /Rotate 180",
+            "/Rotate null",
+            "/Rotate 90",
+        )?;
+        // Despite distinct storage and a shadowed ancestor, the source pages
+        // have the same inherited values. An earlier edit must not affect that
+        // immutable evidence.
+        let Some(parent) = document.edit_handle(existing(2))?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing live-page parent".to_owned()));
+        };
+        parent.insert(b"Rotate".to_vec(), OwnedObject::Integer(270));
+        replace_page_content(&mut document, existing(3), b"0 0 m 1 1 l S".to_vec())?;
+        assert_eq!(
+            stale_page_destination_map(&document)?,
+            BTreeMap::from([(existing(9), existing(3))])
+        );
+        let stats = compact_structure(&mut document)?;
+        assert_eq!(stats.stale_page_destination_references_rewritten, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_destination_identity_rejects_unresolved_ancestry() -> Result<()> {
+        for parent in ["/Parent 10 0 R", "/Parent 99 0 R", "/Parent 4 0 R"] {
+            let document = inherited_destination_fixture("", parent, "", "")?;
+            assert!(source_page_identity(&document, existing(9))?.is_none());
+        }
         Ok(())
     }
 
