@@ -291,7 +291,7 @@ fn hash_cos_value(hasher: &mut Sha256, root: &OwnedObject, references: Fingerpri
                     hash_len_prefixed(hasher, value);
                 }
                 OwnedObject::Reference(handle) => {
-                    references.hash(hasher, *handle, frames.is_empty())
+                    references.hash(hasher, *handle, frames.is_empty());
                 }
                 OwnedObject::Array(values) => {
                     hasher.update([0x06]);
