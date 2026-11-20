@@ -635,17 +635,16 @@ impl DirectDictionaryTarget {
     ) -> Option<Self> {
         let value = dictionary.raw_value(key)?;
         if let Some(target) = value.reference() {
-            Some(Self {
+            return Some(Self {
                 root: target,
                 path: Vec::new(),
-            })
-        } else if value.is_dictionary() {
+            });
+        }
+        value.is_dictionary().then(|| {
             let mut path = path.to_vec();
             path.push(DirectPathStep::DictKey(key.to_vec()));
-            Some(Self { root, path })
-        } else {
-            None
-        }
+            Self { root, path }
+        })
     }
 
     fn current<'a>(&self, document: &'a EditDocument) -> Result<Option<CurrentValue<'a>>> {

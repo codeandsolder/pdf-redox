@@ -28,22 +28,6 @@ pub fn object_at_direct_path_mut<'a>(
     Some(object)
 }
 
-pub fn object_at_direct_path<'a>(
-    mut object: &'a OwnedObject,
-    path: &[DirectPathStep],
-) -> Option<&'a OwnedObject> {
-    for step in path {
-        object = match step {
-            DirectPathStep::DictKey(key) => object.as_dictionary()?.get(key.as_slice())?,
-            DirectPathStep::ArrayIndex(index) => match object {
-                OwnedObject::Array(values) => values.get(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(object)
-}
-
 /// Project a current value onto a direct child without resolving indirect
 /// references or materializing the enclosing object.
 pub fn value_at_direct_path<'a>(

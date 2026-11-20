@@ -2170,8 +2170,13 @@ mod tests {
         let Some(private) = document.current_owned_object(existing(5))? else {
             return Err(Error::Invalid("missing fixture private object".to_owned()));
         };
-        let destination =
-            |path: &[DirectPathStep]| crate::direct_object::object_at_direct_path(&private, path);
+        let destination = |path: &[DirectPathStep]| {
+            crate::direct_object::value_at_direct_path(
+                crate::source::CurrentValue::Owned(&private),
+                path,
+            )
+            .and_then(|value| value.reference())
+        };
         for (path, target) in [
             (
                 vec![
@@ -2204,10 +2209,7 @@ mod tests {
                 3,
             ),
         ] {
-            assert_eq!(
-                destination(&path),
-                Some(&OwnedObject::Reference(existing(target)))
-            );
+            assert_eq!(destination(&path), Some(existing(target)));
         }
         assert!(
             document
