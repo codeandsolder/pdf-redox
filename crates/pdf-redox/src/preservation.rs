@@ -662,29 +662,10 @@ fn inherited_page_value(
     page: &PreservationDictionaryTarget,
     key: &[u8],
 ) -> Result<Option<OwnedObject>> {
-    let Some(mut object) = preservation_target_snapshot(document, page)? else {
+    let Some(object) = preservation_target_snapshot(document, page)? else {
         return Ok(None);
     };
-    let mut seen = BTreeSet::new();
-    for _ in 0..=100 {
-        let Some(dictionary) = object.as_dictionary() else {
-            return Ok(None);
-        };
-        if let Some(value) = dictionary.get(key) {
-            return Ok(Some(value.clone()));
-        }
-        let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice()) else {
-            return Ok(None);
-        };
-        if !seen.insert(*parent) {
-            return Ok(None);
-        }
-        let Some(parent_object) = document.current_owned_object(*parent)? else {
-            return Ok(None);
-        };
-        object = parent_object;
-    }
-    Ok(None)
+    document.inherited_page_value_from_object(object, key)
 }
 
 fn ensure_indirect_owned(document: &mut EditDocument, object: OwnedObject) -> CowObjectHandle {
@@ -1330,6 +1311,82 @@ mod tests {
         pdf.object(7, b"<< /Private true >>")?;
         pdf.object(8, b"<< /Illustrator << /Private true >> >>")?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn inherited_page_values_follow_deep_chains_and_terminate_on_cycles() -> Result<()> {
+        let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
+        let root = CowObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let Some(root_dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture page tree".to_owned()));
+        };
+        root_dictionary.insert(b"Rotate".to_vec(), OwnedObject::Integer(90));
+
+        // Source and preservation inheritance must agree even when a valid
+        // page tree exceeds the old hardcoded limit of 101 parent traversals.
+        let mut parent = root;
+        for _ in 0..160 {
+            parent = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+                OwnedDictionary::from([(b"Parent".to_vec(), OwnedObject::Reference(parent))]),
+            )));
+        }
+        let wrapper = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([(
+                b"NestedPage".to_vec(),
+                OwnedObject::Dictionary(OwnedDictionary::from([(
+                    b"Parent".to_vec(),
+                    OwnedObject::Reference(parent),
+                )])),
+            )]),
+        )));
+        let direct_target = PreservationDictionaryTarget {
+            root: wrapper,
+            path: vec![PreservationPathStep::DictKey(b"NestedPage".to_vec())],
+        };
+        assert_eq!(
+            document.inherited_page_value(parent, b"Rotate")?,
+            Some(OwnedObject::Integer(90))
+        );
+        assert_eq!(
+            inherited_page_value(&document, &direct_target, b"Rotate")?,
+            Some(OwnedObject::Integer(90))
+        );
+
+        // A closer ancestor always wins, regardless of the distant root.
+        let Some(near_dictionary) = document.edit_handle(parent)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing nearest ancestor".to_owned()));
+        };
+        near_dictionary.insert(b"Rotate".to_vec(), OwnedObject::Integer(180));
+        assert_eq!(
+            document.inherited_page_value(parent, b"Rotate")?,
+            Some(OwnedObject::Integer(180))
+        );
+        assert_eq!(
+            inherited_page_value(&document, &direct_target, b"Rotate")?,
+            Some(OwnedObject::Integer(180))
+        );
+
+        // A malformed indirect parent cycle with no value must terminate.
+        let first = CowObjectHandle::New(
+            document.add_object(OwnedObject::Dictionary(OwnedDictionary::new())),
+        );
+        let second = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([(b"Parent".to_vec(), OwnedObject::Reference(first))]),
+        )));
+        let Some(first_dictionary) = document.edit_handle(first)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing cycle node".to_owned()));
+        };
+        first_dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(second));
+        let cycle_target = PreservationDictionaryTarget {
+            root: second,
+            path: Vec::new(),
+        };
+        assert_eq!(document.inherited_page_value(second, b"Rotate")?, None);
+        assert_eq!(
+            inherited_page_value(&document, &cycle_target, b"Rotate")?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
