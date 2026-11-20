@@ -94,12 +94,10 @@ fn composite_components(glyph: &[u8]) -> Option<Vec<u16>> {
     let glyph = Glyph::read(FontData::new(glyph)).ok()?;
     match glyph {
         Glyph::Simple(_) => Some(Vec::new()),
-        Glyph::Composite(composite) => Some(
-            composite
-                .component_glyphs_and_flags()
-                .map(|(gid, _)| gid.to_u16())
-                .collect(),
-        ),
+        Glyph::Composite(composite) => composite
+            .component_glyphs_and_flags()
+            .map(|(gid, _)| u16::try_from(gid.to_u32()).ok())
+            .collect(),
     }
 }
 

@@ -12,7 +12,7 @@ Design goals:
 - never require uploading the document to a server;
 - preserve unsupported/opaque streams rather than damaging them.
 
-Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision. OpenType parsing, rebuilding, and glyph subsetting are delegated to Fontations (`skrifa`, `write-fonts`, and `skera`); the maintained `codeandsolder/fontations` fork carries only the small Skera glyph-mapping API needed to rewrite PDF-side glyph addressing and auto-replays that patch onto upstream.
+Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision. OpenType parsing, rebuilding, and glyph subsetting are delegated to Fontations (`skrifa`, `write-fonts`, and `skera`); the required Skera glyph-mapping API is available in upstream Skera 0.9, so Fontations is consumed directly from crates.io.
 
 ## Workspace
 
