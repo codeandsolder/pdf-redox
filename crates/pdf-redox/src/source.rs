@@ -1108,24 +1108,31 @@ impl EditDocument {
         Ok(self.current_owned_object_cow(handle)?.map(Cow::into_owned))
     }
 
-    /// Resolve a chain of indirect references against the current COW graph.
-    /// Cycles and missing source objects resolve to `None`, matching PDF null-like
-    /// behavior used by the migration passes.
-    pub(crate) fn resolve_owned_value(&self, value: &OwnedObject) -> Result<Option<OwnedObject>> {
-        let mut value = value.clone();
+    /// Resolve an indirect chain, borrowing a direct value or overlay object
+    /// and materializing only an untouched source object. Cycles and missing
+    /// source objects resolve to None, as in the owned resolver.
+    pub(crate) fn resolve_owned_value_cow<'a>(
+        &'a self,
+        value: &'a OwnedObject,
+    ) -> Result<Option<Cow<'a, OwnedObject>>> {
+        let mut value = Cow::Borrowed(value);
         let mut seen = BTreeSet::new();
         loop {
-            let OwnedObject::Reference(handle) = value else {
+            let OwnedObject::Reference(handle) = value.as_ref() else {
                 return Ok(Some(value));
             };
-            if !seen.insert(handle) {
+            if !seen.insert(*handle) {
                 return Ok(None);
             }
-            let Some(next) = self.current_owned_object(handle)? else {
+            let Some(next) = self.current_owned_object_cow(*handle)? else {
                 return Ok(None);
             };
             value = next;
         }
+    }
+
+    pub(crate) fn resolve_owned_value(&self, value: &OwnedObject) -> Result<Option<OwnedObject>> {
+        Ok(self.resolve_owned_value_cow(value)?.map(Cow::into_owned))
     }
 
     /// Write the current COW graph as a compact fresh PDF using classic xref output.
@@ -1226,29 +1233,47 @@ impl EditDocument {
         page: ObjectHandle,
         key: &[u8],
     ) -> Result<Option<OwnedObject>> {
-        let Some(object) = self.current_owned_object(page)? else {
+        Ok(self
+            .inherited_page_value_cow(page, key)?
+            .map(Cow::into_owned))
+    }
+
+    pub(crate) fn inherited_page_value_cow(
+        &self,
+        page: ObjectHandle,
+        key: &[u8],
+    ) -> Result<Option<Cow<'_, OwnedObject>>> {
+        let Some(object) = self.current_owned_object_cow(page)? else {
             return Ok(None);
         };
         self.inherited_page_value_from_object(object, key)
     }
 
     /// Resolve inheritance from a direct or indirect page dictionary snapshot.
-    ///
-    /// The page-tree depth is not fixed by the PDF format. Walk until a value,
-    /// missing parent, or repeated parent is found; the visited set bounds the
-    /// traversal even for malformed cyclic graphs.
-    pub(crate) fn inherited_page_value_from_object(
-        &self,
-        mut object: OwnedObject,
+    /// Borrow overlay ancestors; move only the selected property out of an
+    /// owned source dictionary. The visited set handles arbitrary depth and
+    /// malformed cyclic graphs.
+    pub(crate) fn inherited_page_value_from_object<'a>(
+        &'a self,
+        mut object: Cow<'a, OwnedObject>,
         key: &[u8],
-    ) -> Result<Option<OwnedObject>> {
+    ) -> Result<Option<Cow<'a, OwnedObject>>> {
         let mut seen = BTreeSet::new();
         loop {
             let Some(dictionary) = object.as_dictionary() else {
                 return Ok(None);
             };
-            if let Some(value) = dictionary.get(key) {
-                return Ok(Some(value.clone()));
+            if dictionary.contains_key(key) {
+                return Ok(match object {
+                    Cow::Borrowed(value) => value
+                        .as_dictionary()
+                        .and_then(|dictionary| dictionary.get(key))
+                        .map(Cow::Borrowed),
+                    Cow::Owned(mut value) => value
+                        .as_dictionary_mut()
+                        .and_then(|dictionary| dictionary.remove(key))
+                        .map(Cow::Owned),
+                });
             }
             let Some(OwnedObject::Reference(parent)) = dictionary.get(b"Parent".as_slice()) else {
                 return Ok(None);
@@ -1256,7 +1281,7 @@ impl EditDocument {
             if !seen.insert(*parent) {
                 return Ok(None);
             }
-            let Some(parent_object) = self.current_owned_object(*parent)? else {
+            let Some(parent_object) = self.current_owned_object_cow(*parent)? else {
                 return Ok(None);
             };
             object = parent_object;
@@ -1655,6 +1680,16 @@ pub fn owned_from_maybe_ref(value: MaybeRef<Object<'_>>) -> OwnedObject {
     }
 }
 
+pub fn into_owned_dictionary(value: Cow<'_, OwnedObject>) -> Option<OwnedDictionary> {
+    match value {
+        Cow::Owned(
+            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. },
+        ) => Some(dictionary),
+        Cow::Borrowed(value) => value.as_dictionary().cloned(),
+        Cow::Owned(_) => None,
+    }
+}
+
 fn owned_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
     dictionary
         .entries()
@@ -1674,6 +1709,47 @@ pub fn owned_stream_dictionary(dictionary: &Dict<'_>) -> OwnedDictionary {
 mod tests {
     use super::*;
     use crate::test_support::ClassicPdfBuilder;
+
+    #[test]
+    fn resolved_and_inherited_overlay_values_remain_borrowed() -> Result<()> {
+        let mut pdf = crate::test_support::ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let value = OwnedObject::String(vec![42; 1024 * 1024]);
+        let handle = ObjectHandle::New(document.add_object(value));
+        let reference = OwnedObject::Reference(handle);
+        let chain = ObjectHandle::New(document.add_object(reference.clone()));
+        let parent = ObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([
+                (b"Resources".to_vec(), reference.clone()),
+                (
+                    b"Unrelated".to_vec(),
+                    OwnedObject::String(vec![23; 1024 * 1024]),
+                ),
+            ]),
+        )));
+        let page = ObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([(b"Parent".to_vec(), OwnedObject::Reference(parent))]),
+        )));
+        let Some(Cow::Borrowed(original)) = document.current_owned_object_cow(handle)? else {
+            return Err(Error::Invalid("missing owned value".to_owned()));
+        };
+        assert!(
+            matches!(document.resolve_owned_value_cow(&OwnedObject::Reference(chain))?, Some(Cow::Borrowed(resolved)) if std::ptr::eq(resolved, original))
+        );
+        let Some(Cow::Borrowed(inherited)) =
+            document.inherited_page_value_cow(page, b"Resources")?
+        else {
+            return Err(Error::Invalid("inherited value was copied".to_owned()));
+        };
+        assert_eq!(inherited, &reference);
+        assert!(
+            matches!(document.resolve_owned_value_cow(inherited)?, Some(Cow::Borrowed(resolved)) if std::ptr::eq(resolved, original))
+        );
+        Ok(())
+    }
 
     #[test]
     fn exact_i64_to_f64_rejects_only_lossy_conversions() {

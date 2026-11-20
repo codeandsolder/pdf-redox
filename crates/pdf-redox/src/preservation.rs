@@ -1,9 +1,13 @@
+use crate::direct_object::{DirectPathStep, object_at_direct_path_cow, object_at_direct_path_mut};
 use crate::geometry::{Matrix, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
     OwnedObject, PreservationConfig, Result, StreamData, content::resolved_number_array,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 const SCREEN_HIDDEN_ANNOTATION_FLAGS: i64 = 0x02 | 0x20;
 #[derive(Debug, Clone, Copy, Default)]
@@ -29,59 +33,19 @@ pub struct PreservationStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum PreservationPathStep {
-    DictKey(Vec<u8>),
-    ArrayIndex(usize),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PreservationDictionaryTarget {
     root: CowObjectHandle,
-    path: Vec<PreservationPathStep>,
+    path: Vec<DirectPathStep>,
 }
 
-fn preservation_object_at_path<'a>(
-    mut object: &'a OwnedObject,
-    path: &[PreservationPathStep],
-) -> Option<&'a OwnedObject> {
-    for step in path {
-        object = match step {
-            PreservationPathStep::DictKey(key) => object.as_dictionary()?.get(key.as_slice())?,
-            PreservationPathStep::ArrayIndex(index) => match object {
-                OwnedObject::Array(values) => values.get(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(object)
-}
-
-fn preservation_object_at_path_mut<'a>(
-    mut object: &'a mut OwnedObject,
-    path: &[PreservationPathStep],
-) -> Option<&'a mut OwnedObject> {
-    for step in path {
-        object = match step {
-            PreservationPathStep::DictKey(key) => {
-                object.as_dictionary_mut()?.get_mut(key.as_slice())?
-            }
-            PreservationPathStep::ArrayIndex(index) => match object {
-                OwnedObject::Array(values) => values.get_mut(*index)?,
-                _ => return None,
-            },
-        };
-    }
-    Some(object)
-}
-
-fn preservation_target_snapshot(
-    document: &EditDocument,
+fn preservation_target_snapshot<'a>(
+    document: &'a EditDocument,
     target: &PreservationDictionaryTarget,
-) -> Result<Option<OwnedObject>> {
-    let Some(root) = document.current_owned_object(target.root)? else {
+) -> Result<Option<Cow<'a, OwnedObject>>> {
+    let Some(root) = document.current_owned_object_cow(target.root)? else {
         return Ok(None);
     };
-    Ok(preservation_object_at_path(&root, &target.path).cloned())
+    Ok(object_at_direct_path_cow(root, &target.path))
 }
 
 fn preservation_target_mut<'a>(
@@ -89,10 +53,7 @@ fn preservation_target_mut<'a>(
     target: &PreservationDictionaryTarget,
 ) -> Result<Option<&'a mut OwnedDictionary>> {
     let root = document.edit_handle(target.root)?;
-    Ok(
-        preservation_object_at_path_mut(root, &target.path)
-            .and_then(OwnedObject::as_dictionary_mut),
-    )
+    Ok(object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut))
 }
 
 fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
@@ -105,50 +66,86 @@ fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Op
     })
 }
 
-fn collect_page_tree_value(
+struct PendingPageTreeValue<'a> {
+    target: PreservationDictionaryTarget,
+    value: Cow<'a, OwnedObject>,
+}
+
+fn enqueue_page_tree_children<'a>(
+    pending: &mut Vec<PendingPageTreeValue<'a>>,
+    target: &PreservationDictionaryTarget,
+    children: impl DoubleEndedIterator<Item = Cow<'a, OwnedObject>> + ExactSizeIterator,
+) {
+    pending.extend(children.enumerate().rev().map(|(index, value)| {
+        let mut path = target.path.clone();
+        path.push(DirectPathStep::ArrayIndex(index));
+        PendingPageTreeValue {
+            target: PreservationDictionaryTarget {
+                root: target.root,
+                path,
+            },
+            value,
+        }
+    }));
+}
+
+fn collect_page_tree_targets(
     document: &EditDocument,
-    root: CowObjectHandle,
-    value: &OwnedObject,
-    path: Vec<PreservationPathStep>,
-    seen: &mut BTreeSet<CowObjectHandle>,
+    initial: PendingPageTreeValue<'_>,
     pages: &mut BTreeSet<PreservationDictionaryTarget>,
     nodes: &mut BTreeSet<PreservationDictionaryTarget>,
 ) -> Result<()> {
-    if let OwnedObject::Reference(handle) = value {
-        if !seen.insert(*handle) {
-            return Ok(());
-        }
-        let Some(object) = document.current_owned_object(*handle)? else {
-            return Ok(());
-        };
-        return collect_page_tree_value(document, *handle, &object, Vec::new(), seen, pages, nodes);
-    }
-    match value {
-        OwnedObject::Dictionary(dictionary) => {
-            let target = PreservationDictionaryTarget {
-                root,
-                path: path.clone(),
-            };
-            let kind = owned_name(document, dictionary.get(b"Type".as_slice()))?;
-            if kind.as_deref() == Some(b"Pages") {
-                nodes.insert(target);
-                if let Some(kids) = dictionary.get(b"Kids".as_slice()) {
-                    let mut kid_path = path;
-                    kid_path.push(PreservationPathStep::DictKey(b"Kids".to_vec()));
-                    collect_page_tree_value(document, root, kids, kid_path, seen, pages, nodes)?;
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![initial];
+    while let Some(PendingPageTreeValue { mut target, value }) = pending.pop() {
+        match value.as_ref() {
+            OwnedObject::Reference(handle) => {
+                if seen.insert(*handle)
+                    && let Some(value) = document.current_owned_object_cow(*handle)?
+                {
+                    pending.push(PendingPageTreeValue {
+                        target: PreservationDictionaryTarget {
+                            root: *handle,
+                            path: Vec::new(),
+                        },
+                        value,
+                    });
                 }
-            } else if kind.as_deref() == Some(b"Page") {
-                pages.insert(target);
             }
-        }
-        OwnedObject::Array(values) => {
-            for (index, child) in values.iter().enumerate() {
-                let mut child_path = path.clone();
-                child_path.push(PreservationPathStep::ArrayIndex(index));
-                collect_page_tree_value(document, root, child, child_path, seen, pages, nodes)?;
+            OwnedObject::Dictionary(dictionary) => {
+                let kind = owned_name(document, dictionary.get(b"Type".as_slice()))?;
+                if kind.as_deref() == Some(b"Pages") {
+                    nodes.insert(target.clone());
+                    let step = DirectPathStep::DictKey(b"Kids".to_vec());
+                    if let Some(value) =
+                        object_at_direct_path_cow(value, std::slice::from_ref(&step))
+                    {
+                        target.path.push(step);
+                        pending.push(PendingPageTreeValue { target, value });
+                    }
+                } else if kind.as_deref() == Some(b"Page") {
+                    pages.insert(target);
+                }
             }
+            OwnedObject::Array(_) => match value {
+                Cow::Borrowed(OwnedObject::Array(values)) => {
+                    enqueue_page_tree_children(
+                        &mut pending,
+                        &target,
+                        values.iter().map(Cow::Borrowed),
+                    );
+                }
+                Cow::Owned(OwnedObject::Array(values)) => {
+                    enqueue_page_tree_children(
+                        &mut pending,
+                        &target,
+                        values.into_iter().map(Cow::Owned),
+                    );
+                }
+                _ => {}
+            },
+            _ => {}
         }
-        _ => {}
     }
     Ok(())
 }
@@ -160,24 +157,24 @@ fn preservation_page_tree_targets(
     Vec<PreservationDictionaryTarget>,
 )> {
     let catalog_handle = CowObjectHandle::Existing(document.source().catalog_id());
-    let Some(catalog_object) = document.current_owned_object(catalog_handle)? else {
+    let Some(catalog_object) = document.current_owned_object_cow(catalog_handle)? else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let Some(catalog) = catalog_object.as_dictionary() else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let Some(pages_value) = catalog.get(b"Pages".as_slice()) else {
+    let path = vec![DirectPathStep::DictKey(b"Pages".to_vec())];
+    let Some(pages_value) = object_at_direct_path_cow(catalog_object, &path) else {
         return Ok((Vec::new(), Vec::new()));
     };
     let mut pages = BTreeSet::new();
     let mut nodes = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    collect_page_tree_value(
+    collect_page_tree_targets(
         document,
-        catalog_handle,
-        pages_value,
-        vec![PreservationPathStep::DictKey(b"Pages".to_vec())],
-        &mut seen,
+        PendingPageTreeValue {
+            target: PreservationDictionaryTarget {
+                root: catalog_handle,
+                path,
+            },
+            value: pages_value,
+        },
         &mut pages,
         &mut nodes,
     )?;
@@ -229,7 +226,7 @@ fn annotation_subtype(
     document: &EditDocument,
     annotation: &OwnedObject,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(annotation) = document.resolve_owned_value(annotation)? else {
+    let Some(annotation) = document.resolve_owned_value_cow(annotation)? else {
         return Ok(None);
     };
     let Some(dictionary) = annotation.as_dictionary() else {
@@ -456,7 +453,7 @@ const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
 fn collect_direct_key_removals(
     root: CowObjectHandle,
     object: &OwnedObject,
-    path: &mut Vec<PreservationPathStep>,
+    path: &mut Vec<DirectPathStep>,
     removable_key: &[u8],
     removals: &mut BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
 ) {
@@ -475,7 +472,7 @@ fn collect_direct_key_removals(
                 if key.as_slice() == removable_key || matches!(value, OwnedObject::Reference(_)) {
                     continue;
                 }
-                path.push(PreservationPathStep::DictKey(key.clone()));
+                path.push(DirectPathStep::DictKey(key.clone()));
                 collect_direct_key_removals(root, value, path, removable_key, removals);
                 path.pop();
             }
@@ -485,7 +482,7 @@ fn collect_direct_key_removals(
                 if matches!(value, OwnedObject::Reference(_)) {
                     continue;
                 }
-                path.push(PreservationPathStep::ArrayIndex(index));
+                path.push(DirectPathStep::ArrayIndex(index));
                 collect_direct_key_removals(root, value, path, removable_key, removals);
                 path.pop();
             }
@@ -547,8 +544,8 @@ fn apply_authoring_removals(
 ) -> Result<()> {
     for (target, keys) in removals {
         let root = document.edit_handle(target.root)?;
-        let Some(dictionary) = preservation_object_at_path_mut(root, &target.path)
-            .and_then(OwnedObject::as_dictionary_mut)
+        let Some(dictionary) =
+            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
         else {
             continue;
         };
@@ -665,7 +662,9 @@ fn inherited_page_value(
     let Some(object) = preservation_target_snapshot(document, page)? else {
         return Ok(None);
     };
-    document.inherited_page_value_from_object(object, key)
+    Ok(document
+        .inherited_page_value_from_object(object, key)?
+        .map(Cow::into_owned))
 }
 
 fn ensure_indirect_owned(document: &mut EditDocument, object: OwnedObject) -> CowObjectHandle {
@@ -1314,6 +1313,70 @@ mod tests {
     }
 
     #[test]
+    fn preservation_tree_walk_handles_deep_indirect_nodes_and_direct_leaves() -> Result<()> {
+        let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
+        let root = CowObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let leaf = CowObjectHandle::Existing(crate::ObjectId::new(3, 0));
+        let direct_name = b"UniquePageMarker";
+        let direct_page = OwnedObject::Dictionary(OwnedDictionary::from([
+            (b"Type".to_vec(), OwnedObject::Name(b"Page".to_vec())),
+            (direct_name.to_vec(), OwnedObject::String(vec![11; 4096])),
+        ]));
+        let direct_branch = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([
+                (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+                (
+                    b"Kids".to_vec(),
+                    OwnedObject::Array(vec![direct_page, OwnedObject::Reference(leaf)]),
+                ),
+            ]),
+        )));
+        let mut child = direct_branch;
+        let depth = 20_000;
+        for _ in 0..depth {
+            child = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+                OwnedDictionary::from([
+                    (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
+                    (
+                        b"Kids".to_vec(),
+                        OwnedObject::Array(vec![OwnedObject::Reference(child)]),
+                    ),
+                ]),
+            )));
+        }
+        let Some(root_dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
+            return Err(Error::Invalid("missing fixture root".to_owned()));
+        };
+        root_dictionary.insert(
+            b"Kids".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Reference(child)]),
+        );
+
+        let target = PreservationDictionaryTarget {
+            root: direct_branch,
+            path: vec![
+                DirectPathStep::DictKey(b"Kids".to_vec()),
+                DirectPathStep::ArrayIndex(0),
+            ],
+        };
+        let (pages, nodes) = preservation_page_tree_targets(&document)?;
+        assert_eq!(nodes.len(), depth + 2);
+        assert_eq!(pages.len(), 2);
+        assert!(pages.contains(&target));
+        let Some(Cow::Borrowed(object)) = preservation_target_snapshot(&document, &target)? else {
+            return Err(Error::Invalid(
+                "direct overlay target was copied".to_owned(),
+            ));
+        };
+        assert!(
+            object
+                .as_dictionary()
+                .is_some_and(|dictionary| dictionary.contains_key(direct_name.as_slice()))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn inherited_page_values_follow_deep_chains_and_terminate_on_cycles() -> Result<()> {
         let mut document = EditDocument::from_bytes(auxiliary_state_fixture()?)?;
         let root = CowObjectHandle::Existing(crate::ObjectId::new(2, 0));
@@ -1341,7 +1404,7 @@ mod tests {
         )));
         let direct_target = PreservationDictionaryTarget {
             root: wrapper,
-            path: vec![PreservationPathStep::DictKey(b"NestedPage".to_vec())],
+            path: vec![DirectPathStep::DictKey(b"NestedPage".to_vec())],
         };
         assert_eq!(
             document.inherited_page_value(parent, b"Rotate")?,
