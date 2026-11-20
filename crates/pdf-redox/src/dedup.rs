@@ -4,6 +4,7 @@ use crate::{
 };
 use hayro_syntax::PdfVersion;
 use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::Hash,
@@ -198,73 +199,140 @@ fn hash_cow_handle(hasher: &mut Sha256, handle: CowObjectHandle) {
     }
 }
 
-fn hash_owned_object(hasher: &mut Sha256, object: &OwnedObject) -> Result<()> {
-    match object {
-        OwnedObject::Null => hasher.update([0x00]),
-        OwnedObject::Boolean(value) => hasher.update([0x01, u8::from(*value)]),
-        OwnedObject::Integer(value) => {
-            hasher.update([0x02]);
-            hasher.update(value.to_le_bytes());
-        }
-        OwnedObject::Real(value) => {
-            hasher.update([0x03]);
-            hasher.update(value.to_bits().to_le_bytes());
-        }
-        OwnedObject::Name(value) => {
-            hasher.update([0x04]);
-            hash_len_prefixed(hasher, value);
-        }
-        OwnedObject::String(value) => {
-            hasher.update([0x05]);
-            hash_len_prefixed(hasher, value);
-        }
-        OwnedObject::Reference(handle) => hash_cow_handle(hasher, *handle),
-        OwnedObject::Array(values) => {
-            hasher.update([0x06]);
-            hasher.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                hash_owned_object(hasher, value)?;
+/// Reference projection is independent of COS encoding. Recursive resource
+/// fingerprints have a distinct reference tag; top-level stream projections
+/// only redirect direct dictionary values, not references nested beneath them.
+#[derive(Clone, Copy)]
+enum FingerprintReferences<'a> {
+    Exact,
+    Recursive(&'a HashMap<CowObjectHandle, CowObjectHandle>),
+    TopLevel(&'a HashMap<CowObjectHandle, CowObjectHandle>),
+}
+
+impl FingerprintReferences<'_> {
+    fn hash(self, hasher: &mut Sha256, handle: CowObjectHandle, is_root: bool) {
+        let handle = match self {
+            Self::Recursive(redirects) => {
+                hasher.update([0x70]);
+                canonical_cow_redirect(handle, redirects)
             }
+            Self::TopLevel(redirects) if is_root => canonical_cow_redirect(handle, redirects),
+            Self::Exact | Self::TopLevel(_) => handle,
+        };
+        hash_cow_handle(hasher, handle);
+    }
+}
+
+fn hash_stream_identity(hasher: &mut Sha256, data: &StreamData) {
+    match data {
+        StreamData::Source(id) => {
+            hasher.update([0x80]);
+            hasher.update(id.number().to_le_bytes());
+            hasher.update(id.generation().to_le_bytes());
         }
-        OwnedObject::Dictionary(dictionary) => {
-            hasher.update([0x07]);
-            hasher.update((dictionary.len() as u64).to_le_bytes());
-            for (key, value) in dictionary {
-                hash_len_prefixed(hasher, key);
-                hash_owned_object(hasher, value)?;
-            }
+        StreamData::Owned(bytes) => {
+            hasher.update([0x81]);
+            hash_len_prefixed(hasher, bytes);
         }
-        OwnedObject::Stream { dictionary, data } => {
-            hasher.update([0x08]);
-            hasher.update((dictionary.len() as u64).to_le_bytes());
-            for (key, value) in dictionary {
-                hash_len_prefixed(hasher, key);
-                hash_owned_object(hasher, value)?;
-            }
-            match data {
-                StreamData::Source(id) => {
-                    hasher.update([0x80]);
-                    hasher.update(id.number().to_le_bytes());
-                    hasher.update(id.generation().to_le_bytes());
-                }
-                StreamData::Owned(bytes) => {
-                    hasher.update([0x81]);
-                    hash_len_prefixed(hasher, bytes);
+    }
+}
+
+// A frame holds only unvisited siblings. Stream identities are emitted after
+// the dictionary, not before it, preserving the unambiguous COS encoding.
+enum FingerprintFrame<'a> {
+    Array(std::slice::Iter<'a, OwnedObject>),
+    Dictionary {
+        entries: std::collections::btree_map::Iter<'a, Vec<u8>, OwnedObject>,
+        data: Option<&'a StreamData>,
+    },
+}
+
+impl<'a> FingerprintFrame<'a> {
+    fn next_value(&mut self, hasher: &mut Sha256) -> Option<&'a OwnedObject> {
+        match self {
+            Self::Array(values) => values.next(),
+            Self::Dictionary { entries, data } => {
+                if let Some((key, value)) = entries.next() {
+                    hash_len_prefixed(hasher, key);
+                    Some(value)
+                } else {
+                    if let Some(data) = data.take() {
+                        hash_stream_identity(hasher, data);
+                    }
+                    None
                 }
             }
         }
     }
-    Ok(())
 }
 
-/// Hash source and overlay stream data in place. The callback selects the
-/// dictionary-value hashing semantics without copying encoded payloads.
+fn hash_cos_value(hasher: &mut Sha256, root: &OwnedObject, references: FingerprintReferences<'_>) {
+    let mut frames = SmallVec::<[FingerprintFrame<'_>; 4]>::new();
+    let mut next = Some(root);
+    loop {
+        if let Some(object) = next.take() {
+            match object {
+                OwnedObject::Null => hasher.update([0x00]),
+                OwnedObject::Boolean(value) => hasher.update([0x01, u8::from(*value)]),
+                OwnedObject::Integer(value) => {
+                    hasher.update([0x02]);
+                    hasher.update(value.to_le_bytes());
+                }
+                OwnedObject::Real(value) => {
+                    hasher.update([0x03]);
+                    hasher.update(value.to_bits().to_le_bytes());
+                }
+                OwnedObject::Name(value) => {
+                    hasher.update([0x04]);
+                    hash_len_prefixed(hasher, value);
+                }
+                OwnedObject::String(value) => {
+                    hasher.update([0x05]);
+                    hash_len_prefixed(hasher, value);
+                }
+                OwnedObject::Reference(handle) => {
+                    references.hash(hasher, *handle, frames.is_empty());
+                }
+                OwnedObject::Array(values) => {
+                    hasher.update([0x06]);
+                    hasher.update((values.len() as u64).to_le_bytes());
+                    frames.push(FingerprintFrame::Array(values.iter()));
+                }
+                OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
+                    let data = match object {
+                        OwnedObject::Stream { data, .. } => Some(data),
+                        _ => None,
+                    };
+                    hasher.update([if data.is_some() { 0x08 } else { 0x07 }]);
+                    hasher.update((dictionary.len() as u64).to_le_bytes());
+                    frames.push(FingerprintFrame::Dictionary {
+                        entries: dictionary.iter(),
+                        data,
+                    });
+                }
+            }
+        }
+        while let Some(frame) = frames.last_mut() {
+            if let Some(value) = frame.next_value(hasher) {
+                next = Some(value);
+                break;
+            }
+            frames.pop();
+        }
+        if next.is_none() {
+            return;
+        }
+    }
+}
+
+/// Hash source and overlay stream data in place using one reference policy,
+/// without copying encoded payloads or collecting a temporary entry vector.
 fn hash_stream_with_keys(
     document: &EditDocument,
     stream: CowObjectHandle,
     domain: &[u8],
     ignored_dictionary_keys: &[&[u8]],
-    mut hash_value: impl FnMut(&mut Sha256, &OwnedObject) -> Result<()>,
+    references: FingerprintReferences<'_>,
 ) -> Result<Option<([u8; 32], usize)>> {
     let Some(object) = document.current_owned_object_cow(stream)? else {
         return Ok(None);
@@ -276,16 +344,13 @@ fn hash_stream_with_keys(
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary
-        .iter()
-        .filter(|(key, _)| {
-            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-        })
-        .collect::<Vec<_>>();
-    hasher.update((entries.len() as u64).to_le_bytes());
+    let entries = dictionary.iter().filter(|(key, _)| {
+        key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+    });
+    hasher.update((entries.clone().count() as u64).to_le_bytes());
     for (key, value) in entries {
         hash_len_prefixed(&mut hasher, key);
-        hash_value(&mut hasher, value)?;
+        hash_cos_value(&mut hasher, value, references);
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
@@ -301,7 +366,7 @@ fn source_stream_fingerprint_ignoring(
         stream,
         domain,
         ignored_dictionary_keys,
-        hash_owned_object,
+        FingerprintReferences::Exact,
     )
 }
 
@@ -336,9 +401,13 @@ fn source_font_program_fingerprint(
         if matches!(dict_key.as_slice(), b"Length1" | b"Length2" | b"Length3")
             && let Some(OwnedObject::Integer(integer)) = document.resolve_owned_value(value)?
         {
-            hash_owned_object(&mut hasher, &OwnedObject::Integer(integer))?;
+            hash_cos_value(
+                &mut hasher,
+                &OwnedObject::Integer(integer),
+                FingerprintReferences::Exact,
+            );
         } else {
-            hash_owned_object(&mut hasher, value)?;
+            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
         }
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
@@ -684,55 +753,6 @@ fn canonical_cow_redirect(
     handle
 }
 
-fn hash_owned_object_with_redirects(
-    hasher: &mut Sha256,
-    object: &OwnedObject,
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-) -> Result<()> {
-    match object {
-        OwnedObject::Reference(handle) => {
-            hasher.update([0x70]);
-            hash_cow_handle(hasher, canonical_cow_redirect(*handle, redirects));
-        }
-        OwnedObject::Array(values) => {
-            hasher.update([0x06]);
-            hasher.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                hash_owned_object_with_redirects(hasher, value, redirects)?;
-            }
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            hasher.update([0x07]);
-            hasher.update((dictionary.len() as u64).to_le_bytes());
-            for (key, value) in dictionary {
-                hash_len_prefixed(hasher, key);
-                hash_owned_object_with_redirects(hasher, value, redirects)?;
-            }
-        }
-        OwnedObject::Stream { dictionary, data } => {
-            hasher.update([0x08]);
-            hasher.update((dictionary.len() as u64).to_le_bytes());
-            for (key, value) in dictionary {
-                hash_len_prefixed(hasher, key);
-                hash_owned_object_with_redirects(hasher, value, redirects)?;
-            }
-            match data {
-                StreamData::Source(id) => {
-                    hasher.update([0x80]);
-                    hasher.update(id.number().to_le_bytes());
-                    hasher.update(id.generation().to_le_bytes());
-                }
-                StreamData::Owned(bytes) => {
-                    hasher.update([0x81]);
-                    hash_len_prefixed(hasher, bytes);
-                }
-            }
-        }
-        other => hash_owned_object(hasher, other)?,
-    }
-    Ok(())
-}
-
 fn source_stream_fingerprint_with_redirects(
     document: &EditDocument,
     stream: CowObjectHandle,
@@ -745,7 +765,7 @@ fn source_stream_fingerprint_with_redirects(
         stream,
         domain,
         ignored_dictionary_keys,
-        |hasher, value| hash_owned_object_with_redirects(hasher, value, redirects),
+        FingerprintReferences::Recursive(redirects),
     )
 }
 
@@ -1025,13 +1045,17 @@ fn pattern_payload_fingerprint(
     for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
         hash_len_prefixed(&mut hasher, key);
         if let Some(value) = dictionary.get(key) {
-            hash_owned_object(&mut hasher, value)?;
+            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
         } else {
             hasher.update([0]);
         }
     }
-    hash_owned_object(&mut hasher, bbox)?;
-    hash_owned_object(&mut hasher, &OwnedObject::Dictionary(resources))?;
+    hash_cos_value(&mut hasher, bbox, FingerprintReferences::Exact);
+    hash_cos_value(
+        &mut hasher,
+        &OwnedObject::Dictionary(resources),
+        FingerprintReferences::Exact,
+    );
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
@@ -1299,7 +1323,11 @@ fn hash_non_stream_object_with_redirects(
     }
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
-    hash_owned_object_with_redirects(&mut hasher, &object, redirects)?;
+    hash_cos_value(
+        &mut hasher,
+        &object,
+        FingerprintReferences::Recursive(redirects),
+    );
     Ok(Some(hasher.finalize().into()))
 }
 
@@ -1508,17 +1536,14 @@ pub fn canonicalize_sampled_function_streams(
     })
 }
 
-pub fn exact_dictionary_fingerprint(
-    object: &OwnedObject,
-    domain: &[u8],
-) -> Result<Option<[u8; 32]>> {
+pub fn exact_dictionary_fingerprint(object: &OwnedObject, domain: &[u8]) -> Option<[u8; 32]> {
     if !matches!(object, OwnedObject::Dictionary(_)) {
-        return Ok(None);
+        return None;
     }
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
-    hash_owned_object(&mut hasher, object)?;
-    Ok(Some(hasher.finalize().into()))
+    hash_cos_value(&mut hasher, object, FingerprintReferences::Exact);
+    Some(hasher.finalize().into())
 }
 
 fn exact_dictionary_redirects(
@@ -1536,7 +1561,7 @@ fn exact_dictionary_redirects(
         let Some(object) = document.current_owned_object_cow(handle)? else {
             continue;
         };
-        let Some(fingerprint) = exact_dictionary_fingerprint(&object, domain)? else {
+        let Some(fingerprint) = exact_dictionary_fingerprint(&object, domain) else {
             continue;
         };
 
@@ -1566,7 +1591,7 @@ pub fn has_exact_duplicate_extgstate_dictionaries(
             continue;
         };
         let Some(fingerprint) =
-            exact_dictionary_fingerprint(&object, b"exact-extgstate-dictionary")?
+            exact_dictionary_fingerprint(&object, b"exact-extgstate-dictionary")
         else {
             continue;
         };
@@ -1719,14 +1744,7 @@ fn source_stream_fingerprint_top_level_redirects(
         stream,
         domain,
         ignored_dictionary_keys,
-        |hasher, value| {
-            if let OwnedObject::Reference(handle) = value {
-                hash_cow_handle(hasher, canonical_cow_redirect(*handle, redirects));
-                Ok(())
-            } else {
-                hash_owned_object(hasher, value)
-            }
-        },
+        FingerprintReferences::TopLevel(redirects),
     )?
     .map(|(fingerprint, _)| fingerprint))
 }
@@ -1858,13 +1876,10 @@ fn source_form_fingerprint(
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, b"form-xobject");
     hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary
-        .iter()
-        .filter(|(key, _)| {
-            key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-        })
-        .collect::<Vec<_>>();
-    hasher.update((entries.len() as u64).to_le_bytes());
+    let entries = dictionary.iter().filter(|(key, _)| {
+        key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
+    });
+    hasher.update((entries.clone().count() as u64).to_le_bytes());
     for (key, value) in entries {
         hash_len_prefixed(&mut hasher, key);
         if key.as_slice() == b"Resources" {
@@ -1876,9 +1891,9 @@ fn source_form_fingerprint(
                 image_redirects,
                 form_redirects,
             )?;
-            hash_owned_object(&mut hasher, &normalized)?;
+            hash_cos_value(&mut hasher, &normalized, FingerprintReferences::Exact);
         } else {
-            hash_owned_object(&mut hasher, value)?;
+            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
         }
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
@@ -2454,6 +2469,120 @@ pub fn canonicalize_page_contents(
 mod tests {
     use super::*;
     use crate::{SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn cos_fingerprint_preserves_exact_and_projected_encodings() -> Result<()> {
+        let mut document = EditDocument::from_bytes(duplicate_image_fixture()?)?;
+        let existing = |number, generation| {
+            CowObjectHandle::Existing(crate::ObjectId::new(number, generation))
+        };
+        let original = existing(42, 3);
+        let added = CowObjectHandle::New(document.add_object(OwnedObject::Null));
+        let canonical = existing(7, 0);
+        let redirects = HashMap::from([(original, added), (added, canonical)]);
+        let value = OwnedObject::Dictionary(OwnedDictionary::from([
+            (
+                b"A".to_vec(),
+                OwnedObject::Array(vec![
+                    OwnedObject::Null,
+                    OwnedObject::Boolean(true),
+                    OwnedObject::Integer(-123),
+                    OwnedObject::Real(1.25),
+                    OwnedObject::Name(b"N\0".to_vec()),
+                    OwnedObject::String(vec![0, 255]),
+                    OwnedObject::Reference(original),
+                    OwnedObject::Stream {
+                        dictionary: OwnedDictionary::from([(
+                            b"N".to_vec(),
+                            OwnedObject::Reference(added),
+                        )]),
+                        data: StreamData::Source(crate::ObjectId::new(99, 2)),
+                    },
+                ]),
+            ),
+            (
+                b"M".to_vec(),
+                OwnedObject::Stream {
+                    dictionary: OwnedDictionary::new(),
+                    data: StreamData::Owned(b"q Q".to_vec()),
+                },
+            ),
+            (b"Z".to_vec(), OwnedObject::Reference(original)),
+        ]));
+        let digest = |object: &OwnedObject, mode| {
+            let mut hasher = Sha256::new();
+            hash_cos_value(&mut hasher, object, mode);
+            <[u8; 32]>::from(hasher.finalize())
+        };
+        // Frozen digest values from the previous exact and recursive byte protocols,
+        // including stream dictionary-before-payload order.
+        assert_eq!(
+            digest(&value, FingerprintReferences::Exact),
+            [
+                0x26, 0x4d, 0x87, 0x6d, 0x7c, 0xd9, 0xbb, 0xf0, 0x1f, 0x8a, 0xd8, 0x98, 0x61, 0x3a,
+                0x6e, 0xa7, 0x79, 0xd1, 0x2c, 0xb4, 0x8b, 0xb9, 0xb6, 0x2d, 0x27, 0xbf, 0x5b, 0x8d,
+                0xc1, 0xc7, 0xe1, 0x0e
+            ]
+        );
+        assert_eq!(
+            digest(&value, FingerprintReferences::Recursive(&redirects)),
+            [
+                0xd3, 0x10, 0x66, 0xfb, 0xb6, 0x9f, 0xe9, 0xbd, 0x06, 0xfe, 0xc0, 0x63, 0x04, 0xd2,
+                0x88, 0x1b, 0x42, 0x49, 0x34, 0x04, 0x08, 0xb6, 0x36, 0xdb, 0x9c, 0xd5, 0x96, 0xc5,
+                0x1b, 0x1f, 0xc5, 0x0a
+            ]
+        );
+        assert_eq!(
+            digest(&value, FingerprintReferences::TopLevel(&redirects)),
+            [
+                0x26, 0x4d, 0x87, 0x6d, 0x7c, 0xd9, 0xbb, 0xf0, 0x1f, 0x8a, 0xd8, 0x98, 0x61, 0x3a,
+                0x6e, 0xa7, 0x79, 0xd1, 0x2c, 0xb4, 0x8b, 0xb9, 0xb6, 0x2d, 0x27, 0xbf, 0x5b, 0x8d,
+                0xc1, 0xc7, 0xe1, 0x0e
+            ]
+        );
+        assert_eq!(
+            digest(
+                &OwnedObject::Reference(original),
+                FingerprintReferences::TopLevel(&redirects)
+            ),
+            [
+                0x6c, 0x0b, 0xa4, 0xbe, 0xaa, 0x20, 0xbe, 0x97, 0x4e, 0x1f, 0x85, 0xcc, 0xbc, 0x32,
+                0xd5, 0x2e, 0x57, 0xb9, 0x84, 0xc7, 0xa6, 0x14, 0x2a, 0x32, 0x88, 0xce, 0x87, 0x0c,
+                0x06, 0x84, 0xff, 0x48
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cos_fingerprint_handles_deep_owned_nesting() -> Result<()> {
+        let depth = 20_000;
+        let mut value = OwnedObject::Null;
+        for _ in 0..depth {
+            value = OwnedObject::Array(vec![value]);
+        }
+        let mut expected = Sha256::new();
+        for _ in 0..depth {
+            expected.update([0x06]);
+            expected.update(1u64.to_le_bytes());
+        }
+        expected.update([0x00]);
+        let mut actual = Sha256::new();
+        hash_cos_value(&mut actual, &value, FingerprintReferences::Exact);
+        assert_eq!(actual.finalize(), expected.finalize());
+        // The separate owned-object destructor is recursive; dismantle
+        // the synthetic input after exercising the iterative encoder.
+        for _ in 0..depth {
+            let OwnedObject::Array(mut children) = value else {
+                return Err(crate::Error::Invalid("unexpected fixture shape".to_owned()));
+            };
+            value = children
+                .pop()
+                .ok_or_else(|| crate::Error::Invalid("missing fixture child".to_owned()))?;
+        }
+        assert_eq!(value, OwnedObject::Null);
+        Ok(())
+    }
 
     fn duplicate_image_fixture_with_payload(sample_count: usize) -> Result<Vec<u8>> {
         let mut pdf = ClassicPdfBuilder::new();
