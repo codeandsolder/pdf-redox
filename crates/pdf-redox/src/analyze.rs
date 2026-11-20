@@ -1377,15 +1377,13 @@ impl ObjectAnalysisAccumulator {
         }
         match type_name.as_ref() {
             Ok(Some(name)) if name.as_slice() == b"Font" => {
-                match exact_dictionary_fingerprint(object, b"exact-font-dictionary") {
-                    Ok(Some(fingerprint)) => {
-                        *self
-                            .font_dictionary_fingerprints
-                            .entry(fingerprint)
-                            .or_default() += 1;
-                    }
-                    Ok(None) => {}
-                    Err(_) => self.font_dictionary_fingerprint_inventory_complete = false,
+                if let Some(fingerprint) =
+                    exact_dictionary_fingerprint(object, b"exact-font-dictionary")
+                {
+                    *self
+                        .font_dictionary_fingerprints
+                        .entry(fingerprint)
+                        .or_default() += 1;
                 }
             }
             Ok(_) => {}

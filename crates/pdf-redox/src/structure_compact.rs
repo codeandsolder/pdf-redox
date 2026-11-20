@@ -137,7 +137,7 @@ impl LivePageIdentityIndex {
         // Source materialization already canonicalizes both signs of zero to
         // integer zero, so the exact COS fingerprint agrees with structural
         // equality. Hashing is only an index; compare values in the bucket.
-        exact_dictionary_fingerprint(properties, b"immutable-source-page-identity")?
+        exact_dictionary_fingerprint(properties, b"immutable-source-page-identity")
             .ok_or_else(|| Error::Invalid("page identity is not a dictionary".to_owned()))
     }
 
