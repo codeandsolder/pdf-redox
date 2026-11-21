@@ -5,5 +5,23 @@
   ],
   "ignorePaths": [
     "third_party/hayro-syntax/**"
+  ],
+  "packageRules": [
+    {
+      "description": "Update crates sharing version-specific Rust types together",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "font-types",
+        "read-fonts",
+        "write-fonts",
+        "skrifa",
+        "skera"
+      ],
+      "groupName": "Fontations crates",
+      "groupSlug": "fontations-crates",
+      "automerge": false
+    }
   ]
 }
