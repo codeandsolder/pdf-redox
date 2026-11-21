@@ -213,48 +213,36 @@ impl FlateBatchEncoder {
                 "Flate input and output-limit counts differ".to_owned(),
             ));
         }
-        let outputs = inputs
+        let mut outputs = vec![Vec::new(); inputs.len()];
+        let mut jobs = inputs
             .iter()
             .zip(maximum_lengths)
-            .map(|(input, &limit)| vec![0_u8; limit.min(zlib_rs::compress_bound(input.len()))])
-            .collect::<Vec<_>>();
-        #[cfg(not(target_family = "wasm"))]
-        let mut outputs = outputs;
-
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(compressor) = &self.compressor {
-            let mut jobs = inputs
-                .iter()
-                .zip(&mut outputs)
-                .map(|(input, output)| zlib_rs::BatchJob::new(input, output))
-                .collect::<Vec<_>>();
-            let results = compressor.compress(&mut jobs, flate_config(level));
-            drop(jobs);
-            return outputs
-                .into_iter()
-                .zip(results)
-                .map(|(mut output, result)| {
-                    let Some(written) = flate_length_with_limit(result.written, result.code)?
-                    else {
-                        return Ok(None);
-                    };
-                    output.truncate(written);
-                    Ok(Some(output))
+            .zip(&mut outputs)
+            .map(|((input, &limit), output)| {
+                zlib_rs::BatchJob::with_vec(
+                    input,
+                    output,
+                    limit.min(zlib_rs::compress_bound(input.len())),
+                )
+                .map_err(|error| {
+                    Error::Compression(format!("failed to reserve Flate output: {error}"))
                 })
-                .collect();
-        }
-
-        inputs
-            .iter()
-            .zip(outputs)
-            .map(|(input, mut output)| {
-                let (encoded, code) =
-                    zlib_rs::compress_slice(&mut output, input, flate_config(level));
-                let Some(written) = flate_length_with_limit(encoded.len(), code)? else {
-                    return Ok(None);
-                };
-                output.truncate(written);
-                Ok(Some(output))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let config = flate_config(level);
+        #[cfg(not(target_family = "wasm"))]
+        let results = match &self.compressor {
+            Some(compressor) => compressor.compress(&mut jobs, config),
+            None => zlib_rs::compress_slices_batch(&mut jobs, config),
+        };
+        #[cfg(target_family = "wasm")]
+        let results = zlib_rs::compress_slices_batch(&mut jobs, config);
+        drop(jobs);
+        outputs
+            .into_iter()
+            .zip(results)
+            .map(|(output, result)| {
+                Ok(flate_length_with_limit(result.written, result.code)?.map(|_| output))
             })
             .collect()
     }
