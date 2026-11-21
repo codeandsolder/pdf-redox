@@ -176,7 +176,7 @@ pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>>
 /// Persistent whole-stream Flate executor used by document-level batch phases.
 pub struct FlateBatchEncoder {
     #[cfg(not(target_family = "wasm"))]
-    compressor: Option<zlib_rs::BatchCompressor>,
+    compressor: Option<zlib_rs::BatchCodec>,
 }
 
 impl FlateBatchEncoder {
@@ -189,7 +189,7 @@ impl FlateBatchEncoder {
         #[cfg(not(target_family = "wasm"))]
         {
             let compressor = if workers.get() > 1 {
-                Some(zlib_rs::BatchCompressor::new(workers).map_err(|error| {
+                Some(zlib_rs::BatchCodec::new(workers).map_err(|error| {
                     Error::Compression(format!("failed to create Flate worker pool: {error}"))
                 })?)
             } else {
@@ -222,13 +222,11 @@ impl FlateBatchEncoder {
         let mut outputs = outputs;
 
         #[cfg(not(target_family = "wasm"))]
-        if inputs.len() > 1
-            && let Some(compressor) = &self.compressor
-        {
+        if let Some(compressor) = &self.compressor {
             let mut jobs = inputs
                 .iter()
                 .zip(&mut outputs)
-                .map(|(input, output)| zlib_rs::BatchCompressJob::new(input, output))
+                .map(|(input, output)| zlib_rs::BatchJob::new(input, output))
                 .collect::<Vec<_>>();
             let results = compressor.compress(&mut jobs, flate_config(level));
             drop(jobs);
