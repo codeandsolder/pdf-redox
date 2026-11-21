@@ -63,6 +63,14 @@ impl SourcePdf {
         })
     }
 
+    /// Borrow the already parsed immutable PDF for consumers that need Hayro's
+    /// page interpreter or decoded resource context. No additional document
+    /// parsing, source copying or mutation is required.
+    #[must_use]
+    pub const fn syntax(&self) -> &Pdf {
+        &self.pdf
+    }
+
     /// Original source bytes, unchanged.
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
