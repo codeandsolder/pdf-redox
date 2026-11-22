@@ -561,27 +561,37 @@ fn quantized_pitch_key(value: f64) -> Option<i32> {
 }
 
 fn infer_pitch(lines: &[LineSegment]) -> Option<f64> {
-    let mut counts = BTreeMap::<i32, usize>::new();
+    // The quantizer already bounds keys to a small, dense integer domain.
+    // One indexed histogram avoids a tree lookup/allocation per difference.
+    let first_key = quantized_pitch_key(MIN_PITCH)?;
+    let last_key = quantized_pitch_key(MAX_PITCH)?;
+    let mut counts = vec![0_usize; usize::try_from(last_key - first_key + 1).ok()?];
     let mut add = |value: f64| {
-        if let Some(key) = quantized_pitch_key(value) {
-            *counts.entry(key).or_default() += 1;
+        if let Some(key) = quantized_pitch_key(value)
+            && let Ok(index) = usize::try_from(key - first_key)
+        {
+            counts[index] += 1;
         }
     };
 
+    let mut previous = None::<(f64, f64)>;
     for &((x0, y0), (x1, y1)) in lines {
         add(x1 - x0);
         add(y1 - y0);
+        if let Some((px, py)) = previous {
+            add(x0 - px);
+            add(y0 - py);
+        }
+        previous = Some((x0, y0));
     }
-    for pair in lines.windows(2) {
-        add((pair[1].0).0 - (pair[0].0).0);
-        add((pair[1].0).1 - (pair[0].0).1);
-    }
-    let (key, support) = counts
+    let (index, support) = counts
         .into_iter()
-        .max_by_key(|(key, count)| (*count, std::cmp::Reverse(*key)))?;
+        .enumerate()
+        .max_by_key(|(index, count)| (*count, std::cmp::Reverse(*index)))?;
     if support < 32 || support.saturating_mul(100) < lines.len() {
         return None;
     }
+    let key = first_key + i32::try_from(index).ok()?;
     Some(f64::from(key) / 10_000.0)
 }
 
@@ -669,7 +679,7 @@ fn analyze_microstroke_run(
     let mut xmax = f64::NEG_INFINITY;
     let mut ymax = f64::NEG_INFINITY;
     let mut short = 0usize;
-    let mut lengths = Vec::with_capacity(run.lines.len());
+    let mut at_most_median_limit = 0usize;
     let mut forward_connected = 0usize;
     for &((x0, y0), (x1, y1)) in &run.lines {
         if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
@@ -684,7 +694,7 @@ fn analyze_microstroke_run(
             return None;
         }
         short += usize::from(length <= 2.0);
-        lengths.push(length);
+        at_most_median_limit += usize::from(length <= 1.5);
     }
     for pair in run.lines.windows(2) {
         let (_, previous_end) = pair[0];
@@ -704,15 +714,10 @@ fn analyze_microstroke_run(
     if short.saturating_mul(100) < run.lines.len().saturating_mul(65) {
         return None;
     }
-    // An empty run has no median. Keep the same ineligible outcome as the
-    // original sorted-median path rather than calling selection out of bounds.
-    if lengths.is_empty() {
-        return None;
-    }
-    // Selection is O(n), unlike sorting all lengths merely to find a median.
-    let midpoint = lengths.len() / 2;
-    let (_, median, _) = lengths.select_nth_unstable_by(midpoint, f64::total_cmp);
-    if *median > 1.5 {
+    // The upper median at index len/2 is <= 1.5 exactly when more
+    // than len/2 lengths are <= 1.5. No order statistic or length buffer
+    // is needed when the median itself is not consumed.
+    if at_most_median_limit <= run.lines.len() / 2 {
         return None;
     }
     Some(MicroStrokeGeometry {
@@ -1385,6 +1390,22 @@ mod tests {
         assert!(coarser.mask.packed().len() < natural.mask.packed().len());
         assert!(coarser.mask.packed().iter().any(|byte| *byte != 0xff));
         Ok(())
+    }
+
+    #[test]
+    fn pitch_histogram_preserves_lower_key_tie_break_and_inclusive_bounds() {
+        let lines = (0..32)
+            .flat_map(|_| {
+                [
+                    ((0.0, 0.0), (MIN_PITCH, 0.0)),
+                    ((0.0, 0.0), (MAX_PITCH, 0.0)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(infer_pitch(&lines), Some(MIN_PITCH));
+        assert_eq!(infer_pitch(&lines[1..2]), None);
+        let high_only = [((0.0, 0.0), (MAX_PITCH, 0.0)); 32];
+        assert_eq!(infer_pitch(&high_only), Some(MAX_PITCH));
     }
 
     #[test]
