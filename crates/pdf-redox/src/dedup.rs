@@ -1566,6 +1566,36 @@ pub fn exact_dictionary_fingerprint(object: &CurrentValue<'_>, domain: &[u8]) ->
     Some(hasher.finalize().into())
 }
 
+/// Fingerprint a synthetic dictionary of borrowed values, such as an
+/// immutable page identity whose effective properties span multiple nodes.
+pub fn exact_projected_dictionary_fingerprint(
+    entries: &BTreeMap<Vec<u8>, CurrentValue<'_>>,
+    domain: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, domain);
+    hasher.update([0x07]);
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
+        hash_len_prefixed(&mut hasher, key);
+        hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
+    }
+    hasher.finalize().into()
+}
+
+pub fn exact_projected_dictionary_equal(
+    left: &BTreeMap<Vec<u8>, CurrentValue<'_>>,
+    right: &BTreeMap<Vec<u8>, CurrentValue<'_>>,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_key, left), (right_key, right))| {
+                left_key == right_key && exact_cos_equal(left, right)
+            })
+}
+
 fn exact_dictionary_redirects(
     document: &EditDocument,
     handles: impl IntoIterator<Item = CowObjectHandle>,
