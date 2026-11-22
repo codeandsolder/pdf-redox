@@ -892,17 +892,41 @@ struct LocalPageRewriteStats {
 }
 
 #[derive(Clone, Copy)]
-enum LocalRewriteInput {
-    Original,
-    Normalized,
+enum LocalRewriteKind {
+    OptionalContent,
+    Collinear,
+}
+
+struct LocalRewritePlan<'a> {
+    before: Cow<'a, [u8]>,
+    after: Vec<u8>,
+    operations: usize,
+}
+
+impl LocalRewriteKind {
+    fn plan(self, decoded: &[u8]) -> Option<LocalRewritePlan<'_>> {
+        match self {
+            Self::OptionalContent => {
+                let (after, operations) = coalesce_adjacent_ocg_content(decoded)?;
+                let Cow::Owned(after) = after else {
+                    return None;
+                };
+                Some(LocalRewritePlan {
+                    before: Cow::Borrowed(decoded),
+                    after,
+                    operations,
+                })
+            }
+            Self::Collinear => normalized_collinear_plan(decoded),
+        }
+    }
 }
 
 fn apply_local_page_rewrites(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
-    input_mode: LocalRewriteInput,
-    rewrite: impl for<'a> Fn(&'a [u8]) -> Option<(Cow<'a, [u8]>, usize)>,
+    kind: LocalRewriteKind,
 ) -> Result<LocalPageRewriteStats> {
     let mut stats = LocalPageRewriteStats::default();
     for &page in pages {
@@ -912,28 +936,25 @@ fn apply_local_page_rewrites(
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
-        let input = match input_mode {
-            LocalRewriteInput::Original => Cow::Borrowed(decoded.as_slice()),
-            // Processing normalizes page content later. Compare collinear
-            // rewrites against that representation, but retain the size
-            // threshold on the original decoded stream.
-            LocalRewriteInput::Normalized => {
-                Cow::Owned(crate::content_stream::normalize_content_stream(&decoded))
-            }
-        };
-        let Some((rewritten, operations)) = rewrite(&input) else {
+        let Some(LocalRewritePlan {
+            before,
+            after,
+            operations,
+        }) = kind.plan(&decoded)
+        else {
             continue;
         };
-        if operations == 0 || rewritten.as_ref() == input.as_ref() {
+        if operations == 0 || after.as_slice() == before.as_ref() {
             continue;
         }
-        let before_flate = crate::stream_codec::flate_encoded_len(&input, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?;
-        if after_flate > before_flate {
+        let before_flate = crate::stream_codec::flate_encoded_len(&before, flate_level)?;
+        let Some(after_flate) =
+            crate::stream_codec::flate_capped_encoded_len(&after, before_flate, flate_level)?
+        else {
             continue;
-        }
-        let removed_bytes = input.len().saturating_sub(rewritten.len());
-        replace_page_content(document, page, rewritten.into_owned())?;
+        };
+        let removed_bytes = before.len().saturating_sub(after.len());
+        replace_page_content(document, page, after)?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.operations = stats.operations.saturating_add(operations);
         stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(removed_bytes);
@@ -953,8 +974,7 @@ pub fn coalesce_optional_content(
         document,
         pages,
         flate_level,
-        LocalRewriteInput::Original,
-        coalesce_adjacent_ocg_content,
+        LocalRewriteKind::OptionalContent,
     )?;
     Ok(MarkedContentCoalesceStats {
         pages_rewritten: stats.pages_rewritten,
@@ -1036,59 +1056,87 @@ fn same_forward_line(a: LinePoint, b: LinePoint, c: LinePoint) -> bool {
     cross == 0 && dot > 0
 }
 
-fn line_point(instruction: &hayro_syntax::content::Instruction<'_, '_>) -> Option<LinePoint> {
+fn line_point(
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    span: std::ops::Range<usize>,
+) -> Option<LinePoint> {
     let [x, y] = crate::content_stream::instruction_number_array::<2>(instruction)?;
-    let span = instruction.span();
     Some(LinePoint {
         start: span.start,
-        end: instruction.operator_span().end,
+        end: span.end,
         x: structural_grid_coordinate(x)?,
         y: structural_grid_coordinate(y)?,
     })
 }
 
-/// Reduce a contiguous line run incrementally. The retained stack is the
-/// already simplified path, not a duplicate of every original vertex.
-fn push_collinear_point(
-    stack: &mut Vec<LinePoint>,
-    point: LinePoint,
-    replacements: &mut Vec<(usize, usize, Vec<u8>)>,
-) {
-    stack.push(point);
-    while let [.., a, b, c] = stack.as_slice() {
-        if !same_forward_line(*a, *b, *c) {
-            break;
+/// The retained run is the already simplified path, not a duplicate of
+/// every original vertex. Spans refer to either original or normalized bytes.
+#[derive(Default)]
+struct CollinearScanner {
+    run: Vec<LinePoint>,
+    replacements: Vec<(usize, usize, &'static [u8])>,
+}
+
+impl CollinearScanner {
+    fn instruction(
+        &mut self,
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        span: std::ops::Range<usize>,
+        contiguous: bool,
+    ) {
+        match &instruction.operator[..] {
+            b"m" => {
+                self.run.clear();
+                if contiguous && let Some(point) = line_point(instruction, span) {
+                    self.run.push(point);
+                }
+            }
+            b"l" if !self.run.is_empty() && contiguous => {
+                if let Some(point) = line_point(instruction, span) {
+                    self.run.push(point);
+                    while let [.., a, b, c] = self.run.as_slice() {
+                        if !same_forward_line(*a, *b, *c) {
+                            break;
+                        }
+                        self.replacements.push((b.start, b.end, b""));
+                        let length = self.run.len();
+                        self.run.remove(length - 2);
+                    }
+                } else {
+                    self.run.clear();
+                }
+            }
+            _ => self.run.clear(),
         }
-        replacements.push((b.start, b.end, Vec::new()));
-        let len = stack.len();
-        stack.remove(len - 2);
+    }
+
+    fn finish(self, input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)> {
+        let count = self.replacements.len();
+        if count == 0 {
+            return Some((Cow::Borrowed(input), 0));
+        }
+        Some((
+            Cow::Owned(crate::content_stream::apply_replacements(
+                input,
+                &self.replacements,
+            )?),
+            count,
+        ))
     }
 }
 
 fn compact_collinear_line_points(input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)> {
-    let mut replacements = Vec::<(usize, usize, Vec<u8>)>::new();
-    let mut run = Vec::<LinePoint>::new();
+    let mut scanner = CollinearScanner::default();
     let mut previous_end = None;
     let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
         let span = instruction.span();
         let contiguous =
             previous_end.is_none_or(|end| input.get(end..span.start).is_some_and(trivia_only));
-        match &instruction.operator[..] {
-            b"m" => {
-                run.clear();
-                if contiguous && let Some(point) = line_point(instruction) {
-                    run.push(point);
-                }
-            }
-            b"l" if !run.is_empty() && contiguous => {
-                if let Some(point) = line_point(instruction) {
-                    push_collinear_point(&mut run, point, &mut replacements);
-                } else {
-                    run.clear();
-                }
-            }
-            _ => run.clear(),
-        }
+        scanner.instruction(
+            instruction,
+            span.start..instruction.operator_span().end,
+            contiguous,
+        );
         previous_end = Some(span.end);
         Ok(())
     })
@@ -1096,17 +1144,39 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)>
     if incomplete {
         return None;
     }
-    let count = replacements.len();
-    if count == 0 {
-        return Some((Cow::Borrowed(input), 0));
-    }
-    Some((
-        Cow::Owned(crate::content_stream::apply_replacements(
-            input,
-            &replacements,
-        )?),
-        count,
-    ))
+    scanner.finish(input)
+}
+
+/// Processing compares against normalized source bytes. Reuse the parsed
+/// instructions and emitted offsets rather than reparsing all normalized
+/// tokens. Escaped operator spelling can change tokenization after emission;
+/// such recovery cases (and aborted inline-image normalization) retain the
+/// authoritative standalone parse of the actual emitted representation.
+fn normalized_collinear_plan(input: &[u8]) -> Option<LocalRewritePlan<'_>> {
+    let mut scanner = CollinearScanner::default();
+    let mut identical_operators = true;
+    let normalized =
+        crate::content_stream::normalize_content_stream(input, |instruction, emitted| {
+            identical_operators &=
+                input.get(instruction.operator_span()) == Some(&instruction.operator[..]);
+            if identical_operators {
+                scanner.instruction(instruction, emitted, true);
+            }
+        });
+    let before = normalized.map_or(Cow::Borrowed(input), Cow::Owned);
+    let (after, operations) = if matches!(before, Cow::Owned(_)) && identical_operators {
+        scanner.finish(&before)?
+    } else {
+        compact_collinear_line_points(&before)?
+    };
+    let Cow::Owned(after) = after else {
+        return None;
+    };
+    Some(LocalRewritePlan {
+        before,
+        after,
+        operations,
+    })
 }
 
 #[derive(Debug)]
@@ -1146,11 +1216,12 @@ fn compact_collinear_form_paths(
             continue;
         }
         let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
-        let encoded_len = encoded.len();
-        if encoded_len > before_flate {
+        let Some(encoded) =
+            crate::stream_codec::encode_flate_capped(&compacted, before_flate, flate_level)?
+        else {
             continue;
-        }
+        };
+        let encoded_len = encoded.len();
         let candidate_flate_bytes_saved = before_flate.saturating_sub(encoded_len);
         vertices_removed = vertices_removed.saturating_add(candidate_vertices_removed);
         flate_bytes_saved = flate_bytes_saved.saturating_add(candidate_flate_bytes_saved);
@@ -1194,13 +1265,8 @@ pub fn compact_collinear_paths(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<CollinearPathStats> {
-    let page_stats = apply_local_page_rewrites(
-        document,
-        pages,
-        flate_level,
-        LocalRewriteInput::Normalized,
-        compact_collinear_line_points,
-    )?;
+    let page_stats =
+        apply_local_page_rewrites(document, pages, flate_level, LocalRewriteKind::Collinear)?;
     let form_stats = compact_collinear_form_paths(document, flate_level)?;
     Ok(CollinearPathStats {
         pages_rewritten: page_stats.pages_rewritten,
@@ -2743,6 +2809,36 @@ mod tests {
         assert!(!form_collinear_material(1023, 4095));
         assert!(form_collinear_material(1024, 0));
         assert!(form_collinear_material(0, 4096));
+    }
+
+    #[test]
+    fn fused_collinear_normalization_matches_authoritative_reparse() {
+        let cases: &[&[u8]] = &[
+            b"0 0 m 1 0 l % trivia\n2 0 l S",
+            b"0 0 m 1 1 l 2 2 l 3 1 l 4 0 l S",
+            b"0 0 m 1 0 #6c 2 0 l S",
+            b"0 0 m 1 0 l 2 0 l m#20S 4 4 m 5 5 l 6 6 l f",
+            b"0 0 m 1 0 l 2 0 l S BI /W 1 /H 1 /BPC 8 /CS /G ID x EI q Q",
+            b"0 0 m 1 0 l 2 0 l S [1 2",
+            b"0 0 m 1 1 l 2 0 l S",
+            b"9007199254740993 0 m 1 0 l 2 0 l S",
+            b"0 0 m 1.00 -0.0 l 2 0 l S /Span <</ActualText(hello)>> BDC EMC",
+        ];
+        for &input in cases {
+            let normalized = crate::content_stream::normalize_content_stream(input, |_, _| {})
+                .unwrap_or_else(|| input.to_vec());
+            let expected = compact_collinear_line_points(&normalized);
+            let plan = normalized_collinear_plan(input);
+            match expected {
+                Some((rewritten, count)) if count != 0 => {
+                    let plan = some!(plan, "fused plan");
+                    assert_eq!(plan.before.as_ref(), normalized.as_slice());
+                    assert_eq!(plan.after.as_slice(), rewritten.as_ref());
+                    assert_eq!(plan.operations, count);
+                }
+                _ => assert!(plan.is_none()),
+            }
+        }
     }
 
     #[test]

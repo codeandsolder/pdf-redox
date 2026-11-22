@@ -5144,7 +5144,11 @@ fn encoded_content_payload_len(
     flate_level: crate::FlateLevel,
     normalize_before_flate: bool,
 ) -> Result<usize> {
-    let normalized = normalize_before_flate.then(|| normalize_content_stream(content));
+    let normalized = if normalize_before_flate {
+        normalize_content_stream(content, |_, _| {})
+    } else {
+        None
+    };
     let bytes = normalized.as_deref().unwrap_or(content);
     Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
 }
