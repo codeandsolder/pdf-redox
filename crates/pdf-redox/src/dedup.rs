@@ -1,7 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData,
-    content::resolved_dictionary,
     source::{
         CosScalar, CurrentArrayIter, CurrentChildKey, CurrentChildren, CurrentDictionaryIter,
         CurrentValue, NumericValue, StreamIdentity,
@@ -386,6 +385,10 @@ pub fn exact_cos_equal(left: &CurrentValue<'_>, right: &CurrentValue<'_>) -> boo
     if !compare_cos_node(left, right, &mut frames) {
         return false;
     }
+    compare_cos_frames(frames)
+}
+
+fn compare_cos_frames(mut frames: SmallVec<[EqualityFrame<'_, '_>; 4]>) -> bool {
     while let Some((left, right)) = frames.last_mut() {
         match (left.next(), right.next()) {
             (None, None) => {
@@ -1014,92 +1017,111 @@ pub struct FormMetadataPayloadFactorStats {
 
 fn pattern_integer(
     document: &EditDocument,
-    dictionary: &OwnedDictionary,
+    object: &CurrentValue<'_>,
     key: &[u8],
 ) -> Result<Option<i64>> {
-    let Some(value) = dictionary.get(key) else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Integer(value)) => Some(value),
-        _ => None,
-    })
+    Ok(
+        match object
+            .resolved_entry(document, key)?
+            .and_then(|value| value.number())
+        {
+            Some(NumericValue::Integer(value)) => Some(value),
+            _ => None,
+        },
+    )
 }
 
-fn pattern_already_factored(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
-    let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
+/// Return the only entry of a dictionary if it has the expected key.
+fn sole_dictionary_entry<'a>(object: &CurrentValue<'a>, key: &[u8]) -> Option<CurrentValue<'a>> {
+    let mut entries = object.dictionary_entries()?;
+    let (name, value) = entries.next()?;
+    (name.as_ref() == key && entries.next().is_none()).then_some(value)
+}
+
+fn pattern_already_factored(document: &EditDocument, object: &CurrentValue<'_>) -> Result<bool> {
+    let Some(resources) = object.resolved_entry(document, b"Resources")? else {
         return Ok(false);
     };
-    let Some(resources) = resolved_dictionary(document, Some(resources))? else {
+    let Some(xobjects) = sole_dictionary_entry(&resources, b"XObject") else {
         return Ok(false);
     };
-    if resources.len() != 1 {
-        return Ok(false);
-    }
-    let Some(xobjects) = resources.get(b"XObject".as_slice()) else {
+    let Some(xobjects) = document.resolve_current_value(xobjects)? else {
         return Ok(false);
     };
-    let Some(xobjects) = resolved_dictionary(document, Some(xobjects))? else {
-        return Ok(false);
-    };
-    Ok(xobjects.len() == 1 && xobjects.contains_key(FACTORED_PATTERN_CELL_NAME))
+    Ok(sole_dictionary_entry(&xobjects, FACTORED_PATTERN_CELL_NAME).is_some())
 }
 
 fn pattern_payload_fingerprint(
     document: &EditDocument,
     pattern: CowObjectHandle,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object_cow(pattern)? else {
+    let Some(object) = document.current_value(pattern)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
-        return Ok(None);
-    };
-    if pattern_integer(document, dictionary, b"PatternType")? != Some(1)
-        || pattern_integer(document, dictionary, b"PaintType")? != Some(1)
-        || pattern_already_factored(document, dictionary)?
-        || dictionary.contains_key(b"F".as_slice())
-        || dictionary.contains_key(b"FFilter".as_slice())
-        || dictionary.contains_key(b"FDecodeParms".as_slice())
+    if !object.is_stream()
+        || pattern_integer(document, &object, b"PatternType")? != Some(1)
+        || pattern_integer(document, &object, b"PaintType")? != Some(1)
+        || pattern_already_factored(document, &object)?
+        || [b"F".as_slice(), b"FFilter", b"FDecodeParms"]
+            .into_iter()
+            .any(|key| object.dictionary_entry(key).is_some())
     {
         return Ok(None);
     }
-    let (Some(bbox), Some(resources_value)) = (
-        dictionary.get(b"BBox".as_slice()),
-        dictionary.get(b"Resources".as_slice()),
-    ) else {
+    let Some(bbox) = object.dictionary_entry(b"BBox") else {
         return Ok(None);
     };
-    let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
+    let Some(resources) = object
+        .resolved_entry(document, b"Resources")?
+        .filter(CurrentValue::has_dictionary)
+    else {
         return Ok(None);
     };
-    let raw = data.bytes(document.source())?;
+    let raw = object.stream_bytes(document.source())?;
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, b"pattern-cell-payload");
     hash_len_prefixed(&mut hasher, raw.as_ref());
     for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
         hash_len_prefixed(&mut hasher, key);
-        if let Some(value) = dictionary.get(key) {
-            hash_cos_value(
-                &mut hasher,
-                &CurrentValue::Owned(value),
-                FingerprintReferences::Exact,
-            );
+        if let Some(value) = object.dictionary_entry(key) {
+            hash_cos_value(&mut hasher, &value, FingerprintReferences::Exact);
         } else {
             hasher.update([0]);
         }
     }
-    hash_cos_value(
+    hash_cos_value(&mut hasher, &bbox, FingerprintReferences::Exact);
+    // Match the existing resource dictionary projection even if malformed
+    // Resources resolves to a stream: only the dictionary participates.
+    hash_dictionary_entries(
         &mut hasher,
-        &CurrentValue::Owned(bbox),
-        FingerprintReferences::Exact,
-    );
-    hash_cos_value(
-        &mut hasher,
-        &CurrentValue::Owned(&OwnedObject::Dictionary(resources)),
-        FingerprintReferences::Exact,
-    );
+        &resources,
+        |_| true,
+        |hasher, _, value| {
+            hash_cos_value(hasher, &value, FingerprintReferences::Exact);
+            Ok(())
+        },
+    )?;
     Ok(Some((hasher.finalize().into(), raw.len())))
+}
+
+fn optional_cos_equal(left: Option<CurrentValue<'_>>, right: Option<CurrentValue<'_>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => exact_cos_equal(&left, &right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn dictionary_projection_equal(left: &CurrentValue<'_>, right: &CurrentValue<'_>) -> bool {
+    let (Some(left), Some(right)) = (left.dictionary_entries(), right.dictionary_entries()) else {
+        return false;
+    };
+    let mut frames = SmallVec::new();
+    frames.push((
+        CurrentChildren::Dictionary(left),
+        CurrentChildren::Dictionary(right),
+    ));
+    compare_cos_frames(frames)
 }
 
 fn pattern_payloads_equal(
@@ -1107,79 +1129,82 @@ fn pattern_payloads_equal(
     left: CowObjectHandle,
     right: CowObjectHandle,
 ) -> Result<bool> {
-    let Some(left) = document.current_owned_object_cow(left)? else {
+    let Some(left) = document.current_value(left)? else {
         return Ok(false);
     };
-    let OwnedObject::Stream {
-        dictionary: left_dict,
-        data: left_data,
-    } = left.as_ref()
-    else {
-        return Ok(false);
-    };
-    let Some(right) = document.current_owned_object_cow(right)? else {
-        return Ok(false);
-    };
-    let OwnedObject::Stream {
-        dictionary: right_dict,
-        data: right_data,
-    } = right.as_ref()
-    else {
-        return Ok(false);
-    };
-    if left_data.bytes(document.source())? != right_data.bytes(document.source())? {
+    if !left.is_stream() {
         return Ok(false);
     }
-    for key in [
-        b"BBox".as_slice(),
-        b"Filter".as_slice(),
-        b"DecodeParms".as_slice(),
-    ] {
-        if left_dict.get(key) != right_dict.get(key) {
+    let Some(right) = document.current_value(right)? else {
+        return Ok(false);
+    };
+    if !right.is_stream()
+        || left.stream_bytes(document.source())? != right.stream_bytes(document.source())?
+    {
+        return Ok(false);
+    }
+    for key in [b"BBox".as_slice(), b"Filter", b"DecodeParms"] {
+        if !optional_cos_equal(left.dictionary_entry(key), right.dictionary_entry(key)) {
             return Ok(false);
         }
     }
     let (Some(left_resources), Some(right_resources)) = (
-        left_dict.get(b"Resources".as_slice()),
-        right_dict.get(b"Resources".as_slice()),
+        left.dictionary_entry(b"Resources"),
+        right.dictionary_entry(b"Resources"),
     ) else {
         return Ok(false);
     };
-    Ok(resolved_dictionary(document, Some(left_resources))?
-        == resolved_dictionary(document, Some(right_resources))?)
+    Ok(
+        match (
+            document
+                .resolve_current_value(left_resources)?
+                .filter(CurrentValue::has_dictionary),
+            document
+                .resolve_current_value(right_resources)?
+                .filter(CurrentValue::has_dictionary),
+        ) {
+            (Some(left), Some(right)) => dictionary_projection_equal(&left, &right),
+            (None, None) => true,
+            _ => false,
+        },
+    )
 }
 
 fn shared_pattern_form(
     document: &mut EditDocument,
     representative: CowObjectHandle,
 ) -> Result<Option<CowObjectHandle>> {
-    let Some(OwnedObject::Stream { dictionary, data }) =
-        document.current_owned_object(representative)?
-    else {
+    let Some(object) = document.current_value(representative)? else {
         return Ok(None);
     };
-    let (Some(bbox), Some(resources)) = (
-        dictionary.get(b"BBox".as_slice()).cloned(),
-        dictionary.get(b"Resources".as_slice()).cloned(),
+    let (Some(data), Some(bbox), Some(resources)) = (
+        object.stream_identity(),
+        object.dictionary_entry(b"BBox"),
+        object.dictionary_entry(b"Resources"),
     ) else {
         return Ok(None);
     };
-    let raw = data.bytes(document.source())?.into_owned();
     let mut form = OwnedDictionary::from([
         (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
         (b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec())),
-        (b"BBox".to_vec(), bbox),
-        (b"Resources".to_vec(), resources),
+        (b"BBox".to_vec(), bbox.into_cow().into_owned()),
+        (b"Resources".to_vec(), resources.into_cow().into_owned()),
     ]);
     for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
-        if let Some(value) = dictionary.get(key) {
-            form.insert(key.to_vec(), value.clone());
+        if let Some(value) = object.dictionary_entry(key) {
+            form.insert(key.to_vec(), value.into_cow().into_owned());
         }
     }
+    // Immutable source bytes remain available after the original pattern
+    // is turned into a wrapper; only genuinely owned inline data is copied.
+    let data = match data {
+        StreamIdentity::Source(id) => StreamData::Source(id),
+        StreamIdentity::Inline(bytes) => StreamData::Owned(bytes.into_owned()),
+    };
     Ok(Some(CowObjectHandle::New(document.add_object(
         OwnedObject::Stream {
             dictionary: form,
-            data: StreamData::Owned(raw),
+            data,
         },
     ))))
 }
@@ -1239,15 +1264,16 @@ pub fn factor_duplicate_pattern_payloads(
     }
 
     let patterns = reachable_streams_with_type(document, b"Pattern")?;
-    let mut buckets = BTreeMap::<[u8; 32], Vec<Group>>::new();
+    let mut groups = Vec::<Group>::new();
+    let mut buckets = HashMap::<[u8; 32], Vec<usize>>::new();
     for pattern in patterns {
         let Some((fingerprint, raw_bytes)) = pattern_payload_fingerprint(document, pattern)? else {
             continue;
         };
-        let groups = buckets.entry(fingerprint).or_default();
+        let candidates = buckets.entry(fingerprint).or_default();
         let mut matched = None;
-        for (index, group) in groups.iter().enumerate() {
-            if pattern_payloads_equal(document, pattern, group.representative)? {
+        for &index in &*candidates {
+            if pattern_payloads_equal(document, pattern, groups[index].representative)? {
                 matched = Some(index);
                 break;
             }
@@ -1255,6 +1281,7 @@ pub fn factor_duplicate_pattern_payloads(
         if let Some(index) = matched {
             groups[index].members.push(pattern);
         } else {
+            candidates.push(groups.len());
             groups.push(Group {
                 representative: pattern,
                 members: vec![pattern],
@@ -1263,8 +1290,10 @@ pub fn factor_duplicate_pattern_payloads(
         }
     }
 
+    // Mutation order follows the source's ordered handle scan, not digest
+    // ordering. Changing the fingerprint protocol cannot reorder new forms.
     let mut stats = PatternPayloadFactorStats::default();
-    for group in buckets.into_values().flatten() {
+    for group in groups {
         if group.members.len() < 2 {
             continue;
         }
@@ -2079,12 +2108,12 @@ fn metadata_wrapper_safe_form(
     document: &EditDocument,
     form: CowObjectHandle,
 ) -> Result<Option<usize>> {
-    let Some(object) = document.current_owned_object_cow(form)? else {
+    let Some(object) = document.current_value(form)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+    if !object.is_stream() {
         return Ok(None);
-    };
+    }
     let allowed = [
         b"Type".as_slice(),
         b"Subtype".as_slice(),
@@ -2097,43 +2126,47 @@ fn metadata_wrapper_safe_form(
         b"LastModified".as_slice(),
         b"Name".as_slice(),
     ];
-    if dictionary
-        .keys()
-        .any(|key| !allowed.contains(&key.as_slice()))
-    {
+    let Some(entries) = object.dictionary_entries() else {
         return Ok(None);
+    };
+    let mut has_metadata = false;
+    for (key, _) in entries {
+        if !allowed.contains(&key.as_ref()) {
+            return Ok(None);
+        }
+        has_metadata |= key.as_ref() == b"LastModified";
     }
-    if !dictionary.contains_key(b"LastModified".as_slice()) {
+    if !has_metadata {
         return Ok(None);
     }
     // Require an explicit empty resource dictionary. An absent `/Resources`
     // can inherit the caller's resources in PDF interpreters, while a present
     // empty dictionary intentionally does not. Wrapping only the latter keeps
     // resource lookup unchanged even for malformed bodies that name resources.
-    let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
+    let Some(resources) = object.resolved_entry(document, b"Resources")? else {
         return Ok(None);
     };
-    let Some(resources) = resolved_dictionary(document, Some(resources))? else {
-        return Ok(None);
-    };
-    if !resources.is_empty() {
+    if resources
+        .dictionary_entries()
+        .is_none_or(|mut entries| entries.next().is_some())
+    {
         return Ok(None);
     }
-    let raw_bytes = data.bytes(document.source())?.len();
+    let raw_bytes = object.stream_bytes(document.source())?.len();
     Ok((raw_bytes >= MIN_FORM_METADATA_BODY_RAW_BYTES).then_some(raw_bytes))
 }
 
 fn form_last_modified(
     document: &EditDocument,
     form: CowObjectHandle,
-) -> Result<Option<OwnedObject>> {
-    let Some(object) = document.current_owned_object_cow(form)? else {
+) -> Result<Option<CurrentValue<'_>>> {
+    let Some(object) = document.current_value(form)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
-        return Ok(None);
-    };
-    Ok(dictionary.get(b"LastModified".as_slice()).cloned())
+    Ok(object
+        .is_stream()
+        .then(|| object.dictionary_entry(b"LastModified"))
+        .flatten())
 }
 
 fn rewrite_form_as_metadata_wrapper(
@@ -2169,7 +2202,10 @@ pub fn factor_form_payloads_across_metadata(
             continue;
         };
         if metadata_wrapper_safe_form(document, canonical)?.is_none()
-            || form_last_modified(document, form)? == form_last_modified(document, canonical)?
+            || optional_cos_equal(
+                form_last_modified(document, form)?,
+                form_last_modified(document, canonical)?,
+            )
         {
             continue;
         }
@@ -3140,10 +3176,10 @@ mod tests {
                 metadata_wrapper_safe_form(&source, handle)?,
                 metadata_wrapper_safe_form(&overlay, handle)?
             );
-            assert_eq!(
+            assert!(optional_cos_equal(
                 form_last_modified(&source, handle)?,
                 form_last_modified(&overlay, handle)?
-            );
+            ));
             let empty = HashMap::new();
             let projection = FormResourceProjection {
                 exact: &empty,
@@ -3260,10 +3296,32 @@ mod tests {
         let mut expected = None;
         for _ in 0..16 {
             let mut document = EditDocument::from_bytes(input.clone())?;
+            // Representative ordering is the original reachability traversal,
+            // independent of fingerprint bytes and randomized hash-table order.
+            let mut expected_representatives = Vec::new();
+            let mut seen_groups = BTreeSet::new();
+            for handle in reachable_streams_with_type(&document, b"Pattern")? {
+                let CowObjectHandle::Existing(id) = handle else {
+                    return Err(crate::Error::Invalid("unexpected new pattern".to_owned()));
+                };
+                if seen_groups.insert(id.number() >= 7) {
+                    expected_representatives.push(id);
+                }
+            }
             let stats = factor_duplicate_pattern_payloads(&mut document)?;
             assert_eq!(stats.groups_factored, 2);
             assert_eq!(stats.patterns_rewritten, 4);
             assert_eq!(stats.forms_created, 2);
+            let mut actual_representatives = Vec::new();
+            for handle in document.reachable_output_objects()? {
+                if let CowObjectHandle::New(_) = handle
+                    && let Some(form) = document.current_value(handle)?
+                    && let Some(StreamIdentity::Source(id)) = form.stream_identity()
+                {
+                    actual_representatives.push(id);
+                }
+            }
+            assert_eq!(actual_representatives, expected_representatives);
             let output = document.write_compact()?;
             if let Some(expected) = &expected {
                 assert_eq!(&output, expected);
@@ -3320,8 +3378,37 @@ mod tests {
             first_dictionary.get(b"Matrix".as_slice()),
             second_dictionary.get(b"Matrix".as_slice())
         );
-        assert!(pattern_already_factored(&document, &first_dictionary)?);
-        assert!(pattern_already_factored(&document, &second_dictionary)?);
+        for id in [5, 6] {
+            let handle = CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+            let Some(pattern) = document.current_value(handle)? else {
+                return Err(crate::Error::Invalid("missing factored pattern".to_owned()));
+            };
+            assert!(pattern_already_factored(&document, &pattern)?);
+            let Some(resources) = pattern.resolved_entry(&document, b"Resources")? else {
+                return Err(crate::Error::Invalid(
+                    "missing factored pattern resources".to_owned(),
+                ));
+            };
+            let Some(xobjects) = resources.resolved_entry(&document, b"XObject")? else {
+                return Err(crate::Error::Invalid(
+                    "missing factored pattern XObjects".to_owned(),
+                ));
+            };
+            let Some(form) = xobjects.resolved_entry(&document, FACTORED_PATTERN_CELL_NAME)? else {
+                return Err(crate::Error::Invalid("missing shared form".to_owned()));
+            };
+            let Some(StreamIdentity::Source(source_id)) = form.stream_identity() else {
+                return Err(crate::Error::Invalid(
+                    "factored form should share immutable source payload".to_owned(),
+                ));
+            };
+            assert!(matches!(source_id.number(), 5 | 6));
+            assert_eq!(form.stream_bytes(document.source())?.len(), body_len);
+            assert_eq!(
+                form.stream_bytes(document.source())?,
+                document.source().stream_data(source_id)?
+            );
+        }
 
         assert_eq!(
             factor_duplicate_pattern_payloads(&mut document)?,
