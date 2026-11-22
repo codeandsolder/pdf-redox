@@ -157,8 +157,6 @@ dependencies = [
 [[package]]
 name = "fax"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70ed8646f3993cad0585c6669ffba6f7e5440a0bfb0a1f16600cae33ce7cf307"
 
 [[package]]
 name = "find-msvc-tools"
@@ -589,7 +587,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=1a34532703a9960ce9f499810a5465b7086ba186#1a34532703a9960ce9f499810a5465b7086ba186"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=dbc7f2d58a8661c6a8ee7c92ea820f4ab2ee45fc#dbc7f2d58a8661c6a8ee7c92ea820f4ab2ee45fc"
 dependencies = [
  "rayon-core",
 ]

@@ -24,3 +24,6 @@ members = ["."]
 # Cargo patches are scoped to the consuming workspace.
 [patch."https://github.com/LaurenzV/hayro"]
 hayro-syntax = { path = "../third_party/hayro-syntax" }
+
+[patch.crates-io]
+fax = { path = "../third_party/fax" }

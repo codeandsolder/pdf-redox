@@ -1,0 +1,119 @@
+--- a/src/encoder.rs
++++ b/src/encoder.rs
+@@ -1,3 +1,5 @@
++use std::convert::TryFrom;
++
+ use crate::{
+     maps::{black, mode, white, Mode, EDFB_HALF},
+     BitWriter, Color, Transitions,
+@@ -9,6 +11,61 @@
+     } else {
+         b - a
+     }
++}
++
++/// Find color changes directly in 64 packed pixels. Each set bit of
++/// word XOR (word shifted right with prior color) marks an edge.
++struct PackedTransitions<'a> {
++    words: std::slice::Chunks<'a, u8>,
++    width: u32,
++    next_base: u32,
++    base: u32,
++    previous_white: u64,
++    edges: u64,
++}
++
++impl<'a> PackedTransitions<'a> {
++    fn new(row: &'a [u8], width: u32) -> Self {
++        Self {
++            words: row.chunks(8),
++            width,
++            next_base: 0,
++            base: 0,
++            previous_white: 1,
++            edges: 0,
++        }
++    }
++}
++
++impl Iterator for PackedTransitions<'_> {
++    type Item = u32;
++
++    fn next(&mut self) -> Option<u32> {
++        loop {
++            if self.edges != 0 {
++                let index = self.edges.leading_zeros();
++                self.edges &= !(1u64 << (63 - index));
++                return Some(self.base + index);
++            }
++            let bytes = self.words.next()?;
++            let mut padded = [0u8; 8];
++            padded[..bytes.len()].copy_from_slice(bytes);
++            let word = u64::from_be_bytes(padded);
++            self.base = self.next_base;
++            let valid = (self.width - self.base).min(64);
++            self.next_base += valid;
++            self.edges = (word ^ ((word >> 1) | (self.previous_white << 63)))
++                & (u64::MAX << (64 - valid));
++            self.previous_white = word & 1;
++        }
++    }
++}
++
++/// Failure to encode a packed row.
++#[derive(Debug)]
++pub enum PackedLineError<E> {
++    InvalidRowLength,
++    Write(E),
+ }
+ 
+ pub struct Encoder<W> {
+@@ -54,11 +111,7 @@
+         pels: impl Iterator<Item = Color>,
+         width: u32,
+     ) -> Result<(), W::Error> {
+-        let mut color = Color::White;
+-        let mut transitions = Transitions::new(&self.reference);
+-        let mut a0 = 0;
+-        let mut start_of_line = true;
+-        let mut pels = pels
++        let transitions = pels
+             .enumerate()
+             .scan(Color::White, |state, (i, c)| {
+                 Some(if c != *state {
+@@ -70,6 +123,35 @@
+                 })
+             })
+             .filter_map(|x| x);
++        self.encode_transitions(transitions, width)
++    }
++
++    /// Encode a line of MSB-first packed pixels (one is white).
++    /// Padding bits after width are ignored. The row must contain exactly
++    /// ceil(width / 8) bytes.
++    pub fn encode_packed_line(
++        &mut self,
++        row: &[u8],
++        width: u32,
++    ) -> Result<(), PackedLineError<W::Error>> {
++        let expected = usize::try_from(width / 8 + u32::from(width % 8 != 0))
++            .map_err(|_| PackedLineError::InvalidRowLength)?;
++        if row.len() != expected {
++            return Err(PackedLineError::InvalidRowLength);
++        }
++        self.encode_transitions(PackedTransitions::new(row, width), width)
++            .map_err(PackedLineError::Write)
++    }
++
++    fn encode_transitions(
++        &mut self,
++        mut pels: impl Iterator<Item = u32>,
++        width: u32,
++    ) -> Result<(), W::Error> {
++        let mut color = Color::White;
++        let mut transitions = Transitions::new(&self.reference);
++        let mut a0 = 0;
++        let mut start_of_line = true;
+         let writer = &mut self.writer;
+         self.current.clear();
+ 

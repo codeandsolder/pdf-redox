@@ -1,5 +1,8 @@
 use crate::{Error, OwnedDictionary, OwnedObject, Result};
-use fax::{BitWriter, Bits, Color, VecWriter, encoder::Encoder};
+use fax::{
+    BitWriter, Bits, VecWriter,
+    encoder::{Encoder, PackedLineError},
+};
 use std::{collections::BTreeMap, convert::Infallible};
 
 const CCITT_EXTRA_DICTIONARY_BYTES: usize = 96;
@@ -194,15 +197,13 @@ fn encode_ccitt_group4(
         writer: VecWriter::new(),
         remaining_bits: max_encoded_bytes.saturating_mul(8),
     });
-    let width_usize = usize::try_from(width)
-        .map_err(|_| Error::Invalid("bilevel image row is too wide".to_owned()))?;
     for row in packed.chunks_exact(stride) {
-        let pixels = (0..width_usize).map(|x| {
-            let bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
-            if bit == 0 { Color::Black } else { Color::White }
-        });
-        if encoder.encode_line(pixels, width).is_err() {
-            return Ok(None);
+        match encoder.encode_packed_line(row, width) {
+            Ok(()) => {}
+            Err(PackedLineError::InvalidRowLength) => {
+                return Err(Error::Invalid("invalid packed CCITT row length".to_owned()));
+            }
+            Err(PackedLineError::Write(())) => return Ok(None),
         }
     }
     Ok(encoder.finish().ok().map(|writer| writer.writer.finish()))
@@ -292,7 +293,10 @@ pub fn encode_best_image_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fax::decoder::{decode_g4, pels};
+    use fax::{
+        Color,
+        decoder::{decode_g4, pels},
+    };
 
     fn packed_row(value: u8, width: u32) -> Vec<u8> {
         let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
@@ -341,7 +345,7 @@ mod tests {
 
     #[test]
     fn capped_group4_preserves_original_bytes_and_codec_selection() -> Result<()> {
-        for width in [1u32, 7, 8, 9, 31, 64, 257] {
+        for width in [1u32, 7, 8, 9, 31, 63, 64, 65, 127, 128, 129, 257] {
             let height = 32;
             let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
             let width_usize = usize::try_from(width).unwrap_or(0);

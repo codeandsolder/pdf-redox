@@ -5,7 +5,7 @@ members = [
   "crates/pdf-redox-cli",
   "crates/pdf-redox-wasm",
 ]
-exclude = ["third_party/hayro-syntax"]
+exclude = ["third_party/hayro-syntax", "third_party/fax"]
 
 [workspace.package]
 edition = "2024"
@@ -40,6 +40,9 @@ num-traits = "0.2"
 # Temporary upstream syntax fixes; see third_party/hayro-patches.
 [patch."https://github.com/LaurenzV/hayro"]
 hayro-syntax = { path = "third_party/hayro-syntax" }
+
+[patch.crates-io]
+fax = { path = "third_party/fax" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
