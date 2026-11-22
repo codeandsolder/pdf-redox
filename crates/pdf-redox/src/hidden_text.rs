@@ -1649,7 +1649,8 @@ fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo
             && let Some(descendant) = resolved_dictionary(document, Some(descendant))?
         {
             if let Some(dw) = descendant.get(b"DW".as_slice())
-                && let Some(value) = resolved_number_value(document, dw)?
+                && let Some(value) =
+                    resolved_number_value(document, crate::source::CurrentValue::Owned(dw))?
             {
                 info.default_width = value;
             } else {
@@ -1666,7 +1667,9 @@ fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo
         };
         let widths = resolved_array(document, font.get(b"Widths".as_slice()))?;
         for (offset, width) in widths.iter().enumerate() {
-            if let Some(width) = resolved_number_value(document, width)? {
+            if let Some(width) =
+                resolved_number_value(document, crate::source::CurrentValue::Owned(width))?
+            {
                 info.widths.insert(
                     first.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
                     width,
@@ -1696,7 +1699,9 @@ fn parse_cid_widths(
         let array = resolved_array(document, Some(next))?;
         if !array.is_empty() {
             for (offset, width) in array.iter().enumerate() {
-                if let Some(width) = resolved_number_value(document, width)? {
+                if let Some(width) =
+                    resolved_number_value(document, crate::source::CurrentValue::Owned(width))?
+                {
                     out.insert(
                         start.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX)),
                         width,
@@ -1711,7 +1716,9 @@ fn parse_cid_widths(
             let Some(width) = items.get(index) else {
                 break;
             };
-            if let Some(width) = resolved_number_value(document, width)? {
+            if let Some(width) =
+                resolved_number_value(document, crate::source::CurrentValue::Owned(width))?
+            {
                 for code in start..=end.min(start.saturating_add(65_535)) {
                     out.insert(code, width);
                 }
@@ -1736,11 +1743,15 @@ fn build_ext_gstates(
             continue;
         };
         let fill_alpha = match state.get(b"ca".as_slice()) {
-            Some(value) => resolved_number_value(document, value)?,
+            Some(value) => {
+                resolved_number_value(document, crate::source::CurrentValue::Owned(value))?
+            }
             None => None,
         };
         let stroke_alpha = match state.get(b"CA".as_slice()) {
-            Some(value) => resolved_number_value(document, value)?,
+            Some(value) => {
+                resolved_number_value(document, crate::source::CurrentValue::Owned(value))?
+            }
             None => None,
         };
         let normal_blend = match state.get(b"BM".as_slice()) {

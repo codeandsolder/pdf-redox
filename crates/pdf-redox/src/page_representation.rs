@@ -685,14 +685,19 @@ fn resolved_matrix(document: &EditDocument, value: Option<&OwnedObject>) -> Resu
     let Some(value) = value else {
         return Ok(None);
     };
-    Ok(resolved_finite_number_array::<6>(document, value)?.map(Matrix::from))
+    Ok(
+        resolved_finite_number_array::<6>(document, crate::source::CurrentValue::Owned(value))?
+            .map(Matrix::from),
+    )
 }
 
 fn resolved_rect(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Rect>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    let Some([x0, y0, x1, y1]) = resolved_finite_number_array::<4>(document, value)? else {
+    let Some([x0, y0, x1, y1]) =
+        resolved_finite_number_array::<4>(document, crate::source::CurrentValue::Owned(value))?
+    else {
         return Ok(None);
     };
     let rect = Rect::new(x0, y0, x1, y1);

@@ -173,7 +173,7 @@ fn cow_form_matrix(
     let Some(value) = value else {
         return Ok(Matrix::default());
     };
-    let Some(values) = resolved_number_array::<6>(document, value.into_cow().as_ref())? else {
+    let Some(values) = resolved_number_array::<6>(document, value)? else {
         return Ok(Matrix::default());
     };
     Ok(Matrix::new(

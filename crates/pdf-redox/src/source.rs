@@ -2,7 +2,7 @@ use crate::stream_codec::decode_stream;
 use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
-    object::{Dict, MaybeRef, Name, Object, ObjectIdentifier, Stream, dict::DictEntries},
+    object::{Dict, MaybeRef, Name, Number, Object, ObjectIdentifier, Stream, dict::DictEntries},
 };
 use smallvec::SmallVec;
 use std::{
@@ -583,6 +583,47 @@ pub enum CurrentValue<'a> {
     Owned(&'a OwnedObject),
 }
 
+/// Canonical numeric COS value, independent of source or overlay storage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumericValue {
+    Integer(i64),
+    Real(f64),
+}
+
+impl NumericValue {
+    fn from_hayro(value: Number) -> Self {
+        use num_traits::ToPrimitive;
+        if let Some(integer) = value.as_integer() {
+            return Self::Integer(integer);
+        }
+        let real = value.as_f64();
+        // Integral reals within i64 retain the existing canonicalization
+        // (including signed zero), but never use a saturating conversion.
+        if let Some(integer) = real.to_i64()
+            && exact_i64_to_f64(integer) == Some(real)
+        {
+            Self::Integer(integer)
+        } else {
+            Self::Real(real)
+        }
+    }
+
+    pub fn exact_f64(self) -> Option<f64> {
+        match self {
+            Self::Integer(value) => exact_i64_to_f64(value),
+            Self::Real(value) => Some(value),
+        }
+    }
+
+    fn truncated_i32(self) -> Option<i32> {
+        use num_traits::ToPrimitive;
+        match self {
+            Self::Integer(value) => i32::try_from(value).ok(),
+            Self::Real(value) => value.trunc().to_i32(),
+        }
+    }
+}
+
 impl<'a> CurrentValue<'a> {
     pub fn reference(&self) -> Option<ObjectHandle> {
         match self {
@@ -724,10 +765,21 @@ impl<'a> CurrentValue<'a> {
         }
     }
 
-    fn numeric_scalar(self) -> Option<Cow<'a, OwnedObject>> {
+    pub fn number(&self) -> Option<NumericValue> {
         match self {
-            Self::Source(MaybeRef::NotRef(Object::Number(_)), _)
-            | Self::Owned(OwnedObject::Integer(_) | OwnedObject::Real(_)) => Some(self.into_cow()),
+            Self::Source(MaybeRef::NotRef(Object::Number(value)), _) => {
+                Some(NumericValue::from_hayro(*value))
+            }
+            Self::Owned(OwnedObject::Integer(value)) => Some(NumericValue::Integer(*value)),
+            Self::Owned(OwnedObject::Real(value)) => Some(NumericValue::Real(*value)),
+            _ => None,
+        }
+    }
+
+    pub const fn boolean(&self) -> Option<bool> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Boolean(value)), _)
+            | Self::Owned(OwnedObject::Boolean(value)) => Some(*value),
             _ => None,
         }
     }
@@ -1516,15 +1568,11 @@ impl EditDocument {
             };
             let Some(number) = self
                 .resolve_current_value(component)?
-                .and_then(CurrentValue::numeric_scalar)
+                .and_then(|value| value.number())
             else {
                 return Ok(None);
             };
-            let projected = match number.as_ref() {
-                OwnedObject::Integer(value) => exact_i64_to_f64(*value),
-                OwnedObject::Real(value) => Some(*value),
-                _ => None,
-            };
+            let projected = number.exact_f64();
             if let Some(projected) = projected {
                 *coordinate = projected;
             } else {
@@ -1539,18 +1587,13 @@ impl EditDocument {
     }
 
     fn resolved_page_rotation(&self, value: CurrentValue<'_>) -> Result<Option<i32>> {
-        use num_traits::ToPrimitive;
         let Some(number) = self
             .resolve_current_value(value)?
-            .and_then(CurrentValue::numeric_scalar)
+            .and_then(|value| value.number())
         else {
             return Ok(None);
         };
-        Ok(match number.as_ref() {
-            OwnedObject::Integer(value) => i32::try_from(*value).ok(),
-            OwnedObject::Real(value) => value.trunc().to_i32(),
-            _ => None,
-        })
+        Ok(number.truncated_i32())
     }
 
     /// Determine whether a dictionary entry actually overrides an inherited
@@ -2018,27 +2061,14 @@ pub fn exact_i64_to_f64(value: i64) -> Option<f64> {
     (magnitude.trailing_zeros() >= discarded_bits).then_some(value as f64)
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "this conversion is intentionally compared with Hayro's f64 view to canonicalize numerically integral PDF numbers"
-)]
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is intentional here: only numerically integral real values should canonicalize to Integer"
-)]
 fn owned_from_hayro(object: Object<'_>, stream_id: Option<ObjectId>) -> OwnedObject {
     match object {
         Object::Null(_) => OwnedObject::Null,
         Object::Boolean(value) => OwnedObject::Boolean(value),
-        Object::Number(value) => {
-            let real = value.as_f64();
-            let integer = value.as_i64();
-            if real == integer as f64 {
-                OwnedObject::Integer(integer)
-            } else {
-                OwnedObject::Real(real)
-            }
-        }
+        Object::Number(value) => match NumericValue::from_hayro(value) {
+            NumericValue::Integer(value) => OwnedObject::Integer(value),
+            NumericValue::Real(value) => OwnedObject::Real(value),
+        },
         Object::String(value) => OwnedObject::String(value.as_bytes().to_vec()),
         Object::Name(value) => OwnedObject::Name(value.as_ref().to_vec()),
         Object::Dict(value) => OwnedObject::Dictionary(owned_dictionary(&value)),
@@ -2232,6 +2262,43 @@ mod tests {
         };
         assert!(view.has_dictionary());
         assert!(view.dictionary_entry(b"Length").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn source_number_materialization_never_saturates_to_integer_limits() -> Result<()> {
+        use hayro_syntax::object::FromBytes;
+        for (input, expected) in [
+            (
+                "9007199254740993",
+                NumericValue::Integer(9_007_199_254_740_993),
+            ),
+            ("9223372036854775807", NumericValue::Integer(i64::MAX)),
+            ("-9223372036854775808", NumericValue::Integer(i64::MIN)),
+            (
+                "9223372036854775808",
+                NumericValue::Real(9_223_372_036_854_775_808.0),
+            ),
+            (
+                "9223372036854775808.0",
+                NumericValue::Real(9_223_372_036_854_775_808.0),
+            ),
+            ("-9223372036854775808.0", NumericValue::Integer(i64::MIN)),
+            ("42.0", NumericValue::Integer(42)),
+            ("-0.0", NumericValue::Integer(0)),
+            ("-0.25", NumericValue::Real(-0.25)),
+        ] {
+            let number = Number::from_bytes(input.as_bytes())
+                .ok_or_else(|| Error::Invalid(format!("missing number {input}")))?;
+            let view = CurrentValue::Source(MaybeRef::NotRef(Object::Number(number)), None);
+            assert_eq!(view.number(), Some(expected), "{input}");
+            let owned = view.into_cow().into_owned();
+            assert_eq!(
+                CurrentValue::Owned(&owned).number(),
+                Some(expected),
+                "{input}"
+            );
+        }
         Ok(())
     }
 

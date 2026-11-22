@@ -40,6 +40,14 @@ impl Number {
         }
     }
 
+    /// Return the parsed integer, without rounding or saturating a real.
+    pub const fn as_integer(&self) -> Option<i64> {
+        match self.0 {
+            InternalNumber::Integer(value) => Some(value),
+            InternalNumber::Real(_) => None,
+        }
+    }
+
     /// Returns the number as an i64.
     pub fn as_i64(&self) -> i64 {
         match self.0 {
@@ -455,6 +463,24 @@ mod tests {
                 .unwrap(),
             3245
         );
+    }
+
+    #[test]
+    fn integer_projection_preserves_parsed_kind_and_range() {
+        for (input, expected) in [
+            ("9007199254740993", Some(9_007_199_254_740_993)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("9223372036854775808", None),
+            ("9223372036854775808.0", None),
+            ("42.0", None),
+            ("-0.5", None),
+        ] {
+            let number = Reader::new(input.as_bytes())
+                .read_without_context::<Number>()
+                .unwrap();
+            assert_eq!(number.as_integer(), expected, "{input}");
+        }
     }
 
     #[test]

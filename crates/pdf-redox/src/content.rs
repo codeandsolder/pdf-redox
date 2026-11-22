@@ -94,12 +94,14 @@ fn append_decoded_content(out: &mut Vec<u8>, decoded: &[u8]) {
     out.extend_from_slice(decoded);
 }
 
-pub fn resolved_number_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<f64>> {
-    Ok(match document.resolve_owned_value_cow(value)?.as_deref() {
-        Some(OwnedObject::Integer(value)) => crate::source::exact_i64_to_f64(*value),
-        Some(OwnedObject::Real(value)) => Some(*value),
-        _ => None,
-    })
+pub fn resolved_number_value(
+    document: &EditDocument,
+    value: CurrentValue<'_>,
+) -> Result<Option<f64>> {
+    Ok(document
+        .resolve_current_value(value)?
+        .and_then(|value| value.number())
+        .and_then(crate::source::NumericValue::exact_f64))
 }
 
 pub fn resolved_number(
@@ -109,27 +111,35 @@ pub fn resolved_number(
     let Some(value) = value else {
         return Ok(None);
     };
-    resolved_number_value(document, value)
+    resolved_number_value(document, CurrentValue::Owned(value))
 }
 
 /// Resolve an array containing exactly `N` numeric values.
 pub fn resolved_number_array<const N: usize>(
     document: &EditDocument,
-    value: &OwnedObject,
+    value: CurrentValue<'_>,
 ) -> Result<Option<[f64; N]>> {
-    let resolved = document.resolve_owned_value_cow(value)?;
-    let Some(OwnedObject::Array(values)) = resolved.as_deref() else {
+    let Some(value) = document.resolve_current_value(value)? else {
         return Ok(None);
     };
-    if values.len() != N {
+    let Some(mut values) = value.array_items() else {
+        return Ok(None);
+    };
+    // Check the raw argument count before following references, including
+    // malformed arrays with a deleted reference and extra operands.
+    let components: [Option<CurrentValue<'_>>; N] = std::array::from_fn(|_| values.next());
+    if components.iter().any(Option::is_none) || values.next().is_some() {
         return Ok(None);
     }
     let mut out = [0.0; N];
-    for (index, value) in values.iter().enumerate() {
-        let Some(number) = resolved_number_value(document, value)? else {
+    for (number, component) in out.iter_mut().zip(components) {
+        let Some(component) = component else {
             return Ok(None);
         };
-        out[index] = number;
+        let Some(value) = resolved_number_value(document, component)? else {
+            return Ok(None);
+        };
+        *number = value;
     }
     Ok(Some(out))
 }
@@ -137,7 +147,7 @@ pub fn resolved_number_array<const N: usize>(
 /// Resolve an exact-length numeric array and reject non-finite members.
 pub fn resolved_finite_number_array<const N: usize>(
     document: &EditDocument,
-    value: &OwnedObject,
+    value: CurrentValue<'_>,
 ) -> Result<Option<[f64; N]>> {
     let Some(values) = resolved_number_array::<N>(document, value)? else {
         return Ok(None);
@@ -146,10 +156,9 @@ pub fn resolved_finite_number_array<const N: usize>(
 }
 
 pub fn resolved_bool_value(document: &EditDocument, value: &OwnedObject) -> Result<Option<bool>> {
-    Ok(match document.resolve_owned_value_cow(value)?.as_deref() {
-        Some(OwnedObject::Boolean(value)) => Some(*value),
-        _ => None,
-    })
+    Ok(document
+        .resolve_current_value(CurrentValue::Owned(value))?
+        .and_then(|value| value.boolean()))
 }
 
 pub fn resolved_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {
@@ -167,10 +176,9 @@ pub fn resolved_name(
     let Some(value) = value else {
         return Ok(None);
     };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
+    Ok(document
+        .resolve_current_value(CurrentValue::Owned(value))?
+        .and_then(|value| value.name().map(<[u8]>::to_vec)))
 }
 
 /// Return whether a present value resolves to something other than PDF `null`.
@@ -178,10 +186,9 @@ pub fn resolved_non_null(document: &EditDocument, value: Option<&OwnedObject>) -
     let Some(value) = value else {
         return Ok(false);
     };
-    Ok(!matches!(
-        document.resolve_owned_value_cow(value)?.as_deref(),
-        None | Some(OwnedObject::Null)
-    ))
+    Ok(document
+        .resolve_current_value(CurrentValue::Owned(value))?
+        .is_some_and(|value| !value.is_null()))
 }
 
 pub fn resolved_dictionary(
@@ -388,7 +395,7 @@ pub fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Opt
     let Some(value) = object.dictionary_entry(b"UserUnit") else {
         return Ok(Some(1.0));
     };
-    let Some(value) = resolved_number_value(document, value.into_cow().as_ref())? else {
+    let Some(value) = resolved_number_value(document, value)? else {
         return Ok(None);
     };
     Ok((value.is_finite() && value > 0.0).then_some(value))
@@ -483,6 +490,83 @@ mod tests {
 
     fn content_reference(number: u32) -> OwnedObject {
         OwnedObject::Reference(ObjectHandle::Existing(ObjectId::new(number, 0)))
+    }
+
+    #[test]
+    fn scalar_and_array_projection_preserves_source_overlay_equivalence() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /UserUnit 4 0 R >>",
+        )?;
+        pdf.object(4, b"9223372036854775808.0")?;
+        pdf.object(5, b"[4 0 R -0.0 9007199254740994 1.25]")?;
+        pdf.object(6, b"[4 0 R 9007199254740993]")?;
+        pdf.object(7, b"[4 0 R 1 2]")?;
+        pdf.object(8, b"true")?;
+        pdf.object(9, b"/Example")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| ObjectHandle::Existing(ObjectId::new(number, 0));
+        let exact = content_reference(5);
+        let inexact = content_reference(6);
+        let too_long = content_reference(7);
+        let number = content_reference(4);
+        let boolean = content_reference(8);
+        let name = content_reference(9);
+        let expected = Some([
+            9_223_372_036_854_775_808.0,
+            0.0,
+            9_007_199_254_740_994.0,
+            1.25,
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                resolved_number_value(&document, CurrentValue::Owned(&number))?,
+                expected.map(|numbers| numbers[0])
+            );
+            assert_eq!(
+                page_user_unit(&document, existing(3))?,
+                expected.map(|numbers| numbers[0])
+            );
+            assert_eq!(
+                resolved_finite_number_array::<4>(&document, CurrentValue::Owned(&exact))?,
+                expected
+            );
+            assert_eq!(
+                resolved_number_array::<2>(&document, CurrentValue::Owned(&inexact))?,
+                None
+            );
+            assert_eq!(
+                resolved_number_array::<2>(&document, CurrentValue::Owned(&too_long))?,
+                None
+            );
+            assert_eq!(resolved_bool_value(&document, &boolean)?, Some(true));
+            assert_eq!(
+                resolved_name(&document, Some(&name))?,
+                Some(b"Example".to_vec())
+            );
+            assert!(resolved_non_null(&document, Some(&name))?);
+            for number in 3..=9 {
+                let _ = document.edit_handle(existing(number))?;
+            }
+        }
+        let cycle = document.add_object(OwnedObject::Null);
+        *document.edit_handle(ObjectHandle::New(cycle))? =
+            OwnedObject::Reference(ObjectHandle::New(cycle));
+        let cycle = OwnedObject::Reference(ObjectHandle::New(cycle));
+        assert_eq!(
+            resolved_number_value(&document, CurrentValue::Owned(&cycle))?,
+            None
+        );
+        assert!(!resolved_non_null(&document, Some(&cycle))?);
+        *document.edit_handle(existing(4))? = OwnedObject::Real(f64::INFINITY);
+        assert_eq!(
+            resolved_finite_number_array::<4>(&document, CurrentValue::Owned(&exact))?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
