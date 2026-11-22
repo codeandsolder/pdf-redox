@@ -13,9 +13,9 @@ use crate::{
         PageRewriteResult, page_content, page_xobject_bindings, replace_page_content,
         resolved_dictionary, resolved_finite_number_array,
     },
-    content_stream::{instruction_operands, visit_instructions},
+    content_stream::{instruction_number_array, operand_name},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeadPaintStats {
@@ -24,31 +24,153 @@ pub struct DeadPaintStats {
     pub decoded_bytes_removed: usize,
 }
 
-#[derive(Debug, Clone)]
-struct Instruction {
-    operator: Vec<u8>,
-    start: usize,
-    end: usize,
-    numbers: Vec<f64>,
-    name: Option<Vec<u8>>,
-    operand_count: usize,
+const IDENTITY: [u64; 6] = [1.0_f64.to_bits(), 0, 0, 1.0_f64.to_bits(), 0, 0];
+
+enum PaintToken {
+    Save,
+    Restore,
+    Matrix([u64; 6]),
+    Draw(Vec<u8>),
+    Other,
 }
 
-fn parsed_instructions(content: &[u8]) -> Result<Option<Vec<Instruction>>> {
-    let mut result = Vec::new();
-    let incomplete = visit_instructions(content, |ins| {
-        let operands = instruction_operands(ins);
-        result.push(Instruction {
-            operator: ins.operator.to_vec(),
-            start: ins.span().start,
-            end: ins.span().end,
-            numbers: operands.iter().filter_map(|o| o.number).collect(),
-            name: operands.first().and_then(|o| o.name.clone()),
-            operand_count: operands.len(),
+struct PaintInstruction {
+    start: usize,
+    end: usize,
+    token: PaintToken,
+}
+
+impl PaintInstruction {
+    fn from_parsed(instruction: &hayro_syntax::content::Instruction<'_, '_>) -> Self {
+        let count = instruction.operand_spans().len();
+        let token = match &instruction.operator[..] {
+            b"q" if count == 0 => PaintToken::Save,
+            b"Q" if count == 0 => PaintToken::Restore,
+            b"cm" => instruction_number_array::<6>(instruction)
+                .filter(|values| values.iter().all(|value| value.is_finite()))
+                .map_or(PaintToken::Other, |values| {
+                    PaintToken::Matrix(values.map(f64::to_bits))
+                }),
+            b"Do" if count == 1 => instruction
+                .operands()
+                .next()
+                .and_then(operand_name)
+                .map_or(PaintToken::Other, |name| PaintToken::Draw(name.to_vec())),
+            _ => PaintToken::Other,
+        };
+        let span = instruction.span();
+        Self {
+            start: span.start,
+            end: span.end,
+            token,
+        }
+    }
+}
+
+struct PaintCandidate {
+    start: usize,
+    end: usize,
+    name: Vec<u8>,
+    transform: [u64; 6],
+    bare: bool,
+    begins_run: bool,
+}
+
+#[derive(Default)]
+struct PaintScanner {
+    pending: VecDeque<PaintInstruction>,
+    paints: Vec<PaintCandidate>,
+    begins_run: bool,
+    depth: usize,
+    skipped: bool,
+}
+
+impl PaintScanner {
+    fn advance(&mut self) {
+        let Some(first) = self.pending.front() else {
+            return;
+        };
+        let (draw_index, count, transform, bare) = match &first.token {
+            PaintToken::Draw(_) => (0, 1, [0; 6], true),
+            PaintToken::Save => match (
+                self.pending.get(1).map(|instruction| &instruction.token),
+                self.pending.get(2).map(|instruction| &instruction.token),
+                self.pending.get(3).map(|instruction| &instruction.token),
+            ) {
+                (Some(PaintToken::Draw(_)), Some(PaintToken::Restore), _) => {
+                    (1, 3, IDENTITY, false)
+                }
+                (
+                    Some(PaintToken::Matrix(matrix)),
+                    Some(PaintToken::Draw(_)),
+                    Some(PaintToken::Restore),
+                ) => (2, 4, *matrix, false),
+                _ => {
+                    self.pending.pop_front();
+                    self.skipped = true;
+                    self.begins_run = true;
+                    return;
+                }
+            },
+            _ => {
+                self.pending.pop_front();
+                self.skipped = true;
+                self.begins_run = true;
+                return;
+            }
+        };
+        let start = first.start;
+        let end = self.pending[count - 1].end;
+        // The draw token is consumed rather than cloning its resource name.
+        let PaintToken::Draw(name) =
+            std::mem::replace(&mut self.pending[draw_index].token, PaintToken::Other)
+        else {
+            unreachable!("candidate grammar identifies a draw");
+        };
+        self.pending.drain(..count);
+        self.paints.push(PaintCandidate {
+            start,
+            end,
+            name,
+            transform,
+            bare,
+            begins_run: self.begins_run,
         });
-        Ok(())
-    })?;
-    Ok((!incomplete).then_some(result))
+        self.begins_run = false;
+    }
+
+    fn scan(content: &[u8]) -> Option<Self> {
+        let mut scanner = Self {
+            begins_run: true,
+            ..Self::default()
+        };
+        let mut iter = hayro_syntax::content::UntypedIter::new(content);
+        while let Some(instruction) = iter.next() {
+            match &instruction.operator[..] {
+                // These operations invalidate the entire page's opacity or
+                // structural proof. No further parsing or allocation is useful.
+                b"gs" | b"W" | b"W*" | b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" | b"BI" => {
+                    return None;
+                }
+                b"q" => scanner.depth += 1,
+                b"Q" => scanner.depth = scanner.depth.checked_sub(1)?,
+                _ => {}
+            }
+            scanner
+                .pending
+                .push_back(PaintInstruction::from_parsed(&instruction));
+            if scanner.pending.len() == 4 {
+                scanner.advance();
+            }
+        }
+        if !iter.is_at_end() || scanner.depth != 0 {
+            return None;
+        }
+        while !scanner.pending.is_empty() {
+            scanner.advance();
+        }
+        Some(scanner)
+    }
 }
 
 /// Only ordinary fully opaque raster images qualify. In particular, JPX may
@@ -185,51 +307,22 @@ fn form_contains_only_opaque_image(
     let xobjects =
         resolved_dictionary(document, resources.get(b"XObject".as_slice()))?.unwrap_or_default();
     let content = document.decoded_content_stream_data(handle)?;
-    let Some(instructions) = parsed_instructions(&content)? else {
+    let Some(draw) = single_image_form_draw(&content) else {
         return Ok(false);
     };
-    let Some(draw) = single_image_form_draw(&instructions) else {
-        return Ok(false);
-    };
-    let Some(name) = &draw.name else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Reference(next)) = xobjects.get(name) else {
+    let Some(OwnedObject::Reference(next)) = xobjects.get(&draw) else {
         return Ok(false);
     };
     is_proven_opaque_drawable(document, *next, active, depth + 1)
 }
 
 /// A Form with a single image/Form paint has no other drawing side effects.
-fn single_image_form_draw(instructions: &[Instruction]) -> Option<&Instruction> {
-    match instructions {
-        [draw] if draw.operator == b"Do" && draw.operand_count == 1 => Some(draw),
-        [q, draw, end]
-            if q.operator == b"q"
-                && q.operand_count == 0
-                && draw.operator == b"Do"
-                && draw.operand_count == 1
-                && end.operator == b"Q"
-                && end.operand_count == 0 =>
-        {
-            Some(draw)
-        }
-        [q, cm, draw, end]
-            if q.operator == b"q"
-                && q.operand_count == 0
-                && cm.operator == b"cm"
-                && cm.operand_count == 6
-                && cm.numbers.len() == 6
-                && cm.numbers.iter().all(|value| value.is_finite())
-                && draw.operator == b"Do"
-                && draw.operand_count == 1
-                && end.operator == b"Q"
-                && end.operand_count == 0 =>
-        {
-            Some(draw)
-        }
-        _ => None,
+fn single_image_form_draw(content: &[u8]) -> Option<Vec<u8>> {
+    let scanner = PaintScanner::scan(content)?;
+    if scanner.skipped || scanner.paints.len() != 1 {
+        return None;
     }
+    scanner.paints.into_iter().next().map(|paint| paint.name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -239,188 +332,44 @@ struct PaintKey {
     bare: bool,
 }
 
-#[derive(Debug, Clone)]
-struct Paint {
-    start: usize,
-    end: usize,
-    key: PaintKey,
-    next_instruction: usize,
-}
-
-fn paint_at(
-    document: &EditDocument,
-    instructions: &[Instruction],
-    index: usize,
-    resources: &BTreeMap<Vec<u8>, ObjectHandle>,
-    opaque: &mut BTreeMap<ObjectHandle, bool>,
-) -> Result<Option<Paint>> {
-    let Some(first) = instructions.get(index) else {
-        return Ok(None);
-    };
-    let (draw, last, transform, bare) = if first.operator == b"Do" {
-        (first, first, [0_u64; 6], true)
-    } else if first.operator == b"q" && first.operand_count == 0 {
-        // A q /Fm Do Q block is independent just like q cm /Im Do Q.
-        if let (Some(draw), Some(end)) = (instructions.get(index + 1), instructions.get(index + 2))
-            && draw.operator == b"Do"
-            && draw.operand_count == 1
-            && end.operator == b"Q"
-            && end.operand_count == 0
-        {
-            return checked_paint(
-                document,
-                first,
-                draw,
-                end,
-                // No cm means the identity transform, *not* an all-zero
-                // matrix. A zero-matrix image cannot cover this paint.
-                [1.0_f64.to_bits(), 0, 0, 1.0_f64.to_bits(), 0, 0],
-                false,
-                index + 3,
-                resources,
-                opaque,
-            );
-        }
-        let (Some(cm), Some(draw), Some(end)) = (
-            instructions.get(index + 1),
-            instructions.get(index + 2),
-            instructions.get(index + 3),
-        ) else {
-            return Ok(None);
-        };
-        if cm.operator != b"cm"
-            || cm.operand_count != 6
-            || cm.numbers.len() != 6
-            || !cm.numbers.iter().all(|value| value.is_finite())
-            || draw.operator != b"Do"
-            || end.operator != b"Q"
-            || end.operand_count != 0
-        {
-            return Ok(None);
-        }
-        let mut matrix = [0_u64; 6];
-        for (target, value) in matrix.iter_mut().zip(&cm.numbers) {
-            *target = value.to_bits();
-        }
-        (draw, end, matrix, false)
-    } else {
-        return Ok(None);
-    };
-    checked_paint(
-        document,
-        first,
-        draw,
-        last,
-        transform,
-        bare,
-        index + if bare { 1 } else { 4 },
-        resources,
-        opaque,
-    )
-}
-
-/// Resolve the drawable and cache its opacity proof once per page.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "parsed draw span and shared resources are independent inputs"
-)]
-fn checked_paint(
-    document: &EditDocument,
-    first: &Instruction,
-    draw: &Instruction,
-    last: &Instruction,
-    transform: [u64; 6],
-    bare: bool,
-    next_instruction: usize,
-    resources: &BTreeMap<Vec<u8>, ObjectHandle>,
-    opaque: &mut BTreeMap<ObjectHandle, bool>,
-) -> Result<Option<Paint>> {
-    if draw.operand_count != 1 {
-        return Ok(None);
-    }
-    let Some(name) = &draw.name else {
-        return Ok(None);
-    };
-    let Some(&source) = resources.get(name) else {
-        return Ok(None);
-    };
-    if let Some(&supported) = opaque.get(&source) {
-        if !supported {
-            return Ok(None);
-        }
-    } else {
-        let supported = is_proven_opaque_drawable(document, source, &mut BTreeSet::new(), 0)?;
-        opaque.insert(source, supported);
-        if !supported {
-            return Ok(None);
-        }
-    }
-    Ok(Some(Paint {
-        start: first.start,
-        end: last.end,
-        key: PaintKey {
-            source,
-            transform,
-            bare,
-        },
-        next_instruction,
-    }))
-}
-
 fn select_dead_paints(
     document: &EditDocument,
     content: &[u8],
     resources: &BTreeMap<Vec<u8>, ObjectHandle>,
 ) -> Result<Vec<(usize, usize)>> {
-    let Some(instructions) = parsed_instructions(content)? else {
+    let Some(scanner) = PaintScanner::scan(content) else {
         return Ok(Vec::new());
     };
-    // Any PDF graphics-state override could change alpha, blend mode,
-    // overprint or soft masking. A clip/marked-content boundary can alter
-    // rendered coverage or structural associations. Never cross any of them.
-    if instructions.iter().any(|ins| {
-        matches!(
-            ins.operator.as_slice(),
-            b"gs" | b"W" | b"W*" | b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" | b"BI"
-        )
-    }) {
-        return Ok(Vec::new());
-    }
-    // Malformed graphics-state nesting changes the PDF interpreter's
-    // recovery behavior. Reject the entire scope instead of optimizing
-    // across an unmatched q/Q pair.
-    let mut graphics_depth = 0_usize;
-    for instruction in &instructions {
-        match instruction.operator.as_slice() {
-            b"q" => graphics_depth += 1,
-            b"Q" => {
-                if graphics_depth == 0 {
-                    return Ok(Vec::new());
-                }
-                graphics_depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    if graphics_depth != 0 {
-        return Ok(Vec::new());
-    }
+    // Complete scope admission precedes resource resolution. In particular a
+    // later forbidden operator still suppresses all earlier opacity probes.
     let mut dead = Vec::new();
     let mut opaque = BTreeMap::new();
     let mut seen = BTreeMap::<PaintKey, (usize, usize)>::new();
-    let mut index = 0;
-    while index < instructions.len() {
-        if let Some(paint) = paint_at(document, &instructions, index, resources, &mut opaque)? {
-            if let Some(previous) = seen.insert(paint.key, (paint.start, paint.end)) {
-                dead.push(previous);
-            }
-            index = paint.next_instruction;
-        } else {
-            // Only *sequences of complete, independent image paints* are
-            // considered. Everything else is a barrier; no CTM/clip/state
-            // assumptions are carried across arbitrary PDF operations.
+    for paint in scanner.paints {
+        if paint.begins_run {
             seen.clear();
-            index += 1;
+        }
+        let Some(&source) = resources.get(&paint.name) else {
+            seen.clear();
+            continue;
+        };
+        let supported = match opaque.entry(source) {
+            std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                is_proven_opaque_drawable(document, source, &mut BTreeSet::new(), 0)?,
+            ),
+        };
+        if !supported {
+            seen.clear();
+            continue;
+        }
+        let key = PaintKey {
+            source,
+            transform: paint.transform,
+            bare: paint.bare,
+        };
+        if let Some(previous) = seen.insert(key, (paint.start, paint.end)) {
+            dead.push(previous);
         }
     }
     dead.sort_unstable();
@@ -495,6 +444,7 @@ pub fn eliminate_dead_image_paints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_stream::visit_instructions;
     use crate::{Config, optimize_pdf, test_support::ClassicPdfBuilder};
 
     const PAINT: &str = "q 80 0 0 40 20 30 cm /Im0 Do Q\n";
@@ -549,6 +499,84 @@ mod tests {
         })?;
         assert!(!incomplete);
         Ok(count)
+    }
+
+    #[test]
+    fn streaming_paint_grammar_preserves_run_boundaries_and_form_admission() -> Result<()> {
+        let content =
+            b"q /Im0 Do Q /Im0 Do 0 0 m /Other Do q 1 0 0 1 0 0 cm /Im0 Do Q q /Im0 Do 0 0 l Q";
+        let scanner = PaintScanner::scan(content)
+            .ok_or_else(|| crate::Error::Invalid("paint grammar fixture did not parse".into()))?;
+        let actual = scanner
+            .paints
+            .iter()
+            .map(|paint| {
+                (
+                    &content[paint.start..paint.end],
+                    paint.bare,
+                    paint.begins_run,
+                    paint.transform,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (b"q /Im0 Do Q".as_slice(), false, true, IDENTITY),
+                (b"/Im0 Do".as_slice(), true, false, [0; 6]),
+                (b"/Other Do".as_slice(), true, true, [0; 6]),
+                (
+                    b"q 1 0 0 1 0 0 cm /Im0 Do Q".as_slice(),
+                    false,
+                    false,
+                    IDENTITY
+                ),
+                (b"/Im0 Do".as_slice(), true, true, [0; 6]),
+            ]
+        );
+        assert!(scanner.skipped);
+        for input in [
+            b"/Im0 Do".as_slice(),
+            b"q /Im0 Do Q",
+            b"q 1 0 0 1 0 0 cm /Im0 Do Q",
+        ] {
+            assert_eq!(
+                single_image_form_draw(input).as_deref(),
+                Some(b"Im0".as_slice())
+            );
+        }
+        for input in [
+            b"q /Im0 Do 0 0 m Q".as_slice(),
+            b"/Im0 Do /Im0 Do",
+            b"q /Im0 Do",
+            b"q /Im0 Do 1 Q",
+            b"q 1 0 0 1 0 cm /Im0 Do Q",
+        ] {
+            assert!(single_image_form_draw(input).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn whole_scope_rejection_precedes_opacity_resolution() -> Result<()> {
+        let pdf = fixture(b"q Q", b"", b"", false)?;
+        let mut document = EditDocument::from_bytes(pdf)?;
+        let id = crate::ObjectId::new(5, 0);
+        document.overlay_mut().delete(id);
+        let resources = BTreeMap::from([(b"Im0".to_vec(), ObjectHandle::Existing(id))]);
+        assert!(select_dead_paints(&document, b"/Im0 Do /Im0 Do", &resources).is_err());
+        for content in [
+            b"/Im0 Do /Im0 Do /Unknown gs".as_slice(),
+            b"/Im0 Do /Im0 Do 0 0 10 10 re W n",
+            b"/Im0 Do /Im0 Do Q",
+            b"/Im0 Do /Im0 Do q",
+        ] {
+            assert_eq!(
+                select_dead_paints(&document, content, &resources)?,
+                [] as [(usize, usize); 0]
+            );
+        }
+        Ok(())
     }
 
     #[test]
