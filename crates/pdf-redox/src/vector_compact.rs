@@ -48,12 +48,22 @@ impl VectorFlateLengthMemo {
     }
 
     fn encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
-        if !self.enabled {
-            return crate::stream_codec::flate_encoded_len(decoded, level);
-        }
-        self.measure(decoded, level, usize::MAX)?
-            .map(|measurement| measurement.length)
+        self.capped_len(decoded, level, usize::MAX)?
             .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".to_owned()))
+    }
+
+    fn capped_len(
+        &mut self,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+        limit: usize,
+    ) -> Result<Option<usize>> {
+        if !self.enabled {
+            return crate::stream_codec::flate_capped_encoded_len(decoded, limit, level);
+        }
+        Ok(self
+            .measure(decoded, level, limit)?
+            .map(|measurement| measurement.length))
     }
 
     fn measure(
@@ -1544,20 +1554,19 @@ struct PagePathData {
     decoded: std::sync::Arc<Vec<u8>>,
 }
 
-// Semantic grouping needs only the first occurrence's source offset until a
-// key repeats. Materialize a body once per *repeated candidate*, not once per
-// scanned block (or even once per otherwise-unique semantic group).
+// Candidate bodies borrow the first semantic representative until the
+// complete document-level compressed-size admission succeeds.
 type FormGroups = BTreeMap<SemanticKey, (usize, Vec<PathOccurrence>)>;
-type FormCandidate = (Vec<u8>, usize, Vec<PathOccurrence>);
+type FormCandidate<'a> = (Cow<'a, [u8]>, usize, Vec<PathOccurrence>);
 
-fn repeated_form_candidates(groups: FormGroups, pages: &[PagePathData]) -> Vec<FormCandidate> {
+fn repeated_form_candidates(groups: FormGroups, pages: &[PagePathData]) -> Vec<FormCandidate<'_>> {
     groups
         .into_values()
         .filter(|(_, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
         .map(|(operator_count, occurrences)| {
             let first = &occurrences[0];
-            let body = pages[first.page_index].decoded[first.start..first.end].to_vec();
-            (body, operator_count, occurrences)
+            let body = &pages[first.page_index].decoded[first.start..first.end];
+            (Cow::Borrowed(body), operator_count, occurrences)
         })
         .collect()
 }
@@ -1625,21 +1634,206 @@ struct PathFactoringOutcome {
     rewritten_pages: BTreeSet<ObjectHandle>,
 }
 
-// All three exact Form-factoring passes measure the same operation: the
-// encoded size of the source and its span-replaced content. Do it once in
-// one place so the memo and the original fail-closed behavior stay aligned.
-fn measured_span_replacement(
-    input: &[u8],
-    replacements: &[(usize, usize, Vec<u8>)],
+type PageReplacement<'a> = (usize, usize, &'a [u8]);
+
+struct MeasuredFormRewrites {
+    pages: Vec<(usize, Vec<u8>)>,
+    savings: usize,
+}
+
+/// Use a single decreasing compressed byte budget for the whole speculative
+/// factoring transaction. Every accepted size is exact; a cap failure proves
+/// that the remaining page streams and Form bodies cannot make it profitable.
+fn measure_form_rewrites<'a>(
+    pages: impl Iterator<Item = (usize, &'a [u8], &'a [PageReplacement<'a>])> + Clone,
+    bodies: impl Iterator<Item = &'a [u8]>,
+    fixed_overhead: usize,
     level: crate::FlateLevel,
     flate_lengths: &mut VectorFlateLengthMemo,
-) -> Result<Option<(usize, usize, Vec<u8>)>> {
-    let before = flate_lengths.encoded_len(input, level)?;
-    let Some(rewritten) = crate::content_stream::apply_replacements(input, replacements) else {
+) -> Result<Option<MeasuredFormRewrites>> {
+    let before = pages.clone().try_fold(0_usize, |total, (_, input, _)| {
+        flate_lengths
+            .encoded_len(input, level)
+            .map(|size| total.saturating_add(size))
+    })?;
+    let Some(mut remaining) = before
+        .checked_sub(fixed_overhead)
+        .and_then(|budget| budget.checked_sub(1))
+    else {
         return Ok(None);
     };
-    let after = flate_lengths.encoded_len(&rewritten, level)?;
-    Ok(Some((before, after, rewritten)))
+    let mut rewritten_pages = Vec::new();
+    for (index, input, replacements) in pages {
+        let Some(rewritten) = crate::content_stream::apply_replacements(input, replacements) else {
+            return Ok(None);
+        };
+        let Some(length) = flate_lengths.capped_len(&rewritten, level, remaining)? else {
+            return Ok(None);
+        };
+        remaining -= length;
+        rewritten_pages.push((index, rewritten));
+    }
+    for body in bodies {
+        let Some(length) = flate_lengths.capped_len(body, level, remaining)? else {
+            return Ok(None);
+        };
+        remaining -= length;
+    }
+    Ok(Some(MeasuredFormRewrites {
+        pages: rewritten_pages,
+        savings: remaining + 1,
+    }))
+}
+
+struct SelectedPathForm<'a> {
+    body: Cow<'a, [u8]>,
+    name: Vec<u8>,
+    replacement: Vec<u8>,
+    bounds: Rect,
+    operator_count: usize,
+    occurrences: Vec<PathOccurrence>,
+    page_indices: Vec<usize>,
+}
+
+fn select_path_forms<'a>(
+    candidates: impl Iterator<Item = FormCandidate<'a>>,
+    occupied: &mut BTreeSet<Vec<u8>>,
+    name_start: usize,
+) -> Vec<SelectedPathForm<'a>> {
+    candidates
+        .enumerate()
+        .map(|(index, (body, operator_count, occurrences))| {
+            let name = path_form_name(name_start.saturating_add(index), occupied);
+            let replacement = [b" /".as_slice(), name.as_slice(), b" Do ".as_slice()].concat();
+            let bounds = occurrences[0].bounds;
+            // Discovery visits pages in order. Collapse repeated page indices
+            // without retaining a separate entry for every occurrence.
+            let mut page_indices = Vec::new();
+            for occurrence in &occurrences {
+                if page_indices.last() != Some(&occurrence.page_index) {
+                    page_indices.push(occurrence.page_index);
+                }
+            }
+            if !page_indices.is_sorted() {
+                page_indices.sort_unstable();
+                page_indices.dedup();
+            }
+            SelectedPathForm {
+                body,
+                name,
+                replacement,
+                bounds,
+                operator_count,
+                occurrences,
+                page_indices,
+            }
+        })
+        .collect()
+}
+
+struct PathFormCommit {
+    pages_rewritten: usize,
+    rewritten_page_handles: BTreeSet<ObjectHandle>,
+    generated_page_xobjects: BTreeMap<ObjectHandle, BTreeSet<Vec<u8>>>,
+    savings: usize,
+}
+
+/// Both path and transformed-body factoring share the same admission and
+/// installation mechanics. Only their discovery and reported metrics differ.
+fn apply_path_form_plan(
+    document: &mut EditDocument,
+    page_data: &[PagePathData],
+    selected: &[SelectedPathForm<'_>],
+    level: crate::FlateLevel,
+    flate_lengths: &mut VectorFlateLengthMemo,
+) -> Result<Option<PathFormCommit>> {
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    let mut replacements_by_page = vec![Vec::<PageReplacement<'_>>::new(); page_data.len()];
+    for form in selected {
+        for occurrence in &form.occurrences {
+            replacements_by_page[occurrence.page_index].push((
+                occurrence.start,
+                occurrence.end,
+                form.replacement.as_slice(),
+            ));
+        }
+    }
+    let resource_refs = selected
+        .iter()
+        .map(|form| form.page_indices.len())
+        .sum::<usize>();
+    let fixed_overhead = selected
+        .len()
+        .saturating_mul(256)
+        .saturating_add(resource_refs.saturating_mul(32));
+    let pages = page_data
+        .iter()
+        .zip(&replacements_by_page)
+        .enumerate()
+        .filter_map(|(index, (page, replacements))| {
+            (!replacements.is_empty()).then_some((
+                index,
+                page.decoded.as_slice(),
+                replacements.as_slice(),
+            ))
+        });
+    let Some(measured) = measure_form_rewrites(
+        pages,
+        selected.iter().map(|form| form.body.as_ref()),
+        fixed_overhead,
+        level,
+        flate_lengths,
+    )?
+    else {
+        return Ok(None);
+    };
+    let form_handles = selected
+        .iter()
+        .map(|form| {
+            ObjectHandle::New(document.add_object(OwnedObject::Stream {
+                dictionary: path_form_dictionary(form.bounds),
+                data: StreamData::Owned(form.body.as_ref().to_vec().into()),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let pages_rewritten = measured.pages.len();
+    let mut rewritten_page_handles = BTreeSet::new();
+    for (index, rewritten) in measured.pages {
+        let page = &page_data[index];
+        if rewritten.as_slice() != page.decoded.as_slice() {
+            replace_page_content(document, page.page, rewritten)?;
+            rewritten_page_handles.insert(page.page);
+        }
+    }
+    install_page_resource_bindings(
+        document,
+        b"XObject",
+        selected
+            .iter()
+            .zip(form_handles)
+            .flat_map(|(form, handle)| {
+                form.page_indices
+                    .iter()
+                    .map(move |&index| (page_data[index].page, form.name.as_slice(), handle))
+            }),
+    )?;
+    let mut generated_page_xobjects = BTreeMap::<ObjectHandle, BTreeSet<Vec<u8>>>::new();
+    for form in selected {
+        for &index in &form.page_indices {
+            generated_page_xobjects
+                .entry(page_data[index].page)
+                .or_default()
+                .insert(form.name.clone());
+        }
+    }
+    Ok(Some(PathFormCommit {
+        pages_rewritten,
+        rewritten_page_handles,
+        generated_page_xobjects,
+        savings: measured.savings,
+    }))
 }
 
 /// Preference uses the first semantic representative, not the largest
@@ -1748,10 +1942,6 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
     Ok(true)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "candidate discovery, semantic grouping, size gating, and form rewrites are one ordered factorization pass"
-)]
 fn factor_repeated_path_forms(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -1821,188 +2011,46 @@ fn factor_repeated_path_forms(
     }
 
     let mut candidates = repeated_form_candidates(groups, &page_data);
-    if candidates.is_empty() {
-        return Ok(PathFactoringOutcome {
-            stats: VectorCompactionStats::default(),
-            reusable_blocks,
-            rewritten_pages: BTreeSet::new(),
-        });
-    }
     candidates.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(bytes.len()));
-
-    let mut replacements_by_page = vec![Vec::<(usize, usize, Vec<u8>)>::new(); page_data.len()];
-    let mut selected = Vec::<(Vec<u8>, Vec<u8>, Rect, Vec<PathOccurrence>)>::new();
-    let mut form_index = 0usize;
-    for (bytes, _operator_count, occurrences) in candidates {
-        let name = path_form_name(form_index, &mut occupied_names);
-        form_index = form_index.saturating_add(1);
-        let replacement = [b" /".as_slice(), name.as_slice(), b" Do ".as_slice()].concat();
-        let bounds = occurrences[0].bounds;
-        for occurrence in &occurrences {
-            replacements_by_page[occurrence.page_index].push((
-                occurrence.start,
-                occurrence.end,
-                replacement.clone(),
-            ));
-        }
-        selected.push((bytes, name, bounds, occurrences));
-    }
-    if selected.is_empty() {
+    let selected = select_path_forms(candidates.into_iter(), &mut occupied_names, 0);
+    let Some(commit) =
+        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_lengths)?
+    else {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
-    }
-
-    let affected_pages = selected
-        .iter()
-        .flat_map(|(_, _, _, occurrences)| {
-            occurrences.iter().map(|occurrence| occurrence.page_index)
-        })
-        .collect::<BTreeSet<_>>();
-    let mut before_flate = 0usize;
-    let mut after_flate = 0usize;
-    let mut rewritten_pages = BTreeMap::new();
-    for &page_index in &affected_pages {
-        let Some(page) = page_data.get(page_index) else {
-            continue;
-        };
-        let Some((before, after, rewritten)) = measured_span_replacement(
-            &page.decoded,
-            &replacements_by_page[page_index],
-            flate_level,
-            flate_lengths,
-        )?
-        else {
-            return Ok(PathFactoringOutcome {
-                stats: VectorCompactionStats::default(),
-                reusable_blocks,
-                rewritten_pages: BTreeSet::new(),
-            });
-        };
-        before_flate = before_flate.saturating_add(before);
-        after_flate = after_flate.saturating_add(after);
-        rewritten_pages.insert(page_index, rewritten);
-    }
-    let resource_refs = selected
-        .iter()
-        .map(|(_, _, _, occurrences)| {
-            occurrences
-                .iter()
-                .map(|occurrence| occurrence.page_index)
-                .collect::<BTreeSet<_>>()
-                .len()
-        })
-        .sum::<usize>();
-    let fixed_overhead = selected
-        .len()
-        .saturating_mul(256)
-        .saturating_add(resource_refs.saturating_mul(32));
-    after_flate = after_flate.saturating_add(fixed_overhead);
-    // Compressed Form bodies are non-negative. If rewritten page streams plus
-    // unavoidable Form/resource overhead already lose, reject before spending
-    // CPU compressing every candidate Form body.
-    if after_flate >= before_flate {
-        return Ok(PathFactoringOutcome {
-            stats: VectorCompactionStats::default(),
-            reusable_blocks,
-            rewritten_pages: BTreeSet::new(),
-        });
-    }
-    for (bytes, _, _, _) in &selected {
-        after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
-    }
-    // As with transformed Forms, everything above is speculative. Refuse a
-    // factoring rewrite that does not win after compressed stream bytes and
-    // conservative Form/resource overhead are charged.
-    if after_flate >= before_flate {
-        return Ok(PathFactoringOutcome {
-            stats: VectorCompactionStats::default(),
-            reusable_blocks,
-            rewritten_pages: BTreeSet::new(),
-        });
-    }
-    let mut form_handles = Vec::with_capacity(selected.len());
-    for (bytes, _, bounds, _) in &selected {
-        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-            dictionary: path_form_dictionary(*bounds),
-            data: StreamData::Owned(bytes.clone().into()),
-        }));
-        form_handles.push(handle);
-    }
-    let mut rewritten_page_handles = BTreeSet::new();
-    for (page_index, rewritten) in rewritten_pages {
-        let Some(page) = page_data.get(page_index) else {
-            continue;
-        };
-        if rewritten.as_slice() != page.decoded.as_slice() {
-            replace_page_content(document, page.page, rewritten)?;
-            rewritten_page_handles.insert(page.page);
-        }
-    }
-    let page_data = &page_data;
-    install_page_resource_bindings(
-        document,
-        b"XObject",
-        selected
-            .iter()
-            .zip(form_handles)
-            .flat_map(|((_, name, _, occurrences), handle)| {
-                occurrences
-                    .iter()
-                    .map(|occurrence| occurrence.page_index)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(move |page_index| (page_data[page_index].page, name.as_slice(), handle))
-            }),
-    )?;
-
+    };
     let occurrences = selected
         .iter()
-        .map(|(_, _, _, occurrences)| occurrences.len())
+        .map(|form| form.occurrences.len())
         .sum::<usize>();
     let factored = selected
         .iter()
-        .map(|(bytes, _, _, occurrences)| {
-            bytes
+        .map(|form| {
+            form.body
                 .len()
-                .saturating_mul(occurrences.len().saturating_sub(1))
+                .saturating_mul(form.occurrences.len().saturating_sub(1))
         })
         .sum::<usize>();
-    let mut generated_page_xobjects = BTreeMap::<ObjectHandle, BTreeSet<Vec<u8>>>::new();
-    for (_, name, _, occurrences) in &selected {
-        for occurrence in occurrences {
-            generated_page_xobjects
-                .entry(page_data[occurrence.page_index].page)
-                .or_default()
-                .insert(name.clone());
-        }
-    }
     Ok(PathFactoringOutcome {
         stats: VectorCompactionStats {
-            path_form_pages_rewritten: replacements_by_page
-                .iter()
-                .filter(|r| !r.is_empty())
-                .count(),
+            path_form_pages_rewritten: commit.pages_rewritten,
             path_forms_created: selected.len(),
             path_form_occurrences_replaced: occurrences,
             path_form_decoded_bytes_factored: factored,
-            path_form_estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
-            estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+            path_form_estimated_flate_bytes_saved: commit.savings,
+            estimated_flate_bytes_saved: commit.savings,
             decoded_bytes_removed: factored,
-            generated_page_xobjects,
+            generated_page_xobjects: commit.generated_page_xobjects,
             ..VectorCompactionStats::default()
         },
         reusable_blocks,
-        rewritten_pages: rewritten_page_handles,
+        rewritten_pages: commit.rewritten_page_handles,
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "transformed-block discovery, grouping, and rewrite validation are one ordered factorization pass"
-)]
 fn factor_repeated_transformed_blocks(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
@@ -2048,9 +2096,6 @@ fn factor_repeated_transformed_blocks(
     }
 
     let mut candidates = repeated_form_candidates(groups, &page_data);
-    if candidates.is_empty() {
-        return Ok(VectorCompactionStats::default());
-    }
     candidates.sort_unstable_by_key(|(bytes, operators, occurrences)| {
         std::cmp::Reverse(
             bytes
@@ -2059,153 +2104,40 @@ fn factor_repeated_transformed_blocks(
                 .saturating_add(operators.saturating_mul(occurrences.len())),
         )
     });
-
-    let mut replacements_by_page = vec![Vec::<(usize, usize, Vec<u8>)>::new(); page_data.len()];
-    let mut selected = Vec::<(Vec<u8>, Vec<u8>, Rect, usize, Vec<PathOccurrence>)>::new();
-    let mut form_index = 0usize;
-    for (bytes, operator_count, occurrences) in candidates {
-        if !processing_transformed_factor_candidate(bytes.len(), operator_count, occurrences.len())
-        {
-            continue;
-        }
-        let name = path_form_name(form_index.saturating_add(10_000), &mut occupied_names);
-        form_index = form_index.saturating_add(1);
-        let replacement = [b" /".as_slice(), name.as_slice(), b" Do ".as_slice()].concat();
-        let bounds = occurrences[0].bounds;
-        for occurrence in &occurrences {
-            replacements_by_page[occurrence.page_index].push((
-                occurrence.start,
-                occurrence.end,
-                replacement.clone(),
-            ));
-        }
-        selected.push((bytes, name, bounds, operator_count, occurrences));
-    }
-    if selected.is_empty() {
-        return Ok(VectorCompactionStats::default());
-    }
-
-    let affected_pages = selected
-        .iter()
-        .flat_map(|(_, _, _, _, occurrences)| {
-            occurrences.iter().map(|occurrence| occurrence.page_index)
-        })
-        .collect::<BTreeSet<_>>();
-    let mut before_flate = 0usize;
-    let mut after_flate = 0usize;
-    let mut rewritten_pages = BTreeMap::new();
-    for &page_index in &affected_pages {
-        let Some(page) = page_data.get(page_index) else {
-            continue;
-        };
-        let Some((before, after, rewritten)) = measured_span_replacement(
-            &page.decoded,
-            &replacements_by_page[page_index],
-            flate_level,
-            flate_lengths,
-        )?
-        else {
-            return Ok(VectorCompactionStats::default());
-        };
-        before_flate = before_flate.saturating_add(before);
-        after_flate = after_flate.saturating_add(after);
-        rewritten_pages.insert(page_index, rewritten);
-    }
-    let resource_refs = selected
-        .iter()
-        .map(|(_, _, _, _, occurrences)| {
-            occurrences
-                .iter()
-                .map(|occurrence| occurrence.page_index)
-                .collect::<BTreeSet<_>>()
-                .len()
-        })
-        .sum::<usize>();
-    let fixed_overhead = selected
-        .len()
-        .saturating_mul(256)
-        .saturating_add(resource_refs.saturating_mul(32));
-    after_flate = after_flate.saturating_add(fixed_overhead);
-    // Compressed Form bodies are non-negative. If rewritten page streams plus
-    // unavoidable Form/resource overhead already lose, reject before spending
-    // CPU compressing every candidate Form body.
-    if after_flate >= before_flate {
-        return Ok(VectorCompactionStats::default());
-    }
-    for (bytes, _, _, _, _) in &selected {
-        after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
-    }
-    // All work above is still speculative. Do not materialize Forms or rewrite
-    // pages unless factoring wins after charging both compressed stream bytes
-    // and conservative per-Form/resource-reference overhead.
-    if after_flate >= before_flate {
-        return Ok(VectorCompactionStats::default());
-    }
-    let mut form_handles = Vec::with_capacity(selected.len());
-    for (bytes, _, bounds, _, _) in &selected {
-        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-            dictionary: path_form_dictionary(*bounds),
-            data: StreamData::Owned(bytes.clone().into()),
-        }));
-        form_handles.push(handle);
-    }
-    for (page_index, rewritten) in rewritten_pages {
-        let Some(page) = page_data.get(page_index) else {
-            continue;
-        };
-        if rewritten.as_slice() != page.decoded.as_slice() {
-            replace_page_content(document, page.page, rewritten)?;
-        }
-    }
-    let page_data = &page_data;
-    install_page_resource_bindings(
-        document,
-        b"XObject",
-        selected
-            .iter()
-            .zip(form_handles)
-            .flat_map(|((_, name, _, _, occurrences), handle)| {
-                occurrences
-                    .iter()
-                    .map(|occurrence| occurrence.page_index)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(move |page_index| (page_data[page_index].page, name.as_slice(), handle))
+    let selected = select_path_forms(
+        candidates
+            .into_iter()
+            .filter(|(bytes, operators, occurrences)| {
+                processing_transformed_factor_candidate(bytes.len(), *operators, occurrences.len())
             }),
-    )?;
-
+        &mut occupied_names,
+        10_000,
+    );
+    let Some(commit) =
+        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_lengths)?
+    else {
+        return Ok(VectorCompactionStats::default());
+    };
     let occurrences = selected
         .iter()
-        .map(|(_, _, _, _, occurrences)| occurrences.len())
+        .map(|form| form.occurrences.len())
         .sum::<usize>();
     let operators_factored = selected
         .iter()
-        .map(|(_, _, _, operator_count, occurrences)| {
-            operator_count.saturating_mul(occurrences.len().saturating_sub(1))
+        .map(|form| {
+            form.operator_count
+                .saturating_mul(form.occurrences.len().saturating_sub(1))
         })
         .sum::<usize>();
-    let pages_rewritten = replacements_by_page
-        .iter()
-        .filter(|r| !r.is_empty())
-        .count();
-    let mut generated_page_xobjects = BTreeMap::<ObjectHandle, BTreeSet<Vec<u8>>>::new();
-    for (_, name, _, _, occurrences) in &selected {
-        for occurrence in occurrences {
-            generated_page_xobjects
-                .entry(page_data[occurrence.page_index].page)
-                .or_default()
-                .insert(name.clone());
-        }
-    }
     Ok(VectorCompactionStats {
-        pages_compacted: pages_rewritten,
+        pages_compacted: commit.pages_rewritten,
         transformed_forms_created: selected.len(),
-        transformed_form_pages_rewritten: pages_rewritten,
+        transformed_form_pages_rewritten: commit.pages_rewritten,
         transformed_form_occurrences_replaced: occurrences,
         transformed_form_operators_eliminated: operators_factored,
-        transformed_form_estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
-        estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
-        generated_page_xobjects,
+        transformed_form_estimated_flate_bytes_saved: commit.savings,
+        estimated_flate_bytes_saved: commit.savings,
+        generated_page_xobjects: commit.generated_page_xobjects,
         ..VectorCompactionStats::default()
     })
 }
@@ -2695,6 +2627,7 @@ fn shared_form_dictionary(
 struct SelectedSharedRun {
     candidate: SharedRunCandidate,
     name: Vec<u8>,
+    replacement: Vec<u8>,
     body: Vec<u8>,
     resources: BTreeSet<SharedResourceRef>,
     compressed_body_bytes: usize,
@@ -2805,9 +2738,11 @@ fn factor_shared_q_prefix_runs(
         }
         let name = path_form_name(form_index.saturating_add(20_000), &mut occupied_names);
         form_index = form_index.saturating_add(1);
+        let replacement = [b" /".as_slice(), name.as_slice(), b" Do ".as_slice()].concat();
         selected.push(SelectedSharedRun {
             candidate,
             name,
+            replacement,
             body,
             resources,
             compressed_body_bytes,
@@ -2817,35 +2752,17 @@ fn factor_shared_q_prefix_runs(
         return Ok(VectorCompactionStats::default());
     }
 
-    let mut replacements_by_page = vec![Vec::<(usize, usize, Vec<u8>)>::new(); page_data.len()];
-    let mut affected_pages = BTreeSet::new();
+    let mut replacements_by_page = vec![Vec::<PageReplacement<'_>>::new(); page_data.len()];
     for run in &selected {
-        let replacement = [b" /".as_slice(), run.name.as_slice(), b" Do ".as_slice()].concat();
         for &page_index in &run.candidate.page_indices {
             let first = &page_data[page_index].blocks[run.candidate.start_block];
             let last = &page_data[page_index].blocks[run.candidate.end_block - 1];
-            replacements_by_page[page_index].push((first.start, last.end, replacement.clone()));
-            affected_pages.insert(page_index);
+            replacements_by_page[page_index].push((
+                first.start,
+                last.end,
+                run.replacement.as_slice(),
+            ));
         }
-    }
-
-    let mut before_flate = 0usize;
-    let mut after_flate = 0usize;
-    let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
-    for &page_index in &affected_pages {
-        let page = &page_data[page_index];
-        let Some((before, after, rewritten)) = measured_span_replacement(
-            &page.decoded,
-            &replacements_by_page[page_index],
-            flate_level,
-            flate_lengths,
-        )?
-        else {
-            return Ok(VectorCompactionStats::default());
-        };
-        before_flate = before_flate.saturating_add(before);
-        after_flate = after_flate.saturating_add(after);
-        rewritten_pages.insert(page_index, rewritten);
     }
     let resource_refs = selected
         .iter()
@@ -2855,19 +2772,35 @@ fn factor_shared_q_prefix_runs(
         .iter()
         .map(|run| run.candidate.page_indices.len())
         .sum::<usize>();
-    after_flate = after_flate
-        .saturating_add(
-            selected
-                .iter()
-                .map(|run| run.compressed_body_bytes)
-                .sum::<usize>(),
-        )
+    let fixed_overhead = selected
+        .iter()
+        .map(|run| run.compressed_body_bytes)
+        .sum::<usize>()
         .saturating_add(selected.len().saturating_mul(384))
         .saturating_add(resource_refs.saturating_mul(96))
         .saturating_add(page_refs.saturating_mul(32));
-    if after_flate >= before_flate {
+    let pages = page_data
+        .iter()
+        .zip(&replacements_by_page)
+        .enumerate()
+        .filter_map(|(index, (page, replacements))| {
+            (!replacements.is_empty()).then_some((
+                index,
+                page.decoded.as_slice(),
+                replacements.as_slice(),
+            ))
+        });
+    let Some(measured) = measure_form_rewrites(
+        pages,
+        std::iter::empty(),
+        fixed_overhead,
+        flate_level,
+        flate_lengths,
+    )?
+    else {
         return Ok(VectorCompactionStats::default());
-    }
+    };
+    let pages_rewritten = measured.pages.len();
 
     let mut form_handles = Vec::with_capacity(selected.len());
     for run in &selected {
@@ -2878,7 +2811,7 @@ fn factor_shared_q_prefix_runs(
             },
         )));
     }
-    for (page_index, rewritten) in rewritten_pages {
+    for (page_index, rewritten) in measured.pages {
         replace_page_content(document, page_data[page_index].page, rewritten)?;
     }
     let page_data = &page_data;
@@ -2919,14 +2852,14 @@ fn factor_shared_q_prefix_runs(
     }
 
     Ok(VectorCompactionStats {
-        pages_compacted: affected_pages.len(),
+        pages_compacted: pages_rewritten,
         decoded_bytes_removed: decoded_factored,
-        estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+        estimated_flate_bytes_saved: measured.savings,
         shared_run_forms_created: selected.len(),
-        shared_run_pages_rewritten: affected_pages.len(),
+        shared_run_pages_rewritten: pages_rewritten,
         shared_run_blocks_replaced: blocks_replaced,
         shared_run_decoded_bytes_factored: decoded_factored,
-        shared_run_estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+        shared_run_estimated_flate_bytes_saved: measured.savings,
         generated_page_xobjects,
         ..VectorCompactionStats::default()
     })
@@ -3710,11 +3643,65 @@ mod tests {
         let candidates = repeated_form_candidates(groups, &pages);
         assert_eq!(candidates.len(), 1);
         let (body, operators, occurrences) = &candidates[0];
-        assert_eq!(body, b"0 0 10 10 re f");
+        assert_eq!(body.as_ref(), b"0 0 10 10 re f");
         assert_eq!(*operators, 4);
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].page_index, 0);
         assert_eq!(occurrences[1].page_index, 1);
+    }
+
+    #[test]
+    fn form_budget_admission_preserves_exact_global_savings() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let input = (0..=255u8)
+            .flat_map(|byte| [byte, byte.rotate_left(3)])
+            .cycle()
+            .take(8192)
+            .collect::<Vec<_>>();
+        let edits = [(0, input.len(), b"q Q".as_slice())];
+        let body = b"0 0 m 1 1 l S";
+        let before = crate::stream_codec::flate_encoded_len(&input, level)?;
+        let after = crate::stream_codec::flate_encoded_len(b"q Q", level)?
+            + crate::stream_codec::flate_encoded_len(body, level)?;
+        let pages = [(0, input.as_slice(), edits.as_slice())];
+        for enabled in [false, true] {
+            let mut memo = VectorFlateLengthMemo {
+                enabled,
+                ..VectorFlateLengthMemo::default()
+            };
+            let accepted = measure_form_rewrites(
+                pages.into_iter(),
+                std::iter::once(body.as_slice()),
+                before - after - 1,
+                level,
+                &mut memo,
+            )?
+            .ok_or_else(|| crate::Error::Invalid("one-byte exact saving rejected".into()))?;
+            assert_eq!(accepted.savings, 1);
+            assert_eq!(accepted.pages, [(0, b"q Q".to_vec())]);
+            assert!(
+                measure_form_rewrites(
+                    pages.into_iter(),
+                    std::iter::once(body.as_slice()),
+                    before - after,
+                    level,
+                    &mut memo
+                )?
+                .is_none()
+            );
+            let invalid = [(0, input.len() + 1, b"q Q".as_slice())];
+            assert!(
+                measure_form_rewrites(
+                    [(0, input.as_slice(), invalid.as_slice())].into_iter(),
+                    std::iter::once(body.as_slice()),
+                    0,
+                    level,
+                    &mut memo
+                )?
+                .is_none()
+            );
+        }
+        Ok(())
     }
 
     #[test]
