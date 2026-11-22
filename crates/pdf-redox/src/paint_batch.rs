@@ -863,12 +863,28 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)>
     ))
 }
 
-pub fn coalesce_optional_content(
+#[derive(Default)]
+struct LocalPageRewriteStats {
+    pages_rewritten: usize,
+    operations: usize,
+    decoded_bytes_removed: usize,
+    estimated_flate_bytes_saved: usize,
+}
+
+#[derive(Clone, Copy)]
+enum LocalRewriteInput {
+    Original,
+    Normalized,
+}
+
+fn apply_local_page_rewrites(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
-) -> Result<MarkedContentCoalesceStats> {
-    let mut stats = MarkedContentCoalesceStats::default();
+    input_mode: LocalRewriteInput,
+    rewrite: impl for<'a> Fn(&'a [u8]) -> Option<(Cow<'a, [u8]>, usize)>,
+) -> Result<LocalPageRewriteStats> {
+    let mut stats = LocalPageRewriteStats::default();
     for &page in pages {
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
@@ -876,28 +892,56 @@ pub fn coalesce_optional_content(
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
-        let Some((coalesced, boundaries)) = coalesce_adjacent_ocg_content(&decoded) else {
+        let input = match input_mode {
+            LocalRewriteInput::Original => Cow::Borrowed(decoded.as_slice()),
+            // Processing normalizes page content later. Compare collinear
+            // rewrites against that representation, but retain the size
+            // threshold on the original decoded stream.
+            LocalRewriteInput::Normalized => {
+                Cow::Owned(crate::content_stream::normalize_content_stream(&decoded))
+            }
+        };
+        let Some((rewritten, operations)) = rewrite(&input) else {
             continue;
         };
-        if boundaries == 0 || coalesced.as_ref() == decoded.as_slice() {
+        if operations == 0 || rewritten.as_ref() == input.as_ref() {
             continue;
         }
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&coalesced, flate_level)?;
+        let before_flate = crate::stream_codec::flate_encoded_len(&input, flate_level)?;
+        let after_flate = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?;
         if after_flate > before_flate {
             continue;
         }
-
-        let removed_bytes = decoded.len().saturating_sub(coalesced.len());
-        replace_page_content(document, page, coalesced.into_owned())?;
+        let removed_bytes = input.len().saturating_sub(rewritten.len());
+        replace_page_content(document, page, rewritten.into_owned())?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
-        stats.boundaries_coalesced = stats.boundaries_coalesced.saturating_add(boundaries);
+        stats.operations = stats.operations.saturating_add(operations);
         stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(removed_bytes);
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
     }
     Ok(stats)
+}
+
+pub fn coalesce_optional_content(
+    document: &mut EditDocument,
+    pages: &[ObjectHandle],
+    flate_level: crate::FlateLevel,
+) -> Result<MarkedContentCoalesceStats> {
+    let stats = apply_local_page_rewrites(
+        document,
+        pages,
+        flate_level,
+        LocalRewriteInput::Original,
+        coalesce_adjacent_ocg_content,
+    )?;
+    Ok(MarkedContentCoalesceStats {
+        pages_rewritten: stats.pages_rewritten,
+        boundaries_coalesced: stats.operations,
+        decoded_bytes_removed: stats.decoded_bytes_removed,
+        estimated_flate_bytes_saved: stats.estimated_flate_bytes_saved,
+    })
 }
 
 const STRUCTURAL_GRID_SCALE: f64 = 100.0;
@@ -1130,56 +1174,27 @@ pub fn compact_collinear_paths(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<CollinearPathStats> {
-    let mut stats = CollinearPathStats::default();
-    for &page in pages {
-        let Some(decoded) = page_content_if_present(document, page)? else {
-            continue;
-        };
-        if decoded.len() < MIN_PAGE_CONTENT_BYTES {
-            continue;
-        }
-        // Processing always normalizes page content later. Make the collinear
-        // admission decision against that inevitable representation now, so a
-        // marginal exact win cannot appear only on the next optimizer pass.
-        // Keep the candidate-size threshold on the original decoded stream so
-        // lexical normalization does not silently narrow the existing domain.
-        let normalized = crate::content_stream::normalize_content_stream(&decoded);
-        let Some((compacted, vertices_removed)) = compact_collinear_line_points(&normalized) else {
-            continue;
-        };
-        if vertices_removed == 0 || compacted.as_ref() == normalized.as_slice() {
-            continue;
-        }
-        let before_flate = crate::stream_codec::flate_encoded_len(&normalized, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&compacted, flate_level)?;
-        if after_flate > before_flate {
-            continue;
-        }
-
-        let removed_bytes = normalized.len().saturating_sub(compacted.len());
-        replace_page_content(document, page, compacted.into_owned())?;
-        stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
-        stats.vertices_removed = stats.vertices_removed.saturating_add(vertices_removed);
-        stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(removed_bytes);
-        stats.estimated_flate_bytes_saved = stats
-            .estimated_flate_bytes_saved
-            .saturating_add(before_flate.saturating_sub(after_flate));
-    }
-
+    let page_stats = apply_local_page_rewrites(
+        document,
+        pages,
+        flate_level,
+        LocalRewriteInput::Normalized,
+        compact_collinear_line_points,
+    )?;
     let form_stats = compact_collinear_form_paths(document, flate_level)?;
-    stats.forms_rewritten = stats
-        .forms_rewritten
-        .saturating_add(form_stats.forms_rewritten);
-    stats.vertices_removed = stats
-        .vertices_removed
-        .saturating_add(form_stats.vertices_removed);
-    stats.decoded_bytes_removed = stats
-        .decoded_bytes_removed
-        .saturating_add(form_stats.decoded_bytes_removed);
-    stats.estimated_flate_bytes_saved = stats
-        .estimated_flate_bytes_saved
-        .saturating_add(form_stats.estimated_flate_bytes_saved);
-    Ok(stats)
+    Ok(CollinearPathStats {
+        pages_rewritten: page_stats.pages_rewritten,
+        forms_rewritten: form_stats.forms_rewritten,
+        vertices_removed: page_stats
+            .operations
+            .saturating_add(form_stats.vertices_removed),
+        decoded_bytes_removed: page_stats
+            .decoded_bytes_removed
+            .saturating_add(form_stats.decoded_bytes_removed),
+        estimated_flate_bytes_saved: page_stats
+            .estimated_flate_bytes_saved
+            .saturating_add(form_stats.estimated_flate_bytes_saved),
+    })
 }
 
 #[derive(Debug, Clone)]
