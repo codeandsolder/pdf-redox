@@ -18,18 +18,24 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-// Only the encoded length is retained: no unbounded copies of source streams
-// or compressed payloads. A fixed FIFO makes worst-case retention O(1) per
-// input and prevents duplicate- or adversarial-document memory growth.
+// Only exact encoded lengths or proved lower bounds are retained: no
+// unbounded copies of source streams or compressed payloads. A fixed FIFO
+// bounds retention regardless of duplicate or adversarial input growth.
 // Key by the *full decoded bytes' SHA-256* and the exact Flate level, never
 // page identity: the same content can reappear on different pages and passes.
 const MAX_VECTOR_FLATE_LENGTHS: usize = 8_192;
 type VectorFlateKey = (i32, [u8; 32]);
 
+#[derive(Clone, Copy)]
+enum FlateLengthEvidence {
+    Exact(usize),
+    Exceeds(usize),
+}
+
 #[derive(Default)]
 struct VectorFlateLengthMemo {
     enabled: bool,
-    lengths: HashMap<VectorFlateKey, usize>,
+    lengths: HashMap<VectorFlateKey, FlateLengthEvidence>,
     insertion_order: VecDeque<VectorFlateKey>,
     #[cfg(test)]
     hits: usize,
@@ -75,16 +81,26 @@ impl VectorFlateLengthMemo {
         let digest = Sha256::digest(decoded).into();
         let key = (level.value(), digest);
         if self.enabled {
-            if let Some(&length) = self.lengths.get(&key) {
-                #[cfg(test)]
-                {
-                    self.hits = self.hits.saturating_add(1);
+            match self.lengths.get(&key).copied() {
+                Some(FlateLengthEvidence::Exact(length)) => {
+                    #[cfg(test)]
+                    {
+                        self.hits = self.hits.saturating_add(1);
+                    }
+                    return Ok((length <= limit).then_some(FlateMeasurement {
+                        length,
+                        encoding: None,
+                        digest,
+                    }));
                 }
-                return Ok((length <= limit).then_some(FlateMeasurement {
-                    length,
-                    encoding: None,
-                    digest,
-                }));
+                Some(FlateLengthEvidence::Exceeds(previous_limit)) if limit <= previous_limit => {
+                    #[cfg(test)]
+                    {
+                        self.hits = self.hits.saturating_add(1);
+                    }
+                    return Ok(None);
+                }
+                _ => {}
             }
             #[cfg(test)]
             {
@@ -92,6 +108,9 @@ impl VectorFlateLengthMemo {
             }
         }
         let Some(encoded) = crate::stream_codec::encode_flate_capped(decoded, limit, level)? else {
+            if self.enabled {
+                self.insert_evidence(key, FlateLengthEvidence::Exceeds(limit));
+            }
             return Ok(None);
         };
         let length = encoded.len();
@@ -105,12 +124,21 @@ impl VectorFlateLengthMemo {
 
     fn remember_encoded_len(&mut self, digest: [u8; 32], level: crate::FlateLevel, length: usize) {
         if self.enabled {
-            self.insert_length((level.value(), digest), length);
+            self.insert_evidence((level.value(), digest), FlateLengthEvidence::Exact(length));
         }
     }
 
-    fn insert_length(&mut self, key: VectorFlateKey, length: usize) {
-        if self.lengths.contains_key(&key) {
+    fn insert_evidence(&mut self, key: VectorFlateKey, evidence: FlateLengthEvidence) {
+        if let Some(current) = self.lengths.get_mut(&key) {
+            match (*current, evidence) {
+                (FlateLengthEvidence::Exact(_), _) => {}
+                (FlateLengthEvidence::Exceeds(old), FlateLengthEvidence::Exceeds(new)) => {
+                    *current = FlateLengthEvidence::Exceeds(old.max(new));
+                }
+                (FlateLengthEvidence::Exceeds(_), FlateLengthEvidence::Exact(_)) => {
+                    *current = evidence;
+                }
+            }
             return;
         }
         if self.lengths.len() == MAX_VECTOR_FLATE_LENGTHS
@@ -123,12 +151,12 @@ impl VectorFlateLengthMemo {
             }
         }
         self.insertion_order.push_back(key);
-        self.lengths.insert(key, length);
+        self.lengths.insert(key, evidence);
     }
 }
 
 /// An exact measured length and, on a cache miss, its reusable encoding.
-/// Failed capped measurements are never entered into the exact-length memo.
+/// Failed capped measurements retain only a strict lower bound, not an exact length.
 struct FlateMeasurement {
     length: usize,
     encoding: Option<Vec<u8>>,
@@ -3065,7 +3093,12 @@ impl PathCoordinateScanner {
         else {
             return;
         };
-        if !self.path_geometry_is_within_tolerance(operator, old, &new) {
+        if old
+            .iter()
+            .zip(&new)
+            .all(|(old, new)| old.to_bits() == new.to_bits())
+            || !self.path_geometry_is_within_tolerance(operator, old, &new)
+        {
             return;
         }
 
@@ -3799,21 +3832,32 @@ mod tests {
     }
 
     #[test]
-    fn capped_vector_measurement_rejects_without_caching_inexact_lengths() -> Result<()> {
+    fn capped_vector_measurement_reuses_proved_bounds_and_promotes_to_exact() -> Result<()> {
         let level = crate::FlateLevel::PROCESSING;
         let data = b"0 0 30 30 re f\n".repeat(512);
         let expected = crate::stream_codec::encode_flate(&data, level)?;
         let mut memo = VectorFlateLengthMemo::processing();
 
-        assert!(memo.measure(&data, level, expected.len() - 1)?.is_none());
-        assert!(memo.lengths.is_empty());
+        let limit = expected.len() - 2;
+        assert!(memo.measure(&data, level, limit)?.is_none());
+        assert_eq!(memo.lengths.len(), 1);
+        assert!(memo.measure(&data, level, limit)?.is_none());
+        assert!(memo.measure(&data, level, limit - 1)?.is_none());
+        assert_eq!(memo.hits, 2);
+        assert_eq!(memo.misses, 1);
+
+        assert!(memo.measure(&data, level, limit + 1)?.is_none());
+        assert!(memo.measure(&data, level, limit + 1)?.is_none());
+        assert_eq!(memo.hits, 3);
+        assert_eq!(memo.misses, 2);
         let measured = memo
             .measure(&data, level, expected.len())?
             .ok_or_else(|| crate::Error::Invalid("exact-cap encoding rejected".into()))?;
         assert_eq!(measured.length, expected.len());
         assert_eq!(measured.encoding.as_deref(), Some(expected.as_slice()));
-        assert_eq!(memo.misses, 2);
+        assert_eq!(memo.misses, 3);
         assert_eq!(memo.lengths.len(), 1);
+        assert_eq!(memo.insertion_order.len(), 1);
 
         assert!(memo.measure(&data, level, expected.len() - 1)?.is_none());
         let cached = memo
@@ -3821,7 +3865,13 @@ mod tests {
             .ok_or_else(|| crate::Error::Invalid("cached exact length rejected".into()))?;
         assert_eq!(cached.length, expected.len());
         assert!(cached.encoding.is_none());
-        assert_eq!(memo.hits, 2);
+        assert_eq!(memo.hits, 5);
+        let other_level = crate::FlateLevel::SIZE;
+        assert_eq!(
+            memo.encoded_len(&data, other_level)?,
+            crate::stream_codec::flate_encoded_len(&data, other_level)?
+        );
+        assert_eq!(memo.misses, 4);
         Ok(())
     }
 
@@ -4955,6 +5005,22 @@ mod tests {
         assert!(output.contains("1.004 2 m S Q"));
         assert!(output.contains("BT /F1 12 Tf (keep 1.009) Tj ET"));
         assert!(output.contains("5 6 m S"));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinate_noop_fast_path_preserves_transaction_admission() -> Result<()> {
+        let unchanged = b"q 100 0 0 100 0 0 cm 1 2 m 3.25 4.5 l 2 3 4 5 re S Q";
+        assert!(canonicalize_path_coordinates(unchanged, 1.0).is_none());
+
+        let input = b"q 100 0 0 100 0 0 cm 1 2.004 m 3.25 4.5 l S Q 1 2.004 m 3.25 4.5 l S";
+        let (output, count) = canonicalize_path_coordinates(input, 1.0)
+            .ok_or_else(|| crate::Error::Invalid("missing mixed path rewrite".into()))?;
+        assert_eq!(count, 1);
+        assert_eq!(
+            output,
+            b"q 100 0 0 100 0 0 cm 1 2.004 m 3.25 4.5 l S Q 1 2 m 3.25 4.5 l S"
+        );
         Ok(())
     }
 
