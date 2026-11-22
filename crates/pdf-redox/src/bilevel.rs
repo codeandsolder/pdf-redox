@@ -1,5 +1,5 @@
 use crate::{Error, OwnedDictionary, OwnedObject, Result};
-use fax::{Color, VecWriter, encoder::Encoder};
+use fax::{BitWriter, Bits, Color, VecWriter, encoder::Encoder};
 use std::{collections::BTreeMap, convert::Infallible};
 
 const CCITT_EXTRA_DICTIONARY_BYTES: usize = 96;
@@ -147,7 +147,31 @@ fn infallible<T>(value: std::result::Result<T, Infallible>) -> T {
     }
 }
 
-fn encode_ccitt_group4(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+/// Stop the encoder once its padded byte count cannot beat Flate.
+struct CappedFaxWriter {
+    writer: VecWriter,
+    remaining_bits: usize,
+}
+
+impl BitWriter for CappedFaxWriter {
+    type Error = ();
+
+    fn write(&mut self, bits: Bits) -> std::result::Result<(), Self::Error> {
+        self.remaining_bits = self
+            .remaining_bits
+            .checked_sub(usize::from(bits.len))
+            .ok_or(())?;
+        infallible(self.writer.write(bits));
+        Ok(())
+    }
+}
+
+fn encode_ccitt_group4(
+    packed: &[u8],
+    width: u32,
+    height: u32,
+    max_encoded_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
     let stride = usize::try_from(width.div_ceil(8))
         .map_err(|_| Error::Invalid("bilevel image row is too wide".to_owned()))?;
     let height_usize = usize::try_from(height)
@@ -155,23 +179,33 @@ fn encode_ccitt_group4(packed: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     let expected = stride
         .checked_mul(height_usize)
         .ok_or_else(|| Error::Invalid("bilevel image dimensions overflow".to_owned()))?;
-    if packed.len() != expected {
+    if stride == 0 || packed.len() != expected {
         return Err(Error::Invalid(format!(
-            "bilevel image payload has {} bytes, expected {expected}",
+            "invalid bilevel dimensions {width}x{height}: {} bytes, expected {expected}",
             packed.len()
         )));
     }
 
-    let writer = VecWriter::with_capacity(packed.len().saturating_mul(8));
-    let mut encoder = Encoder::new(writer);
+    // End-of-facsimile-block alone is two twelve-bit end-of-line words.
+    if max_encoded_bytes < 3 {
+        return Ok(None);
+    }
+    let mut encoder = Encoder::new(CappedFaxWriter {
+        writer: VecWriter::new(),
+        remaining_bits: max_encoded_bytes.saturating_mul(8),
+    });
+    let width_usize = usize::try_from(width)
+        .map_err(|_| Error::Invalid("bilevel image row is too wide".to_owned()))?;
     for row in packed.chunks_exact(stride) {
-        let pixels = (0..usize::try_from(width).unwrap_or(usize::MAX)).map(|x| {
+        let pixels = (0..width_usize).map(|x| {
             let bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
             if bit == 0 { Color::Black } else { Color::White }
         });
-        infallible(encoder.encode_line(pixels, width));
+        if encoder.encode_line(pixels, width).is_err() {
+            return Ok(None);
+        }
     }
-    Ok(infallible(encoder.finish()).finish())
+    Ok(encoder.finish().ok().map(|writer| writer.writer.finish()))
 }
 
 pub fn set_bilevel_filter(
@@ -226,19 +260,18 @@ pub fn encode_best_bilevel_data(
     flate_level: crate::FlateLevel,
 ) -> Result<BilevelEncodedData> {
     let flate = crate::stream_codec::encode_flate(packed, flate_level)?;
-    let ccitt = encode_ccitt_group4(packed, width, height)?;
-
-    let codec =
-        if estimated_bilevel_stream_cost(ccitt.len(), BilevelCodec::CcittGroup4) < flate.len() {
-            BilevelCodec::CcittGroup4
-        } else {
-            BilevelCodec::Flate
-        };
-    let data = match codec {
-        BilevelCodec::Flate => flate,
-        BilevelCodec::CcittGroup4 => ccitt,
-    };
-    Ok(BilevelEncodedData { data, codec })
+    // Preserve the extra dictionary cost and strict tie-break for Flate.
+    let budget = flate.len().saturating_sub(CCITT_EXTRA_DICTIONARY_BYTES + 1);
+    Ok(encode_ccitt_group4(packed, width, height, budget)?.map_or(
+        BilevelEncodedData {
+            data: flate,
+            codec: BilevelCodec::Flate,
+        },
+        |data| BilevelEncodedData {
+            data,
+            codec: BilevelCodec::CcittGroup4,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -278,7 +311,14 @@ mod tests {
         for first in 0u8..32 {
             for second in 0u8..32 {
                 let packed = [packed_row(first, 5), packed_row(second, 5)].concat();
-                let encoded = encode_ccitt_group4(&packed, 5, 2)?;
+                let encoded = encode_ccitt_group4(&packed, 5, 2, usize::MAX)?.ok_or_else(|| {
+                    Error::Invalid("uncapped CCITT encoding rejected fixture".into())
+                })?;
+                assert_eq!(
+                    encode_ccitt_group4(&packed, 5, 2, encoded.len())?.as_ref(),
+                    Some(&encoded)
+                );
+                assert!(encode_ccitt_group4(&packed, 5, 2, encoded.len() - 1)?.is_none());
                 let mut decoded = Vec::new();
                 assert!(
                     decode_g4(encoded.into_iter(), 5, Some(2), |line| {
@@ -296,6 +336,57 @@ mod tests {
                 assert_eq!(decoded, [first, second]);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn capped_group4_preserves_original_bytes_and_codec_selection() -> Result<()> {
+        for width in [1u32, 7, 8, 9, 31, 64, 257] {
+            let height = 32;
+            let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
+            let width_usize = usize::try_from(width).unwrap_or(0);
+            for pattern in [0u8, 0xff, 0x55, 0xaa, 0x31] {
+                let mut packed = vec![pattern; stride * 32];
+                if pattern == 0x31 {
+                    for (index, value) in packed.iter_mut().enumerate() {
+                        *value = (index.wrapping_mul(97) ^ index.rotate_left(3)).to_le_bytes()[0];
+                    }
+                }
+                let mut reference = Encoder::new(VecWriter::new());
+                for row in packed.chunks_exact(stride) {
+                    infallible(reference.encode_line(
+                        (0..width_usize).map(|x| {
+                            if row[x / 8] & (0x80 >> (x % 8)) == 0 {
+                                Color::Black
+                            } else {
+                                Color::White
+                            }
+                        }),
+                        width,
+                    ));
+                }
+                let expected = infallible(reference.finish()).finish();
+                assert_eq!(
+                    encode_ccitt_group4(&packed, width, height, expected.len())?,
+                    Some(expected.clone())
+                );
+                assert!(encode_ccitt_group4(&packed, width, height, expected.len() - 1)?.is_none());
+                let flate = crate::stream_codec::encode_flate(&packed, crate::FlateLevel::SIZE)?;
+                let best =
+                    encode_best_bilevel_data(&packed, width, height, crate::FlateLevel::SIZE)?;
+                if estimated_bilevel_stream_cost(expected.len(), BilevelCodec::CcittGroup4)
+                    < flate.len()
+                {
+                    assert_eq!(best.codec, BilevelCodec::CcittGroup4);
+                    assert_eq!(best.data, expected);
+                } else {
+                    assert_eq!(best.codec, BilevelCodec::Flate);
+                    assert_eq!(best.data, flate);
+                }
+            }
+        }
+        assert!(encode_ccitt_group4(&[], 0, 1, 0).is_err());
+        assert!(encode_ccitt_group4(&[], 8, 1, 0).is_err());
         Ok(())
     }
 
