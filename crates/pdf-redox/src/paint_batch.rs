@@ -3,7 +3,8 @@ use crate::content_stream::trivia_only;
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        effective_page_resources, install_page_resource, replace_page_content, resolved_dictionary,
+        effective_page_resources, install_page_resource_bindings, replace_page_content,
+        resolved_dictionary,
     },
 };
 use num_traits::ToPrimitive;
@@ -2040,6 +2041,7 @@ pub fn factor_repeated_stroke_forms(
         return Ok(StrokeFormFactorStats::default());
     }
 
+    let mut bindings = Vec::new();
     for plan in &plans {
         let Some(dictionary) = stroke_form_dictionary(plan.bounds, plan.bbox_margin_grid) else {
             return Ok(StrokeFormFactorStats::default());
@@ -2048,21 +2050,16 @@ pub fn factor_repeated_stroke_forms(
             dictionary,
             data: StreamData::Owned(plan.body.clone()),
         }));
-        let pages = plan
-            .occurrences
-            .iter()
-            .map(|item| item.page_index)
-            .collect::<BTreeSet<_>>();
-        for page_index in pages {
-            install_page_resource(
-                document,
-                page_data[page_index].page,
-                b"XObject",
-                plan.name.clone(),
-                form,
-            )?;
-        }
+        bindings.extend(
+            plan.occurrences
+                .iter()
+                .map(|item| item.page_index)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|page_index| (page_data[page_index].page, plan.name.as_slice(), form)),
+        );
     }
+    install_page_resource_bindings(document, b"XObject", bindings)?;
     for (page_index, rewritten) in rewritten_pages {
         replace_page_content(document, page_data[page_index].page, rewritten)?;
     }
@@ -2304,10 +2301,14 @@ fn factor_polyline_outlined_glyphs(
             continue;
         }
 
-        for plan in &plans {
-            let font = outlined_glyph_font_dictionary(document, plan);
-            install_page_resource(document, page, b"Font", plan.name.clone(), font)?;
-        }
+        let bindings = plans
+            .iter()
+            .map(|plan| {
+                let font = outlined_glyph_font_dictionary(document, plan);
+                (page, plan.name.as_slice(), font)
+            })
+            .collect::<Vec<_>>();
+        install_page_resource_bindings(document, b"Font", bindings)?;
         replace_page_content(document, page, rewritten.clone())?;
 
         let glyphs_created = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
