@@ -221,7 +221,7 @@ struct BlockFrame {
     p1: Option<(f64, f64)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct MicroStrokeBlock {
     start: usize,
     end: usize,
@@ -236,7 +236,6 @@ struct MicroStrokeScanner {
     ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>,
     frame: Option<BlockFrame>,
     path_nonempty: bool,
-    blocks: Vec<MicroStrokeBlock>,
 }
 
 impl MicroStrokeScanner {
@@ -247,7 +246,6 @@ impl MicroStrokeScanner {
             ext_gstates,
             frame: None,
             path_nonempty: false,
-            blocks: Vec::new(),
         }
     }
 
@@ -316,17 +314,25 @@ impl MicroStrokeScanner {
         }
     }
 
-    fn instruction(&mut self, instruction: &Instruction<'_, '_>) {
+    fn instruction(
+        &mut self,
+        instruction: &Instruction<'_, '_>,
+        emit: &mut impl FnMut(MicroStrokeBlock),
+    ) {
         if &instruction.operator[..] == b"BI" {
             self.invalidate_frame();
             return;
         }
-        self.process_operator(instruction);
+        self.process_operator(instruction, emit);
     }
 
-    fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
+    fn scan(
+        &mut self,
+        content: &[u8],
+        mut emit: impl FnMut(MicroStrokeBlock),
+    ) -> crate::Result<()> {
         let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            self.instruction(instruction);
+            self.instruction(instruction, &mut emit);
             Ok(())
         })?;
         if incomplete {
@@ -339,7 +345,11 @@ impl MicroStrokeScanner {
         clippy::too_many_lines,
         reason = "PDF graphics operator state transitions must remain ordered and co-located for auditability"
     )]
-    fn process_operator(&mut self, instruction: &Instruction<'_, '_>) {
+    fn process_operator(
+        &mut self,
+        instruction: &Instruction<'_, '_>,
+        emit: &mut impl FnMut(MicroStrokeBlock),
+    ) {
         let operator = &instruction.operator[..];
         let span = instruction.operator_span();
         let offset = span.start;
@@ -368,7 +378,7 @@ impl MicroStrokeScanner {
                     && let (Some(p0), Some(p1)) = (frame.p0, frame.p1)
                     && [p0.0, p0.1, p1.0, p1.1].into_iter().all(f64::is_finite)
                 {
-                    self.blocks.push(MicroStrokeBlock {
+                    emit(MicroStrokeBlock {
                         start: frame.start,
                         end,
                         state: frame.base,
@@ -519,37 +529,53 @@ struct MicroStrokeRun {
     lines: Vec<LineSegment>,
 }
 
-fn grouped_runs(input: &[u8], blocks: &[MicroStrokeBlock]) -> Vec<MicroStrokeRun> {
-    let mut runs = Vec::new();
-    let mut index = 0usize;
-    while index < blocks.len() {
-        let first = &blocks[index];
-        let mut end_index = index + 1;
-        while end_index < blocks.len() {
-            let previous = &blocks[end_index - 1];
-            let next = &blocks[end_index];
-            let Some(gap) = input.get(previous.end..next.start) else {
-                break;
-            };
-            if previous.state != next.state || !pdf_whitespace(gap) {
-                break;
+/// Keep only line coordinates and one graphics state per contiguous run.
+/// Short runs reuse their allocation instead of retaining one record and
+/// full graphics state for every individual stroke on the page.
+#[derive(Default)]
+struct MicroStrokeRunBuilder {
+    pending: Option<MicroStrokeRun>,
+    runs: Vec<MicroStrokeRun>,
+}
+
+impl MicroStrokeRunBuilder {
+    fn push(&mut self, input: &[u8], block: MicroStrokeBlock) {
+        if let Some(run) = &mut self.pending
+            && run.state == block.state
+            && input.get(run.end..block.start).is_some_and(pdf_whitespace)
+        {
+            run.end = block.end;
+            run.lines.push((block.p0, block.p1));
+            return;
+        }
+        let mut lines = match self.pending.take() {
+            Some(run) if run.lines.len() >= MIN_MICROSTROKE_RUN => {
+                self.runs.push(run);
+                Vec::new()
             }
-            end_index = end_index.saturating_add(1);
-        }
-        if end_index.saturating_sub(index) >= MIN_MICROSTROKE_RUN {
-            runs.push(MicroStrokeRun {
-                start: first.start,
-                end: blocks[end_index - 1].end,
-                state: first.state,
-                lines: blocks[index..end_index]
-                    .iter()
-                    .map(|block| (block.p0, block.p1))
-                    .collect(),
-            });
-        }
-        index = end_index;
+            Some(mut run) => {
+                run.lines.clear();
+                run.lines
+            }
+            None => Vec::new(),
+        };
+        lines.push((block.p0, block.p1));
+        self.pending = Some(MicroStrokeRun {
+            start: block.start,
+            end: block.end,
+            state: block.state,
+            lines,
+        });
     }
-    runs
+
+    fn finish(mut self) -> Vec<MicroStrokeRun> {
+        if let Some(run) = self.pending
+            && run.lines.len() >= MIN_MICROSTROKE_RUN
+        {
+            self.runs.push(run);
+        }
+        self.runs
+    }
 }
 
 fn quantized_pitch_key(value: f64) -> Option<i32> {
@@ -736,7 +762,11 @@ fn rasterize_run_at_pitch(
     user_unit: f64,
 ) -> Option<RasterizedRun> {
     let geometry = analyze_microstroke_run(run, geometry_pitch)?;
-    rasterize_run_on_grid(run, geometry, requested_sample_pitch, user_unit)
+    rasterize_run_on_grid(
+        run,
+        geometry,
+        raster_sample_pitch(run.state, requested_sample_pitch, user_unit)?,
+    )
 }
 
 /// Render an already eligible geometry on one bounded grid. Source eligibility
@@ -748,10 +778,8 @@ fn rasterize_run_at_pitch(
 fn rasterize_run_on_grid(
     run: &MicroStrokeRun,
     geometry: MicroStrokeGeometry,
-    requested_sample_pitch: f64,
-    user_unit: f64,
+    sample_pitch: f64,
 ) -> Option<RasterizedRun> {
-    let sample_pitch = raster_sample_pitch(run.state, requested_sample_pitch, user_unit)?;
     if run.state.width / sample_pitch < MIN_STROKE_RASTER_PIXELS {
         return None;
     }
@@ -909,6 +937,28 @@ fn microstroke_page_grid_pitch(
     (pitch.is_finite() && pitch > 0.0).then_some(pitch)
 }
 
+fn microstroke_sample_pitches(
+    state: StrokeState,
+    pitch: f64,
+    user_unit: f64,
+) -> smallvec::SmallVec<[f64; 3]> {
+    // Preserve the original candidate order, eligibility and strict cost
+    // tie-break; discard only grids with identical effective sample pitch.
+    let finer = microstroke_page_grid_pitch(state, user_unit, 72.0 / 300.0)
+        .filter(|candidate| (*candidate - pitch).abs() > pitch * 1.0e-12);
+    let coarser = coarser_microstroke_sample_pitch(state, pitch, user_unit)
+        .filter(|sample_pitch| Some(*sample_pitch) != finer);
+    let mut pitches = smallvec::SmallVec::<[f64; 3]>::new();
+    for requested in std::iter::once(pitch).chain(finer).chain(coarser) {
+        if let Some(effective) = raster_sample_pitch(state, requested, user_unit)
+            && !pitches.contains(&effective)
+        {
+            pitches.push(effective);
+        }
+    }
+    pitches
+}
+
 fn image_payload(
     raster: &RasterizedRun,
     flate_level: crate::FlateLevel,
@@ -1023,8 +1073,9 @@ pub fn rasterize_pathological_microstrokes(
             continue;
         };
         let mut scanner = MicroStrokeScanner::new(ext_gstate_patches(document, &resources)?);
-        scanner.scan(&decoded)?;
-        let runs = grouped_runs(&decoded, &scanner.blocks);
+        let mut builder = MicroStrokeRunBuilder::default();
+        scanner.scan(&decoded, |block| builder.push(&decoded, block))?;
+        let runs = builder.finish();
         if runs.is_empty() {
             continue;
         }
@@ -1048,17 +1099,9 @@ pub fn rasterize_pathological_microstrokes(
             };
             let name = next_image_name(&mut name_index, &mut occupied);
             let mut chosen: Option<(BilevelImagePayload, Vec<u8>, usize)> = None;
-            // Coarser grids are not guaranteed to be cheaper or even eligible.
-            // Keep the 300-DPI fallback when offering more compact masks.
-            // Offer the former 300-DPI grid even if source pitch is coarser.
-            let finer = microstroke_page_grid_pitch(run.state, user_unit, 72.0 / 300.0)
-                .filter(|candidate| (*candidate - pitch).abs() > pitch * 1.0e-12);
-            let coarser = coarser_microstroke_sample_pitch(run.state, pitch, user_unit)
-                .filter(|sample_pitch| Some(*sample_pitch) != finer);
-            for sample_pitch in std::iter::once(pitch).chain(finer).chain(coarser) {
+            for sample_pitch in microstroke_sample_pitches(run.state, pitch, user_unit) {
                 // Oversized natural masks must not preclude a valid compact grid.
-                let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch, user_unit)
-                else {
+                let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch) else {
                     continue;
                 };
                 let payload = image_payload(&raster, flate_level)?;
@@ -1199,22 +1242,66 @@ mod tests {
     fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
         let input = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q q 1 0 0 1 10.1 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        scanner.scan(input)?;
-        assert_eq!(scanner.blocks.len(), 2);
-        let runs = grouped_runs(input, &scanner.blocks);
-        assert!(runs.is_empty());
-        assert_eq!(scanner.blocks[0].p0, (10.0, 20.0));
-        assert_eq!(scanner.blocks[1].p0, (10.1, 20.0));
+        let mut blocks = Vec::new();
+        scanner.scan(input, |block| blocks.push(block))?;
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].p0, (10.0, 20.0));
+        assert_eq!(blocks[1].p0, (10.1, 20.0));
+        let mut builder = MicroStrokeRunBuilder::default();
+        for block in blocks {
+            builder.push(input, block);
+        }
+        assert!(builder.finish().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn streaming_runs_flush_at_state_and_nonwhitespace_boundaries() -> Result<()> {
+        let block = "q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q ";
+        let input = format!(
+            "{}% gap\n{}2 w {}",
+            block.repeat(MIN_MICROSTROKE_RUN),
+            block.repeat(MIN_MICROSTROKE_RUN - 1),
+            block.repeat(MIN_MICROSTROKE_RUN)
+        );
+        let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
+        let mut builder = MicroStrokeRunBuilder::default();
+        scanner.scan(input.as_bytes(), |block| {
+            builder.push(input.as_bytes(), block);
+        })?;
+        let runs = builder.finish();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].lines.len(), MIN_MICROSTROKE_RUN);
+        assert_eq!(runs[1].lines.len(), MIN_MICROSTROKE_RUN);
+        assert_eq!(runs[1].state.width, 2.0);
+        assert!(runs[0].end < runs[1].start);
+        Ok(())
+    }
+
+    #[test]
+    fn effective_grid_projection_preserves_order_and_distinct_candidates() {
+        let state = StrokeState {
+            width: 0.45,
+            cap: 1,
+            ..StrokeState::default()
+        };
+        let pitches = microstroke_sample_pitches(state, 0.08, 1.0);
+        assert_eq!(pitches.first().copied(), Some(0.08));
+        assert_eq!(pitches.len(), 3);
+        for (index, pitch) in pitches.iter().enumerate() {
+            assert!(!pitches[..index].contains(pitch));
+            assert_eq!(raster_sample_pitch(state, *pitch, 1.0), Some(*pitch));
+        }
     }
 
     #[test]
     fn fractional_line_cap_is_not_silently_truncated() -> Result<()> {
         let input = b"1.5 J q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
-        scanner.scan(input)?;
-        assert_eq!(scanner.blocks.len(), 1);
-        assert!(!scanner.blocks[0].state.raster_safe());
+        let mut blocks = Vec::new();
+        scanner.scan(input, |block| blocks.push(block))?;
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].state.raster_safe());
         Ok(())
     }
 
