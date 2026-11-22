@@ -116,20 +116,26 @@ enum FillKind {
 /// operands are retained only when they can establish a geometry proof.
 #[derive(Debug, Clone)]
 enum EventOperands {
-    Numbers(SmallVec<[f64; 6]>),
+    Numbers(usize),
     NonFiniteSingle(f64),
     Other,
 }
 
 impl EventOperands {
-    fn project(instruction: &hayro_syntax::content::Instruction<'_, '_>, count: usize) -> Self {
+    fn project(
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        count: usize,
+        numbers: &mut Vec<f64>,
+    ) -> Self {
         use crate::content_stream::operand_number;
-        let mut numbers = SmallVec::new();
+        let start = numbers.len();
         for operand in instruction.operands() {
             let Some(number) = operand_number(operand) else {
+                numbers.truncate(start);
                 return Self::Other;
             };
             if !number.is_finite() {
+                numbers.truncate(start);
                 return if count == 1 {
                     Self::NonFiniteSingle(number)
                 } else {
@@ -138,7 +144,7 @@ impl EventOperands {
             }
             numbers.push(number);
         }
-        Self::Numbers(numbers)
+        Self::Numbers(start)
     }
 }
 
@@ -152,9 +158,11 @@ struct Event {
 }
 
 impl Event {
-    fn numbers(&self) -> &[f64] {
+    fn numbers<'a>(&self, numbers: &'a [f64]) -> &'a [f64] {
         match &self.operands {
-            EventOperands::Numbers(numbers) => numbers,
+            // Projection appends exactly one value per operand from the same
+            // parser stack, or rolls the whole instruction back.
+            EventOperands::Numbers(start) => &numbers[*start..*start + self.operand_count],
             _ => &[],
         }
     }
@@ -163,17 +171,27 @@ impl Event {
         matches!(self.operands, EventOperands::Numbers(_))
     }
 
-    fn sole_number(&self) -> Option<f64> {
+    fn sole_number(&self, numbers: &[f64]) -> Option<f64> {
         match &self.operands {
-            EventOperands::Numbers(numbers) if numbers.len() == 1 => numbers.first().copied(),
+            EventOperands::Numbers(start) if self.operand_count == 1 => {
+                numbers.get(*start).copied()
+            }
             EventOperands::NonFiniteSingle(number) => Some(*number),
             _ => None,
         }
     }
 }
 
-fn events_for(input: &[u8], forbidden: &[&[u8]]) -> Option<Vec<Event>> {
-    let mut events = Some(Vec::new());
+/// A page-local contiguous numeric arena avoids paying for six inline
+/// coordinates in every event or allocating large operand lists individually.
+#[derive(Default)]
+struct EventTable {
+    records: Vec<Event>,
+    numbers: Vec<f64>,
+}
+
+fn events_for(input: &[u8], forbidden: &[&[u8]]) -> Option<EventTable> {
+    let mut events = Some(EventTable::default());
     let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
         let Some(projected) = &mut events else {
             return Ok(());
@@ -186,7 +204,7 @@ fn events_for(input: &[u8], forbidden: &[&[u8]]) -> Option<Vec<Event>> {
         }
         let span = instruction.span();
         if &instruction.operator[..] == b"BI" {
-            projected.push(Event {
+            projected.records.push(Event {
                 start: span.start,
                 end: span.end,
                 operator: SmallVec::from_slice(b"__inline_image__"),
@@ -195,12 +213,12 @@ fn events_for(input: &[u8], forbidden: &[&[u8]]) -> Option<Vec<Event>> {
             });
         } else {
             let count = instruction.operand_spans().len();
-            projected.push(Event {
+            projected.records.push(Event {
                 start: span.start,
                 end: instruction.operator_span().end,
                 operator: SmallVec::from_slice(&instruction.operator[..]),
                 operand_count: count,
-                operands: EventOperands::project(instruction, count),
+                operands: EventOperands::project(instruction, count, &mut projected.numbers),
             });
         }
         Ok(())
@@ -345,53 +363,36 @@ fn contour_has_area(points: &[Point]) -> bool {
         .any(|point| orientation(first, second, point).is_some())
 }
 
-fn event_points(event: &Event) -> Option<SmallVec<[Point; 3]>> {
+fn event_points(event: &Event, numbers: &[f64]) -> Option<SmallVec<[Point; 3]>> {
     if !event.all_operands_numeric() {
         return None;
     }
     let mut points = SmallVec::new();
-    match event.operator.as_slice() {
-        b"m" | b"l" if event.numbers().len() == 2 => points.push(Point {
-            x: event.numbers()[0],
-            y: event.numbers()[1],
-        }),
-        b"c" if event.numbers().len() == 6 => {
-            for pair in event.numbers().as_chunks::<2>().0 {
-                points.push(Point {
-                    x: pair[0],
-                    y: pair[1],
-                });
+    let args = event.numbers(numbers);
+    match (event.operator.as_slice(), args) {
+        (b"m" | b"l", [x, y]) => points.push(Point { x: *x, y: *y }),
+        (b"c", [_, _, _, _, _, _]) | (b"v" | b"y", [_, _, _, _]) => {
+            for [x, y] in args.as_chunks::<2>().0 {
+                points.push(Point { x: *x, y: *y });
             }
         }
-        b"v" | b"y" if event.numbers().len() == 4 => {
-            for pair in event.numbers().as_chunks::<2>().0 {
-                points.push(Point {
-                    x: pair[0],
-                    y: pair[1],
-                });
-            }
-        }
-        b"re" if event.numbers().len() == 4 => {
-            let x = event.numbers()[0];
-            let y = event.numbers()[1];
-            let width = event.numbers()[2];
-            let height = event.numbers()[3];
-            points.push(Point { x, y });
+        (b"re", [x, y, width, height]) => {
+            points.push(Point { x: *x, y: *y });
             points.push(Point {
                 x: x + width,
                 y: y + height,
             });
         }
-        b"h" if event.numbers().is_empty() => {}
+        (b"h", []) => {}
         _ => return None,
     }
     Some(points)
 }
 
-fn path_bounds(events: &[Event]) -> Option<Bounds> {
+fn path_bounds(events: &[Event], numbers: &[f64]) -> Option<Bounds> {
     let mut bounds: Option<Bounds> = None;
     for event in events {
-        let points = event_points(event)?;
+        let points = event_points(event, numbers)?;
         for point in points {
             if !point.x.is_finite() || !point.y.is_finite() {
                 return None;
@@ -405,30 +406,24 @@ fn path_bounds(events: &[Event]) -> Option<Bounds> {
     bounds
 }
 
-fn fill_kind(events: &[Event]) -> FillKind {
+fn fill_kind(events: &[Event], numbers: &[f64]) -> FillKind {
     let mut contours = Vec::<Vec<Point>>::new();
     let mut current = Vec::<Point>::new();
     for event in events {
-        match event.operator.as_slice() {
-            b"m" if event.all_operands_numeric() && event.numbers().len() == 2 => {
+        match (event.operator.as_slice(), event.numbers(numbers)) {
+            (b"m", [x, y]) => {
                 if !current.is_empty() {
                     contours.push(std::mem::take(&mut current));
                 }
-                current.push(Point {
-                    x: event.numbers()[0],
-                    y: event.numbers()[1],
-                });
+                current.push(Point { x: *x, y: *y });
             }
-            b"l" if event.all_operands_numeric() && event.numbers().len() == 2 => {
+            (b"l", [x, y]) => {
                 if current.is_empty() {
                     return FillKind::Unknown;
                 }
-                current.push(Point {
-                    x: event.numbers()[0],
-                    y: event.numbers()[1],
-                });
+                current.push(Point { x: *x, y: *y });
             }
-            b"h" if event.operand_count == 0 => {
+            (b"h", _) if event.operand_count == 0 => {
                 if !current.is_empty() {
                     contours.push(std::mem::take(&mut current));
                 }
@@ -490,9 +485,11 @@ struct ClosedFillTransaction {
 
 fn closed_fill_transaction(
     input: &[u8],
-    events: &[Event],
+    table: &EventTable,
     index: usize,
 ) -> Option<(ClosedFillTransaction, usize)> {
+    let events = &table.records;
+    let numbers = &table.numbers;
     let q = events.get(index)?;
     let miter = events.get(index + 1)?;
     if q.operator.as_slice() != b"q"
@@ -503,7 +500,7 @@ fn closed_fill_transaction(
     {
         return None;
     }
-    let miter_value = miter.sole_number()?;
+    let miter_value = miter.sole_number(numbers)?;
     if !miter_value.is_finite() {
         return None;
     }
@@ -546,8 +543,8 @@ fn closed_fill_transaction(
             body_start: first_path.start,
             body_end: paint.start,
             body_already_closed: last_path.operator.as_slice() == b"h",
-            bounds: path_bounds(path_events),
-            fill_kind: fill_kind(path_events),
+            bounds: path_bounds(path_events, numbers),
+            fill_kind: fill_kind(path_events, numbers),
         },
         cursor + 3,
     ))
@@ -673,21 +670,21 @@ fn record_closed_fill_group(
 
 fn batch_closed_fills<'a>(
     input: &'a [u8],
-    events: &[Event],
+    table: &EventTable,
 ) -> Option<(Cow<'a, [u8]>, ContentBatchStats)> {
     let mut replacements = Vec::<(usize, usize, Vec<u8>)>::new();
     let mut stats = ContentBatchStats::default();
     let mut index = 0usize;
 
-    while index < events.len() {
-        let Some((first, mut next_index)) = closed_fill_transaction(input, events, index) else {
+    while index < table.records.len() {
+        let Some((first, mut next_index)) = closed_fill_transaction(input, table, index) else {
             index += 1;
             continue;
         };
         let miter_bits = first.miter_bits;
         let mut group = vec![first];
 
-        while let Some((next, after_next)) = closed_fill_transaction(input, events, next_index) {
+        while let Some((next, after_next)) = closed_fill_transaction(input, table, next_index) {
             let previous = group.last()?;
             if miter_bits != next.miter_bits
                 || !input.get(previous.end..next.start).is_some_and(trivia_only)
@@ -798,10 +795,10 @@ fn batch_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, ContentBatchStats)> {
 
     let (filled, fill_stats) = batch_closed_fills(input, &events)?;
     let (stroked, stroke_stats) = match filled {
-        Cow::Borrowed(filled) => batch_strokes(filled, &events)?,
+        Cow::Borrowed(filled) => batch_strokes(filled, &events.records)?,
         Cow::Owned(filled) => {
             let stroke_events = events_for(&filled, &[b"gs", b"d"])?;
-            let (stroked, stroke_stats) = batch_strokes(&filled, &stroke_events)?;
+            let (stroked, stroke_stats) = batch_strokes(&filled, &stroke_events.records)?;
             let stroked = match stroked {
                 Cow::Borrowed(_) => Cow::Owned(filled),
                 Cow::Owned(stroked) => Cow::Owned(stroked),
@@ -1360,6 +1357,7 @@ fn stroke_signature_value(signature: &mut Vec<u8>, value: i64) {
 
 fn stroke_form_path_event(
     event: &Event,
+    numbers: &[f64],
     origin_x: i64,
     origin_y: i64,
     signature: &mut Vec<u8>,
@@ -1372,7 +1370,8 @@ fn stroke_form_path_event(
         b"h" => 0,
         _ => return None,
     };
-    if !event.all_operands_numeric() || event.numbers().len() != expected {
+    let args = event.numbers(numbers);
+    if !event.all_operands_numeric() || args.len() != expected {
         return None;
     }
     signature.push(u8::try_from(event.operator.len()).ok()?);
@@ -1382,8 +1381,7 @@ fn stroke_form_path_event(
         return Some(());
     }
 
-    let values = event
-        .numbers()
+    let values = args
         .iter()
         .copied()
         .map(structural_grid_coordinate)
@@ -1425,27 +1423,30 @@ fn stroke_form_path_event(
 
 fn fenced_stroke_form_occurrence(
     input: &[u8],
-    events: &[Event],
+    table: &EventTable,
     index: usize,
     caller_path_empty: bool,
     state: StrokeGraphicsState,
 ) -> Option<(StrokeFormOccurrence, usize)> {
+    let events = &table.records;
+    let numbers = &table.numbers;
     if !caller_path_empty {
         return None;
     }
     let save = events.get(index)?;
     let first = events.get(index + 1)?;
+    let [x, y] = first.numbers(numbers) else {
+        return None;
+    };
     if save.operator.as_slice() != b"q"
         || save.operand_count != 0
         || first.operator.as_slice() != b"m"
-        || first.numbers().len() != 2
-        || !first.all_operands_numeric()
         || !adjacent(input, save, first)
     {
         return None;
     }
-    let origin_x = structural_grid_coordinate(first.numbers()[0])?;
-    let origin_y = structural_grid_coordinate(first.numbers()[1])?;
+    let origin_x = structural_grid_coordinate(*x)?;
+    let origin_y = structural_grid_coordinate(*y)?;
     let mut signature = b"PdfRedoxStrokeForm1".to_vec();
     let mut bounds = None::<GridBounds>;
     let mut cursor = index + 1;
@@ -1460,7 +1461,14 @@ fn fenced_stroke_form_occurrence(
             event.operator.as_slice(),
             b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re"
         ) {
-            stroke_form_path_event(event, origin_x, origin_y, &mut signature, &mut bounds)?;
+            stroke_form_path_event(
+                event,
+                numbers,
+                origin_x,
+                origin_y,
+                &mut signature,
+                &mut bounds,
+            )?;
             previous = event;
             cursor += 1;
             continue;
@@ -1501,14 +1509,15 @@ fn fenced_stroke_form_occurrence(
 fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
     let events = events_for(input, &[b"gs", b"d"])?;
 
+    let numbers = &events.numbers;
     let mut occurrences = Vec::new();
     let mut state = StrokeGraphicsState::default();
     let mut state_stack = Vec::<StrokeGraphicsState>::new();
     let mut path_nonempty = false;
     let mut index = 0usize;
 
-    while index < events.len() {
-        let event = &events[index];
+    while index < events.records.len() {
+        let event = &events.records[index];
         if event.operator.as_slice() == b"q"
             && let Some((occurrence, next)) =
                 fenced_stroke_form_occurrence(input, &events, index, !path_nonempty, state)
@@ -1529,12 +1538,12 @@ fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
             }
             b"w" if event.operand_count == 1 => {
                 state.line_width = event
-                    .sole_number()
+                    .sole_number(numbers)
                     .filter(|value| value.is_finite() && *value >= 0.0);
             }
             b"M" if event.operand_count == 1 => {
                 state.miter_limit = event
-                    .sole_number()
+                    .sole_number(numbers)
                     .filter(|value| value.is_finite() && *value > 0.0);
             }
             b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" => {
@@ -1552,9 +1561,11 @@ fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
 
 fn outlined_glyph_transaction(
     input: &[u8],
-    events: &[Event],
+    table: &EventTable,
     index: usize,
 ) -> Option<(GlyphTransaction, usize)> {
+    let events = &table.records;
+    let numbers = &table.numbers;
     let save = events.get(index)?;
     let miter = events.get(index + 1)?;
     if save.operator.as_slice() != b"q"
@@ -1565,7 +1576,7 @@ fn outlined_glyph_transaction(
     {
         return None;
     }
-    let miter_value = miter.sole_number()?;
+    let miter_value = miter.sole_number(numbers)?;
     if !miter_value.is_finite() {
         return None;
     }
@@ -1580,10 +1591,10 @@ fn outlined_glyph_transaction(
         if cursor > index + 2 && !adjacent(input, &events[cursor - 1], event) {
             return None;
         }
-        match event.operator.as_slice() {
-            b"m" | b"l" if event.all_operands_numeric() && event.numbers().len() == 2 => {
-                let x = structural_grid_coordinate(event.numbers()[0])?;
-                let y = structural_grid_coordinate(event.numbers()[1])?;
+        match (event.operator.as_slice(), event.numbers(numbers)) {
+            (b"m" | b"l", [x, y]) => {
+                let x = structural_grid_coordinate(*x)?;
+                let y = structural_grid_coordinate(*y)?;
                 let point = GridBounds::from_point(x, y);
                 match &mut bounds {
                     Some(bounds) => bounds.include(point),
@@ -1597,7 +1608,7 @@ fn outlined_glyph_transaction(
                 saw_path = true;
                 cursor += 1;
             }
-            b"h" if event.operand_count == 0 => {
+            (b"h", _) if event.operand_count == 0 => {
                 closes.push(ops.len());
                 cursor += 1;
             }
@@ -1793,7 +1804,7 @@ fn outlined_glyph_components(input: &[u8]) -> Option<Vec<GlyphComponent>> {
     let events = events_for(input, &[b"BT", b"ET"])?;
     let mut components = Vec::new();
     let mut index = 0usize;
-    while index < events.len() {
+    while index < events.records.len() {
         let Some((first, mut next_index)) = outlined_glyph_transaction(input, &events, index)
         else {
             index += 1;
@@ -2475,14 +2486,14 @@ mod tests {
 
     fn batch_content_reparsed(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
         let fill_events = events_for(input, &[])?;
-        if !page_paint_batching_is_safe(&fill_events) {
+        if !page_paint_batching_is_safe(&fill_events.records) {
             return Some((input.to_vec(), ContentBatchStats::default()));
         }
         let (filled, fill_stats) = batch_closed_fills(input, &fill_events)?;
 
         let stroke_events = events_for(&filled, &[])?;
-        let (stroked, stroke_stats) = if page_paint_batching_is_safe(&stroke_events) {
-            batch_strokes(&filled, &stroke_events)?
+        let (stroked, stroke_stats) = if page_paint_batching_is_safe(&stroke_events.records) {
+            batch_strokes(&filled, &stroke_events.records)?
         } else {
             (filled, ContentBatchStats::default())
         };
@@ -2509,6 +2520,7 @@ mod tests {
             return 0;
         };
         events
+            .records
             .iter()
             .filter(|event| event.operator.as_slice() == operator)
             .count()
@@ -2521,7 +2533,7 @@ mod tests {
             return;
         };
         assert!(
-            events.iter().all(|event| {
+            events.records.iter().all(|event| {
                 matches!(
                     event.operator.as_slice(),
                     b"q" | b"Q"
@@ -2551,20 +2563,33 @@ mod tests {
         let events = events_for(input, &[]).ok_or_else(|| {
             crate::Error::Invalid("event projection fixture did not parse".into())
         })?;
-        assert_eq!(events.len(), 8);
-        assert_eq!(events[0].operator.as_slice(), b"m");
-        assert_eq!(events[0].numbers(), &[1.0, 2.0]);
-        assert!(!events[1].all_operands_numeric());
-        for event in &events[2..4] {
+        assert_eq!(events.records.len(), 8);
+        assert_eq!(
+            events.numbers,
+            [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        );
+        assert_eq!(events.records[0].operator.as_slice(), b"m");
+        assert_eq!(events.records[0].numbers(&events.numbers), &[1.0, 2.0]);
+        assert!(!events.records[1].all_operands_numeric());
+        for event in &events.records[2..4] {
             assert!(!event.all_operands_numeric());
             assert_eq!(event.operand_count, 2);
-            assert_eq!(event.numbers(), &[] as &[f64]);
+            assert_eq!(event.numbers(&events.numbers), &[] as &[f64]);
         }
-        assert!(events[4].all_operands_numeric());
-        assert_eq!(events[4].operand_count, 0);
-        assert_eq!(events[5].numbers(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-        assert_eq!(events[6].operator.as_slice(), b"unknownLongOperator");
-        assert_eq!(&input[events[0].start..events[0].end], b"1 2 #6d");
+        assert!(events.records[4].all_operands_numeric());
+        assert_eq!(events.records[4].operand_count, 0);
+        assert_eq!(
+            events.records[5].numbers(&events.numbers),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        );
+        assert_eq!(
+            events.records[6].operator.as_slice(),
+            b"unknownLongOperator"
+        );
+        assert_eq!(
+            &input[events.records[0].start..events.records[0].end],
+            b"1 2 #6d"
+        );
         Ok(())
     }
 
@@ -2589,24 +2614,27 @@ mod tests {
         input.extend_from_slice(b"f 0 0 m 1 0 l S 2 0 m 3 0 l S");
         let events =
             events_for(&input, &[]).ok_or_else(|| crate::Error::Invalid("path fixture".into()))?;
-        let (candidate, next) = stroke_transaction(&input, &events, 0);
+        let (candidate, next) = stroke_transaction(&input, &events.records, 0);
         assert!(candidate.is_none());
         assert_eq!(next, 20_001);
-        assert_eq!(events[next].operator.as_slice(), b"f");
-        let (output, stats) = batch_strokes(&input, &events)
+        assert_eq!(events.records[next].operator.as_slice(), b"f");
+        let (output, stats) = batch_strokes(&input, &events.records)
             .ok_or_else(|| crate::Error::Invalid("stroke fixture".into()))?;
         assert_eq!(stats.paints_eliminated, 1);
         assert_eq!(operator_count(&output, b"f"), 1);
         assert_eq!(operator_count(&output, b"S"), 1);
-        assert!(output.starts_with(&input[..events[next].end]));
+        assert!(output.starts_with(&input[..events.records[next].end]));
         Ok(())
     }
 
     #[test]
     fn event_disqualification_discards_projection_but_preserves_parse_outcome() {
         let input = b"0 0 m 1 1 l S /GS #67s 2 2 m 3 3 l S";
-        assert!(events_for(input, &[b"gs", b"d"]).is_some_and(|events| events.is_empty()));
-        assert!(events_for(input, &[]).is_some_and(|events| events.len() == 7));
+        assert!(
+            events_for(input, &[b"gs", b"d"])
+                .is_some_and(|events| events.records.is_empty() && events.numbers.is_empty())
+        );
+        assert!(events_for(input, &[]).is_some_and(|events| events.records.len() == 7));
         let malformed = b"/GS gs [1 2";
         assert_eq!(
             events_for(malformed, &[b"gs"]).is_none(),

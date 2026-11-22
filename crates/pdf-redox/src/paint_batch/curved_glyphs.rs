@@ -2,8 +2,8 @@
 //! Discovery is approximate, but canonical membership is checked across
 //! every occurrence using the same local-point coordinate bound.
 use super::{
-    BTreeMap, BTreeSet, EditDocument, Event, GlyphComponent, GlyphFontPlan, GlyphShapePlan,
-    MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
+    BTreeMap, BTreeSet, EditDocument, Event, EventTable, GlyphComponent, GlyphFontPlan,
+    GlyphShapePlan, MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
     OutlinedGlyphFactorStats, Result, adjacent, effective_page_resources, events_for,
     install_page_resource_bindings, outlined_glyph_estimated_after_flate,
     outlined_glyph_font_dictionary, outlined_glyph_font_name, replace_page_content,
@@ -68,8 +68,8 @@ fn pdf_num(x: f64) -> String {
 }
 
 // Linear CTM determines how a local-coordinate error magnifies in page space.
-fn matrix_from_event(e: &Event) -> Option<[f64; 6]> {
-    let matrix: [f64; 6] = e.numbers().try_into().ok()?;
+fn matrix_from_event(e: &Event, numbers: &[f64]) -> Option<[f64; 6]> {
+    let matrix: [f64; 6] = e.numbers(numbers).try_into().ok()?;
     matrix
         .iter()
         .all(|value| value.is_finite())
@@ -101,7 +101,9 @@ fn normalize_control_points(
     (normalized, dimensions)
 }
 
-fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option<(Shape, usize)> {
+fn read_shape(input: &[u8], table: &EventTable, i: usize, ctm: [f64; 6]) -> Option<(Shape, usize)> {
+    let events = &table.records;
+    let numbers = &table.numbers;
     // Only an unpainted path followed by a filling operator is replaced.
     // Its surrounding graphics state (including any cm, q/Q, clipping and
     // optional-content scopes) stays in the original content stream.
@@ -128,7 +130,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
         {
             return None;
         }
-        let args = e.numbers().to_vec();
+        let args = e.numbers(numbers).to_vec();
         if e.operator.as_slice() == b"re" {
             // PDF 're' operands are x, y, WIDTH, HEIGHT. Width and height
             // are not independent x/y control points.
@@ -387,8 +389,8 @@ fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
     let mut stack = Vec::new();
     let mut shapes = Vec::new();
     let mut fills = Vec::new();
-    while cursor < events.len() {
-        let e = &events[cursor];
+    while cursor < events.records.len() {
+        let e = &events.records[cursor];
         if e.operator.as_slice() == b"BT" {
             text = true;
         }
@@ -421,7 +423,7 @@ fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
         match e.operator.as_slice() {
             b"q" => stack.push(ctm),
             b"Q" => ctm = stack.pop()?,
-            b"cm" => ctm = compose_affine_matrix(ctm, matrix_from_event(e)?),
+            b"cm" => ctm = compose_affine_matrix(ctm, matrix_from_event(e, &events.numbers)?),
             _ => {}
         }
         if arity(&e.operator).is_some() {
