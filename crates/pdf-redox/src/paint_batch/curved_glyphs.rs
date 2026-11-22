@@ -68,7 +68,7 @@ fn pdf_num(x: f64) -> String {
 
 // Linear CTM determines how a local-coordinate error magnifies in page space.
 fn matrix_from_event(e: &Event) -> Option<[f64; 6]> {
-    let matrix: [f64; 6] = e.numbers.as_slice().try_into().ok()?;
+    let matrix: [f64; 6] = e.numbers().try_into().ok()?;
     matrix
         .iter()
         .all(|value| value.is_finite())
@@ -121,14 +121,14 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
         let Some(need) = arity(&e.operator) else {
             break;
         };
-        if !e.all_operands_numeric
+        if !e.all_operands_numeric()
             || e.operand_count != need
             || (cursor > i && !adjacent(input, events.get(cursor - 1)?, e))
         {
             return None;
         }
-        let args = e.numbers.iter().copied().collect::<Vec<_>>();
-        if e.operator == b"re" {
+        let args = e.numbers().to_vec();
+        if e.operator.as_slice() == b"re" {
             // PDF 're' operands are x, y, WIDTH, HEIGHT. Width and height
             // are not independent x/y control points.
             for (x, y) in [(args[0], args[1]), (args[0] + args[2], args[1] + args[3])] {
@@ -149,7 +149,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
         skeleton.extend_from_slice(&e.operator);
         skeleton.push(0);
         ops.push(ShapeOp {
-            token: e.operator.clone(),
+            token: e.operator.to_vec(),
             args,
             start: e.start,
             end: e.end,
@@ -195,7 +195,7 @@ fn read_shape(input: &[u8], events: &[Event], i: usize, ctm: [f64; 6]) -> Option
             page_index: 0,
             fill_index: 0,
             raw_subpaths: Vec::new(),
-            paint: paint.operator.clone(),
+            paint: paint.operator.to_vec(),
             ops,
             skeleton,
             normalized,
@@ -380,7 +380,7 @@ fn independent_components(input: &[u8], original: &Shape) -> Option<Vec<Shape>> 
 }
 
 fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
-    let events = events_for(input, "filled curve outlines")?;
+    let events = events_for(input)?;
     let (mut cursor, mut text, mut path_open) = (0, false, false);
     let mut ctm = [1., 0., 0., 1., 0., 0.];
     let mut stack = Vec::new();
@@ -388,10 +388,10 @@ fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
     let mut fills = Vec::new();
     while cursor < events.len() {
         let e = &events[cursor];
-        if e.operator == b"BT" {
+        if e.operator.as_slice() == b"BT" {
             text = true;
         }
-        if e.operator == b"ET" {
+        if e.operator.as_slice() == b"ET" {
             text = false;
         }
         if !text
