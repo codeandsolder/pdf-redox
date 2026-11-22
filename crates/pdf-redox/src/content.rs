@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    source::{CurrentValue, into_owned_dictionary},
+    source::{CurrentValue, PageBoxCoordinates, into_owned_dictionary},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -231,10 +231,8 @@ pub fn page_box_numbers_matching(
     mut accept: impl FnMut([f64; 4]) -> bool,
 ) -> Result<Option<[f64; 4]>> {
     for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
-        let Some(value) = document.inherited_page_value_cow(page, key)? else {
-            continue;
-        };
-        let Some(values) = resolved_number_array::<4>(document, &value)? else {
+        let Some(PageBoxCoordinates::Exact(values)) = document.inherited_page_box(page, key)?
+        else {
             continue;
         };
         if accept(values) {
@@ -544,6 +542,62 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(page_content_if_present(&document, pages[1])?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn page_boxes_project_the_same_numeric_prefix_used_for_inheritance() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [1 2 101 202] /MediaBox [0 0 300 400] >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /CropBox 4 0 R >>")?;
+        pdf.object(4, b"[10 20 5 0 R 220 /Extra]")?;
+        pdf.object(5, b"110")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| ObjectHandle::Existing(crate::ObjectId::new(number, 0));
+        let page = existing(3);
+        let crop = document.source().syntax().pages()[0].crop_box();
+        assert_eq!(
+            [crop.x0, crop.y0, crop.x1, crop.y1],
+            [10.0, 20.0, 110.0, 220.0]
+        );
+        assert_eq!(
+            page_box_numbers(&document, page)?,
+            Some([10.0, 20.0, 110.0, 220.0])
+        );
+        // Invalidating a coordinate through the overlay makes the parent CropBox effective.
+        *document.edit_handle(existing(5))? = OwnedObject::Null;
+        assert_eq!(
+            page_box_numbers(&document, page)?,
+            Some([1.0, 2.0, 101.0, 202.0])
+        );
+        // An inexact but numeric local box still shadows the ancestor; proof
+        // clients retain the established MediaBox fallback instead.
+        *document.edit_handle(existing(5))? = OwnedObject::Integer(9_007_199_254_740_993);
+        assert_eq!(
+            document.inherited_page_value(page, b"CropBox")?,
+            Some(OwnedObject::Reference(existing(4)))
+        );
+        assert!(matches!(
+            document.inherited_page_box(page, b"CropBox")?,
+            Some(PageBoxCoordinates::Inexact)
+        ));
+        assert_eq!(
+            page_box_numbers(&document, page)?,
+            Some([0.0, 0.0, 300.0, 400.0])
+        );
+        // A wholly owned array uses identical prefix and reference semantics.
+        *document.edit_handle(existing(4))? = OwnedObject::Array(vec![
+            OwnedObject::Integer(-4),
+            OwnedObject::Integer(6),
+            OwnedObject::Integer(70),
+            OwnedObject::Integer(80),
+            OwnedObject::Name(b"Trailing".to_vec()),
+        ]);
+        assert_eq!(
+            page_box_numbers(&document, page)?,
+            Some([-4.0, 6.0, 70.0, 80.0])
+        );
         Ok(())
     }
 

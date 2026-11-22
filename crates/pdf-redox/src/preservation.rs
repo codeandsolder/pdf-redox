@@ -1003,13 +1003,10 @@ fn wrap_page_contents(
 }
 
 fn page_rotate(document: &EditDocument, page: &DirectObjectTarget) -> Result<i32> {
-    let Some(value) = inherited_page_value(document, page, b"Rotate")? else {
+    let Some(object) = page.current(document)? else {
         return Ok(0);
     };
-    Ok(match document.resolve_owned_value(&value)? {
-        Some(OwnedObject::Integer(value)) => i32::try_from(value).unwrap_or(0),
-        _ => 0,
-    })
+    document.inherited_page_rotation_from_view(object)
 }
 
 fn flatten_annotations(
@@ -1442,6 +1439,68 @@ mod tests {
             object
                 .as_dictionary()
                 .is_some_and(|dictionary| dictionary.contains_key(direct_name.as_slice()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn annotation_rotation_matches_hayro_including_real_and_wrapped_angles() -> Result<()> {
+        use hayro_syntax::page::Rotation;
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R] /Count 6 /Rotate 90 /MediaBox [0 0 100 100] >>")?;
+        for (number, rotation) in [
+            (3, "-90.5"),
+            (4, "450"),
+            (5, "180.9"),
+            (6, "45"),
+            (7, "2147483648"),
+            (8, "9 0 R"),
+        ] {
+            pdf.object(
+                number,
+                format!("<< /Type /Page /Parent 2 0 R /Rotate {rotation} >>").as_bytes(),
+            )?;
+        }
+        pdf.object(9, b"null")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| CowObjectHandle::Existing(crate::ObjectId::new(number, 0));
+        let target = |number| DirectObjectTarget {
+            root: existing(number),
+            path: Vec::new(),
+        };
+        let expected = [270, 90, 180, 0, 90, 90];
+        let pages = document.source().syntax().pages();
+        assert_eq!(pages.len(), expected.len());
+        for ((number, expected), page) in (3..=8).zip(expected).zip(pages.iter()) {
+            let renderer_rotation = match page.rotation() {
+                Rotation::None => 0,
+                Rotation::Horizontal => 90,
+                Rotation::Flipped => 180,
+                Rotation::FlippedHorizontal => 270,
+            };
+            assert_eq!(renderer_rotation, expected);
+            assert_eq!(page_rotate(&document, &target(number))?, expected);
+        }
+        *document.edit_handle(existing(9))? = OwnedObject::Real(-450.5);
+        assert_eq!(page_rotate(&document, &target(8))?, 270);
+        *document.edit_handle(existing(9))? = OwnedObject::Real(f64::INFINITY);
+        assert_eq!(page_rotate(&document, &target(8))?, 90);
+        let direct = CowObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+            OwnedObject::Dictionary(OwnedDictionary::from([
+                (b"Parent".to_vec(), OwnedObject::Reference(existing(2))),
+                (b"Rotate".to_vec(), OwnedObject::Real(540.5)),
+            ])),
+        ])));
+        assert_eq!(
+            page_rotate(
+                &document,
+                &DirectObjectTarget {
+                    root: direct,
+                    path: vec![DirectPathStep::ArrayIndex(0)]
+                }
+            )?,
+            180
         );
         Ok(())
     }
