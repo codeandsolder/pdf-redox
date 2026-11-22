@@ -31,7 +31,7 @@ jobs:
         cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo test --locked --workspace --all-features
         RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "nightly-2026-11-20"
+      rust-toolchain: "nightly-2026-11-22"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -43,6 +43,6 @@ jobs:
         declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
         test "$declared" = "$RUST_TOOLCHAIN" || { echo "WASM toolchain $RUST_TOOLCHAIN differs from $declared" >&2; exit 1; }
         cargo check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
-      rust-toolchain: "nightly-2026-11-20"
+      rust-toolchain: "nightly-2026-11-22"
       rust-targets: "wasm32-unknown-unknown"
       rustflags: ""
