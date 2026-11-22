@@ -126,42 +126,47 @@ impl Readable<'_> for Number {
 impl Number {
     #[inline(always)]
     pub(crate) fn read_simple(r: &mut Reader<'_>) -> Option<Self> {
-        let negative = match r.peek_byte() {
-            Some(b'-') => {
-                r.forward();
-                true
+        #[inline(always)]
+        fn digits<'a>(mut bytes: &'a [u8], mantissa: &mut u64) -> &'a [u8] {
+            while let Some((&byte, rest)) = bytes.split_first() {
+                let digit = byte.wrapping_sub(b'0');
+                if digit >= 10 {
+                    break;
+                }
+                *mantissa = mantissa.wrapping_mul(10).wrapping_add(u64::from(digit));
+                bytes = rest;
             }
-            Some(b'+') => {
-                r.forward();
-                false
-            }
-            _ => false,
-        };
-
-        let mut mantissa: u64 = 0;
-        let mut read_digits = |r: &mut Reader<'_>| {
-            let start = r.offset();
-            while let Some(d) = r
-                .peek_byte()
-                .map(|b| b.wrapping_sub(b'0'))
-                .filter(|d| *d < 10)
-            {
-                mantissa = mantissa.wrapping_mul(10).wrapping_add(d as u64);
-                r.forward();
-            }
-            r.offset() - start
-        };
-
-        let mut digits = read_digits(r);
-        let mut decimal_shift = None;
-        if r.peek_byte() == Some(b'.') {
-            r.forward();
-            let fraction_digits = read_digits(r);
-            decimal_shift = Some(fraction_digits as u32);
-            digits += fraction_digits;
+            bytes
         }
 
-        if digits == 0 || digits > 18 || r.peek_byte().is_some_and(is_regular_character) {
+        let initial = r.tail()?;
+        let (negative, unsigned) = match initial {
+            [b'-', rest @ ..] => (true, rest),
+            [b'+', rest @ ..] => (false, rest),
+            _ => (false, initial),
+        };
+        let mut mantissa = 0;
+        let after_integer = digits(unsigned, &mut mantissa);
+        let integer_digits = unsigned.len() - after_integer.len();
+        let (remaining, decimal_shift, digit_count) = if let [b'.', fraction @ ..] = after_integer {
+            let remaining = digits(fraction, &mut mantissa);
+            let fraction_digits = fraction.len() - remaining.len();
+            (
+                remaining,
+                Some(fraction_digits as u32),
+                integer_digits + fraction_digits,
+            )
+        } else {
+            (after_integer, None, integer_digits)
+        };
+
+        // Keep the original failure cursor as well as the successful token
+        // boundary; callers can reset it when invoking the recovery parser.
+        r.jump(r.offset() + initial.len() - remaining.len());
+        if digit_count == 0
+            || digit_count > 18
+            || remaining.first().copied().is_some_and(is_regular_character)
+        {
             return None;
         }
 

@@ -1,0 +1,116 @@
+diff --git a/hayro-syntax/src/content/mod.rs b/hayro-syntax/src/content/mod.rs
+index e3e3378..f33f6ca 100644
+--- a/hayro-syntax/src/content/mod.rs
++++ b/hayro-syntax/src/content/mod.rs
+@@ -53,14 +53,20 @@ impl Skippable for Operator<'_> {
+ 
+ impl<'a> Readable<'a> for Operator<'a> {
+     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
+-        let start = r.offset();
++        let tail = r.tail()?;
+         let mut escaped = false;
+-        while let Some(b) = r.peek_byte().filter(|b| is_regular_character(*b)) {
+-            escaped |= b == b'#';
+-            r.forward();
+-        }
+-
+-        let data = r.range(start..r.offset())?;
++        let len = tail
++            .iter()
++            .position(|&byte| {
++                if !is_regular_character(byte) {
++                    return true;
++                }
++                escaped |= byte == b'#';
++                false
++            })
++            .unwrap_or(tail.len());
++        let data = &tail[..len];
++        r.jump(r.offset() + len);
+         if data.is_empty() {
+             return None;
+         }
+diff --git a/hayro-syntax/src/object/number.rs b/hayro-syntax/src/object/number.rs
+index 2d59394..5c488bd 100644
+--- a/hayro-syntax/src/object/number.rs
++++ b/hayro-syntax/src/object/number.rs
+@@ -126,42 +126,47 @@ impl Readable<'_> for Number {
+ impl Number {
+     #[inline(always)]
+     pub(crate) fn read_simple(r: &mut Reader<'_>) -> Option<Self> {
+-        let negative = match r.peek_byte() {
+-            Some(b'-') => {
+-                r.forward();
+-                true
+-            }
+-            Some(b'+') => {
+-                r.forward();
+-                false
++        #[inline(always)]
++        fn digits<'a>(mut bytes: &'a [u8], mantissa: &mut u64) -> &'a [u8] {
++            while let Some((&byte, rest)) = bytes.split_first() {
++                let digit = byte.wrapping_sub(b'0');
++                if digit >= 10 {
++                    break;
++                }
++                *mantissa = mantissa.wrapping_mul(10).wrapping_add(u64::from(digit));
++                bytes = rest;
+             }
+-            _ => false,
+-        };
++            bytes
++        }
+ 
+-        let mut mantissa: u64 = 0;
+-        let mut read_digits = |r: &mut Reader<'_>| {
+-            let start = r.offset();
+-            while let Some(d) = r
+-                .peek_byte()
+-                .map(|b| b.wrapping_sub(b'0'))
+-                .filter(|d| *d < 10)
+-            {
+-                mantissa = mantissa.wrapping_mul(10).wrapping_add(d as u64);
+-                r.forward();
+-            }
+-            r.offset() - start
++        let initial = r.tail()?;
++        let (negative, unsigned) = match initial {
++            [b'-', rest @ ..] => (true, rest),
++            [b'+', rest @ ..] => (false, rest),
++            _ => (false, initial),
++        };
++        let mut mantissa = 0;
++        let after_integer = digits(unsigned, &mut mantissa);
++        let integer_digits = unsigned.len() - after_integer.len();
++        let (remaining, decimal_shift, digit_count) = if let [b'.', fraction @ ..] = after_integer {
++            let remaining = digits(fraction, &mut mantissa);
++            let fraction_digits = fraction.len() - remaining.len();
++            (
++                remaining,
++                Some(fraction_digits as u32),
++                integer_digits + fraction_digits,
++            )
++        } else {
++            (after_integer, None, integer_digits)
+         };
+ 
+-        let mut digits = read_digits(r);
+-        let mut decimal_shift = None;
+-        if r.peek_byte() == Some(b'.') {
+-            r.forward();
+-            let fraction_digits = read_digits(r);
+-            decimal_shift = Some(fraction_digits as u32);
+-            digits += fraction_digits;
+-        }
+-
+-        if digits == 0 || digits > 18 || r.peek_byte().is_some_and(is_regular_character) {
++        // Keep the original failure cursor as well as the successful token
++        // boundary; callers can reset it when invoking the recovery parser.
++        r.jump(r.offset() + initial.len() - remaining.len());
++        if digit_count == 0
++            || digit_count > 18
++            || remaining.first().copied().is_some_and(is_regular_character)
++        {
+             return None;
+         }
+ 

@@ -53,14 +53,20 @@ impl Skippable for Operator<'_> {
 
 impl<'a> Readable<'a> for Operator<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        let start = r.offset();
+        let tail = r.tail()?;
         let mut escaped = false;
-        while let Some(b) = r.peek_byte().filter(|b| is_regular_character(*b)) {
-            escaped |= b == b'#';
-            r.forward();
-        }
-
-        let data = r.range(start..r.offset())?;
+        let len = tail
+            .iter()
+            .position(|&byte| {
+                if !is_regular_character(byte) {
+                    return true;
+                }
+                escaped |= byte == b'#';
+                false
+            })
+            .unwrap_or(tail.len());
+        let data = &tail[..len];
+        r.jump(r.offset() + len);
         if data.is_empty() {
             return None;
         }
