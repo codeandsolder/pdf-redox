@@ -1,11 +1,12 @@
 use crate::{
-    EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
-    RiskKind,
+    EditDocument, ObjectHandle as CowObjectHandle, PdfAnalysis, Result, RiskFinding, RiskKind,
     content::{page_content, page_resources},
     cos_fingerprint::exact_dictionary_fingerprint,
     hidden_text::analyze_hidden_text,
+    source::{CosScalar, CurrentArrayIter, CurrentDictionaryIter, CurrentValue, NumericValue},
 };
 use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 pub fn input_sha256(input: &[u8]) -> String {
@@ -46,22 +47,16 @@ fn document_info_text(document: &EditDocument, key: &[u8]) -> Result<Option<Stri
     let Some(info) = document.trailer().get(b"Info".as_slice()) else {
         return Ok(None);
     };
-    let Some(info) = document.resolve_owned_value(info)? else {
+    let Some(info) = document.resolve_current_value(CurrentValue::Owned(info))? else {
         return Ok(None);
     };
-    let Some(dictionary) = info.as_dictionary() else {
+    let Some(value) = info.resolved_entry(document, key)? else {
         return Ok(None);
     };
-    let Some(value) = dictionary.get(key) else {
+    let Some(bytes) = value.string() else {
         return Ok(None);
     };
-    let Some(value) = document.resolve_owned_value(value)? else {
-        return Ok(None);
-    };
-    let OwnedObject::String(bytes) = value else {
-        return Ok(None);
-    };
-    let text = crate::hidden_text::decode_pdf_text_string(&bytes)
+    let text = crate::hidden_text::decode_pdf_text_string(bytes)
         .trim()
         .to_owned();
     Ok((!text.is_empty()).then_some(text))
@@ -100,29 +95,30 @@ enum RoleValue {
 }
 
 impl RoleValue {
-    fn from_object(object: &OwnedObject) -> Self {
-        match object {
-            OwnedObject::Null => Self::Null,
-            OwnedObject::Boolean(_) => Self::Boolean,
-            OwnedObject::Integer(_) | OwnedObject::Real(_) => Self::Number,
-            OwnedObject::Name(_) => Self::Name,
-            OwnedObject::String(_) => Self::String,
-            OwnedObject::Reference(handle) => Self::Reference(*handle),
-            OwnedObject::Array(values) => {
-                Self::Array(values.iter().map(Self::from_object).collect())
-            }
-            OwnedObject::Dictionary(dictionary) => Self::Dictionary(
-                dictionary
-                    .iter()
-                    .map(|(key, value)| (key.clone().into_boxed_slice(), Self::from_object(value)))
-                    .collect(),
-            ),
-            OwnedObject::Stream { dictionary, .. } => Self::Stream(
-                dictionary
-                    .iter()
-                    .map(|(key, value)| (key.clone().into_boxed_slice(), Self::from_object(value)))
-                    .collect(),
-            ),
+    fn from_value(object: &CurrentValue<'_>) -> Self {
+        if let Some(scalar) = object.scalar() {
+            return match scalar {
+                CosScalar::Null => Self::Null,
+                CosScalar::Boolean(_) => Self::Boolean,
+                CosScalar::Number(_) => Self::Number,
+                CosScalar::Name(_) => Self::Name,
+                CosScalar::String(_) => Self::String,
+                CosScalar::Reference(handle) => Self::Reference(handle),
+            };
+        }
+        if let Some(values) = object.array_items() {
+            return Self::Array(values.map(|value| Self::from_value(&value)).collect());
+        }
+        let Some(entries) = object.dictionary_entries() else {
+            unreachable!("non-scalar COS value is a container")
+        };
+        let dictionary = entries
+            .map(|(key, value)| (key.as_ref().into(), Self::from_value(&value)))
+            .collect();
+        if object.is_stream() {
+            Self::Stream(dictionary)
+        } else {
+            Self::Dictionary(dictionary)
         }
     }
 
@@ -179,35 +175,24 @@ struct PreflightRefs {
     icc_profiles: HashSet<CowObjectHandle>,
 }
 
-fn collect_ext_g_state_map_refs(value: &OwnedObject, refs: &mut PreflightRefs) {
-    match value {
-        OwnedObject::Reference(handle) => {
-            refs.ext_gstate_maps.insert(*handle);
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            for child in dictionary.values() {
-                if let OwnedObject::Reference(handle) = child {
-                    refs.ext_gstates.insert(*handle);
-                }
-            }
-        }
-        _ => {}
+fn collect_ext_g_state_map_refs(value: &CurrentValue<'_>, refs: &mut PreflightRefs) {
+    if let Some(handle) = value.reference() {
+        refs.ext_gstate_maps.insert(handle);
+    } else if value.is_dictionary() {
+        collect_dictionary_references(value, &mut refs.ext_gstates);
+    }
+}
+
+fn collect_dictionary_references(value: &CurrentValue<'_>, refs: &mut HashSet<CowObjectHandle>) {
+    if let Some(entries) = value.dictionary_entries() {
+        refs.extend(entries.filter_map(|(_, child)| child.reference()));
     }
 }
 
 fn resolve_ext_g_state_map_refs(document: &EditDocument, refs: &mut PreflightRefs) -> Result<()> {
-    let maps: Vec<_> = refs.ext_gstate_maps.iter().copied().collect();
-    for handle in maps {
-        let Some(object) = document.current_owned_object(handle)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        for child in dictionary.values() {
-            if let OwnedObject::Reference(target) = child {
-                refs.ext_gstates.insert(*target);
-            }
+    for &handle in &refs.ext_gstate_maps {
+        if let Some(object) = document.current_value(handle)? {
+            collect_dictionary_references(&object, &mut refs.ext_gstates);
         }
     }
     Ok(())
@@ -314,16 +299,12 @@ fn collect_incoming_roles(
 
 fn dictionary_name(
     document: &EditDocument,
-    dictionary: &BTreeMap<Vec<u8>, OwnedObject>,
+    object: &CurrentValue<'_>,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let Some(value) = dictionary.get(key) else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
+    Ok(object
+        .resolved_entry(document, key)?
+        .and_then(|value| value.name().map(<[u8]>::to_vec)))
 }
 
 #[derive(Debug)]
@@ -719,16 +700,6 @@ fn analyze_page_content(
     Ok(())
 }
 
-fn raw_stream_bytes<'a>(
-    document: &'a EditDocument,
-    object: &'a OwnedObject,
-) -> Result<std::borrow::Cow<'a, [u8]>> {
-    let OwnedObject::Stream { data, .. } = object else {
-        return Err(crate::Error::Invalid("object is not a stream".to_owned()));
-    };
-    data.bytes(document.source())
-}
-
 fn record_to_unicode_stream_payload(
     raw: &[u8],
     raw_payloads: &mut HashMap<[u8; 32], (usize, usize)>,
@@ -778,32 +749,32 @@ fn record_font_file2_opportunity(
     }
 }
 
-fn filter_value_name(document: &EditDocument, value: &OwnedObject) -> Result<String> {
-    let Some(value) = document.resolve_owned_value(value)? else {
+fn filter_value_name(document: &EditDocument, value: CurrentValue<'_>) -> Result<String> {
+    let Some(value) = document.resolve_current_value(value)? else {
         return Ok("null".to_owned());
     };
-    Ok(match value {
-        OwnedObject::Name(name) => format!("/{}", String::from_utf8_lossy(&name)),
-        OwnedObject::Array(values) => {
-            let mut parts = Vec::with_capacity(values.len());
-            for value in &values {
-                parts.push(filter_value_name(document, value)?);
-            }
-            format!("[{}]", parts.join(" "))
-        }
-        OwnedObject::Null => "null".to_owned(),
-        other => format!("{other:?}"),
+    if let Some(name) = value.name() {
+        return Ok(format!("/{}", String::from_utf8_lossy(name)));
+    }
+    if let Some(values) = value.array_items() {
+        let parts = values
+            .map(|value| filter_value_name(document, value))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(format!("[{}]", parts.join(" ")));
+    }
+    Ok(if value.is_null() {
+        "null".to_owned()
+    } else {
+        // Preserve the diagnostic spelling of malformed filter values.
+        format!("{:?}", value.into_cow())
     })
 }
 
-fn filter_name(
-    document: &EditDocument,
-    dictionary: &BTreeMap<Vec<u8>, OwnedObject>,
-) -> Result<String> {
-    let Some(value) = dictionary.get(b"Filter".as_slice()) else {
-        return Ok("null".to_owned());
-    };
-    filter_value_name(document, value)
+fn filter_name(document: &EditDocument, object: &CurrentValue<'_>) -> Result<String> {
+    object.dictionary_entry(b"Filter").map_or_else(
+        || Ok("null".to_owned()),
+        |value| filter_value_name(document, value),
+    )
 }
 
 /// The three supported analysis contracts. Each exposes a different set of
@@ -900,176 +871,182 @@ struct DirectPreflightScanner<'a> {
     inventory: &'a mut DirectKeyInventory,
 }
 
+enum PreflightChildren<'a> {
+    Dictionary(CurrentDictionaryIter<'a>, bool),
+    Array {
+        prefix: [Option<CurrentValue<'a>>; 2],
+        remaining: std::iter::Fuse<CurrentArrayIter<'a>>,
+    },
+}
+
+struct PreflightFrame<'a> {
+    children: PreflightChildren<'a>,
+    mode: DirectPreflightMode,
+}
+
 impl DirectPreflightScanner<'_> {
-    fn scan(&mut self, object: &OwnedObject, mode: DirectPreflightMode) -> Result<()> {
-        match object {
-            OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-                self.scan_dictionary(object, dictionary, mode)
-            }
-            OwnedObject::Array(values) => self.scan_array(values, mode),
-            OwnedObject::Reference(_)
-            | OwnedObject::Null
-            | OwnedObject::Boolean(_)
-            | OwnedObject::Integer(_)
-            | OwnedObject::Real(_)
-            | OwnedObject::Name(_)
-            | OwnedObject::String(_) => Ok(()),
-        }
-    }
-
-    fn scan_dictionary(
-        &mut self,
-        object: &OwnedObject,
-        dictionary: &crate::OwnedDictionary,
-        mode: DirectPreflightMode,
-    ) -> Result<()> {
-        if dictionary.contains_key(b"Subtype".as_slice()) {
-            match dictionary_name(self.document, dictionary, b"Subtype") {
-                Ok(Some(name)) if name == b"Type3" => {
-                    self.inventory.type3_font_scopes =
-                        self.inventory.type3_font_scopes.saturating_add(1);
-                }
-                Ok(_) => {}
-                Err(_) => self.inventory.font_glyph_scope_inventory_complete = false,
-            }
-        }
-        if matches!(object, OwnedObject::Stream { .. })
-            && let Some(pattern_type) = dictionary.get(b"PatternType".as_slice())
-        {
-            match self.document.resolve_owned_value(pattern_type) {
-                Ok(Some(OwnedObject::Integer(1))) => {
-                    self.inventory.tiling_pattern_scopes =
-                        self.inventory.tiling_pattern_scopes.saturating_add(1);
-                }
-                Ok(_) => {}
-                Err(_) => self.inventory.font_glyph_scope_inventory_complete = false,
-            }
-        }
-
-        if mode.count_targeted_keys {
-            self.inventory.piece_info = self.inventory.piece_info.saturating_add(usize::from(
-                dictionary.contains_key(b"PieceInfo".as_slice()),
-            ));
-            self.inventory.authoring_metadata = self
-                .inventory
-                .authoring_metadata
-                .saturating_add(usize::from(dictionary.contains_key(b"Metadata".as_slice())));
-            self.inventory.authoring_metadata =
-                self.inventory
-                    .authoring_metadata
-                    .saturating_add(usize::from(
-                        dictionary.contains_key(b"LastModified".as_slice()),
-                    ));
-            self.inventory.to_unicode = self.inventory.to_unicode.saturating_add(usize::from(
-                dictionary.contains_key(b"ToUnicode".as_slice()),
-            ));
-            self.inventory.ext_gstate = self.inventory.ext_gstate.saturating_add(usize::from(
-                dictionary.contains_key(b"ExtGState".as_slice()),
-            ));
-            self.inventory.char_procs = self.inventory.char_procs.saturating_add(usize::from(
-                dictionary.contains_key(b"CharProcs".as_slice()),
-            ));
-            self.inventory.appearance = self
-                .inventory
-                .appearance
-                .saturating_add(usize::from(dictionary.contains_key(b"AP".as_slice())));
-        }
-
-        for (key, value) in dictionary {
-            let child_collect_refs = mode.collect_refs
-                && if matches!(key.as_slice(), b"FontFile" | b"FontFile2" | b"FontFile3") {
-                    if let OwnedObject::Reference(handle) = value {
-                        self.refs.font.insert(*handle);
-                        if key.as_slice() == b"FontFile2" {
-                            self.refs.font_file2.insert(*handle);
-                        }
-                    }
-                    false
-                } else if key.as_slice() == b"ToUnicode" {
-                    if let OwnedObject::Reference(handle) = value {
-                        self.refs.to_unicode.insert(*handle);
-                    }
-                    false
-                } else if key.as_slice() == b"CIDToGIDMap" {
-                    if let OwnedObject::Reference(handle) = value {
-                        self.refs.cid_to_gid.insert(*handle);
-                    }
-                    false
-                } else if key.as_slice() == b"ExtGState" {
-                    collect_ext_g_state_map_refs(value, self.refs);
-                    false
-                } else {
-                    !matches!(value, OwnedObject::Reference(_))
-                };
-            if !matches!(value, OwnedObject::Reference(_)) {
-                self.scan(
-                    value,
-                    DirectPreflightMode {
-                        collect_refs: child_collect_refs,
-                        ..mode
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn scan_array(&mut self, values: &[OwnedObject], mode: DirectPreflightMode) -> Result<()> {
-        let mut child_collect_icc_profiles = mode.collect_icc_profiles;
-        let mut resolved_icc_based = None;
-        if mode.collect_icc_profiles && values.len() >= 2 {
-            let is_icc_based = matches!(
-                self.document.resolve_owned_value(&values[0])?,
-                Some(OwnedObject::Name(name)) if name == b"ICCBased"
-            );
-            resolved_icc_based = Some(is_icc_based);
-            if is_icc_based {
-                if let Some(OwnedObject::Reference(handle)) = values.get(1) {
-                    self.refs.icc_profiles.insert(*handle);
-                }
-                // ICCBased arrays are terminal for profile-reference discovery.
-                child_collect_icc_profiles = false;
-            }
-        }
-
-        let mut count_child_targeted_keys = mode.count_targeted_keys;
-        if mode.count_targeted_keys {
-            let icc_status = resolved_icc_based.or_else(|| {
-                values
-                    .first()
-                    .map(|first| match self.document.resolve_owned_value(first) {
-                        Ok(Some(OwnedObject::Name(name))) => name == b"ICCBased",
-                        Ok(_) => false,
-                        Err(_) => true,
+    fn scan(&mut self, object: &CurrentValue<'_>, mode: DirectPreflightMode) -> Result<()> {
+        let Some(root) = self.frame(object, mode)? else {
+            return Ok(());
+        };
+        // Retain one cursor per active container, never a queue of siblings or
+        // a materialized tree. Array prefixes are reused after classification.
+        let mut frames = SmallVec::<[PreflightFrame<'_>; 4]>::new();
+        frames.push(root);
+        while let Some(frame) = frames.last_mut() {
+            let mut mode = frame.mode;
+            let value = match &mut frame.children {
+                PreflightChildren::Dictionary(entries, is_stream) => {
+                    entries.next().map(|(key, value)| {
+                        mode.collect_refs =
+                            self.dictionary_child(key.as_ref(), &value, *is_stream, mode);
+                        value
                     })
-            });
-            if icc_status == Some(true) && matches!(values.get(1), Some(OwnedObject::Reference(_)))
-            {
-                self.inventory.icc_based_arrays = self.inventory.icc_based_arrays.saturating_add(1);
-                // Preserve the targeted-key inventory's ICCBased terminal semantics,
-                // but continue the physical walk for reference and glyph-scope proofs.
-                count_child_targeted_keys = false;
-            }
-        }
-        for value in values {
-            if !matches!(value, OwnedObject::Reference(_)) {
-                self.scan(
-                    value,
-                    DirectPreflightMode {
-                        collect_icc_profiles: child_collect_icc_profiles,
-                        count_targeted_keys: count_child_targeted_keys,
-                        ..mode
-                    },
-                )?;
+                }
+                PreflightChildren::Array { prefix, remaining } => prefix[0]
+                    .take()
+                    .or_else(|| prefix[1].take())
+                    .or_else(|| remaining.next()),
+            };
+            let Some(value) = value else {
+                frames.pop();
+                continue;
+            };
+            if let Some(child) = self.frame(&value, mode)? {
+                frames.push(child);
             }
         }
         Ok(())
+    }
+
+    fn frame<'a>(
+        &mut self,
+        object: &CurrentValue<'a>,
+        mut mode: DirectPreflightMode,
+    ) -> Result<Option<PreflightFrame<'a>>> {
+        let children = if let Some(entries) = object.dictionary_entries() {
+            PreflightChildren::Dictionary(entries, object.is_stream())
+        } else if let Some(values) = object.array_items() {
+            let mut remaining = values.fuse();
+            let prefix = [remaining.next(), remaining.next()];
+            let second_ref = prefix[1].as_ref().and_then(CurrentValue::reference);
+            let strict_icc = mode.collect_icc_profiles && prefix[1].is_some();
+            if strict_icc || mode.count_targeted_keys {
+                let icc = prefix[0]
+                    .as_ref()
+                    .map(|value| self.resolved_matches(value, |value| value.is_name(b"ICCBased")))
+                    .transpose();
+                let based = if strict_icc {
+                    icc? == Some(true)
+                } else {
+                    icc.unwrap_or(Some(true)) == Some(true)
+                };
+                if based {
+                    if strict_icc {
+                        self.refs.icc_profiles.extend(second_ref);
+                        mode.collect_icc_profiles = false;
+                    }
+                    if mode.count_targeted_keys && second_ref.is_some() {
+                        self.inventory.icc_based_arrays =
+                            self.inventory.icc_based_arrays.saturating_add(1);
+                        // ICCBased is terminal only for these two inventories.
+                        mode.count_targeted_keys = false;
+                    }
+                }
+            }
+            PreflightChildren::Array { prefix, remaining }
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(PreflightFrame { children, mode }))
+    }
+
+    fn resolved_matches(
+        &self,
+        value: &CurrentValue<'_>,
+        predicate: impl FnOnce(&CurrentValue<'_>) -> bool,
+    ) -> Result<bool> {
+        let Some(handle) = value.reference() else {
+            return Ok(predicate(value));
+        };
+        let Some(value) = self.document.current_value(handle)? else {
+            return Ok(false);
+        };
+        Ok(self
+            .document
+            .resolve_current_value(value)?
+            .is_some_and(|value| predicate(&value)))
+    }
+
+    fn dictionary_child(
+        &mut self,
+        key: &[u8],
+        value: &CurrentValue<'_>,
+        is_stream: bool,
+        mode: DirectPreflightMode,
+    ) -> bool {
+        if key == b"Subtype" || (is_stream && key == b"PatternType") {
+            self.record_glyph_scope(key, value);
+        }
+        if mode.count_targeted_keys {
+            let count = match key {
+                b"PieceInfo" => Some(&mut self.inventory.piece_info),
+                b"Metadata" | b"LastModified" => Some(&mut self.inventory.authoring_metadata),
+                b"ToUnicode" => Some(&mut self.inventory.to_unicode),
+                b"ExtGState" => Some(&mut self.inventory.ext_gstate),
+                b"CharProcs" => Some(&mut self.inventory.char_procs),
+                b"AP" => Some(&mut self.inventory.appearance),
+                _ => None,
+            };
+            if let Some(count) = count {
+                *count = count.saturating_add(1);
+            }
+        }
+        if !mode.collect_refs {
+            return false;
+        }
+        let reference = value.reference();
+        match key {
+            b"FontFile" | b"FontFile2" | b"FontFile3" => {
+                self.refs.font.extend(reference);
+                if key == b"FontFile2" {
+                    self.refs.font_file2.extend(reference);
+                }
+            }
+            b"ToUnicode" => self.refs.to_unicode.extend(reference),
+            b"CIDToGIDMap" => self.refs.cid_to_gid.extend(reference),
+            b"ExtGState" => collect_ext_g_state_map_refs(value, self.refs),
+            _ => return reference.is_none(),
+        }
+        false
+    }
+
+    fn record_glyph_scope(&mut self, key: &[u8], value: &CurrentValue<'_>) {
+        let matches_scope = |value: &CurrentValue<'_>| {
+            if key == b"Subtype" {
+                value.is_name(b"Type3")
+            } else {
+                value.number() == Some(NumericValue::Integer(1))
+            }
+        };
+        match self.resolved_matches(value, matches_scope) {
+            Ok(true) => {
+                let count = if key == b"Subtype" {
+                    &mut self.inventory.type3_font_scopes
+                } else {
+                    &mut self.inventory.tiling_pattern_scopes
+                };
+                *count = count.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(_) => self.inventory.font_glyph_scope_inventory_complete = false,
+        }
     }
 }
 
 fn scan_direct_preflight_root(
     document: &EditDocument,
-    object: &OwnedObject,
+    object: &CurrentValue<'_>,
     refs: &mut PreflightRefs,
     inventory: &mut DirectKeyInventory,
     collect_icc_profiles: bool,
@@ -1354,17 +1331,17 @@ impl ObjectAnalysisAccumulator {
         document: &EditDocument,
         out: &mut PdfAnalysis,
         handle: CowObjectHandle,
-        object: &OwnedObject,
+        object: &CurrentValue<'_>,
         preflight_refs: &PreflightRefs,
     ) -> Result<()> {
-        let Some(dictionary) = object.as_dictionary() else {
+        if !object.has_dictionary() {
             return Ok(());
-        };
-        let type_name = dictionary_name(document, dictionary, b"Type");
-        if matches!(
-            dictionary.get(b"A".as_slice()),
-            Some(OwnedObject::Reference(_))
-        ) {
+        }
+        let type_name = dictionary_name(document, object, b"Type");
+        if object
+            .dictionary_entry(b"A")
+            .is_some_and(|value| value.reference().is_some())
+        {
             let may_be_struct_elem = match type_name.as_ref() {
                 Ok(Some(name)) => name.as_slice() == b"StructElem",
                 Ok(None) => false,
@@ -1377,10 +1354,9 @@ impl ObjectAnalysisAccumulator {
         }
         match type_name.as_ref() {
             Ok(Some(name)) if name.as_slice() == b"Font" => {
-                if let Some(fingerprint) = exact_dictionary_fingerprint(
-                    &crate::source::CurrentValue::Owned(object),
-                    b"exact-font-dictionary",
-                ) {
+                if let Some(fingerprint) =
+                    exact_dictionary_fingerprint(object, b"exact-font-dictionary")
+                {
                     *self
                         .font_dictionary_fingerprints
                         .entry(fingerprint)
@@ -1390,8 +1366,8 @@ impl ObjectAnalysisAccumulator {
             Ok(_) => {}
             Err(_) => self.font_dictionary_fingerprint_inventory_complete = false,
         }
-        let is_stream = matches!(object, OwnedObject::Stream { .. });
-        if dictionary.contains_key(b"Thumb".as_slice()) {
+        let is_stream = object.is_stream();
+        if object.dictionary_entry(b"Thumb").is_some() {
             push_risk(
                 &mut self.risks,
                 RiskKind::Thumbnail,
@@ -1399,8 +1375,8 @@ impl ObjectAnalysisAccumulator {
                 "page thumbnail stream is separate hidden raster content",
             );
         }
-        if dictionary.contains_key(b"AA".as_slice())
-            || dictionary.contains_key(b"OpenAction".as_slice())
+        if object.dictionary_entry(b"AA").is_some()
+            || object.dictionary_entry(b"OpenAction").is_some()
         {
             push_risk(
                 &mut self.risks,
@@ -1409,7 +1385,7 @@ impl ObjectAnalysisAccumulator {
                 "automatic PDF actions are executable/interactive hidden state",
             );
         }
-        if dictionary.contains_key(b"OCProperties".as_slice()) {
+        if object.dictionary_entry(b"OCProperties").is_some() {
             push_risk(
                 &mut self.risks,
                 RiskKind::HiddenLayer,
@@ -1417,7 +1393,7 @@ impl ObjectAnalysisAccumulator {
                 "optional-content groups can hide content from the default view",
             );
         }
-        if dictionary.contains_key(b"ActualText".as_slice()) {
+        if object.dictionary_entry(b"ActualText").is_some() {
             push_risk(
                 &mut self.risks,
                 RiskKind::SuspiciousHiddenText,
@@ -1425,7 +1401,7 @@ impl ObjectAnalysisAccumulator {
                 "ActualText may differ from visible glyphs and should be retained but audited in privacy mode",
             );
         }
-        if dictionary.contains_key(b"V".as_slice()) && dictionary.contains_key(b"FT".as_slice()) {
+        if object.dictionary_entry(b"V").is_some() && object.dictionary_entry(b"FT").is_some() {
             push_risk(
                 &mut self.risks,
                 RiskKind::FormValue,
@@ -1439,7 +1415,7 @@ impl ObjectAnalysisAccumulator {
                     handle,
                     DeepObjectFacts {
                         kind: type_name?,
-                        subtype: dictionary_name(document, dictionary, b"Subtype")?,
+                        subtype: dictionary_name(document, object, b"Subtype")?,
                         raw_stream_bytes: None,
                     },
                 );
@@ -1455,7 +1431,7 @@ impl ObjectAnalysisAccumulator {
         if may_be_pattern {
             out.pattern_stream_count = out.pattern_stream_count.saturating_add(1);
         }
-        let raw = raw_stream_bytes(document, object)?;
+        let raw = object.stream_bytes(document.source())?;
         out.stream_count += 1;
         out.stream_raw_bytes += raw.len();
         if self.deep {
@@ -1471,10 +1447,10 @@ impl ObjectAnalysisAccumulator {
             self.processed_to_unicode_refs.insert(handle);
         }
 
-        let filter = filter_name(document, dictionary)?;
+        let filter = filter_name(document, object)?;
         *out.filter_counts.entry(filter.clone()).or_default() += 1;
 
-        let subtype = dictionary_name(document, dictionary, b"Subtype")?;
+        let subtype = dictionary_name(document, object, b"Subtype")?;
         let is_image = subtype.as_deref() == Some(b"Image");
         let is_form = subtype.as_deref() == Some(b"Form");
         let is_font = preflight_refs.font.contains(&handle);
@@ -1484,7 +1460,7 @@ impl ObjectAnalysisAccumulator {
             || (self.deep && (is_form || filter == "/FlateDecode"))
             || is_content_density_form
         {
-            match document.decoded_stream_value(&crate::source::CurrentValue::Owned(object)) {
+            match document.decoded_stream_value(object) {
                 Ok(decoded) => Some(decoded),
                 Err(error) => {
                     if is_content_density_form && self.form_content_analysis_error.is_none() {
@@ -1610,13 +1586,13 @@ impl ObjectAnalysisAccumulator {
             .difference(&self.processed_to_unicode_refs)
             .copied()
         {
-            let Some(object) = document.current_owned_object(handle)? else {
+            let Some(object) = document.current_value(handle)? else {
                 continue;
             };
-            if !matches!(object, OwnedObject::Stream { .. }) {
+            if !object.is_stream() {
                 continue;
             }
-            let raw = raw_stream_bytes(document, &object)?;
+            let raw = object.stream_bytes(document.source())?;
             record_to_unicode_stream_payload(raw.as_ref(), &mut self.to_unicode_raw_payloads);
         }
         for handle in preflight_refs
@@ -1624,16 +1600,14 @@ impl ObjectAnalysisAccumulator {
             .difference(&self.processed_font_refs)
             .copied()
         {
-            let Some(object) = document.current_owned_object(handle)? else {
+            let Some(object) = document.current_value(handle)? else {
                 continue;
             };
-            if !matches!(object, OwnedObject::Stream { .. }) {
+            if !object.is_stream() {
                 continue;
             }
-            let raw = raw_stream_bytes(document, &object)?;
-            let decoded = document
-                .decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
-                .ok();
+            let raw = object.stream_bytes(document.source())?;
+            let decoded = document.decoded_stream_value(&object).ok();
             record_font_program_payload(
                 raw.as_ref(),
                 decoded.as_deref(),
@@ -1661,12 +1635,10 @@ impl ObjectAnalysisAccumulator {
             .difference(&self.processed_font_file2_refs)
             .copied()
         {
-            let Some(object) = document.current_owned_object(handle)? else {
+            let Some(object) = document.current_value(handle)? else {
                 continue;
             };
-            if let Ok(decoded) =
-                document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
-            {
+            if let Ok(decoded) = document.decoded_stream_value(&object) {
                 record_font_file2_opportunity(
                     &decoded,
                     &mut self.font_sparse_skeletons,
@@ -1850,7 +1822,7 @@ fn analyze_document_impl(
             .ok_or_else(|| crate::Error::Invalid("deep role graph missing".to_owned()))?;
         for &id in ids {
             let handle = CowObjectHandle::Existing(id);
-            let Some(object) = document.current_owned_object(handle)? else {
+            let Some(object) = document.current_value(handle)? else {
                 continue;
             };
             scan_direct_preflight_root(
@@ -1860,7 +1832,7 @@ fn analyze_document_impl(
                 &mut direct_key_inventory,
                 true,
             )?;
-            role_objects.push((handle, RoleValue::from_object(&object)));
+            role_objects.push((handle, RoleValue::from_value(&object)));
         }
         // The source xref inventory can change as lazy object-stream entries
         // are materialized. Preserve the original deep-analysis observation
@@ -1875,7 +1847,7 @@ fn analyze_document_impl(
 
     if let Some(objects) = objects.as_deref() {
         for (handle, _) in objects {
-            let Some(object) = document.current_owned_object(*handle)? else {
+            let Some(object) = document.current_value(*handle)? else {
                 continue;
             };
             object_analysis.analyze_object(
@@ -1889,7 +1861,7 @@ fn analyze_document_impl(
     } else {
         for id in document.source().object_ids() {
             let handle = CowObjectHandle::Existing(id);
-            let Some(object) = document.current_owned_object(handle)? else {
+            let Some(object) = document.current_value(handle)? else {
                 continue;
             };
             scan_direct_preflight_root(
@@ -2014,7 +1986,7 @@ fn analyze_document_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ClassicPdfBuilder;
+    use crate::{OwnedObject, test_support::ClassicPdfBuilder};
 
     #[test]
     fn packed_role_topology_preserves_nested_references_and_incoming_roles() {
@@ -2050,7 +2022,7 @@ mod tests {
         let compact = objects
             .iter()
             .map(|(handle, object)| {
-                let role = RoleValue::from_object(object);
+                let role = RoleValue::from_value(&CurrentValue::Owned(object));
                 assert_eq!(role.references(), object.references());
                 assert_eq!(
                     role.as_dictionary().map(<[_]>::len),
@@ -2170,6 +2142,50 @@ mod tests {
             b"0 0 m 5 5 l S",
         )?;
         pdf.finish(1)
+    }
+
+    #[test]
+    fn borrowed_analysis_matches_materialized_overlay_in_all_modes() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /Private [8 0 R 5 0 R << /PieceInfo << /A true >> /Subtype 9 0 R >>] /Nested << /FontFile2 6 0 R /ToUnicode 6 0 R >> >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState 7 0 R >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.stream(5, b"/N 3 /Alternate /DeviceRGB", b"profile")?;
+        pdf.stream(6, b"", b"program")?;
+        pdf.object(7, b"<< /A 10 0 R /B 11 0 R >>")?;
+        pdf.object(8, b"/ICCBased")?;
+        pdf.object(9, b"/Type3")?;
+        pdf.object(10, b"<< /BM /Multiply /CA 0.5 >>")?;
+        pdf.object(11, b"<< /BM /Multiply /CA 0.5 >>")?;
+        let input = pdf.finish(1)?;
+        let source = EditDocument::from_bytes(input.clone())?;
+        let mut overlay = EditDocument::from_bytes(input.clone())?;
+        for id in overlay.source().object_ids() {
+            let _ = overlay.edit_handle(CowObjectHandle::Existing(id))?;
+        }
+        for mode in [
+            AnalysisMode::Optimization,
+            AnalysisMode::Preflight,
+            AnalysisMode::Complete,
+        ] {
+            let a = analyze_document_impl(&input, &source, mode)?;
+            let b = analyze_document_impl(&input, &overlay, mode)?;
+            assert_eq!(
+                a.ext_gstate_dictionary_handles,
+                b.ext_gstate_dictionary_handles
+            );
+            assert_eq!(a.report.icc_based_array_count, 1);
+            assert_eq!(a.report.type3_font_scope_count, 1);
+            assert_eq!(a.report.piece_info_key_count, 0);
+            assert_eq!(
+                serde_json::to_value(&a.report)
+                    .map_err(|error| crate::Error::Invalid(error.to_string()))?,
+                serde_json::to_value(&b.report)
+                    .map_err(|error| crate::Error::Invalid(error.to_string()))?
+            );
+        }
+        Ok(())
     }
 
     #[test]
