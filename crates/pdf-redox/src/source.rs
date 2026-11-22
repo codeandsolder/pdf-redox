@@ -27,6 +27,14 @@ enum SourceStreamKind {
 
 pub const PAGE_INHERITABLE_KEYS: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
+// A numerically valid page box can still be unsuitable for an exact-coordinate
+// optimization proof (e.g. an integer not exactly representable in binary64).
+#[derive(Debug, Clone, Copy)]
+pub enum PageBoxCoordinates {
+    Exact([f64; 4]),
+    Inexact,
+}
+
 /// Immutable, lazily parsed source PDF backed by Hayro.
 ///
 /// Hayro keeps the original bytes alive and parses objects on demand. Mutations
@@ -704,6 +712,14 @@ impl<'a> CurrentValue<'a> {
                 Some(CurrentArrayIter::Source(array.raw_iter()))
             }
             Self::Owned(OwnedObject::Array(array)) => Some(CurrentArrayIter::Owned(array.iter())),
+            _ => None,
+        }
+    }
+
+    fn numeric_scalar(self) -> Option<Cow<'a, OwnedObject>> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Number(_)), _)
+            | Self::Owned(OwnedObject::Integer(_) | OwnedObject::Real(_)) => Some(self.into_cow()),
             _ => None,
         }
     }
@@ -1475,57 +1491,78 @@ impl EditDocument {
             .collect())
     }
 
+    fn resolved_page_box(&self, value: CurrentValue<'_>) -> Result<Option<PageBoxCoordinates>> {
+        let Some(value) = self.resolve_current_value(value)? else {
+            return Ok(None);
+        };
+        let Some(mut values) = value.array_items() else {
+            return Ok(None);
+        };
+        let mut coordinates = [0.0; 4];
+        let mut exact = true;
+        // Hayro reads the first four rectangle coordinates, ignoring trailing
+        // entries. Retain binary64 coordinates for our geometry proofs.
+        for coordinate in &mut coordinates {
+            let Some(component) = values.next() else {
+                return Ok(None);
+            };
+            let Some(number) = self
+                .resolve_current_value(component)?
+                .and_then(CurrentValue::numeric_scalar)
+            else {
+                return Ok(None);
+            };
+            let projected = match number.as_ref() {
+                OwnedObject::Integer(value) => exact_i64_to_f64(*value),
+                OwnedObject::Real(value) => Some(*value),
+                _ => None,
+            };
+            if let Some(projected) = projected {
+                *coordinate = projected;
+            } else {
+                exact = false;
+            }
+        }
+        Ok(Some(if exact {
+            PageBoxCoordinates::Exact(coordinates)
+        } else {
+            PageBoxCoordinates::Inexact
+        }))
+    }
+
+    fn resolved_page_rotation(&self, value: CurrentValue<'_>) -> Result<Option<i32>> {
+        use num_traits::ToPrimitive;
+        let Some(number) = self
+            .resolve_current_value(value)?
+            .and_then(CurrentValue::numeric_scalar)
+        else {
+            return Ok(None);
+        };
+        Ok(match number.as_ref() {
+            OwnedObject::Integer(value) => i32::try_from(*value).ok(),
+            OwnedObject::Real(value) => value.trunc().to_i32(),
+            _ => None,
+        })
+    }
+
     /// Determine whether a dictionary entry actually overrides an inherited
     /// page property. Match the reader's typed fallback through null/invalid
     /// values while retaining the raw value when inheritance is materialized.
     pub(crate) fn effective_page_value(&self, key: &[u8], value: CurrentValue<'_>) -> Result<bool> {
-        let Some(value) = self.resolve_current_value(value)? else {
-            return Ok(false);
-        };
-        Ok(match key {
-            b"Resources" => value.is_dictionary(),
-            b"MediaBox" | b"CropBox" => {
-                let Some(mut values) = value.array_items() else {
+        match key {
+            b"MediaBox" | b"CropBox" => Ok(self.resolved_page_box(value)?.is_some()),
+            b"Rotate" => Ok(self.resolved_page_rotation(value)?.is_some()),
+            _ => {
+                let Some(value) = self.resolve_current_value(value)? else {
                     return Ok(false);
                 };
-                for _ in 0..4 {
-                    let Some(component) = values.next() else {
-                        return Ok(false);
-                    };
-                    if !matches!(
-                        self.resolve_current_value(component)?,
-                        Some(
-                            CurrentValue::Source(MaybeRef::NotRef(Object::Number(_)), _)
-                                | CurrentValue::Owned(
-                                    OwnedObject::Integer(_) | OwnedObject::Real(_)
-                                )
-                        )
-                    ) {
-                        return Ok(false);
-                    }
-                }
-                true
+                Ok(if key == b"Resources" {
+                    value.is_dictionary()
+                } else {
+                    !value.is_null()
+                })
             }
-            b"Rotate" => match value {
-                CurrentValue::Source(MaybeRef::NotRef(Object::Number(_)), _)
-                | CurrentValue::Owned(OwnedObject::Integer(_) | OwnedObject::Real(_)) => {
-                    match value.into_cow().as_ref() {
-                        OwnedObject::Integer(value) => i32::try_from(*value).is_ok(),
-                        OwnedObject::Real(value) => {
-                            let integer = value.trunc();
-                            integer >= f64::from(i32::MIN) && integer <= f64::from(i32::MAX)
-                        }
-                        _ => false,
-                    }
-                }
-                _ => false,
-            },
-            _ => !matches!(
-                value,
-                CurrentValue::Source(MaybeRef::NotRef(Object::Null(_)), _)
-                    | CurrentValue::Owned(OwnedObject::Null)
-            ),
-        })
+        }
     }
 
     pub(crate) fn effective_page_inheritance_mask(
@@ -1576,15 +1613,61 @@ impl EditDocument {
 
     pub(crate) fn inherited_page_value_from_view<'a>(
         &'a self,
-        mut object: CurrentValue<'a>,
+        object: CurrentValue<'a>,
         key: &[u8],
     ) -> Result<Option<CurrentValue<'a>>> {
-        let mut seen = BTreeSet::new();
-        loop {
+        self.inherited_page_projection(object, |object| {
             if let Some(value) = object.dictionary_entry(key)
                 && self.effective_page_value(key, value)?
             {
                 return Ok(object.dictionary_entry(key));
+            }
+            Ok(None)
+        })
+    }
+
+    pub(crate) fn inherited_page_box(
+        &self,
+        page: ObjectHandle,
+        key: &[u8],
+    ) -> Result<Option<PageBoxCoordinates>> {
+        let Some(object) = self.current_value(page)? else {
+            return Ok(None);
+        };
+        self.inherited_page_projection(object, |object| {
+            object
+                .dictionary_entry(key)
+                .map_or(Ok(None), |value| self.resolved_page_box(value))
+        })
+    }
+
+    pub(crate) fn inherited_page_rotation_from_view(
+        &self,
+        object: CurrentValue<'_>,
+    ) -> Result<i32> {
+        let rotation = self
+            .inherited_page_projection(object, |object| {
+                object
+                    .dictionary_entry(b"Rotate")
+                    .map_or(Ok(None), |value| self.resolved_page_rotation(value))
+            })?
+            .unwrap_or(0)
+            .rem_euclid(360);
+        Ok(match rotation {
+            90 | 180 | 270 => rotation,
+            _ => 0,
+        })
+    }
+
+    fn inherited_page_projection<'a, T>(
+        &'a self,
+        mut object: CurrentValue<'a>,
+        mut project: impl FnMut(&CurrentValue<'a>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let mut seen = BTreeSet::new();
+        loop {
+            if let Some(value) = project(&object)? {
+                return Ok(Some(value));
             }
             let Some(parent) = object
                 .dictionary_entry(b"Parent")
