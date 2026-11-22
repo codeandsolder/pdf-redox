@@ -172,12 +172,21 @@ impl Event {
     }
 }
 
-fn events_for(input: &[u8]) -> Option<Vec<Event>> {
-    let mut events = Vec::new();
+fn events_for(input: &[u8], forbidden: &[&[u8]]) -> Option<Vec<Event>> {
+    let mut events = Some(Vec::new());
     let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
+        let Some(projected) = &mut events else {
+            return Ok(());
+        };
+        if forbidden.contains(&&instruction.operator[..]) {
+            // Continue parsing to distinguish a complete disqualified page
+            // from an incomplete stream, but retain no unused event table.
+            events = None;
+            return Ok(());
+        }
         let span = instruction.span();
         if &instruction.operator[..] == b"BI" {
-            events.push(Event {
+            projected.push(Event {
                 start: span.start,
                 end: span.end,
                 operator: SmallVec::from_slice(b"__inline_image__"),
@@ -186,7 +195,7 @@ fn events_for(input: &[u8]) -> Option<Vec<Event>> {
             });
         } else {
             let count = instruction.operand_spans().len();
-            events.push(Event {
+            projected.push(Event {
                 start: span.start,
                 end: instruction.operator_span().end,
                 operator: SmallVec::from_slice(&instruction.operator[..]),
@@ -197,7 +206,7 @@ fn events_for(input: &[u8]) -> Option<Vec<Event>> {
         Ok(())
     })
     .ok()?;
-    (!incomplete).then_some(events)
+    (!incomplete).then_some(events.unwrap_or_default())
 }
 
 const fn path_operator(operator: &[u8]) -> bool {
@@ -208,6 +217,7 @@ fn adjacent(input: &[u8], left: &Event, right: &Event) -> bool {
     left.end <= right.start && input.get(left.end..right.start).is_some_and(trivia_only)
 }
 
+#[cfg(test)]
 fn page_paint_batching_is_safe(events: &[Event]) -> bool {
     !events
         .iter()
@@ -572,14 +582,19 @@ struct StrokeTransaction {
     body_end: usize,
 }
 
+/// Advance over an entire contiguous path run. If its terminating event
+/// cannot be a plain stroke, no suffix of that same run can be one either.
+/// Preserve the terminator itself for the next iteration.
 fn stroke_transaction(
     input: &[u8],
     events: &[Event],
     index: usize,
-) -> Option<(StrokeTransaction, usize)> {
-    let first = events.get(index)?;
+) -> (Option<StrokeTransaction>, usize) {
+    let Some(first) = events.get(index) else {
+        return (None, events.len());
+    };
     if !path_operator(&first.operator) {
-        return None;
+        return (None, index + 1);
     }
     let mut cursor = index;
     while let Some(next) = events.get(cursor + 1) {
@@ -589,22 +604,24 @@ fn stroke_transaction(
             break;
         }
     }
-    let last_path = events.get(cursor)?;
-    let paint = events.get(cursor + 1)?;
+    let terminator = cursor + 1;
+    let Some(paint) = events.get(terminator) else {
+        return (None, terminator);
+    };
     if paint.operator.as_slice() != b"S"
         || paint.operand_count != 0
-        || !adjacent(input, last_path, paint)
+        || !adjacent(input, &events[cursor], paint)
     {
-        return None;
+        return (None, terminator);
     }
-    Some((
-        StrokeTransaction {
+    (
+        Some(StrokeTransaction {
             start: first.start,
             end: paint.end,
             body_end: paint.start,
-        },
-        cursor + 2,
-    ))
+        }),
+        terminator + 1,
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -721,22 +738,32 @@ fn batch_strokes<'a>(
 ) -> Option<(Cow<'a, [u8]>, ContentBatchStats)> {
     let mut replacements = Vec::<(usize, usize, Vec<u8>)>::new();
     let mut stats = ContentBatchStats::default();
-    let mut index = 0usize;
+    // Discover each path once. Retain instruction indices as well as byte
+    // spans so a rejected intervening instruction always breaks the batch.
+    let mut cursor = 0usize;
+    let mut transactions = std::iter::from_fn(|| {
+        while cursor < events.len() {
+            let start = cursor;
+            let (candidate, next) = stroke_transaction(input, events, start);
+            cursor = next;
+            if let Some(candidate) = candidate {
+                return Some((start, next, candidate));
+            }
+        }
+        None
+    })
+    .peekable();
 
-    while index < events.len() {
-        let Some((first, mut next_index)) = stroke_transaction(input, events, index) else {
-            index += 1;
-            continue;
-        };
+    while let Some((_, mut next_index, first)) = transactions.next() {
         let mut run = vec![first];
-        while next_index < events.len() {
-            let Some((next, after_next)) = stroke_transaction(input, events, next_index) else {
-                break;
-            };
+        while let Some((start_index, _, next)) = transactions.peek() {
             let previous = run.last()?;
-            if !input.get(previous.end..next.start).is_some_and(trivia_only) {
+            if *start_index != next_index
+                || !input.get(previous.end..next.start).is_some_and(trivia_only)
+            {
                 break;
             }
+            let (_, after_next, next) = transactions.next()?;
             run.push(next);
             next_index = after_next;
         }
@@ -757,7 +784,6 @@ fn batch_strokes<'a>(
                 .saturating_add(run.len().saturating_sub(output_paints));
             replacements.push((start, end, replacement));
         }
-        index = next_index;
     }
 
     if replacements.is_empty() {
@@ -768,26 +794,19 @@ fn batch_strokes<'a>(
 }
 
 fn batch_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, ContentBatchStats)> {
-    let events = events_for(input)?;
-    if !page_paint_batching_is_safe(&events) {
-        return Some((Cow::Borrowed(input), ContentBatchStats::default()));
-    }
+    let events = events_for(input, &[b"gs", b"d"])?;
 
     let (filled, fill_stats) = batch_closed_fills(input, &events)?;
     let (stroked, stroke_stats) = match filled {
         Cow::Borrowed(filled) => batch_strokes(filled, &events)?,
         Cow::Owned(filled) => {
-            let stroke_events = events_for(&filled)?;
-            if page_paint_batching_is_safe(&stroke_events) {
-                let (stroked, stroke_stats) = batch_strokes(&filled, &stroke_events)?;
-                let stroked = match stroked {
-                    Cow::Borrowed(_) => Cow::Owned(filled),
-                    Cow::Owned(stroked) => Cow::Owned(stroked),
-                };
-                (stroked, stroke_stats)
-            } else {
-                (Cow::Owned(filled), ContentBatchStats::default())
-            }
+            let stroke_events = events_for(&filled, &[b"gs", b"d"])?;
+            let (stroked, stroke_stats) = batch_strokes(&filled, &stroke_events)?;
+            let stroked = match stroked {
+                Cow::Borrowed(_) => Cow::Owned(filled),
+                Cow::Owned(stroked) => Cow::Owned(stroked),
+            };
+            (stroked, stroke_stats)
         }
     };
     Some((
@@ -1414,10 +1433,7 @@ fn fenced_stroke_form_occurrence(
 }
 
 fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
-    let events = events_for(input)?;
-    if !page_paint_batching_is_safe(&events) {
-        return Some(Vec::new());
-    }
+    let events = events_for(input, &[b"gs", b"d"])?;
 
     let mut occurrences = Vec::new();
     let mut state = StrokeGraphicsState::default();
@@ -1708,13 +1724,7 @@ fn outlined_glyph_components_for_run(run: &[GlyphTransaction]) -> Vec<GlyphCompo
 }
 
 fn outlined_glyph_components(input: &[u8]) -> Option<Vec<GlyphComponent>> {
-    let events = events_for(input)?;
-    if events
-        .iter()
-        .any(|event| matches!(event.operator.as_slice(), b"BT" | b"ET"))
-    {
-        return Some(Vec::new());
-    }
+    let events = events_for(input, &[b"BT", b"ET"])?;
     let mut components = Vec::new();
     let mut index = 0usize;
     while index < events.len() {
@@ -2400,13 +2410,13 @@ mod tests {
     }
 
     fn batch_content_reparsed(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
-        let fill_events = events_for(input)?;
+        let fill_events = events_for(input, &[])?;
         if !page_paint_batching_is_safe(&fill_events) {
             return Some((input.to_vec(), ContentBatchStats::default()));
         }
         let (filled, fill_stats) = batch_closed_fills(input, &fill_events)?;
 
-        let stroke_events = events_for(&filled)?;
+        let stroke_events = events_for(&filled, &[])?;
         let (stroked, stroke_stats) = if page_paint_batching_is_safe(&stroke_events) {
             batch_strokes(&filled, &stroke_events)?
         } else {
@@ -2429,7 +2439,7 @@ mod tests {
     }
 
     fn operator_count(output: &[u8], operator: &[u8]) -> usize {
-        let events = events_for(output);
+        let events = events_for(output, &[]);
         assert!(events.is_some(), "parse output");
         let Some(events) = events else {
             return 0;
@@ -2441,7 +2451,7 @@ mod tests {
     }
 
     fn assert_known_operators(output: &[u8]) {
-        let events = events_for(output);
+        let events = events_for(output, &[]);
         assert!(events.is_some(), "parse output");
         let Some(events) = events else {
             return;
@@ -2474,7 +2484,7 @@ mod tests {
     #[test]
     fn compact_events_preserve_operator_and_operand_facets() -> Result<()> {
         let input = b"1 2 #6d /OC /Layer#20one BDC 9007199254740993 0 l 2 /Other l q 1 2 3 4 5 6 7 scn unknownLongOperator EMC";
-        let events = events_for(input).ok_or_else(|| {
+        let events = events_for(input, &[]).ok_or_else(|| {
             crate::Error::Invalid("event projection fixture did not parse".into())
         })?;
         assert_eq!(events.len(), 8);
@@ -2506,6 +2516,38 @@ mod tests {
             assert_eq!(optimized.0.as_ref(), reparsed.0.as_slice());
             assert_eq!(optimized.1, reparsed.1);
         }
+    }
+
+    #[test]
+    fn rejected_long_path_advances_once_to_its_terminator() -> Result<()> {
+        let mut input = b"0 0 m ".to_vec();
+        input.extend_from_slice(&b"1 1 l ".repeat(20_000));
+        input.extend_from_slice(b"f 0 0 m 1 0 l S 2 0 m 3 0 l S");
+        let events =
+            events_for(&input, &[]).ok_or_else(|| crate::Error::Invalid("path fixture".into()))?;
+        let (candidate, next) = stroke_transaction(&input, &events, 0);
+        assert!(candidate.is_none());
+        assert_eq!(next, 20_001);
+        assert_eq!(events[next].operator.as_slice(), b"f");
+        let (output, stats) = batch_strokes(&input, &events)
+            .ok_or_else(|| crate::Error::Invalid("stroke fixture".into()))?;
+        assert_eq!(stats.paints_eliminated, 1);
+        assert_eq!(operator_count(&output, b"f"), 1);
+        assert_eq!(operator_count(&output, b"S"), 1);
+        assert!(output.starts_with(&input[..events[next].end]));
+        Ok(())
+    }
+
+    #[test]
+    fn event_disqualification_discards_projection_but_preserves_parse_outcome() {
+        let input = b"0 0 m 1 1 l S /GS #67s 2 2 m 3 3 l S";
+        assert!(events_for(input, &[b"gs", b"d"]).is_some_and(|events| events.is_empty()));
+        assert!(events_for(input, &[]).is_some_and(|events| events.len() == 7));
+        let malformed = b"/GS gs [1 2";
+        assert_eq!(
+            events_for(malformed, &[b"gs"]).is_none(),
+            events_for(malformed, &[]).is_none()
+        );
     }
 
     #[test]
