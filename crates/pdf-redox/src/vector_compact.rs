@@ -9,7 +9,7 @@ use crate::{
         page_box_numbers_matching, page_user_unit, replace_page_content,
         replace_page_content_with_handle, resolved_dictionary,
     },
-    content_stream::{InstructionOperand as Operand, instruction_operands_into, operand_numbers},
+    content_stream::{operand_name, operand_number},
     flate::FlateReuseCache,
 };
 use num_traits::ToPrimitive;
@@ -287,19 +287,83 @@ impl FillSafety {
     }
 }
 
+/// The fill, path-factor, transformed-factor and coordinate passes consume
+/// the same bounded numeric operands. Project them once, and keep resource
+/// names borrowed. Operators that cannot use numbers never decode them.
+struct VectorOperands<'a> {
+    count: usize,
+    first_offset: Option<usize>,
+    numbers: Option<SmallVec<[f64; 6]>>,
+    name: Option<&'a [u8]>,
+}
+
+impl<'a> VectorOperands<'a> {
+    fn project(instruction: &'a hayro_syntax::content::Instruction<'_, '_>) -> Self {
+        let mut spans = instruction.operand_spans();
+        let count = spans.len();
+        let first_offset = spans.next().map(|span| span.start);
+        let operator = &instruction.operator[..];
+        let expected = match operator {
+            b"m" | b"l" => Some(2),
+            b"c" | b"cm" => Some(6),
+            b"v" | b"y" | b"re" | b"k" => Some(4),
+            b"rg" => Some(3),
+            b"g" => Some(1),
+            b"h" | b"f" | b"F" | b"f*" => Some(0),
+            _ => None,
+        };
+        let numbers = if expected == Some(count) {
+            instruction.operands().map(operand_number).collect()
+        } else {
+            None
+        };
+        let name = if operator == b"gs" && count == 1 {
+            instruction.operands().next().and_then(operand_name)
+        } else {
+            None
+        };
+        Self {
+            count,
+            first_offset,
+            numbers,
+            name,
+        }
+    }
+
+    fn numbers(&self) -> Option<&[f64]> {
+        self.numbers.as_deref()
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
 trait VectorInstructionScanner {
-    fn operand_buffer(&mut self) -> &mut Vec<Operand>;
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize);
+    fn process_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+        operands: &VectorOperands<'_>,
+    );
     fn inline_image(&mut self);
 
     fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        self.projected_instruction(instruction, &VectorOperands::project(instruction));
+    }
+
+    fn projected_instruction(
+        &mut self,
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        operands: &VectorOperands<'_>,
+    ) {
         if &instruction.operator[..] == b"BI" {
             self.inline_image();
             return;
         }
-        instruction_operands_into(instruction, self.operand_buffer());
         let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len());
+        self.process_operator(&instruction.operator[..], span.start, span.len(), operands);
     }
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
@@ -311,7 +375,6 @@ trait VectorInstructionScanner {
 }
 
 struct FillScanner {
-    operands: Vec<Operand>,
     current_rect: Option<Rect>,
     current_path_start: Option<usize>,
     path_is_single_rect: bool,
@@ -326,7 +389,6 @@ struct FillScanner {
 impl FillScanner {
     fn new(ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>) -> Self {
         Self {
-            operands: Vec::new(),
             current_rect: None,
             current_path_start: None,
             path_is_single_rect: true,
@@ -345,36 +407,31 @@ impl FillScanner {
         self.path_is_single_rect = true;
     }
 
-    fn barrier(&mut self) {
-        self.operands.clear();
+    const fn barrier(&mut self) {
         self.clear_path();
         self.epoch = self.epoch.saturating_add(1);
     }
 
-    fn rectangle(&mut self) {
-        if !self.path_is_single_rect || self.current_rect.is_some() || self.operands.len() != 4 {
+    fn rectangle(&mut self, operands: &VectorOperands<'_>) {
+        if !self.path_is_single_rect || self.current_rect.is_some() || operands.count != 4 {
             self.path_is_single_rect = false;
-            self.operands.clear();
             return;
         }
-        let values = operand_numbers(&self.operands);
+        let values = operands.numbers();
         let Some(values) = values else {
             self.path_is_single_rect = false;
-            self.operands.clear();
             return;
         };
         let Some(rect) = Rect::from_xywh(values[0], values[1], values[2], values[3]) else {
             self.path_is_single_rect = false;
-            self.operands.clear();
             return;
         };
-        self.current_path_start = self.operands.first().map(|operand| operand.offset);
+        self.current_path_start = operands.first_offset;
         self.current_rect = Some(rect);
-        self.operands.clear();
     }
 
-    fn fill(&mut self, operator: &[u8], end: usize) {
-        if self.operands.is_empty()
+    fn fill(&mut self, operator: &[u8], end: usize, operands: &VectorOperands<'_>) {
+        if operands.is_empty()
             && self.path_is_single_rect
             && let (Some(path_start), Some(rect)) = (self.current_path_start, self.current_rect)
         {
@@ -392,28 +449,24 @@ impl FillScanner {
             // a rewrite can never consume geometry that was omitted from `fills`.
             self.epoch = self.epoch.saturating_add(1);
         }
-        self.operands.clear();
         self.clear_path();
     }
 
-    fn simple_fill_color(&mut self, components: usize) {
-        self.fill_safety.simple_fill_color = self.operands.len() == components
-            && self
-                .operands
-                .iter()
-                .all(|operand| operand.number.is_some_and(f64::is_finite));
+    fn simple_fill_color(&mut self, operands: &VectorOperands<'_>) {
+        self.fill_safety.simple_fill_color = operands
+            .numbers()
+            .is_some_and(|values| values.iter().all(|value| value.is_finite()));
         self.barrier();
     }
 
-    fn unknown_fill_color(&mut self) {
+    const fn unknown_fill_color(&mut self) {
         self.fill_safety.simple_fill_color = false;
         self.barrier();
     }
 
-    fn apply_ext_gstate(&mut self) {
-        let patch = (self.operands.len() == 1)
-            .then(|| self.operands[0].name.as_deref())
-            .flatten()
+    fn apply_ext_gstate(&mut self, operands: &VectorOperands<'_>) {
+        let patch = operands
+            .name
             .and_then(|name| self.ext_gstates.get(name).copied());
         if let Some(patch) = patch {
             self.fill_safety.apply_ext_gstate(patch);
@@ -423,8 +476,8 @@ impl FillScanner {
         self.barrier();
     }
 
-    fn concat_ctm(&mut self) {
-        let values = operand_numbers(&self.operands);
+    fn concat_ctm(&mut self, operands: &VectorOperands<'_>) {
+        let values = operands.numbers();
         if let Some(values) = values
             && values.len() == 6
         {
@@ -437,15 +490,17 @@ impl FillScanner {
 }
 
 impl VectorInstructionScanner for FillScanner {
-    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
-        &mut self.operands
-    }
-
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
+    fn process_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+        operands: &VectorOperands<'_>,
+    ) {
         let end = offset.saturating_add(length);
         match operator {
-            b"re" => self.rectangle(),
-            b"f" | b"F" | b"f*" => self.fill(operator, end),
+            b"re" => self.rectangle(operands),
+            b"f" | b"F" | b"f*" => self.fill(operator, end, operands),
             b"q" => {
                 self.state_stack.push((self.ctm, self.fill_safety));
                 self.barrier();
@@ -465,19 +520,16 @@ impl VectorInstructionScanner for FillScanner {
                 }
                 self.barrier();
             }
-            b"cm" => self.concat_ctm(),
-            b"g" => self.simple_fill_color(1),
-            b"rg" => self.simple_fill_color(3),
-            b"k" => self.simple_fill_color(4),
+            b"cm" => self.concat_ctm(operands),
+            b"g" | b"rg" | b"k" => self.simple_fill_color(operands),
             b"cs" | b"sc" | b"scn" => self.unknown_fill_color(),
-            b"gs" => self.apply_ext_gstate(),
+            b"gs" => self.apply_ext_gstate(operands),
             _ => self.barrier(),
         }
     }
 
     fn inline_image(&mut self) {
         self.barrier();
-        self.operands.clear();
     }
 }
 
@@ -916,7 +968,7 @@ impl PathBlockScanner {
         &mut self,
         operator: &[u8],
         operator_offset: usize,
-        operands: &[Operand],
+        operands: &VectorOperands<'_>,
     ) {
         if self.inside_text {
             self.path_valid = false;
@@ -926,22 +978,13 @@ impl PathBlockScanner {
                 self.path_valid = false;
                 return;
             }
-            self.path_start = operands
-                .first()
-                .map_or(Some(operator_offset), |operand| Some(operand.offset));
+            self.path_start = Some(operands.first_offset.unwrap_or(operator_offset));
         }
-        let values = operand_numbers(operands);
-        let expected = match operator {
-            b"m" | b"l" => 2,
-            b"c" => 6,
-            b"v" | b"y" | b"re" => 4,
-            _ => 0,
-        };
-        let Some(values) = values.filter(|values| values.len() == expected) else {
+        let Some(values) = operands.numbers() else {
             self.path_valid = false;
             return;
         };
-        update_semantic_hasher(&mut self.semantic_hasher, operator, &values);
+        update_semantic_hasher(&mut self.semantic_hasher, operator, values);
         self.operator_count = self.operator_count.saturating_add(1);
         if operator == b"re" {
             let x = values[0];
@@ -957,7 +1000,12 @@ impl PathBlockScanner {
         }
     }
 
-    fn finish_fill_with_operands(&mut self, operator: &[u8], end: usize, operands: &[Operand]) {
+    fn finish_fill_with_operands(
+        &mut self,
+        operator: &[u8],
+        end: usize,
+        operands: &VectorOperands<'_>,
+    ) {
         let block_len = self.path_start.map_or(0, |start| end.saturating_sub(start));
         if operands.is_empty()
             && self.path_valid
@@ -985,7 +1033,7 @@ impl PathBlockScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-        operands: &[Operand],
+        operands: &VectorOperands<'_>,
     ) {
         let end = offset.saturating_add(length);
         match operator {
@@ -1098,7 +1146,6 @@ struct TransformedBlock {
 }
 
 struct TransformedBlockScanner {
-    operands: Vec<Operand>,
     frames: Vec<TransformedBlockFrame>,
     blocks: Vec<TransformedBlock>,
     current_path_nonempty: bool,
@@ -1107,16 +1154,10 @@ struct TransformedBlockScanner {
 impl TransformedBlockScanner {
     const fn new() -> Self {
         Self {
-            operands: Vec::new(),
             frames: Vec::new(),
             blocks: Vec::new(),
             current_path_nonempty: false,
         }
-    }
-
-    fn numeric_operands_from(operands: &[Operand], expected: usize) -> Option<SmallVec<[f64; 6]>> {
-        let values = operand_numbers(operands)?;
-        (values.len() == expected).then_some(values)
     }
 
     fn invalidate_parents_for_nested_q(&mut self) {
@@ -1125,32 +1166,18 @@ impl TransformedBlockScanner {
         }
     }
 
-    fn body_operator(&mut self, operator: &[u8], operands: &[Operand]) {
+    fn body_operator(&mut self, operator: &[u8], operands: &VectorOperands<'_>) {
         let Some(frame) = self.frames.last_mut() else {
             return;
         };
         if !frame.valid || frame.stage != TransformedBlockStage::Body {
             return;
         }
-        let expected = match operator {
-            b"m" | b"l" => Some(2),
-            b"c" => Some(6),
-            b"v" | b"y" | b"re" | b"k" => Some(4),
-            b"rg" => Some(3),
-            b"g" => Some(1),
-            b"h" | b"f" | b"F" | b"f*" => Some(0),
-            _ => None,
-        };
-        let Some(expected) = expected else {
+        let Some(values) = operands.numbers() else {
             frame.valid = false;
             return;
         };
-        let values = operand_numbers(operands);
-        let Some(values) = values.filter(|values| values.len() == expected) else {
-            frame.valid = false;
-            return;
-        };
-        frame.append_semantic(operator, &values);
+        frame.append_semantic(operator, values);
         match operator {
             b"m" => {
                 frame.path_started = true;
@@ -1199,7 +1226,7 @@ impl TransformedBlockScanner {
         operator: &[u8],
         offset: usize,
         length: usize,
-        operands: &[Operand],
+        operands: &VectorOperands<'_>,
     ) {
         let end = offset.saturating_add(length);
         match operator {
@@ -1210,7 +1237,7 @@ impl TransformedBlockScanner {
             }
             b"Q" => self.close_frame(offset),
             b"cm" => {
-                let valid_placement = Self::numeric_operands_from(operands, 6).is_some();
+                let valid_placement = operands.numbers().is_some();
                 if let Some(frame) = self.frames.last_mut() {
                     if frame.stage == TransformedBlockStage::ExpectPlacement {
                         if valid_placement {
@@ -1269,22 +1296,20 @@ impl TransformedBlockScanner {
 }
 
 impl VectorInstructionScanner for TransformedBlockScanner {
-    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
-        &mut self.operands
-    }
-
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
-        let operands = std::mem::take(&mut self.operands);
-        self.process_operator_with_operands(operator, offset, length, &operands);
-        self.operands = operands;
-        self.operands.clear();
+    fn process_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+        operands: &VectorOperands<'_>,
+    ) {
+        self.process_operator_with_operands(operator, offset, length, operands);
     }
 
     fn inline_image(&mut self) {
         if let Some(frame) = self.frames.last_mut() {
             frame.valid = false;
         }
-        self.operands.clear();
     }
 }
 
@@ -1303,7 +1328,7 @@ fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
         if &instruction.operator[..] == b"BI" {
             scanner.unsupported_operator_state(false);
         } else {
-            let operands = crate::content_stream::instruction_operands(instruction);
+            let operands = VectorOperands::project(instruction);
             let span = instruction.operator_span();
             scanner.process_operator_with_operands(
                 &instruction.operator[..],
@@ -1321,7 +1346,6 @@ fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
 }
 
 struct ProcessingFactorScanner {
-    operands: Vec<Operand>,
     path: PathBlockScanner,
     transformed: TransformedBlockScanner,
 }
@@ -1329,7 +1353,6 @@ struct ProcessingFactorScanner {
 impl ProcessingFactorScanner {
     fn new() -> Self {
         Self {
-            operands: Vec::new(),
             path: PathBlockScanner::new(),
             transformed: TransformedBlockScanner::new(),
         }
@@ -1337,24 +1360,22 @@ impl ProcessingFactorScanner {
 }
 
 impl VectorInstructionScanner for ProcessingFactorScanner {
-    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
-        &mut self.operands
-    }
-
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
+    fn process_operator(
+        &mut self,
+        operator: &[u8],
+        offset: usize,
+        length: usize,
+        operands: &VectorOperands<'_>,
+    ) {
         self.path
-            .process_operator_with_operands(operator, offset, length, &self.operands);
+            .process_operator_with_operands(operator, offset, length, operands);
         self.transformed
-            .process_operator_with_operands(operator, offset, length, &self.operands);
-        self.operands.clear();
+            .process_operator_with_operands(operator, offset, length, operands);
     }
 
     fn inline_image(&mut self) {
         self.path.unsupported_operator_state(false);
-        if let Some(frame) = self.transformed.frames.last_mut() {
-            frame.valid = false;
-        }
-        self.operands.clear();
+        self.transformed.inline_image();
     }
 }
 
@@ -1458,11 +1479,12 @@ impl ProcessingPageScanner {
         input: &[u8],
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
     ) {
+        let operands = VectorOperands::project(instruction);
         if let Some(path_coordinates) = &mut self.path_coordinates {
-            path_coordinates.instruction(input, instruction);
+            path_coordinates.projected_instruction(input, instruction, &operands);
         }
-        self.fill.instruction(instruction);
-        self.factor.instruction(instruction);
+        self.fill.projected_instruction(instruction, &operands);
+        self.factor.projected_instruction(instruction, &operands);
     }
 
     pub(crate) fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
@@ -2949,13 +2971,6 @@ const MIN_PATH_COORDINATE_FLATE_SAVINGS: usize = 4 * 1024;
 const PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR: usize = 200;
 
 #[derive(Debug, Clone)]
-struct PathCoordinateOperand {
-    value: Option<f64>,
-    offset: usize,
-    length: usize,
-}
-
-#[derive(Debug, Clone)]
 struct PathCoordinatePlan {
     canonicalized: Vec<u8>,
     coordinates_canonicalized: usize,
@@ -2969,7 +2984,6 @@ struct CoordinateReplacement {
 }
 
 struct PathCoordinateScanner {
-    operands: Vec<PathCoordinateOperand>,
     ctm: Option<Matrix>,
     state_stack: Vec<Option<Matrix>>,
     user_unit: f64,
@@ -2981,7 +2995,6 @@ struct PathCoordinateScanner {
 impl PathCoordinateScanner {
     fn new(user_unit: f64) -> Self {
         Self {
-            operands: Vec::new(),
             ctm: Some(Matrix::default()),
             state_stack: Vec::new(),
             user_unit,
@@ -3117,24 +3130,16 @@ impl PathCoordinateScanner {
         }
     }
 
-    fn canonicalize_path_operands(&mut self, input: &[u8], operator: &[u8]) {
-        let expected = match operator {
-            b"m" | b"l" => 2,
-            b"c" => 6,
-            b"v" | b"y" | b"re" => 4,
-            _ => return,
-        };
-        if self.operands.len() != expected || self.ctm.is_none() {
+    fn canonicalize_path_operands(
+        &mut self,
+        input: &[u8],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        old: &[f64],
+    ) {
+        if self.ctm.is_none() {
             return;
         }
-        let Some(old) = self
-            .operands
-            .iter()
-            .map(|operand| operand.value)
-            .collect::<Option<SmallVec<[f64; 6]>>>()
-        else {
-            return;
-        };
+        let operator = &instruction.operator[..];
         let Some(new) = old
             .iter()
             .copied()
@@ -3143,28 +3148,28 @@ impl PathCoordinateScanner {
         else {
             return;
         };
-        if !self.path_geometry_is_within_tolerance(operator, &old, &new) {
+        if !self.path_geometry_is_within_tolerance(operator, old, &new) {
             return;
         }
 
         // A path operator has at most six coordinate operands. Keep its
         // atomic replacement transaction inline until all spans validate.
         let mut pending = SmallVec::<[(usize, usize, SmallVec<[u8; 32]>); 6]>::new();
-        for (operand, &rounded) in self.operands.iter().zip(&new) {
-            if rounded.to_bits() == operand.value.unwrap_or_default().to_bits() {
+        for ((span, &original_value), &rounded) in instruction.operand_spans().zip(old).zip(&new) {
+            if rounded.to_bits() == original_value.to_bits() {
                 continue;
             }
             let Some(replacement) = Self::rounded_coordinate_bytes(rounded) else {
                 return;
             };
-            let end = operand.offset.saturating_add(operand.length);
-            let Some(original) = input.get(operand.offset..end) else {
+            let end = span.end;
+            let Some(original) = input.get(span.start..end) else {
                 return;
             };
             if replacement.len() >= original.len() {
                 continue;
             }
-            pending.push((operand.offset, end, replacement));
+            pending.push((span.start, end, replacement));
         }
         self.coordinates_canonicalized =
             self.coordinates_canonicalized.saturating_add(pending.len());
@@ -3180,66 +3185,40 @@ impl PathCoordinateScanner {
         }
     }
 
-    fn concat_ctm(&mut self) {
-        let matrix = self
-            .operands
-            .iter()
-            .map(|operand| operand.value)
-            .collect::<Option<SmallVec<[f64; 6]>>>()
-            .filter(|values| values.len() == 6)
-            .map(|values| {
-                Matrix::new(
-                    values[0], values[1], values[2], values[3], values[4], values[5],
-                )
-            });
+    fn concat_ctm(&mut self, values: Option<&[f64]>) {
+        let matrix = values.map(|values| {
+            Matrix::new(
+                values[0], values[1], values[2], values[3], values[4], values[5],
+            )
+        });
         match (&mut self.ctm, matrix) {
             (Some(ctm), Some(matrix)) => ctm.concat(matrix),
             _ => self.ctm = None,
         }
     }
 
-    fn process_operator(&mut self, input: &[u8], operator: &[u8]) {
-        match operator {
-            b"q" => self.state_stack.push(self.ctm),
-            b"Q" => {
-                self.ctm = self.state_stack.pop().unwrap_or(None);
-            }
-            b"cm" => self.concat_ctm(),
-            b"m" | b"l" | b"c" | b"v" | b"y" | b"re" => {
-                self.canonicalize_path_operands(input, operator);
-            }
-            _ => {}
-        }
-        self.operands.clear();
-    }
-
-    fn instruction(
+    fn projected_instruction(
         &mut self,
         input: &[u8],
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        operands: &VectorOperands<'_>,
     ) {
-        let operator = &instruction.operator[..];
-        if !matches!(operator, b"cm" | b"m" | b"l" | b"c" | b"v" | b"y" | b"re") {
-            // Only CTM changes and path geometry consume operands. Still
-            // process q/Q so the graphics-state stack stays authoritative.
-            self.process_operator(input, operator);
-            return;
+        match &instruction.operator[..] {
+            b"q" => self.state_stack.push(self.ctm),
+            b"Q" => self.ctm = self.state_stack.pop().unwrap_or(None),
+            b"cm" => self.concat_ctm(operands.numbers()),
+            b"m" | b"l" | b"c" | b"v" | b"y" | b"re" => {
+                if let Some(values) = operands.numbers() {
+                    self.canonicalize_path_operands(input, instruction, values);
+                }
+            }
+            _ => {}
         }
-        self.operands.clear();
-        self.operands
-            .extend(instruction.operands().zip(instruction.operand_spans()).map(
-                |(object, span)| PathCoordinateOperand {
-                    value: crate::content_stream::operand_number(object),
-                    offset: span.start,
-                    length: span.len(),
-                },
-            ));
-        self.process_operator(input, &instruction.operator[..]);
     }
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.projected_instruction(input, instruction, &VectorOperands::project(instruction));
             Ok(())
         })
     }
