@@ -198,18 +198,24 @@ pub fn apply_replacements<B: AsRef<[u8]>>(
 
 /// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
 ///
-/// Streams with inline images or malformed trailing input are left unchanged so
-/// arbitrary inline payload bytes and recovery cases remain byte-for-byte stable.
-pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
+/// Return no normalized representation for inline images or incomplete parses.
+/// The observer receives each parsed instruction and its exact emitted span,
+/// allowing geometry consumers to reuse the same parse. Observations are
+/// speculative until the complete normalization succeeds.
+pub fn normalize_content_stream(
+    input: &[u8],
+    mut observe: impl FnMut(&hayro_syntax::content::Instruction<'_, '_>, std::ops::Range<usize>),
+) -> Option<Vec<u8>> {
     let mut iter = UntypedIter::new(input);
     let mut output = Vec::with_capacity(input.len());
     while let Some(instruction) = iter.next() {
         if &instruction.operator[..] == b"BI" {
-            return input.to_vec();
+            return None;
         }
         if !output.is_empty() {
             output.push(b'\n');
         }
+        let start = output.len();
         let mut first = true;
         for span in instruction.operand_spans() {
             if !first {
@@ -227,12 +233,9 @@ pub fn normalize_content_stream(input: &[u8]) -> Vec<u8> {
             output.push(b' ');
         }
         output.extend_from_slice(&instruction.operator[..]);
+        observe(&instruction, start..output.len());
     }
-    if iter.is_at_end() {
-        output
-    } else {
-        input.to_vec()
-    }
+    iter.is_at_end().then_some(output)
 }
 
 #[cfg(test)]
@@ -387,27 +390,33 @@ mod tests {
     }
 
     #[test]
-    fn content_normalization_is_idempotent_for_composite_operand_spacing() {
+    fn content_normalization_is_idempotent_for_composite_operand_spacing() -> Result<()> {
         let input = b"/Span <</ActualText<FEFF2008>>>  BDC\n( ) Tj\nEMC";
-        let normalized = normalize_content_stream(input);
+        let normalized = normalize_content_stream(input, |_, _| {})
+            .ok_or_else(|| crate::Error::Invalid("normalization fixture".into()))?;
         assert_eq!(
             normalized,
             b"/Span <</ActualText<FEFF2008>>> BDC\n( ) Tj\nEMC"
         );
-        assert_eq!(normalize_content_stream(&normalized), normalized);
+        assert_eq!(
+            normalize_content_stream(&normalized, |_, _| {}).as_deref(),
+            Some(normalized.as_slice())
+        );
 
         let all_pdf_whitespace = b"/Span <</ActualText<FEFF2008>>>\0\t\n\x0c\r   BDC";
         assert_eq!(
-            normalize_content_stream(all_pdf_whitespace),
-            b"/Span <</ActualText<FEFF2008>>> BDC"
+            normalize_content_stream(all_pdf_whitespace, |_, _| {}).as_deref(),
+            Some(b"/Span <</ActualText<FEFF2008>>> BDC".as_slice())
         );
 
         let with_comment = b"1 % discarded lexical comment\n 2 m";
-        let comment_normalized = normalize_content_stream(with_comment);
+        let comment_normalized = normalize_content_stream(with_comment, |_, _| {})
+            .ok_or_else(|| crate::Error::Invalid("comment normalization fixture".into()))?;
         assert_eq!(comment_normalized, b"1 2 m");
         assert_eq!(
-            normalize_content_stream(&comment_normalized),
-            comment_normalized
+            normalize_content_stream(&comment_normalized, |_, _| {}).as_deref(),
+            Some(comment_normalized.as_slice())
         );
+        Ok(())
     }
 }

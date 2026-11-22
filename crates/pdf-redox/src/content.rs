@@ -485,7 +485,10 @@ pub fn normalize_page_contents(document: &mut EditDocument, pages: &[ObjectHandl
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let normalized = crate::content_stream::normalize_content_stream(&decoded);
+        let Some(normalized) = crate::content_stream::normalize_content_stream(&decoded, |_, _| {})
+        else {
+            continue;
+        };
         if normalized.as_slice() != decoded.as_slice() {
             replace_page_content(document, page, normalized)?;
         }
