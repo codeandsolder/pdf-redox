@@ -1579,6 +1579,7 @@ impl EditDocument {
     }
 
     /// Resolve one inheritable page-tree value from a current page dictionary.
+    #[cfg(test)]
     pub(crate) fn inherited_page_value(
         &self,
         page: ObjectHandle,
@@ -1589,6 +1590,7 @@ impl EditDocument {
             .map(Cow::into_owned))
     }
 
+    #[cfg(test)]
     pub(crate) fn inherited_page_value_cow(
         &self,
         page: ObjectHandle,
@@ -1600,6 +1602,7 @@ impl EditDocument {
         Ok(Some(value.into_cow()))
     }
 
+    #[cfg(test)]
     pub(crate) fn inherited_page_raw_value(
         &self,
         page: ObjectHandle,
@@ -1611,6 +1614,7 @@ impl EditDocument {
         self.inherited_page_value_from_view(object, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn inherited_page_value_from_view<'a>(
         &'a self,
         object: CurrentValue<'a>,
@@ -1623,6 +1627,27 @@ impl EditDocument {
                 return Ok(object.dictionary_entry(key));
             }
             Ok(None)
+        })
+    }
+
+    pub(crate) fn inherited_page_resources(
+        &self,
+        page: ObjectHandle,
+    ) -> Result<Option<CurrentValue<'_>>> {
+        let Some(object) = self.current_value(page)? else {
+            return Ok(None);
+        };
+        self.inherited_page_resources_from_view(object)
+    }
+
+    pub(crate) fn inherited_page_resources_from_view<'a>(
+        &'a self,
+        object: CurrentValue<'a>,
+    ) -> Result<Option<CurrentValue<'a>>> {
+        self.inherited_page_projection(object, |object| {
+            Ok(object
+                .resolved_entry(self, b"Resources")?
+                .filter(CurrentValue::is_dictionary))
         })
     }
 
@@ -2181,7 +2206,7 @@ mod tests {
             b"q Q"
         );
         assert_eq!(
-            crate::content::page_xobject_handles(&document, existing(3))?,
+            crate::content::page_xobject_bindings(&document, existing(3))?.handles,
             BTreeMap::from([(b"Root".to_vec(), existing(4))])
         );
         Ok(())

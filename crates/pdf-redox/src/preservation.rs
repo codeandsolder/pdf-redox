@@ -613,6 +613,7 @@ fn prune_dictionary_target(
     Ok(())
 }
 
+#[cfg(test)]
 fn inherited_page_value(
     document: &EditDocument,
     page: &DirectObjectTarget,
@@ -856,13 +857,13 @@ fn appearance_content(
 }
 
 fn page_resources(document: &EditDocument, page: &DirectObjectTarget) -> Result<OwnedDictionary> {
-    let Some(resources) = inherited_page_value(document, page, b"Resources")? else {
+    let Some(object) = page.current(document)? else {
         return Ok(OwnedDictionary::new());
     };
-    Ok(match document.resolve_owned_value(&resources)? {
-        Some(OwnedObject::Dictionary(dictionary)) => dictionary,
-        _ => OwnedDictionary::new(),
-    })
+    Ok(document
+        .inherited_page_resources_from_view(object)?
+        .and_then(|resources| crate::source::into_owned_dictionary(resources.into_cow()))
+        .unwrap_or_default())
 }
 
 fn resource_dictionary(

@@ -3,7 +3,8 @@ use crate::images::ImageResizeTarget;
 use crate::{
     Result,
     content::{
-        page_content, page_user_unit, resolved_name, resolved_number, resolved_number_array,
+        object_subtype, page_content, page_user_unit, page_xobject_bindings, resolved_number,
+        resolved_number_array, resource_xobject_bindings,
     },
 };
 use num_traits::ToPrimitive;
@@ -165,55 +166,14 @@ impl CowPlacementScanner {
     }
 }
 
-fn cow_resolved_dictionary(
-    document: &crate::EditDocument,
-    value: Option<&crate::OwnedObject>,
-) -> Result<Option<crate::OwnedDictionary>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    Ok(document
-        .resolve_owned_value(value)?
-        .and_then(|value| match value {
-            crate::OwnedObject::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        }))
-}
-
-fn cow_xobjects(
-    document: &crate::EditDocument,
-    resources: Option<crate::OwnedObject>,
-) -> Result<(BTreeMap<Vec<u8>, crate::ObjectHandle>, bool)> {
-    let Some(resources) = resources else {
-        return Ok((BTreeMap::new(), true));
-    };
-    let Some(resources) = cow_resolved_dictionary(document, Some(&resources))? else {
-        return Ok((BTreeMap::new(), false));
-    };
-    let Some(xobjects) = cow_resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok((BTreeMap::new(), true));
-    };
-    let mut out = BTreeMap::new();
-    let mut complete = true;
-    for (name, value) in xobjects {
-        if let crate::OwnedObject::Reference(handle) = value {
-            out.insert(name, handle);
-        } else {
-            complete = false;
-        }
-    }
-    Ok((out, complete))
-}
-
 fn cow_form_matrix(
     document: &crate::EditDocument,
-    dictionary: &crate::OwnedDictionary,
+    value: Option<crate::source::CurrentValue<'_>>,
 ) -> Result<Matrix> {
-    let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
+    let Some(value) = value else {
         return Ok(Matrix::default());
     };
-    let Some(values) = resolved_number_array::<6>(document, value)? else {
+    let Some(values) = resolved_number_array::<6>(document, value.into_cow().as_ref())? else {
         return Ok(Matrix::default());
     };
     Ok(Matrix::new(
@@ -241,19 +201,6 @@ fn cow_image_dimensions(
         return Ok(None);
     }
     Ok(width.to_u32().zip(height.to_u32()))
-}
-
-fn cow_subtype(
-    document: &crate::EditDocument,
-    handle: crate::ObjectHandle,
-) -> Result<Option<Vec<u8>>> {
-    let Some(object) = document.current_owned_object(handle)? else {
-        return Ok(None);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    resolved_name(document, dictionary.get(b"Subtype".as_slice()))
 }
 
 fn cow_record_image(
@@ -316,22 +263,26 @@ fn cow_scan_form(
         return Ok(());
     }
     let result = (|| {
-        let Some(object) = document.current_owned_object(form)? else {
+        let Some(object) = document.current_value(form)? else {
             *state.complete = false;
             return Ok(());
         };
-        let Some(dictionary) = object.as_dictionary() else {
+        if !object.has_dictionary() {
             *state.complete = false;
             return Ok(());
-        };
+        }
         let mut base_ctm = outer_ctm;
-        base_ctm.concat(cow_form_matrix(document, dictionary)?);
-        let resources = dictionary.get(b"Resources".as_slice()).cloned();
-        let (xobjects, scope_complete) = if resources.is_some() {
-            cow_xobjects(document, resources)?
-        } else {
-            (inherited_xobjects.clone(), true)
-        };
+        base_ctm.concat(cow_form_matrix(
+            document,
+            object.dictionary_entry(b"Matrix"),
+        )?);
+        let (xobjects, scope_complete) =
+            if let Some(resources) = object.dictionary_entry(b"Resources") {
+                let bindings = resource_xobject_bindings(document, Some(resources))?;
+                (bindings.handles, bindings.complete)
+            } else {
+                (inherited_xobjects.clone(), true)
+            };
         if !scope_complete {
             *state.complete = false;
         }
@@ -342,7 +293,7 @@ fn cow_scan_form(
         }
         let current = scanner.xobjects.clone();
         for draw in scanner.draws {
-            match cow_subtype(document, draw.target)?.as_deref() {
+            match object_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
                     cow_record_image(document, state.placements, draw.target, draw.ctm)?;
                 }
@@ -452,13 +403,13 @@ pub fn plan_print_downsampling(
     let mut direct_page_bindings = HashSet::new();
     let mut complete = true;
     for &page in pages {
-        let resources = document.inherited_page_value(page, b"Resources")?;
-        let (xobjects, scope_complete) = cow_xobjects(document, resources)?;
+        let bindings = page_xobject_bindings(document, page)?;
+        let (xobjects, scope_complete) = (bindings.handles, bindings.complete);
         if !scope_complete {
             complete = false;
         }
         for handle in xobjects.values() {
-            if cow_subtype(document, *handle)?.as_deref() == Some(b"Image") {
+            if object_subtype(document, *handle)?.as_deref() == Some(b"Image") {
                 direct_page_bindings.insert((page, *handle));
             }
         }
@@ -473,7 +424,7 @@ pub fn plan_print_downsampling(
         let current = scanner.xobjects.clone();
         let mut form_stack = HashSet::new();
         for draw in scanner.draws {
-            match cow_subtype(document, draw.target)?.as_deref() {
+            match object_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
                     cow_record_image(document, &mut placements, draw.target, draw.ctm)?;
                 }

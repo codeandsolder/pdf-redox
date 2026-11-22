@@ -3399,10 +3399,7 @@ fn compact_processing_fill_tail(
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let resources = match document.inherited_page_value(page, b"Resources")? {
-            Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
-            None => OwnedDictionary::default(),
-        };
+        let resources = effective_page_resources(document, page)?;
         let ext_gstates = ext_gstate_patches(document, &resources)?;
         let (compacted, stats) = compact_content_with_ext_gstates(&decoded, &ext_gstates);
         if compacted == decoded {
@@ -3636,10 +3633,7 @@ pub fn compact_vector_paths_with_flate_cache(
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let resources = match document.inherited_page_value(page, b"Resources")? {
-            Some(value) => resolved_dictionary(document, Some(&value))?.unwrap_or_default(),
-            None => OwnedDictionary::default(),
-        };
+        let resources = effective_page_resources(document, page)?;
         let ext_gstates = ext_gstate_patches(document, &resources)?;
         let ((compacted, stats), factor_cache) = if goal == OptimizationGoal::Processing {
             let analysis = if let Some(analysis) = raster_pre_scanned.remove(&page) {

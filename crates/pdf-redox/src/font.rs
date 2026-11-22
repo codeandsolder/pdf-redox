@@ -1,4 +1,4 @@
-use crate::content::page_content_if_present;
+use crate::content::{page_content_if_present, page_resources};
 use crate::stream_codec::{
     decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
 };
@@ -1675,10 +1675,7 @@ fn font_glyph_usage_with_hints(
     let mut usage = FontUsageAccumulator::default();
 
     for &page in pages {
-        let Some(resources_value) = document.inherited_page_value(page, b"Resources")? else {
-            continue;
-        };
-        let Some(resources) = resolved_dictionary(document, Some(&resources_value))? else {
+        let Some(resources) = page_resources(document, page)? else {
             continue;
         };
         let identity_eligible =

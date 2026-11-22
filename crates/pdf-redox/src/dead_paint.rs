@@ -10,7 +10,7 @@
 use crate::{
     EditDocument, ObjectHandle, OwnedObject, Result,
     content::{
-        PageRewriteResult, page_content, page_xobject_handles, replace_page_content,
+        PageRewriteResult, page_content, page_xobject_bindings, replace_page_content,
         resolved_dictionary, resolved_finite_number_array,
     },
     content_stream::{instruction_operands, visit_instructions},
@@ -467,7 +467,7 @@ pub fn eliminate_dead_image_paints(
         if page_dict.contains_key(b"Group".as_slice()) {
             continue;
         }
-        let resources = page_xobject_handles(document, page)?;
+        let resources = page_xobject_bindings(document, page)?.handles;
         if resources.is_empty() {
             continue;
         }
