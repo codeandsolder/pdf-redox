@@ -122,26 +122,43 @@ impl StrokeFootprint {
             )
             .to_u32()?;
         let mut covered = false;
+        // Equal absolute axial errors have exactly equal transverse
+        // predicates, even with the original FMA operand order. Square
+        // caps have no axial-error dependence at all.
+        let mut cached_interval = None::<(u64, Option<RangeInclusive<u32>>)>;
         for index in axial_range.clone() {
             let coordinate = sample_center(index);
             let raw_t = ((coordinate - origin) * delta) * self.inv_len2;
             let Some(t) = self.projected_parameter(raw_t) else {
                 continue;
             };
-            let axial_error = coordinate - t.mul_add(delta, origin);
-            let axial_square = axial_error * axial_error;
-            let interval = covered_interval(cross_range, nearest, |cross| {
-                let error = sample_center(cross) - transverse;
-                if self.cap == 2 {
-                    (error * delta).abs() <= self.square_cap_cross_limit
-                } else if HORIZONTAL {
-                    error.mul_add(error, axial_square) <= self.radius2
-                } else {
-                    // Retain the original FMA operand order even on a
-                    // vertical stroke; swapping axes could change a tie.
-                    axial_error.mul_add(axial_error, error * error) <= self.radius2
-                }
-            });
+            let axial_error = if self.cap == 2 {
+                0.0
+            } else {
+                coordinate - t.mul_add(delta, origin)
+            };
+            let axial_key = axial_error.abs().to_bits();
+            let interval = if let Some((key, interval)) = &cached_interval
+                && *key == axial_key
+            {
+                interval.clone()
+            } else {
+                let axial_square = axial_error * axial_error;
+                let interval = covered_interval(cross_range, nearest, |cross| {
+                    let error = sample_center(cross) - transverse;
+                    if self.cap == 2 {
+                        (error * delta).abs() <= self.square_cap_cross_limit
+                    } else if HORIZONTAL {
+                        error.mul_add(error, axial_square) <= self.radius2
+                    } else {
+                        // Retain the original FMA operand order even on a
+                        // vertical stroke; swapping axes could change a tie.
+                        axial_error.mul_add(axial_error, error * error) <= self.radius2
+                    }
+                });
+                cached_interval = Some((axial_key, interval.clone()));
+                interval
+            };
             if let Some(interval) = interval {
                 covered = true;
                 if HORIZONTAL {
@@ -238,6 +255,48 @@ mod tests {
                                 assert_eq!(
                                     actual, expected,
                                     "cap={cap}, origin={origin:?}, end={end:?}, radius={radius}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reused_axis_intervals_match_every_pixel_at_rounding_boundaries() -> Result<()> {
+        let bounds = SampleBounds {
+            xs: 0..=63,
+            ys: 0..=63,
+        };
+        // Exact sample-centre and half-pixel radii exercise inclusive ties,
+        // and nearby representable floats exercise either side of the tie.
+        for cap in 0..=2 {
+            for coordinate in [0.5_f64, 15.5, 32.0, 63.5] {
+                for bits in [
+                    coordinate.to_bits() - 1,
+                    coordinate.to_bits(),
+                    coordinate.to_bits() + 1,
+                ] {
+                    let origin = (f64::from_bits(bits), f64::from_bits(bits));
+                    for delta in [-63.125, -1.0, 0.125, 1.0, 63.125] {
+                        for radius in [0.5_f64, 1.0, 1.5] {
+                            for end in [(origin.0 + delta, origin.1), (origin.0, origin.1 + delta)]
+                            {
+                                let stroke = StrokeFootprint::new(origin, end, radius, cap)
+                                    .ok_or_else(|| Error::Invalid("stroke fixture".into()))?;
+                                let mut expected = BilevelRaster::transparent(64, 64)
+                                    .ok_or_else(|| Error::Invalid("raster fixture".into()))?;
+                                let mut actual = expected.clone();
+                                assert_eq!(
+                                    stroke.paint(&mut actual, &bounds),
+                                    stroke.paint_general(&mut expected, &bounds)
+                                );
+                                assert_eq!(
+                                    actual, expected,
+                                    "{cap}, {origin:?}, {end:?}, {radius}"
                                 );
                             }
                         }
