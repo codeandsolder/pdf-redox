@@ -117,7 +117,7 @@ impl BilevelRaster {
 /// Validate and collect the low bits of eight binary bytes in one word.
 /// Multiplication by 255 expands each spaced low bit into its own byte;
 /// equality proves that every original sample was either 0 or 255.
-fn binary_byte(samples: [u8; 8]) -> Option<u8> {
+const fn binary_byte(samples: [u8; 8]) -> Option<u8> {
     let word = u64::from_le_bytes(samples);
     let low_bits = word & 0x0101_0101_0101_0101;
     if low_bits * 255 != word {
@@ -131,7 +131,7 @@ fn binary_byte(samples: [u8; 8]) -> Option<u8> {
 /// Pack one bit per sample, preserving row boundaries for arbitrary
 /// component counts. The stencil polarity inverts only active samples,
 /// never the unused low padding bits of a row's final byte.
-pub(crate) fn pack_binary_samples<const INVERT: bool>(
+pub fn pack_binary_samples<const INVERT: bool>(
     data: &[u8],
     width: u32,
     height: u32,
@@ -148,11 +148,10 @@ pub(crate) fn pack_binary_samples<const INVERT: bool>(
     let mut packed = Vec::with_capacity(samples_per_row.div_ceil(8).checked_mul(height)?);
     let polarity = if INVERT { u8::MAX } else { 0 };
     for row in data.chunks_exact(samples_per_row) {
-        let mut groups = row.chunks_exact(8);
-        for group in &mut groups {
-            packed.push(binary_byte(group.try_into().ok()?)? ^ polarity);
+        let (groups, tail) = row.as_chunks::<8>();
+        for &group in groups {
+            packed.push(binary_byte(group)? ^ polarity);
         }
-        let tail = groups.remainder();
         if !tail.is_empty() {
             let mut samples = [0; 8];
             samples[..tail.len()].copy_from_slice(tail);
@@ -164,7 +163,7 @@ pub(crate) fn pack_binary_samples<const INVERT: bool>(
 }
 
 /// Admission needs only a binary alpha proof, not an allocated mask.
-pub(crate) fn is_binary_sample_plane(data: &[u8], width: u32, height: u32) -> bool {
+pub fn is_binary_sample_plane(data: &[u8], width: u32, height: u32) -> bool {
     usize::try_from(width)
         .ok()
         .and_then(|width| width.checked_mul(usize::try_from(height).ok()?))
