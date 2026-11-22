@@ -1103,7 +1103,7 @@ pub fn rasterize_pathological_microstrokes(
                     (
                         candidate.start,
                         candidate.end,
-                        candidate.replacement.clone(),
+                        candidate.replacement.as_slice(),
                     )
                 })
                 .collect::<Vec<_>>();

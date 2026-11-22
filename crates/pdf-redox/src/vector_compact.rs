@@ -1594,44 +1594,15 @@ fn path_form_dictionary(bounds: Rect) -> OwnedDictionary {
     dictionary
 }
 
-fn apply_sorted_span_replacements<'a>(
-    input: &[u8],
-    replacements: impl IntoIterator<Item = (usize, usize, Option<&'a [u8]>)>,
-) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
-        if start < cursor || end > input.len() || start > end {
-            return None;
-        }
-        output.extend_from_slice(input.get(cursor..start)?);
-        output.extend_from_slice(replacement?);
-        cursor = end;
-    }
-    output.extend_from_slice(input.get(cursor..)?);
-    Some(output)
-}
-
-fn apply_span_replacements_owned<B: AsRef<[u8]>>(
-    input: &[u8],
-    mut replacements: Vec<(usize, usize, B)>,
-) -> Option<Vec<u8>> {
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    apply_sorted_span_replacements(
-        input,
-        replacements
-            .iter()
-            .map(|(start, end, bytes)| (*start, *end, Some(bytes.as_ref()))),
-    )
-}
-
 fn apply_span_replacements_from_arena(
     input: &[u8],
     mut replacements: Vec<CoordinateReplacement>,
     bytes: &[u8],
 ) -> Option<Vec<u8>> {
-    replacements.sort_unstable_by_key(|replacement| replacement.start);
-    apply_sorted_span_replacements(
+    if !replacements.is_sorted_by_key(|replacement| (replacement.start, replacement.end)) {
+        replacements.sort_by_key(|replacement| (replacement.start, replacement.end));
+    }
+    crate::content_stream::apply_ordered_replacements(
         input,
         replacements.iter().map(|replacement| {
             (
@@ -1643,19 +1614,6 @@ fn apply_span_replacements_from_arena(
                     .and_then(|end| bytes.get(replacement.byte_start..end)),
             )
         }),
-    )
-}
-
-fn apply_span_replacements(
-    input: &[u8],
-    replacements: &[(usize, usize, Vec<u8>)],
-) -> Option<Vec<u8>> {
-    apply_span_replacements_owned(
-        input,
-        replacements
-            .iter()
-            .map(|(start, end, bytes)| (*start, *end, bytes.as_slice()))
-            .collect(),
     )
 }
 
@@ -1677,7 +1635,7 @@ fn measured_span_replacement(
     flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<Option<(usize, usize, Vec<u8>)>> {
     let before = flate_lengths.encoded_len(input, level)?;
-    let Some(rewritten) = apply_span_replacements(input, replacements) else {
+    let Some(rewritten) = crate::content_stream::apply_replacements(input, replacements) else {
         return Ok(None);
     };
     let after = flate_lengths.encoded_len(&rewritten, level)?;
@@ -4663,8 +4621,8 @@ mod tests {
             .iter()
             .map(|(start, end, bytes)| (*start, *end, SmallVec::<[u8; 32]>::from_slice(bytes)))
             .collect::<Vec<_>>();
-        let borrowed_output = apply_span_replacements(input, &borrowed);
-        let owned_output = apply_span_replacements_owned(input, owned);
+        let borrowed_output = crate::content_stream::apply_replacements(input, &borrowed);
+        let owned_output = crate::content_stream::apply_replacements(input, &owned);
         assert_eq!(borrowed_output, owned_output);
         assert_eq!(owned_output.as_deref(), Some(b"AzDEFxy4567Q".as_slice()));
 
@@ -4672,9 +4630,9 @@ mod tests {
             (1, 4, SmallVec::<[u8; 32]>::from_slice(b"x")),
             (3, 5, SmallVec::<[u8; 32]>::from_slice(b"y")),
         ];
-        assert!(apply_span_replacements_owned(input, overlapping).is_none());
+        assert!(crate::content_stream::apply_replacements(input, &overlapping).is_none());
         let invalid_end = vec![(14, 17, SmallVec::<[u8; 32]>::from_slice(b"x"))];
-        assert!(apply_span_replacements_owned(input, invalid_end).is_none());
+        assert!(crate::content_stream::apply_replacements(input, &invalid_end).is_none());
         // Coordinate assembler references a single contiguous arena instead
         // of owning separate payloads or cloning them at page finalization.
         let arena = b"xyzQ".to_vec();
@@ -4729,7 +4687,7 @@ mod tests {
         // storage, without truncating the f64 formatter's unusual magnitudes.
         let long = vec![b'5'; 512];
         let owned = vec![(4, 6, SmallVec::<[u8; 32]>::from_slice(&long))];
-        let result = apply_span_replacements_owned(input, owned);
+        let result = crate::content_stream::apply_replacements(input, &owned);
         assert_eq!(
             result.as_ref().map(Vec::len),
             Some(input.len() - 2 + long.len())

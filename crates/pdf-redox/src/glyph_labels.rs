@@ -281,7 +281,7 @@ fn amend_page(
     if patches.is_empty() {
         return Ok(None);
     }
-    crate::content_stream::apply_replacements_owned(decoded, patches)
+    crate::content_stream::apply_replacements(decoded, &patches)
         .ok_or_else(|| invalid("invalid ActualText replacement ranges"))
         .map(Some)
 }

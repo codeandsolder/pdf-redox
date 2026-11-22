@@ -153,34 +153,56 @@ pub fn instruction_number_array<const N: usize>(
     operands.next().is_none().then_some(values)
 }
 
-/// Apply sorted, non-overlapping byte-range replacements to a content stream.
-///
-/// Returns `None` when any range is invalid or overlaps an earlier replacement.
-pub fn apply_replacements_owned(
+/// Assemble a checked, already ordered replacement stream. Arena-backed
+/// callers can project payloads directly without allocating individual
+/// replacement buffers. Validate and measure before allocating output.
+pub fn apply_ordered_replacements<'a>(
     input: &[u8],
-    mut replacements: Vec<(usize, usize, Vec<u8>)>,
+    replacements: impl Iterator<Item = (usize, usize, Option<&'a [u8]>)> + Clone,
 ) -> Option<Vec<u8>> {
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut output = Vec::with_capacity(input.len());
-    let mut cursor = 0usize;
-    for (start, end, replacement) in replacements {
+    let mut cursor = 0;
+    let mut length = 0_usize;
+    for (start, end, bytes) in replacements.clone() {
         if start < cursor || start > end || end > input.len() {
             return None;
         }
+        length = length
+            .checked_add(start - cursor)?
+            .checked_add(bytes?.len())?;
+        cursor = end;
+    }
+    length = length.checked_add(input.len() - cursor)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(length).ok()?;
+    cursor = 0;
+    for (start, end, bytes) in replacements {
         output.extend_from_slice(input.get(cursor..start)?);
-        output.extend_from_slice(&replacement);
+        output.extend_from_slice(bytes?);
         cursor = end;
     }
     output.extend_from_slice(input.get(cursor..)?);
     Some(output)
 }
 
-/// Borrowed convenience variant; the owned form avoids cloning replacement payloads.
-pub fn apply_replacements(
+/// Apply non-overlapping byte-range replacements without copying payloads.
+/// Already sorted spans require no auxiliary allocation. Insertions at an
+/// identical offset retain input order and precede a nonempty replacement
+/// beginning there; overlapping nonempty ranges are rejected.
+pub fn apply_replacements<B: AsRef<[u8]>>(
     input: &[u8],
-    replacements: &[(usize, usize, Vec<u8>)],
+    replacements: &[(usize, usize, B)],
 ) -> Option<Vec<u8>> {
-    apply_replacements_owned(input, replacements.to_vec())
+    fn project<B: AsRef<[u8]>>(
+        (start, end, bytes): &(usize, usize, B),
+    ) -> (usize, usize, Option<&[u8]>) {
+        (*start, *end, Some(bytes.as_ref()))
+    }
+    if replacements.is_sorted_by_key(|(start, end, _)| (*start, *end)) {
+        return apply_ordered_replacements(input, replacements.iter().map(project));
+    }
+    let mut ordered = replacements.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(start, end, _)| (*start, *end));
+    apply_ordered_replacements(input, ordered.into_iter().map(project))
 }
 
 /// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
@@ -320,28 +342,53 @@ mod tests {
     }
 
     #[test]
-    fn owned_and_borrowed_replacements_agree_and_reject_overlaps() {
+    fn replacements_borrow_payloads_and_reject_overlaps() {
         let input = b"abcdefghij";
-        let replacements = vec![(6, 8, b"Q".to_vec()), (1, 4, b"XX".to_vec())];
+        let replacements = [(6, 8, b"Q".as_slice()), (1, 4, b"XX".as_slice())];
         let expected = Some(b"aXXefQij".to_vec());
         assert_eq!(apply_replacements(input, &replacements), expected);
-        assert_eq!(apply_replacements_owned(input, replacements), expected);
+        let owned = replacements.map(|(start, end, bytes)| (start, end, bytes.to_vec()));
+        assert_eq!(apply_replacements(input, &owned), expected);
 
-        let overlap = vec![(4, 6, b"z".to_vec()), (1, 5, b"x".to_vec())];
-        assert_eq!(apply_replacements(input, &overlap), None);
-        assert_eq!(apply_replacements_owned(input, overlap), None);
         assert_eq!(
-            apply_replacements_owned(input, vec![(7, 4, Vec::new())]),
+            apply_replacements(input, &[(4, 6, b"z"), (1, 5, b"x")]),
             None
         );
+        assert_eq!(apply_replacements(input, &[(7, 4, b"")]), None);
+        assert_eq!(apply_replacements(input, &[(0, 11, b"")]), None);
         assert_eq!(
-            apply_replacements_owned(input, vec![(0, 11, Vec::new())]),
-            None
-        );
-        assert_eq!(
-            apply_replacements_owned(input, Vec::new()),
+            apply_replacements::<&[u8]>(input, &[]),
             Some(input.to_vec())
         );
+    }
+
+    #[test]
+    fn replacements_order_insertions_and_preserve_expansion_and_tail() {
+        let input = b"abcdef";
+        let edits = [
+            (2, 4, b"replacement".as_slice()),
+            (2, 2, b"first".as_slice()),
+            (6, 6, b"tail".as_slice()),
+            (2, 2, b"second".as_slice()),
+            (0, 0, b"start".as_slice()),
+        ];
+        assert_eq!(
+            apply_replacements(input, &edits).as_deref(),
+            Some(b"startabfirstsecondreplacementeftail".as_slice())
+        );
+        assert_eq!(
+            apply_replacements(
+                input,
+                &[
+                    (1, 4, b"".as_slice()),
+                    (1, 1, b"A".as_slice()),
+                    (4, 4, b"B".as_slice())
+                ]
+            )
+            .as_deref(),
+            Some(b"aABef".as_slice())
+        );
+        assert_eq!(apply_replacements(input, &[(1, 4, b""), (2, 2, b"")]), None);
     }
 
     #[test]

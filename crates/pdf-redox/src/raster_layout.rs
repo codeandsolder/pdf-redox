@@ -5620,7 +5620,7 @@ fn apply_plans(
     if replacements.is_empty() {
         return Ok((resources, result));
     }
-    let rewritten = crate::content_stream::apply_replacements_owned(input.content, replacements)
+    let rewritten = crate::content_stream::apply_replacements(input.content, &replacements)
         .ok_or_else(|| {
             Error::Invalid("overlapping/invalid raster-layout content replacement".to_owned())
         })?;
