@@ -1,6 +1,8 @@
 use crate::{Error, OwnedDictionary, OwnedObject, Result};
-use fax::{BitWriter, Bits, Color, VecWriter, encoder::Encoder};
-use std::{collections::BTreeMap, convert::Infallible};
+use std::collections::BTreeMap;
+
+mod ccitt;
+use ccitt::encode_ccitt_group4;
 
 const CCITT_EXTRA_DICTIONARY_BYTES: usize = 96;
 
@@ -140,74 +142,6 @@ impl BilevelRaster {
     }
 }
 
-fn infallible<T>(value: std::result::Result<T, Infallible>) -> T {
-    match value {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
-}
-
-/// Stop the encoder once its padded byte count cannot beat Flate.
-struct CappedFaxWriter {
-    writer: VecWriter,
-    remaining_bits: usize,
-}
-
-impl BitWriter for CappedFaxWriter {
-    type Error = ();
-
-    fn write(&mut self, bits: Bits) -> std::result::Result<(), Self::Error> {
-        self.remaining_bits = self
-            .remaining_bits
-            .checked_sub(usize::from(bits.len))
-            .ok_or(())?;
-        infallible(self.writer.write(bits));
-        Ok(())
-    }
-}
-
-fn encode_ccitt_group4(
-    packed: &[u8],
-    width: u32,
-    height: u32,
-    max_encoded_bytes: usize,
-) -> Result<Option<Vec<u8>>> {
-    let stride = usize::try_from(width.div_ceil(8))
-        .map_err(|_| Error::Invalid("bilevel image row is too wide".to_owned()))?;
-    let height_usize = usize::try_from(height)
-        .map_err(|_| Error::Invalid("bilevel image is too tall".to_owned()))?;
-    let expected = stride
-        .checked_mul(height_usize)
-        .ok_or_else(|| Error::Invalid("bilevel image dimensions overflow".to_owned()))?;
-    if stride == 0 || packed.len() != expected {
-        return Err(Error::Invalid(format!(
-            "invalid bilevel dimensions {width}x{height}: {} bytes, expected {expected}",
-            packed.len()
-        )));
-    }
-
-    // End-of-facsimile-block alone is two twelve-bit end-of-line words.
-    if max_encoded_bytes < 3 {
-        return Ok(None);
-    }
-    let mut encoder = Encoder::new(CappedFaxWriter {
-        writer: VecWriter::new(),
-        remaining_bits: max_encoded_bytes.saturating_mul(8),
-    });
-    let width_usize = usize::try_from(width)
-        .map_err(|_| Error::Invalid("bilevel image row is too wide".to_owned()))?;
-    for row in packed.chunks_exact(stride) {
-        let pixels = (0..width_usize).map(|x| {
-            let bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
-            if bit == 0 { Color::Black } else { Color::White }
-        });
-        if encoder.encode_line(pixels, width).is_err() {
-            return Ok(None);
-        }
-    }
-    Ok(encoder.finish().ok().map(|writer| writer.writer.finish()))
-}
-
 pub fn set_bilevel_filter(
     dictionary: &mut OwnedDictionary,
     width: u32,
@@ -292,7 +226,19 @@ pub fn encode_best_image_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fax::decoder::{decode_g4, pels};
+    use fax::{
+        Color, VecWriter,
+        decoder::{decode_g4, pels},
+        encoder::Encoder,
+    };
+    use std::convert::Infallible;
+
+    fn infallible<T>(value: std::result::Result<T, Infallible>) -> T {
+        match value {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
 
     fn packed_row(value: u8, width: u32) -> Vec<u8> {
         let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
@@ -341,7 +287,7 @@ mod tests {
 
     #[test]
     fn capped_group4_preserves_original_bytes_and_codec_selection() -> Result<()> {
-        for width in [1u32, 7, 8, 9, 31, 64, 257] {
+        for width in [1u32, 7, 8, 9, 31, 63, 64, 65, 127, 128, 129, 257, 2625] {
             let height = 32;
             let stride = usize::try_from(width.div_ceil(8)).unwrap_or(0);
             let width_usize = usize::try_from(width).unwrap_or(0);
