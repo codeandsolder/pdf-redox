@@ -1917,21 +1917,27 @@ fn load_factor_pages(
     pages: &[ObjectHandle],
     groups: &mut [RepeatedFormGroup],
 ) -> Result<(Vec<PagePathData>, BTreeSet<Vec<u8>>)> {
-    let candidate_indices = groups
-        .iter()
-        .flat_map(|(_, occurrences)| occurrences.iter().map(|item| item.page_index))
-        .collect::<BTreeSet<_>>();
-    let mut page_data = Vec::with_capacity(candidate_indices.len());
+    // Mark candidate pages in the same table that will hold their new
+    // indices. Dense source page indices make each occurrence O(1).
     let mut compact_indices = vec![None; pages.len()];
+    for (_, occurrences) in groups.iter() {
+        for occurrence in occurrences {
+            let slot = compact_indices
+                .get_mut(occurrence.page_index)
+                .ok_or_else(|| crate::Error::Invalid("missing candidate factor page".into()))?;
+            *slot = Some(occurrence.page_index);
+        }
+    }
+    let mut page_data = Vec::with_capacity(compact_indices.iter().flatten().count());
     let mut occupied = BTreeSet::new();
-    for (index, &page) in pages.iter().enumerate() {
-        if candidate_indices.contains(&index) {
+    for (&page, candidate) in pages.iter().zip(&mut compact_indices) {
+        if let Some(index) = candidate {
             let Some(decoded) = page_content_if_present(document, page)? else {
                 return Err(crate::Error::Invalid(
                     "factor page disappeared after inventory".into(),
                 ));
             };
-            compact_indices[index] = Some(page_data.len());
+            *index = page_data.len();
             page_data.push(PagePathData { page, decoded });
         }
         if let Some(resources) = document.inherited_page_resources(page)?
