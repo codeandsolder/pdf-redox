@@ -49,7 +49,9 @@ impl FlateBatchLimits {
 struct FlateReuseEntry {
     level: crate::FlateLevel,
     decoded_sha256: [u8; 32],
-    encoded: Vec<u8>,
+    // Match the actual retained allocation to the cache byte budget,
+    // rather than retaining an often much larger compression bound.
+    encoded: Box<[u8]>,
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +89,7 @@ impl FlateReuseCache {
             FlateReuseEntry {
                 level,
                 decoded_sha256,
-                encoded,
+                encoded: encoded.into_boxed_slice(),
             },
         );
     }
@@ -101,7 +103,8 @@ impl FlateReuseCache {
         let entry = self.entries.remove(&handle)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
         let decoded_sha256: [u8; 32] = Sha256::digest(decoded).into();
-        (entry.level == level && entry.decoded_sha256 == decoded_sha256).then_some(entry.encoded)
+        (entry.level == level && entry.decoded_sha256 == decoded_sha256)
+            .then(|| entry.encoded.into_vec())
     }
 }
 
