@@ -1973,7 +1973,7 @@ struct StrokeFormPageScan {
 }
 
 #[derive(Default)]
-pub(crate) struct StrokeFormScanEvidence {
+pub struct StrokeFormScanEvidence {
     pages: BTreeMap<ObjectHandle, StrokeFormPageScan>,
 }
 
