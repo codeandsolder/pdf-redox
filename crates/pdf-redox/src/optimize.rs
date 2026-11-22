@@ -34,8 +34,9 @@ use crate::{
     microstroke::{MicrostrokeRasterStats, rasterize_pathological_microstrokes},
     paint_batch::{
         CollinearPathStats, MarkedContentCoalesceStats, OutlinedGlyphFactorStats, PaintBatchStats,
-        StrokeFormFactorStats, batch_page_paints, coalesce_optional_content,
-        compact_collinear_paths, factor_outlined_glyphs, factor_repeated_stroke_forms,
+        StrokeFormFactorStats, StrokeFormScanEvidence, batch_page_paints,
+        coalesce_optional_content, compact_collinear_paths, factor_outlined_glyphs,
+        factor_repeated_stroke_forms,
     },
     polyline_simplify::{
         MAX_POLYLINE_PAGE_ERROR_PT, PolylineSimplificationStats, simplify_page_polylines,
@@ -915,9 +916,10 @@ fn run_vector_optimization_phase(
     })?;
     evidence.after_resource_mutation(outlined_glyphs.fonts_created != 0);
 
+    let mut stroke_scan_evidence = StrokeFormScanEvidence::default();
     let paint_batch = timed(timings, "paint-batching", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            batch_page_paints(document, pages)
+            batch_page_paints(document, pages, &mut stroke_scan_evidence)
         } else {
             Ok(PaintBatchStats::default())
         }
@@ -925,7 +927,7 @@ fn run_vector_optimization_phase(
 
     let stroke_forms = timed(timings, "stroke-form-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_repeated_stroke_forms(document, pages, flate_level)
+            factor_repeated_stroke_forms(document, pages, flate_level, &mut stroke_scan_evidence)
         } else {
             Ok(StrokeFormFactorStats::default())
         }
