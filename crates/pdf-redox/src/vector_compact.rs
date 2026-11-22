@@ -15,6 +15,7 @@ use crate::{
 use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 // Only the encoded length is retained: no unbounded copies of source streams
@@ -50,27 +51,51 @@ impl VectorFlateLengthMemo {
         if !self.enabled {
             return crate::stream_codec::flate_encoded_len(decoded, level);
         }
-        let key = (level.value(), Sha256::digest(decoded).into());
-        if let Some(&length) = self.lengths.get(&key) {
-            #[cfg(test)]
-            {
-                self.hits = self.hits.saturating_add(1);
-            }
-            return Ok(length);
-        }
-        #[cfg(test)]
-        {
-            self.misses = self.misses.saturating_add(1);
-        }
-        let length = crate::stream_codec::flate_encoded_len(decoded, level)?;
-        self.insert_length(key, length);
-        Ok(length)
+        self.measure(decoded, level, usize::MAX)?
+            .map(|measurement| measurement.length)
+            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".to_owned()))
     }
 
-    fn remember_encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel, length: usize) {
+    fn measure(
+        &mut self,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+        limit: usize,
+    ) -> Result<Option<FlateMeasurement>> {
+        let digest = Sha256::digest(decoded).into();
+        let key = (level.value(), digest);
         if self.enabled {
-            let key = (level.value(), Sha256::digest(decoded).into());
-            self.insert_length(key, length);
+            if let Some(&length) = self.lengths.get(&key) {
+                #[cfg(test)]
+                {
+                    self.hits = self.hits.saturating_add(1);
+                }
+                return Ok((length <= limit).then_some(FlateMeasurement {
+                    length,
+                    encoding: None,
+                    digest,
+                }));
+            }
+            #[cfg(test)]
+            {
+                self.misses = self.misses.saturating_add(1);
+            }
+        }
+        let Some(encoded) = crate::stream_codec::encode_flate_capped(decoded, limit, level)? else {
+            return Ok(None);
+        };
+        let length = encoded.len();
+        self.remember_encoded_len(digest, level, length);
+        Ok(Some(FlateMeasurement {
+            length,
+            encoding: Some(encoded),
+            digest,
+        }))
+    }
+
+    fn remember_encoded_len(&mut self, digest: [u8; 32], level: crate::FlateLevel, length: usize) {
+        if self.enabled {
+            self.insert_length((level.value(), digest), length);
         }
     }
 
@@ -89,6 +114,22 @@ impl VectorFlateLengthMemo {
         }
         self.insertion_order.push_back(key);
         self.lengths.insert(key, length);
+    }
+}
+
+/// An exact measured length and, on a cache miss, its reusable encoding.
+/// Failed capped measurements are never entered into the exact-length memo.
+struct FlateMeasurement {
+    length: usize,
+    encoding: Option<Vec<u8>>,
+    digest: [u8; 32],
+}
+
+impl FlateMeasurement {
+    fn retain(self, cache: &mut FlateReuseCache, handle: ObjectHandle, level: crate::FlateLevel) {
+        if let Some(encoded) = self.encoding {
+            cache.insert_with_digest(handle, level, self.digest, encoded);
+        }
     }
 }
 
@@ -717,12 +758,12 @@ fn covered_fill_ranges(fills: &[FillPaint]) -> BTreeSet<(usize, usize)> {
     ranges
 }
 
-fn apply_covered_fill_ranges(
-    input: &[u8],
+fn apply_covered_fill_ranges<'a>(
+    input: &'a [u8],
     ranges: &BTreeSet<(usize, usize)>,
-) -> (Vec<u8>, VectorCompactionStats) {
+) -> (Cow<'a, [u8]>, VectorCompactionStats) {
     if ranges.is_empty() {
-        return (input.to_vec(), VectorCompactionStats::default());
+        return (Cow::Borrowed(input), VectorCompactionStats::default());
     }
 
     let mut output = Vec::with_capacity(input.len());
@@ -730,7 +771,7 @@ fn apply_covered_fill_ranges(
     let mut stats = VectorCompactionStats::default();
     for &(start, end) in ranges {
         if start < cursor || end > input.len() {
-            return (input.to_vec(), VectorCompactionStats::default());
+            return (Cow::Borrowed(input), VectorCompactionStats::default());
         }
         output.extend_from_slice(&input[cursor..start]);
         output.push(b' ');
@@ -740,7 +781,7 @@ fn apply_covered_fill_ranges(
         cursor = end;
     }
     output.extend_from_slice(&input[cursor..]);
-    (output, stats)
+    (Cow::Owned(output), stats)
 }
 
 fn build_rewrites(input: &[u8], fills: &[FillPaint]) -> Vec<Rewrite> {
@@ -790,11 +831,11 @@ fn build_rewrites(input: &[u8], fills: &[FillPaint]) -> Vec<Rewrite> {
     rewrites
 }
 
-fn compact_content_from_fill_scan(
-    input: &[u8],
+fn compact_content_from_fill_scan<'a>(
+    input: &'a [u8],
     ext_gstates: &BTreeMap<Vec<u8>, ExtGStatePatch>,
     initial_fills: &[FillPaint],
-) -> (Vec<u8>, VectorCompactionStats) {
+) -> (Cow<'a, [u8]>, VectorCompactionStats) {
     let covered_ranges = covered_fill_ranges(initial_fills);
     let (covered_pruned, mut stats) = apply_covered_fill_ranges(input, &covered_ranges);
     let rescanned_fills;
@@ -803,7 +844,7 @@ fn compact_content_from_fill_scan(
     } else {
         let mut scanner = FillScanner::new(ext_gstates.clone());
         if !matches!(scanner.scan(&covered_pruned), Ok(false)) {
-            return (input.to_vec(), VectorCompactionStats::default());
+            return (Cow::Borrowed(input), VectorCompactionStats::default());
         }
         rescanned_fills = scanner.fills;
         &rescanned_fills
@@ -816,7 +857,7 @@ fn compact_content_from_fill_scan(
     let mut cursor = 0usize;
     for rewrite in rewrites {
         if rewrite.start < cursor || rewrite.end > covered_pruned.len() {
-            return (input.to_vec(), VectorCompactionStats::default());
+            return (Cow::Borrowed(input), VectorCompactionStats::default());
         }
         output.extend_from_slice(&covered_pruned[cursor..rewrite.start]);
         output.extend_from_slice(&rewrite.replacement);
@@ -829,22 +870,22 @@ fn compact_content_from_fill_scan(
         cursor = rewrite.end;
     }
     output.extend_from_slice(&covered_pruned[cursor..]);
-    (output, stats)
+    (Cow::Owned(output), stats)
 }
 
-fn compact_content_with_ext_gstates(
-    input: &[u8],
+fn compact_content_with_ext_gstates<'a>(
+    input: &'a [u8],
     ext_gstates: &BTreeMap<Vec<u8>, ExtGStatePatch>,
-) -> (Vec<u8>, VectorCompactionStats) {
+) -> (Cow<'a, [u8]>, VectorCompactionStats) {
     let mut scanner = FillScanner::new(ext_gstates.clone());
     if !matches!(scanner.scan(input), Ok(false)) {
-        return (input.to_vec(), VectorCompactionStats::default());
+        return (Cow::Borrowed(input), VectorCompactionStats::default());
     }
     compact_content_from_fill_scan(input, ext_gstates, &scanner.fills)
 }
 
 #[cfg(test)]
-fn compact_content(input: &[u8]) -> (Vec<u8>, VectorCompactionStats) {
+fn compact_content(input: &[u8]) -> (Cow<'_, [u8]>, VectorCompactionStats) {
     compact_content_with_ext_gstates(input, &BTreeMap::new())
 }
 
@@ -3229,59 +3270,60 @@ fn canonicalize_page_path_coordinates(
     let mut stats = VectorCompactionStats::default();
     let mut coordinate_rewritten_pages = BTreeSet::new();
     for &page in pages {
-        let Some(user_unit) = page_user_unit(document, page)? else {
-            continue;
-        };
-        // Preserve the original /Contents handle for the Flate reuse cache.
-        let Some(object) = document.current_owned_object(page)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        decoded_content_value(
-            document,
-            crate::source::CurrentValue::Owned(contents),
-            &mut decoded,
-        )?;
         let cached = (!rewritten_pages.contains(&page))
             .then(|| pre_scanned.remove(&page))
             .flatten();
+        // A complete negative scan is sufficient: no content decoding or
+        // dictionary traversal is needed when that page has not changed.
+        if matches!(cached, Some(None)) {
+            continue;
+        }
+        let Some(user_unit) = page_user_unit(document, page)? else {
+            continue;
+        };
+        let Some(object) = document.current_value(page)? else {
+            continue;
+        };
+        let Some(contents) = object.dictionary_entry(b"Contents") else {
+            continue;
+        };
+        let contents_handle = contents.reference();
+        let mut decoded = Vec::new();
+        decoded_content_value(document, contents, &mut decoded)?;
         let candidate = match cached {
-            Some(Some(plan)) => {
-                let coordinates = plan.coordinates_canonicalized;
-                Some((plan.canonicalized, coordinates))
-            }
-            Some(None) => continue,
+            Some(Some(plan)) => Some((plan.canonicalized, plan.coordinates_canonicalized)),
+            Some(None) => None,
             None => canonicalize_path_coordinates(&decoded, user_unit),
         };
         let Some((canonicalized, coordinates)) = candidate else {
             continue;
         };
-        let before_encoded = crate::stream_codec::encode_flate(&decoded, flate_level)?;
-        let before_flate = before_encoded.len();
-        flate_state
+        let Some(before) = flate_state
             .lengths
-            .remember_encoded_len(&decoded, flate_level, before_flate);
-        let after_flate = flate_state
-            .lengths
-            .encoded_len(&canonicalized, flate_level)?;
-        let savings = before_flate.saturating_sub(after_flate);
+            .measure(&decoded, flate_level, usize::MAX)?
+        else {
+            return Err(crate::Error::Compression(
+                "Flate output exceeded its bound".to_owned(),
+            ));
+        };
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
-            .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
-        if savings < required {
-            if let OwnedObject::Reference(handle) = contents {
-                flate_state
-                    .reuse
-                    .insert(*handle, flate_level, &decoded, before_encoded);
+            .max(before.length / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
+        let after = match before.length.checked_sub(required) {
+            Some(limit) => flate_state
+                .lengths
+                .measure(&canonicalized, flate_level, limit)?,
+            None => None,
+        };
+        let Some(after) = after else {
+            if let Some(handle) = contents_handle {
+                before.retain(flate_state.reuse, handle, flate_level);
             }
             continue;
-        }
-        replace_page_content(document, page, canonicalized.clone())?;
+        };
+        let savings = before.length - after.length;
+        let decoded_bytes_removed = decoded.len().saturating_sub(canonicalized.len());
+        let replacement = replace_page_content_with_handle(document, page, canonicalized)?;
+        after.retain(flate_state.reuse, replacement, flate_level);
         coordinate_rewritten_pages.insert(page);
         stats.pages_compacted = stats.pages_compacted.saturating_add(1);
         stats.path_coordinate_pages_rewritten =
@@ -3291,7 +3333,7 @@ fn canonicalize_page_path_coordinates(
             .saturating_add(coordinates);
         stats.path_coordinate_decoded_bytes_removed = stats
             .path_coordinate_decoded_bytes_removed
-            .saturating_add(decoded.len().saturating_sub(canonicalized.len()));
+            .saturating_add(decoded_bytes_removed);
         stats.path_coordinate_estimated_flate_bytes_saved = stats
             .path_coordinate_estimated_flate_bytes_saved
             .saturating_add(savings);
@@ -3318,12 +3360,12 @@ fn compact_processing_fill_tail(
         let resources = effective_page_resources(document, page)?;
         let ext_gstates = ext_gstate_patches(document, &resources)?;
         let (compacted, stats) = compact_content_with_ext_gstates(&decoded, &ext_gstates);
-        if compacted == decoded {
+        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded {
             continue;
         }
         let before_flate = flate_lengths.encoded_len(&decoded, flate_level)?;
         let after_flate = flate_lengths.encoded_len(&compacted, flate_level)?;
-        replace_page_content(document, page, compacted)?;
+        replace_page_content(document, page, compacted.into_owned())?;
         total.pages_compacted = total.pages_compacted.saturating_add(1);
         total.fill_groups_batched = total
             .fill_groups_batched
@@ -3520,13 +3562,13 @@ fn write_compacted_vector_page(
     // compression phase instead of recompressing unchanged page content.
     let after_encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
     let after_flate = after_encoded.len();
-    flate_state
-        .lengths
-        .remember_encoded_len(&compacted, flate_level, after_flate);
     if goal == OptimizationGoal::Size && after_flate >= before_flate {
         return Ok(None);
     }
     let decoded_sha256 = Sha256::digest(&compacted).into();
+    flate_state
+        .lengths
+        .remember_encoded_len(decoded_sha256, flate_level, after_flate);
     let replacement = replace_page_content_with_handle(document, page, compacted)?;
     flate_state
         .reuse
@@ -3591,7 +3633,7 @@ pub fn compact_vector_paths_with_flate_cache(
                 None,
             )
         };
-        if compacted == decoded {
+        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded {
             if let Some(factor_cache) = factor_cache {
                 pre_scanned_processing.insert(page, factor_cache);
             }
@@ -3601,7 +3643,7 @@ pub fn compact_vector_paths_with_flate_cache(
             document,
             page,
             &decoded,
-            compacted,
+            compacted.into_owned(),
             flate_level,
             goal,
             &mut flate_state,
@@ -3731,7 +3773,7 @@ mod tests {
         assert_eq!(memo.misses, 2);
         for i in 0..=MAX_VECTOR_FLATE_LENGTHS {
             let unique = i.to_le_bytes();
-            memo.remember_encoded_len(&unique, level, unique.len());
+            memo.remember_encoded_len(Sha256::digest(unique).into(), level, unique.len());
         }
         assert_eq!(memo.lengths.len(), MAX_VECTOR_FLATE_LENGTHS);
         assert_eq!(memo.insertion_order.len(), memo.lengths.len());
@@ -3741,6 +3783,41 @@ mod tests {
             crate::stream_codec::flate_encoded_len(&data, level)?
         );
         Ok(())
+    }
+
+    #[test]
+    fn capped_vector_measurement_rejects_without_caching_inexact_lengths() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let data = b"0 0 30 30 re f\n".repeat(512);
+        let expected = crate::stream_codec::encode_flate(&data, level)?;
+        let mut memo = VectorFlateLengthMemo::processing();
+
+        assert!(memo.measure(&data, level, expected.len() - 1)?.is_none());
+        assert!(memo.lengths.is_empty());
+        let measured = memo
+            .measure(&data, level, expected.len())?
+            .ok_or_else(|| crate::Error::Invalid("exact-cap encoding rejected".into()))?;
+        assert_eq!(measured.length, expected.len());
+        assert_eq!(measured.encoding.as_deref(), Some(expected.as_slice()));
+        assert_eq!(memo.misses, 2);
+        assert_eq!(memo.lengths.len(), 1);
+
+        assert!(memo.measure(&data, level, expected.len() - 1)?.is_none());
+        let cached = memo
+            .measure(&data, level, usize::MAX)?
+            .ok_or_else(|| crate::Error::Invalid("cached exact length rejected".into()))?;
+        assert_eq!(cached.length, expected.len());
+        assert!(cached.encoding.is_none());
+        assert_eq!(memo.hits, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_fill_compaction_borrows_input() {
+        let input = b"BT /F1 12 Tf (hello) Tj ET";
+        let (result, stats) = compact_content(input);
+        assert!(matches!(result, Cow::Borrowed(bytes) if bytes == input));
+        assert_eq!(stats, VectorCompactionStats::default());
     }
 
     #[test]
@@ -4228,7 +4305,7 @@ mod tests {
         let input = b"636.43 216.22 63 15.72 re f* 699.43 216.22 4.68 15.72 re f*";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4236,7 +4313,7 @@ mod tests {
         let input = b"0 0 10 10 re f 10.01 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4244,7 +4321,7 @@ mod tests {
         let input = b"0 0 10 10 re f 9 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4273,7 +4350,7 @@ mod tests {
         let input = b"0 0 10 10 re f 2 2 1 1 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4281,7 +4358,7 @@ mod tests {
         let input = b"0 0 10 10 re f 0 0 10 10 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4289,7 +4366,7 @@ mod tests {
         let input = b"0.2 2 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4297,7 +4374,7 @@ mod tests {
         let input = b"0 7 1 1 re f 0 0 20 20 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4305,7 +4382,7 @@ mod tests {
         let input = b"/GS0 gs 0 0 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4321,7 +4398,7 @@ mod tests {
         let input = b"/Pattern cs /P0 scn 0 0 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4329,7 +4406,7 @@ mod tests {
         let input = b"0 0 10 10 re f 1 0 0 rg 10 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
     #[test]
     fn resolved_opaque_ext_gstate_allows_covered_fill_pruning() {
@@ -4369,7 +4446,7 @@ mod tests {
         let input = b"/Half gs /Normal gs 0 0 2 2 re f 0 0 10 10 re f";
         let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4548,7 +4625,7 @@ mod tests {
     fn path_coordinate_canonicalization_can_expose_exact_fill_adjacency() -> crate::Result<()> {
         let input = b"0 0 10.004 10 re f 10.003 0 9.997 10 re f";
         let (before, before_stats) = compact_content(input);
-        assert_eq!(before, input);
+        assert_eq!(before.as_ref(), input);
         assert_eq!(before_stats.fill_groups_batched, 0);
 
         let (canonicalized, coordinates) =

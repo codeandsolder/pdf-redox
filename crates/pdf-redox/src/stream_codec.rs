@@ -332,9 +332,22 @@ pub fn flate_capped_encoded_len(
     maximum_length: usize,
     level: crate::FlateLevel,
 ) -> Result<Option<usize>> {
-    let mut output = vec![0_u8; maximum_length];
+    Ok(encode_flate_capped(decoded, maximum_length, level)?.map(|bytes| bytes.len()))
+}
+
+/// The ordinary zlib encoding, only if it fits the exact byte budget.
+pub fn encode_flate_capped(
+    decoded: &[u8],
+    maximum_length: usize,
+    level: crate::FlateLevel,
+) -> Result<Option<Vec<u8>>> {
+    let mut output = vec![0_u8; maximum_length.min(zlib_rs::compress_bound(decoded.len()))];
     let (encoded, code) = zlib_rs::compress_slice(&mut output, decoded, flate_config(level));
-    flate_length_with_limit(encoded.len(), code)
+    let Some(length) = flate_length_with_limit(encoded.len(), code)? else {
+        return Ok(None);
+    };
+    output.truncate(length);
+    Ok(Some(output))
 }
 
 /// Return the encoded byte length of ordinary zlib/Flate data.
