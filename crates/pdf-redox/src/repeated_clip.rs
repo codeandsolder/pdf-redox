@@ -35,6 +35,8 @@ struct ClipBlock {
     restore_start: usize,
     clip_prefix_end: Option<usize>,
     path_clear_at_end: bool,
+    // The scanner proved byte-for-byte equality with the preceding emitted block.
+    prefix_reused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,7 @@ struct Scanner {
     block_start: Option<usize>,
     block_valid: bool,
     clip_prefix_state: ClipPrefixState,
+    prefix_reused: bool,
     path_state: PathState,
     blocks: Vec<ClipBlock>,
 }
@@ -69,6 +72,7 @@ impl Scanner {
             block_start: None,
             block_valid: true,
             clip_prefix_state: ClipPrefixState::Path,
+            prefix_reused: false,
             path_state: PathState::Clear,
             blocks: Vec::new(),
         }
@@ -154,6 +158,7 @@ impl Scanner {
         self.depth = 1;
         self.block_start = Some(start);
         self.block_valid = true;
+        self.prefix_reused = false;
         self.clip_prefix_state = if matches!(self.path_state, PathState::Clear) {
             ClipPrefixState::Path
         } else {
@@ -176,6 +181,7 @@ impl Scanner {
                     _ => None,
                 },
                 path_clear_at_end: matches!(self.path_state, PathState::Clear),
+                prefix_reused: self.prefix_reused,
             });
         }
         self.block_valid = true;
@@ -246,6 +252,7 @@ impl Scanner {
         }
         let end = input.len() - suffix.len();
         self.clip_prefix_state = ClipPrefixState::Done(end);
+        self.prefix_reused = true;
         self.path_state = PathState::Clear;
         Some(end)
     }
@@ -309,7 +316,7 @@ fn repeated_runs(input: &[u8], blocks: &[ClipBlock]) -> Vec<ClipRun> {
             let candidate = &blocks[end];
             if !candidate.path_clear_at_end
                 || !blocks_contiguous(input, previous, candidate)
-                || clip_prefix(input, candidate) != Some(prefix)
+                || (!candidate.prefix_reused && clip_prefix(input, candidate) != Some(prefix))
             {
                 break;
             }
@@ -336,41 +343,43 @@ fn hoisted_run(input: &[u8], blocks: &[ClipBlock], run: ClipRun) -> Option<(Repl
     let last = selected.last()?;
     let prefix = clip_prefix(input, first)?;
 
-    let mut output = Vec::with_capacity(last.end.saturating_sub(first.start));
-    output.extend_from_slice(prefix);
-    output.push(b'\n');
-    for block in selected {
-        let clip_end = block.clip_prefix_end?;
-        if clip_end > block.restore_start || block.restore_start > block.end {
-            return None;
-        }
-        output.extend_from_slice(b"q\n");
-        output.extend_from_slice(input.get(clip_end..block.restore_start)?);
-        output.extend_from_slice(b"\nQ\n");
-    }
-    output.extend_from_slice(b"Q\n");
-
-    let decoded_savings = last
-        .end
-        .saturating_sub(first.start)
-        .saturating_sub(output.len());
+    // Measure the exact output first. Large repeated prefixes can make the
+    // original span orders of magnitude larger than its replacement.
+    let output_len = selected
+        .iter()
+        .try_fold(prefix.len().checked_add(3)?, |total, block| {
+            let clip_end = block.clip_prefix_end?;
+            if clip_end > block.restore_start || block.restore_start > block.end {
+                return None;
+            }
+            total
+                .checked_add(input.get(clip_end..block.restore_start)?.len())?
+                .checked_add(5)
+        })?;
+    let decoded_savings = last.end.checked_sub(first.start)?.checked_sub(output_len)?;
     if decoded_savings < MIN_DECODED_SAVINGS {
         return None;
     }
+    let mut output = Vec::new();
+    output.try_reserve_exact(output_len).ok()?;
+    output.extend_from_slice(prefix);
+    output.push(b'\n');
+    for block in selected {
+        output.extend_from_slice(b"q\n");
+        output.extend_from_slice(input.get(block.clip_prefix_end?..block.restore_start)?);
+        output.extend_from_slice(b"\nQ\n");
+    }
+    output.extend_from_slice(b"Q\n");
     Some(((first.start, last.end, output), decoded_savings))
 }
 
 /// Size mode only admits strictly smaller compressed page streams. Processing
 /// also accepts equal-sized output because eliminating repeated clip work is
 /// valuable independently of PDF bytes.
-const fn clip_rewrite_accepted(
-    before_encoded: usize,
-    after_encoded: usize,
-    goal: OptimizationGoal,
-) -> bool {
+const fn clip_rewrite_budget(before_encoded: usize, goal: OptimizationGoal) -> Option<usize> {
     match goal {
-        OptimizationGoal::Size => after_encoded < before_encoded,
-        OptimizationGoal::Processing => after_encoded <= before_encoded,
+        OptimizationGoal::Size => before_encoded.checked_sub(1),
+        OptimizationGoal::Processing => Some(before_encoded),
     }
 }
 
@@ -415,10 +424,14 @@ pub fn hoist_repeated_clip_prefixes(
             continue;
         };
         let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?;
-        if !clip_rewrite_accepted(before_flate, after_flate, goal) {
+        let Some(budget) = clip_rewrite_budget(before_flate, goal) else {
             continue;
-        }
+        };
+        let Some(after_flate) =
+            crate::stream_codec::flate_capped_encoded_len(&rewritten, budget, flate_level)?
+        else {
+            continue;
+        };
 
         replace_page_content(document, page, rewritten)?;
         result.stats.pages_rewritten = result.stats.pages_rewritten.saturating_add(1);
@@ -444,20 +457,16 @@ mod tests {
 
     #[test]
     fn clip_admission_is_goal_specific_at_encoded_size_equality() {
-        assert!(clip_rewrite_accepted(100, 99, OptimizationGoal::Size));
-        assert!(!clip_rewrite_accepted(100, 100, OptimizationGoal::Size));
-        assert!(!clip_rewrite_accepted(100, 101, OptimizationGoal::Size));
-        assert!(clip_rewrite_accepted(100, 99, OptimizationGoal::Processing));
-        assert!(clip_rewrite_accepted(
-            100,
-            100,
-            OptimizationGoal::Processing
-        ));
-        assert!(!clip_rewrite_accepted(
-            100,
-            101,
-            OptimizationGoal::Processing
-        ));
+        assert_eq!(clip_rewrite_budget(100, OptimizationGoal::Size), Some(99));
+        assert_eq!(
+            clip_rewrite_budget(100, OptimizationGoal::Processing),
+            Some(100)
+        );
+        assert_eq!(clip_rewrite_budget(0, OptimizationGoal::Size), None);
+        assert_eq!(
+            clip_rewrite_budget(0, OptimizationGoal::Processing),
+            Some(0)
+        );
     }
 
     fn large_clip() -> String {
@@ -485,7 +494,21 @@ mod tests {
                     scanner.instruction(instruction, 0);
                     Ok(())
                 })?;
-            assert_eq!(Scanner::scan(input.as_bytes()), scanner.finish(incomplete));
+            let expected = scanner.finish(incomplete);
+            let mut actual = Scanner::scan(input.as_bytes());
+            if let Some(blocks) = &mut actual {
+                for index in 0..blocks.len() {
+                    if blocks[index].prefix_reused {
+                        assert!(index > 0);
+                        assert_eq!(
+                            clip_prefix(input.as_bytes(), &blocks[index]),
+                            clip_prefix(input.as_bytes(), &blocks[index - 1])
+                        );
+                        blocks[index].prefix_reused = false;
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
         }
         Ok(())
     }
