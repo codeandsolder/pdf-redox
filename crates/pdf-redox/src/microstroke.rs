@@ -1,4 +1,5 @@
 use crate::content::page_content_if_present;
+use crate::content_stream::{instruction_number_array, operand_name};
 use crate::ext_gstate::ext_gstate_semantics;
 use crate::geometry::Matrix;
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
         resolved_dictionary,
     },
 };
+use hayro_syntax::content::Instruction;
 use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,19 +46,6 @@ pub struct MicrostrokeRasterStats {
     pub flate_images: usize,
     /// Estimated encoded bytes saved relative to the equivalent Flate representation.
     pub estimated_flate_bytes_saved: usize,
-}
-
-#[derive(Debug, Clone)]
-struct Operand {
-    number: Option<f64>,
-    name: Option<Vec<u8>>,
-}
-
-fn operand_numbers(operands: &[Operand], expected: usize) -> Option<Vec<f64>> {
-    if operands.len() != expected {
-        return None;
-    }
-    operands.iter().map(|operand| operand.number).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -242,7 +231,6 @@ struct MicroStrokeBlock {
 }
 
 struct MicroStrokeScanner {
-    operands: Vec<Operand>,
     state: StrokeState,
     stack: Vec<StrokeState>,
     ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>,
@@ -254,7 +242,6 @@ struct MicroStrokeScanner {
 impl MicroStrokeScanner {
     fn new(ext_gstates: BTreeMap<Vec<u8>, ExtGStatePatch>) -> Self {
         Self {
-            operands: Vec::new(),
             state: StrokeState::default(),
             stack: Vec::new(),
             ext_gstates,
@@ -270,8 +257,8 @@ impl MicroStrokeScanner {
         }
     }
 
-    fn set_gray(&mut self) {
-        let Some(values) = operand_numbers(&self.operands, 1) else {
+    fn set_gray(&mut self, instruction: &Instruction<'_, '_>) {
+        let Some(values) = instruction_number_array::<1>(instruction) else {
             self.state.color = None;
             return;
         };
@@ -280,8 +267,8 @@ impl MicroStrokeScanner {
             .then_some(StrokeColor::Gray(values[0]));
     }
 
-    fn set_rgb(&mut self) {
-        let Some(values) = operand_numbers(&self.operands, 3) else {
+    fn set_rgb(&mut self, instruction: &Instruction<'_, '_>) {
+        let Some(values) = instruction_number_array::<3>(instruction) else {
             self.state.color = None;
             return;
         };
@@ -291,8 +278,8 @@ impl MicroStrokeScanner {
             .then_some(StrokeColor::Rgb([values[0], values[1], values[2]]));
     }
 
-    fn set_cmyk(&mut self) {
-        let Some(values) = operand_numbers(&self.operands, 4) else {
+    fn set_cmyk(&mut self, instruction: &Instruction<'_, '_>) {
+        let Some(values) = instruction_number_array::<4>(instruction) else {
             self.state.color = None;
             return;
         };
@@ -305,25 +292,22 @@ impl MicroStrokeScanner {
                 ]));
     }
 
-    fn concat_ctm(&mut self) {
-        let Some(values) = operand_numbers(&self.operands, 6) else {
+    fn concat_ctm(&mut self, values: Option<[f64; 6]>) {
+        let Some(values) = values.filter(|values| values.iter().all(|value| value.is_finite()))
+        else {
             self.state.safety.invalidate();
             return;
         };
-        if !values.iter().all(|value| value.is_finite()) {
-            self.state.safety.invalidate();
-            return;
-        }
         self.state.ctm.concat(Matrix::new(
             values[0], values[1], values[2], values[3], values[4], values[5],
         ));
     }
 
-    fn apply_ext_gstate(&mut self) {
-        let patch = self
-            .operands
-            .first()
-            .and_then(|operand| operand.name.as_deref())
+    fn apply_ext_gstate(&mut self, instruction: &Instruction<'_, '_>) {
+        let patch = instruction
+            .operands()
+            .next()
+            .and_then(operand_name)
             .and_then(|name| self.ext_gstates.get(name).copied());
         if let Some(patch) = patch {
             self.state.apply_ext_gstate(patch);
@@ -332,21 +316,12 @@ impl MicroStrokeScanner {
         }
     }
 
-    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+    fn instruction(&mut self, instruction: &Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             self.invalidate_frame();
-            self.operands.clear();
             return;
         }
-        self.operands = instruction
-            .operands()
-            .map(|object| Operand {
-                number: crate::content_stream::operand_number(object),
-                name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
-            })
-            .collect();
-        let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len());
+        self.process_operator(instruction);
     }
 
     fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
@@ -364,8 +339,11 @@ impl MicroStrokeScanner {
         clippy::too_many_lines,
         reason = "PDF graphics operator state transitions must remain ordered and co-located for auditability"
     )]
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
-        let end = offset.saturating_add(length);
+    fn process_operator(&mut self, instruction: &Instruction<'_, '_>) {
+        let operator = &instruction.operator[..];
+        let span = instruction.operator_span();
+        let offset = span.start;
+        let end = span.end;
         match operator {
             b"q" => {
                 if self.frame.is_some() {
@@ -405,9 +383,9 @@ impl MicroStrokeScanner {
                 }
             }
             b"cm" => {
+                let values = instruction_number_array::<6>(instruction);
                 if let Some(frame) = &mut self.frame {
                     if frame.stage == BlockStage::ExpectTranslation {
-                        let values = operand_numbers(&self.operands, 6);
                         if let Some(values) = values.filter(|values| {
                             values.iter().all(|value| value.is_finite())
                                 && (values[0] - 1.0).abs() <= 1.0e-12
@@ -425,13 +403,13 @@ impl MicroStrokeScanner {
                         frame.stage = BlockStage::Invalid;
                     }
                 }
-                self.concat_ctm();
+                self.concat_ctm(values);
             }
             b"m" => {
                 self.path_nonempty = true;
                 if let Some(frame) = &mut self.frame {
                     if frame.stage == BlockStage::ExpectMove {
-                        if let Some(values) = operand_numbers(&self.operands, 2) {
+                        if let Some(values) = instruction_number_array::<2>(instruction) {
                             frame.p0 = Some((frame.tx + values[0], frame.ty + values[1]));
                             frame.stage = BlockStage::ExpectLine;
                         } else {
@@ -446,7 +424,7 @@ impl MicroStrokeScanner {
                 self.path_nonempty = true;
                 if let Some(frame) = &mut self.frame {
                     if frame.stage == BlockStage::ExpectLine {
-                        if let Some(values) = operand_numbers(&self.operands, 2) {
+                        if let Some(values) = instruction_number_array::<2>(instruction) {
                             frame.p1 = Some((frame.tx + values[0], frame.ty + values[1]));
                             frame.stage = BlockStage::ExpectStroke;
                         } else {
@@ -477,13 +455,13 @@ impl MicroStrokeScanner {
             }
             b"w" => {
                 self.invalidate_frame();
-                self.state.width = operand_numbers(&self.operands, 1)
+                self.state.width = instruction_number_array::<1>(instruction)
                     .and_then(|values| values[0].is_finite().then_some(values[0]))
                     .unwrap_or(f64::NAN);
             }
             b"J" => {
                 self.invalidate_frame();
-                self.state.cap = operand_numbers(&self.operands, 1)
+                self.state.cap = instruction_number_array::<1>(instruction)
                     .and_then(|values| match values[0] {
                         0.0 => Some(0),
                         1.0 => Some(1),
@@ -494,7 +472,7 @@ impl MicroStrokeScanner {
             }
             b"j" => {
                 self.invalidate_frame();
-                self.state.join = operand_numbers(&self.operands, 1)
+                self.state.join = instruction_number_array::<1>(instruction)
                     .and_then(|values| match values[0] {
                         0.0 => Some(0),
                         1.0 => Some(1),
@@ -509,15 +487,15 @@ impl MicroStrokeScanner {
             }
             b"G" => {
                 self.invalidate_frame();
-                self.set_gray();
+                self.set_gray(instruction);
             }
             b"RG" => {
                 self.invalidate_frame();
-                self.set_rgb();
+                self.set_rgb(instruction);
             }
             b"K" => {
                 self.invalidate_frame();
-                self.set_cmyk();
+                self.set_cmyk(instruction);
             }
             b"CS" | b"SC" | b"SCN" => {
                 self.invalidate_frame();
@@ -525,13 +503,12 @@ impl MicroStrokeScanner {
             }
             b"gs" => {
                 self.invalidate_frame();
-                self.apply_ext_gstate();
+                self.apply_ext_gstate(instruction);
             }
             // Other operators either do not affect the tracked stroking state or are
             // conservatively treated as a barrier for candidate-frame reuse.
             _ => self.invalidate_frame(),
         }
-        self.operands.clear();
     }
 }
 
