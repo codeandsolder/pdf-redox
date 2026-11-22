@@ -624,7 +624,88 @@ impl NumericValue {
     }
 }
 
+/// Scalar identity in the editable COS representation; references stay unresolved.
+#[derive(Debug, PartialEq)]
+pub enum CosScalar<'a> {
+    Null,
+    Boolean(bool),
+    Number(NumericValue),
+    Name(&'a [u8]),
+    String(&'a [u8]),
+    Reference(ObjectHandle),
+}
+
+/// Stream identity as it would appear in the mutation overlay, not merely
+/// equality of encoded bytes. Direct streams have inline payload identity.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamIdentity<'a> {
+    Source(ObjectId),
+    Inline(Cow<'a, [u8]>),
+}
+
 impl<'a> CurrentValue<'a> {
+    pub fn scalar(&self) -> Option<CosScalar<'_>> {
+        Some(match self {
+            Self::Source(MaybeRef::Ref(reference), _) => {
+                CosScalar::Reference(ObjectHandle::Existing((*reference).into()))
+            }
+            Self::Source(MaybeRef::NotRef(object), _) => match object {
+                Object::Null(_) => CosScalar::Null,
+                Object::Boolean(value) => CosScalar::Boolean(*value),
+                Object::Number(value) => CosScalar::Number(NumericValue::from_hayro(*value)),
+                Object::Name(value) => CosScalar::Name(value.as_ref()),
+                Object::String(value) => CosScalar::String(value.as_bytes()),
+                Object::Array(_) | Object::Dict(_) | Object::Stream(_) => return None,
+            },
+            Self::Owned(object) => match object {
+                OwnedObject::Null => CosScalar::Null,
+                OwnedObject::Boolean(value) => CosScalar::Boolean(*value),
+                OwnedObject::Integer(value) => CosScalar::Number(NumericValue::Integer(*value)),
+                OwnedObject::Real(value) => CosScalar::Number(NumericValue::Real(*value)),
+                OwnedObject::Name(value) => CosScalar::Name(value),
+                OwnedObject::String(value) => CosScalar::String(value),
+                OwnedObject::Reference(value) => CosScalar::Reference(*value),
+                OwnedObject::Array(_) | OwnedObject::Dictionary(_) | OwnedObject::Stream { .. } => {
+                    return None;
+                }
+            },
+        })
+    }
+
+    pub fn stream_identity(&self) -> Option<StreamIdentity<'a>> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Stream(stream)), id) => Some(id.map_or_else(
+                || StreamIdentity::Inline(stream.raw_data()),
+                StreamIdentity::Source,
+            )),
+            Self::Owned(OwnedObject::Stream { data, .. }) => Some(match data {
+                StreamData::Source(id) => StreamIdentity::Source(*id),
+                StreamData::Owned(bytes) => StreamIdentity::Inline(Cow::Borrowed(bytes)),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Number of readable array entries, matching materialized COS semantics.
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Array(array)), _) => {
+                Some(array.raw_iter().count())
+            }
+            Self::Owned(OwnedObject::Array(array)) => Some(array.len()),
+            _ => None,
+        }
+    }
+
+    /// Count entries in the editable dictionary view (source stream Length
+    /// omitted; duplicate and unparseable source entries handled by Hayro).
+    pub fn dictionary_len(&self) -> Option<usize> {
+        match self {
+            Self::Owned(value) => value.as_dictionary().map(BTreeMap::len),
+            Self::Source(..) => self.dictionary_entries().map(Iterator::count),
+        }
+    }
+
     pub fn reference(&self) -> Option<ObjectHandle> {
         match self {
             Self::Source(MaybeRef::Ref(reference), _) => {

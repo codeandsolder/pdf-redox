@@ -1377,9 +1377,10 @@ impl ObjectAnalysisAccumulator {
         }
         match type_name.as_ref() {
             Ok(Some(name)) if name.as_slice() == b"Font" => {
-                if let Some(fingerprint) =
-                    exact_dictionary_fingerprint(object, b"exact-font-dictionary")
-                {
+                if let Some(fingerprint) = exact_dictionary_fingerprint(
+                    &crate::source::CurrentValue::Owned(object),
+                    b"exact-font-dictionary",
+                ) {
                     *self
                         .font_dictionary_fingerprints
                         .entry(fingerprint)
