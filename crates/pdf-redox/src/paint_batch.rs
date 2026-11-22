@@ -3182,14 +3182,31 @@ mod tests {
         pdf.stream(6, b"", &other)?;
         pdf.stream(7, b"/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b"q Q")?;
 
-        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let fixture = pdf.finish(1)?;
+        let mut cold = EditDocument::from_bytes(fixture.clone())?;
+        let cold_pages = cold.page_handles()?;
+        let cold_stats = factor_repeated_stroke_forms(
+            &mut cold,
+            &cold_pages,
+            crate::FlateLevel::PROCESSING,
+            &mut StrokeFormScanEvidence::default(),
+        )?;
+
+        let mut document = EditDocument::from_bytes(fixture)?;
         let pages = document.page_handles()?;
+        let mut evidence = StrokeFormScanEvidence::default();
+        let batch_stats = batch_page_paints(&mut document, &pages, &mut evidence)?;
+        assert_eq!(batch_stats.pages_rewritten, 0);
+        assert_eq!(evidence.pages.len(), 2);
         let stats = factor_repeated_stroke_forms(
             &mut document,
             &pages,
             crate::FlateLevel::PROCESSING,
-            &mut StrokeFormScanEvidence::default(),
+            &mut evidence,
         )?;
+        assert!(evidence.pages.is_empty());
+        assert_eq!(stats, cold_stats);
+        assert_eq!(document.write_compact()?, cold.write_compact()?);
         assert_eq!(stats.pages_rewritten, 1);
         assert_eq!(stats.forms_created, 1);
         assert_eq!(stats.occurrences_replaced, 100);
