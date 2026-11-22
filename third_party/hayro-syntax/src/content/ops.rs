@@ -15,7 +15,7 @@ use crate::content::macros::{op_all, op_impl, op0, op1, op2, op3, op4, op6};
 include!("ops_generated.rs");
 
 fn parse_named_color<'b, 'a>(
-    objects: &'b [Object<'a>],
+    objects: impl Iterator<Item = &'b Object<'a>>,
 ) -> Option<(
     SmallVec<[Number; INLINE_COLOR_COMPONENTS]>,
     Option<&'b Name<'a>>,
@@ -79,7 +79,7 @@ op_impl!(
     "SCN",
     u8::MAX as usize,
     |stack: &'b Stack<'a>| {
-        let (nums, name) = parse_named_color(stack.as_slice())?;
+        let (nums, name) = parse_named_color(stack.iter())?;
         Some(StrokeColorNamed(nums, name))
     }
 );
@@ -101,7 +101,7 @@ op_impl!(
     "scn",
     u8::MAX as usize,
     |stack: &'b Stack<'a>| {
-        let (nums, name) = parse_named_color(stack.as_slice())?;
+        let (nums, name) = parse_named_color(stack.iter())?;
         Some(NonStrokeColorNamed(nums, name))
     }
 );
