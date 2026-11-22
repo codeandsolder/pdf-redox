@@ -1,11 +1,11 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
-    dedup::exact_dictionary_fingerprint,
+    dedup::{exact_projected_dictionary_equal, exact_projected_dictionary_fingerprint},
     direct_object::{
         DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep,
         DirectWalkControl, object_at_direct_path_mut, walk_direct_object,
     },
-    source::{CurrentArrayIter, CurrentValue, PAGE_INHERITABLE_KEYS, owned_from_maybe_ref},
+    source::{CurrentArrayIter, CurrentValue, PAGE_INHERITABLE_KEYS},
 };
 use hayro_syntax::object::{Dict as HayroDict, Object as HayroObject, Rect};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,9 +28,9 @@ pub struct StructureCompactionStats {
     pub stale_page_destination_references_rewritten: usize,
 }
 
-fn take_inherited_page_keys(
-    dictionary: &HayroDict<'_>,
-    inherited: &mut [Option<OwnedObject>; PAGE_INHERITABLE_KEYS.len()],
+fn take_inherited_page_keys<'a>(
+    dictionary: &HayroDict<'a>,
+    inherited: &mut [Option<CurrentValue<'a>>; PAGE_INHERITABLE_KEYS.len()],
 ) {
     for (key, value) in PAGE_INHERITABLE_KEYS.into_iter().zip(inherited) {
         if value.is_some() {
@@ -49,15 +49,17 @@ fn take_inherited_page_keys(
         if valid {
             *value = dictionary
                 .get_raw::<HayroObject<'_>>(key)
-                .map(owned_from_maybe_ref);
+                .map(|value| CurrentValue::Source(value, None));
         }
     }
 }
 
+type PageIdentity<'a> = BTreeMap<Vec<u8>, CurrentValue<'a>>;
+
 fn source_page_identity(
     document: &EditDocument,
     page: ObjectHandle,
-) -> Result<Option<OwnedObject>> {
+) -> Result<Option<PageIdentity<'_>>> {
     let ObjectHandle::Existing(id) = page else {
         return Ok(None);
     };
@@ -67,7 +69,7 @@ fn source_page_identity(
     // Compare the complete original local page semantics, not a whitelist of
     // visual attributes or the rewritten overlay. Only structural ancestry
     // and the four separately resolved inheritable properties are excluded.
-    let mut properties = OwnedDictionary::new();
+    let mut properties = PageIdentity::new();
     for name in dictionary.keys() {
         let key = name.as_ref();
         if key == b"Parent" || PAGE_INHERITABLE_KEYS.contains(&key) {
@@ -77,7 +79,7 @@ fn source_page_identity(
             // An unparseable property cannot prove equality with another page.
             return Ok(None);
         };
-        properties.insert(key.to_vec(), owned_from_maybe_ref(value));
+        properties.insert(key.to_vec(), CurrentValue::Source(value, None));
     }
     let mut inherited = std::array::from_fn(|_| None);
     let mut seen = BTreeSet::from([id]);
@@ -107,7 +109,7 @@ fn source_page_identity(
             .zip(inherited)
             .filter_map(|(key, value)| value.map(|value| (key.to_vec(), value))),
     );
-    Ok(Some(OwnedObject::Dictionary(properties)))
+    Ok(Some(properties))
 }
 
 fn reachable_page_dictionaries(document: &EditDocument) -> Result<Vec<ObjectHandle>> {
@@ -130,35 +132,28 @@ enum LivePageMatch {
     Ambiguous,
 }
 
-struct StalePageIdentity {
-    properties: OwnedObject,
+struct StalePageIdentity<'a> {
+    properties: PageIdentity<'a>,
     stale_pages: Vec<ObjectHandle>,
     live_match: LivePageMatch,
 }
 
 #[derive(Default)]
-struct StalePageIdentityIndex {
-    by_fingerprint: BTreeMap<[u8; 32], Vec<StalePageIdentity>>,
+struct StalePageIdentityIndex<'a> {
+    by_fingerprint: BTreeMap<[u8; 32], Vec<StalePageIdentity<'a>>>,
 }
 
-impl StalePageIdentityIndex {
-    fn fingerprint(properties: &OwnedObject) -> Result<[u8; 32]> {
-        // Source materialization already canonicalizes both signs of zero to
-        // integer zero, so the exact COS fingerprint agrees with structural
-        // equality. Hashing is only an index; compare values in the bucket.
-        exact_dictionary_fingerprint(
-            &CurrentValue::Owned(properties),
-            b"immutable-source-page-identity",
-        )
-        .ok_or_else(|| Error::Invalid("page identity is not a dictionary".to_owned()))
+impl<'a> StalePageIdentityIndex<'a> {
+    fn fingerprint(properties: &PageIdentity<'_>) -> [u8; 32] {
+        exact_projected_dictionary_fingerprint(properties, b"immutable-source-page-identity")
     }
 
-    fn insert_stale(&mut self, page: ObjectHandle, properties: OwnedObject) -> Result<()> {
-        let fingerprint = Self::fingerprint(&properties)?;
+    fn insert_stale(&mut self, page: ObjectHandle, properties: PageIdentity<'a>) {
+        let fingerprint = Self::fingerprint(&properties);
         let bucket = self.by_fingerprint.entry(fingerprint).or_default();
         if let Some(existing) = bucket
             .iter_mut()
-            .find(|candidate| candidate.properties == properties)
+            .find(|candidate| exact_projected_dictionary_equal(&candidate.properties, &properties))
         {
             existing.stale_pages.push(page);
         } else {
@@ -168,18 +163,17 @@ impl StalePageIdentityIndex {
                 live_match: LivePageMatch::Unmatched,
             });
         }
-        Ok(())
     }
 
-    fn observe_live(&mut self, page: ObjectHandle, properties: &OwnedObject) -> Result<()> {
-        let fingerprint = Self::fingerprint(properties)?;
+    fn observe_live(&mut self, page: ObjectHandle, properties: &PageIdentity<'_>) {
+        let fingerprint = Self::fingerprint(properties);
         if let Some(candidate) = self
             .by_fingerprint
             .get_mut(&fingerprint)
             .and_then(|bucket| {
-                bucket
-                    .iter_mut()
-                    .find(|candidate| candidate.properties == *properties)
+                bucket.iter_mut().find(|candidate| {
+                    exact_projected_dictionary_equal(&candidate.properties, properties)
+                })
             })
         {
             candidate.live_match = match candidate.live_match {
@@ -187,7 +181,6 @@ impl StalePageIdentityIndex {
                 LivePageMatch::Unique(_) | LivePageMatch::Ambiguous => LivePageMatch::Ambiguous,
             };
         }
-        Ok(())
     }
 
     fn into_redirects(self) -> BTreeMap<ObjectHandle, ObjectHandle> {
@@ -220,7 +213,7 @@ fn stale_page_destination_map_from_plan(
         .filter(|handle| !plan.owners.contains_key(handle))
     {
         if let Some(identity) = source_page_identity(document, handle)? {
-            stale_identities.insert_stale(handle, identity)?;
+            stale_identities.insert_stale(handle, identity);
         }
     }
     if stale_identities.by_fingerprint.is_empty() {
@@ -229,7 +222,7 @@ fn stale_page_destination_map_from_plan(
 
     for page in &plan.pages {
         if let Some(identity) = source_page_identity(document, page.handle)? {
-            stale_identities.observe_live(page.handle, &identity)?;
+            stale_identities.observe_live(page.handle, &identity);
         }
     }
     Ok(stale_identities.into_redirects())
@@ -2522,19 +2515,23 @@ mod tests {
             return Err(Error::Invalid("missing source identity".to_owned()));
         };
         let mut index = StalePageIdentityIndex::default();
-        index.insert_stale(existing(9), identity.clone())?;
-        index.insert_stale(existing(11), identity.clone())?;
+        for stale in [9, 11] {
+            let Some(properties) = source_page_identity(&document, existing(3))? else {
+                return Err(Error::Invalid("missing source identity".to_owned()));
+            };
+            index.insert_stale(existing(stale), properties);
+        }
         // A colliding bucket entry must never be eligible merely because of its hash.
-        let fingerprint = StalePageIdentityIndex::fingerprint(&identity)?;
+        let fingerprint = StalePageIdentityIndex::fingerprint(&identity);
         index.by_fingerprint.entry(fingerprint).or_default().insert(
             0,
             StalePageIdentity {
-                properties: OwnedObject::Dictionary(OwnedDictionary::new()),
+                properties: PageIdentity::new(),
                 stale_pages: vec![existing(10)],
                 live_match: LivePageMatch::Unmatched,
             },
         );
-        index.observe_live(existing(3), &identity)?;
+        index.observe_live(existing(3), &identity);
         assert!(matches!(
             index.by_fingerprint[&fingerprint][0].live_match,
             LivePageMatch::Unmatched
@@ -2543,8 +2540,8 @@ mod tests {
             matches!(index.by_fingerprint[&fingerprint][1].live_match, LivePageMatch::Unique(page) if page == existing(3))
         );
         assert_eq!(index.by_fingerprint[&fingerprint][1].stale_pages.len(), 2);
-        index.observe_live(existing(12), &identity)?;
-        index.observe_live(existing(13), &identity)?;
+        index.observe_live(existing(12), &identity);
+        index.observe_live(existing(13), &identity);
         assert_eq!(
             index.by_fingerprint.get(&fingerprint).map(Vec::len),
             Some(2)
@@ -2554,25 +2551,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_identity_index_redirects_all_equal_stale_pages_only_to_unique_live_match() -> Result<()>
-    {
+    fn stale_identity_index_redirects_all_equal_stale_pages_only_to_unique_live_match() {
         let mut index = StalePageIdentityIndex::default();
-        let identity = OwnedObject::Dictionary(OwnedDictionary::from([(
-            b"Type".to_vec(),
-            OwnedObject::Name(b"Page".to_vec()),
-        )]));
-        let other = OwnedObject::Dictionary(OwnedDictionary::new());
-        index.insert_stale(existing(9), identity.clone())?;
-        index.insert_stale(existing(10), identity.clone())?;
-        index.insert_stale(existing(11), other.clone())?;
-        index.observe_live(existing(3), &identity)?;
-        index.observe_live(existing(4), &other)?;
-        index.observe_live(existing(5), &other)?;
+        let value = OwnedObject::Name(b"Page".to_vec());
+        let identity = || PageIdentity::from([(b"Type".to_vec(), CurrentValue::Owned(&value))]);
+        index.insert_stale(existing(9), identity());
+        index.insert_stale(existing(10), identity());
+        index.insert_stale(existing(11), PageIdentity::new());
+        index.observe_live(existing(3), &identity());
+        index.observe_live(existing(4), &PageIdentity::new());
+        index.observe_live(existing(5), &PageIdentity::new());
         assert_eq!(
             index.into_redirects(),
             BTreeMap::from([(existing(9), existing(3)), (existing(10), existing(3)),])
         );
-        Ok(())
     }
 
     #[test]
