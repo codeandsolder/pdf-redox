@@ -907,13 +907,6 @@ fn microstroke_sample_pitches(
     pitches
 }
 
-fn image_payload(
-    raster: &RasterizedRun,
-    flate_level: crate::FlateLevel,
-) -> Result<BilevelImagePayload> {
-    raster.mask.encode_image_mask(flate_level)
-}
-
 fn compact_real(value: f64) -> String {
     let mut text = format!("{value:.6}");
     while text.contains('.') && text.ends_with('0') {
@@ -1047,35 +1040,45 @@ pub fn rasterize_pathological_microstrokes(
             };
             let name = next_image_name(&mut name_index, &mut occupied);
             let mut chosen: Option<(BilevelImagePayload, Vec<u8>, usize)> = None;
+            let mut local_before = None;
             for sample_pitch in microstroke_sample_pitches(run.state, pitch, user_unit) {
                 // Oversized natural masks must not preclude a valid compact grid.
                 let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch) else {
                     continue;
                 };
-                let payload = image_payload(&raster, flate_level)?;
+                let original_cost = if let Some(cost) = local_before {
+                    cost
+                } else {
+                    let cost = crate::stream_codec::flate_encoded_len(
+                        &decoded[run.start..run.end],
+                        flate_level,
+                    )?;
+                    local_before = Some(cost);
+                    cost
+                };
                 let replacement = replacement_bytes(&name, &run, &raster);
-                let cost = payload
-                    .data
-                    .len()
-                    .saturating_add(replacement.len())
-                    .saturating_add(192);
-                if chosen
-                    .as_ref()
-                    .is_none_or(|(_, _, selected_cost)| cost < *selected_cost)
-                {
-                    chosen = Some((payload, replacement, cost));
-                }
+                let overhead = replacement.len().saturating_add(192);
+                let limit = chosen.as_ref().map_or(original_cost, |(_, _, cost)| *cost);
+                let Some(max_payload) = limit
+                    .checked_sub(overhead)
+                    .and_then(|budget| budget.checked_sub(1))
+                else {
+                    continue;
+                };
+                let Some(payload) = raster
+                    .mask
+                    .encode_image_mask_capped(flate_level, max_payload)?
+                else {
+                    continue;
+                };
+                let cost = payload.data.len().saturating_add(overhead);
+                chosen = Some((payload, replacement, cost));
             }
-            let Some((chosen_payload, chosen_replacement, chosen_cost)) = chosen else {
+            let (Some((chosen_payload, chosen_replacement, chosen_cost)), Some(local_before)) =
+                (chosen, local_before)
+            else {
                 continue;
             };
-            let local_before =
-                crate::stream_codec::flate_encoded_len(&decoded[run.start..run.end], flate_level)?;
-            if chosen_cost >= local_before {
-                // More paints have no value if the available raster encoding
-                // already costs more than the original repeated vector run.
-                continue;
-            }
             candidates.push(Candidate {
                 start: run.start,
                 end: run.end,
@@ -1116,10 +1119,13 @@ pub fn rasterize_pathological_microstrokes(
                 .iter()
                 .map(|candidate| candidate.data.len().saturating_add(192))
                 .sum::<usize>();
-            let after = crate::stream_codec::flate_encoded_len(&rewritten, flate_level)?
-                .saturating_add(image_cost);
-            if after < before {
-                break Some((rewritten, after));
+            if let Some(budget) = before
+                .checked_sub(image_cost)
+                .and_then(|remaining| remaining.checked_sub(1))
+                && let Some(length) =
+                    crate::stream_codec::flate_capped_encoded_len(&rewritten, budget, flate_level)?
+            {
+                break Some((rewritten, length + image_cost));
             }
             // Whole-page Flate has contextual effects not reflected in each
             // isolated run estimate. If the full rewrite grows the PDF, drop
@@ -1135,23 +1141,6 @@ pub fn rasterize_pathological_microstrokes(
         }) else {
             continue;
         };
-
-        let mut installed = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-                dictionary: candidate.dictionary.clone(),
-                data: StreamData::Owned(candidate.data.clone().into()),
-            }));
-            installed.push((candidate.name.clone(), handle));
-        }
-        replace_page_content(document, page, rewritten)?;
-        install_page_resource_bindings(
-            document,
-            b"XObject",
-            installed
-                .iter()
-                .map(|(name, handle)| (page, name.as_slice(), *handle)),
-        )?;
 
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.runs_rasterized = stats.runs_rasterized.saturating_add(candidates.len());
@@ -1182,6 +1171,23 @@ pub fn rasterize_pathological_microstrokes(
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
             .saturating_add(before.saturating_sub(after));
+
+        let mut installed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+                dictionary: candidate.dictionary,
+                data: StreamData::Owned(candidate.data.into()),
+            }));
+            installed.push((candidate.name, handle));
+        }
+        replace_page_content(document, page, rewritten)?;
+        install_page_resource_bindings(
+            document,
+            b"XObject",
+            installed
+                .iter()
+                .map(|(name, handle)| (page, name.as_slice(), *handle)),
+        )?;
     }
     Ok(stats)
 }

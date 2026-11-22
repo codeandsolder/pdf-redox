@@ -156,12 +156,29 @@ impl BilevelRaster {
         &self,
         flate_level: crate::FlateLevel,
     ) -> Result<BilevelImagePayload> {
-        let encoded = self.encode(flate_level)?;
-        Ok(BilevelImagePayload {
+        self.encode_image_mask_capped(flate_level, usize::MAX)?
+            .ok_or_else(|| {
+                crate::Error::Compression("unbounded stencil encoding exceeded budget".into())
+            })
+    }
+
+    pub(crate) fn encode_image_mask_capped(
+        &self,
+        flate_level: crate::FlateLevel,
+        max_payload: usize,
+    ) -> Result<Option<BilevelImagePayload>> {
+        Ok(encode_best_bilevel_data_capped(
+            &self.packed,
+            self.width,
+            self.height,
+            flate_level,
+            max_payload,
+        )?
+        .map(|encoded| BilevelImagePayload {
             dictionary: image_mask_dictionary(self.width, self.height, encoded.codec),
             codec: encoded.codec,
             data: encoded.data,
-        })
+        }))
     }
 }
 
@@ -273,19 +290,42 @@ pub fn encode_best_bilevel_data(
     height: u32,
     flate_level: crate::FlateLevel,
 ) -> Result<BilevelEncodedData> {
-    let flate = crate::stream_codec::encode_flate(packed, flate_level)?;
-    // Preserve the extra dictionary cost and strict tie-break for Flate.
-    let budget = flate.len().saturating_sub(CCITT_EXTRA_DICTIONARY_BYTES + 1);
-    Ok(encode_ccitt_group4(packed, width, height, budget)?.map_or(
-        BilevelEncodedData {
-            data: flate,
-            codec: BilevelCodec::Flate,
-        },
-        |data| BilevelEncodedData {
+    encode_best_bilevel_data_capped(packed, width, height, flate_level, usize::MAX)?.ok_or_else(
+        || crate::Error::Compression("unbounded bilevel encoding exceeded budget".into()),
+    )
+}
+
+/// Preserve the selected codec and its strict dictionary-cost preference,
+/// then reject if the selected payload would exceed the caller's raw-byte cap.
+/// A Flate result larger than the cap plus the CCITT dictionary surcharge
+/// cannot beat any admissible CCITT payload; its exact length is unnecessary.
+fn encode_best_bilevel_data_capped(
+    packed: &[u8],
+    width: u32,
+    height: u32,
+    flate_level: crate::FlateLevel,
+    max_payload: usize,
+) -> Result<Option<BilevelEncodedData>> {
+    let flate = crate::stream_codec::encode_flate_capped(
+        packed,
+        max_payload.saturating_add(CCITT_EXTRA_DICTIONARY_BYTES),
+        flate_level,
+    )?;
+    let ccitt_budget = flate.as_ref().map_or(max_payload, |bytes| {
+        max_payload.min(bytes.len().saturating_sub(CCITT_EXTRA_DICTIONARY_BYTES + 1))
+    });
+    if let Some(data) = encode_ccitt_group4(packed, width, height, ccitt_budget)? {
+        return Ok(Some(BilevelEncodedData {
             data,
             codec: BilevelCodec::CcittGroup4,
-        },
-    ))
+        }));
+    }
+    Ok(flate
+        .filter(|bytes| bytes.len() <= max_payload)
+        .map(|data| BilevelEncodedData {
+            data,
+            codec: BilevelCodec::Flate,
+        }))
 }
 
 #[cfg(test)]
@@ -463,6 +503,28 @@ mod tests {
                 } else {
                     assert_eq!(best.codec, BilevelCodec::Flate);
                     assert_eq!(best.data, flate);
+                }
+                for cap in [
+                    0,
+                    best.data.len() - 1,
+                    best.data.len(),
+                    best.data.len() + 1,
+                    flate.len().saturating_sub(CCITT_EXTRA_DICTIONARY_BYTES),
+                    flate.len(),
+                    usize::MAX,
+                ] {
+                    let bounded = encode_best_bilevel_data_capped(
+                        &packed,
+                        width,
+                        height,
+                        crate::FlateLevel::SIZE,
+                        cap,
+                    )?;
+                    assert_eq!(bounded.is_some(), best.data.len() <= cap);
+                    if let Some(bounded) = bounded {
+                        assert_eq!(bounded.codec, best.codec);
+                        assert_eq!(bounded.data, best.data);
+                    }
                 }
             }
         }
