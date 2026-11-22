@@ -7699,8 +7699,12 @@ mod tests {
                         reference.mark_other_paint();
                         reference.barrier();
                     } else {
-                        reference.operands =
-                            crate::content_stream::instruction_operands(instruction);
+                        let mut operands = Vec::new();
+                        crate::content_stream::instruction_operands_into(
+                            instruction,
+                            &mut operands,
+                        );
+                        reference.operands = operands;
                         let span = instruction.operator_span();
                         reference.operator(&instruction.operator[..], span.start, span.len());
                         reference.operands.clear();

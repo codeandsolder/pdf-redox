@@ -12,7 +12,7 @@ use crate::{
         form_content, form_resources, page_box_numbers_matching, resolved_dictionary,
         resolved_finite_number_array, resolved_name, resolved_number,
     },
-    content_stream::{instruction_operands, operand_numbers},
+    content_stream::{instruction_number_array, operand_name, operand_number},
     geometry::{Matrix, Rect},
     report::{DocumentRepresentation, PageRepresentation},
 };
@@ -188,19 +188,8 @@ impl<'a> PageClassifier<'a> {
 
     fn scan_content(&mut self, content: &[u8], resources: &OwnedDictionary) -> Result<bool> {
         crate::content_stream::visit_instructions(content, |instruction| {
-            let operator = &instruction.operator[..];
-            let operands = instruction_operands(instruction);
-            self.observe_operator(operator, &operands, resources)
+            self.observe_instruction(instruction, resources)
         })
-    }
-
-    pub fn observe_operator(
-        &mut self,
-        operator: &[u8],
-        operands: &[crate::content_stream::InstructionOperand],
-        resources: &OwnedDictionary,
-    ) -> Result<()> {
-        self.operator(operator, operands, resources)
     }
 
     pub fn finish(mut self, parse_incomplete: bool) -> PageObservation {
@@ -217,13 +206,13 @@ impl<'a> PageClassifier<'a> {
         }
     }
 
-    fn operator(
+    pub fn observe_instruction(
         &mut self,
-        operator: &[u8],
-        operands: &[crate::content_stream::InstructionOperand],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
         resources: &OwnedDictionary,
     ) -> Result<()> {
-        if self.handle_path_operator(operator, operands) {
+        let operator = &instruction.operator[..];
+        if self.handle_path_operator(instruction) {
             return Ok(());
         }
         match operator {
@@ -236,19 +225,15 @@ impl<'a> PageClassifier<'a> {
                 }
             }
             b"cm" => {
-                if operands.len() != 6 {
-                    self.facts.complete = false;
-                } else if let Some(values) = operand_numbers(operands) {
-                    self.state.ctm.concat(Matrix::new(
-                        values[0], values[1], values[2], values[3], values[4], values[5],
-                    ));
+                if let Some([a, b, c, d, e, f]) = instruction_number_array::<6>(instruction) {
+                    self.state.ctm.concat(Matrix::new(a, b, c, d, e, f));
                 } else {
                     self.facts.complete = false;
                 }
             }
-            b"gs" => self.apply_ext_gstate(operands, resources)?,
+            b"gs" => self.apply_ext_gstate(instruction, resources)?,
             b"Tr" => {
-                let Some(value) = operands.first().and_then(|operand| operand.number) else {
+                let Some(value) = instruction.operands().next().and_then(operand_number) else {
                     self.facts.complete = false;
                     return Ok(());
                 };
@@ -269,7 +254,7 @@ impl<'a> PageClassifier<'a> {
                     };
                 }
             }
-            b"Do" => self.paint_xobject(operands, resources)?,
+            b"Do" => self.paint_xobject(instruction, resources)?,
             b"BI" => {
                 // Hayro deliberately treats the entire inline image as one
                 // instruction. Until its dictionary/extent is surfaced here,
@@ -309,11 +294,10 @@ impl<'a> PageClassifier<'a> {
 
     fn handle_path_operator(
         &mut self,
-        operator: &[u8],
-        operands: &[crate::content_stream::InstructionOperand],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
     ) -> bool {
-        match operator {
-            b"re" => self.append_rect_path(operands),
+        match &instruction.operator[..] {
+            b"re" => self.append_rect_path(instruction),
             b"m" | b"l" | b"c" | b"v" | b"y" => {
                 self.path_reliable = false;
                 self.path_rect = None;
@@ -361,17 +345,18 @@ impl<'a> PageClassifier<'a> {
         true
     }
 
-    fn append_rect_path(&mut self, operands: &[crate::content_stream::InstructionOperand]) {
-        if !self.path_reliable || self.path_rect.is_some() || operands.len() != 4 {
+    fn append_rect_path(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        if !self.path_reliable || self.path_rect.is_some() {
             self.path_reliable = false;
             self.path_rect = None;
             return;
         }
-        let Some(values) = operand_numbers(operands) else {
+        let Some([x, y, width, height]) = instruction_number_array::<4>(instruction) else {
             self.path_reliable = false;
+            self.path_rect = None;
             return;
         };
-        let Some(rect) = Rect::from_xywh(values[0], values[1], values[2], values[3]) else {
+        let Some(rect) = Rect::from_xywh(x, y, width, height) else {
             self.path_reliable = false;
             return;
         };
@@ -427,10 +412,10 @@ impl<'a> PageClassifier<'a> {
 
     fn apply_ext_gstate(
         &mut self,
-        operands: &[crate::content_stream::InstructionOperand],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
         resources: &OwnedDictionary,
     ) -> Result<()> {
-        let Some(name) = one_name_operand(operands) else {
+        let Some(name) = one_name_operand(instruction) else {
             self.facts.complete = false;
             return Ok(());
         };
@@ -441,7 +426,7 @@ impl<'a> PageClassifier<'a> {
             &mut self.resource_dictionaries,
             resources.get(b"ExtGState".as_slice()),
         )?
-        .and_then(|states| states.get(name.as_slice()))
+        .and_then(|states| states.get(name))
         .cloned();
         let Some(dictionary) = cached_resource_dictionary(
             self.document,
@@ -475,10 +460,10 @@ impl<'a> PageClassifier<'a> {
 
     fn paint_xobject(
         &mut self,
-        operands: &[crate::content_stream::InstructionOperand],
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
         resources: &OwnedDictionary,
     ) -> Result<()> {
-        let Some(name) = one_name_operand(operands) else {
+        let Some(name) = one_name_operand(instruction) else {
             self.facts.mark_unknown("xobject-resolution");
             self.facts.complete = false;
             return Ok(());
@@ -488,7 +473,7 @@ impl<'a> PageClassifier<'a> {
             &mut self.resource_dictionaries,
             resources.get(b"XObject".as_slice()),
         )?
-        .and_then(|objects| objects.get(name.as_slice()))
+        .and_then(|objects| objects.get(name))
         .and_then(|value| match value {
             OwnedObject::Reference(handle) => Some(*handle),
             _ => None,
@@ -663,11 +648,14 @@ impl<'a> PageClassifier<'a> {
     }
 }
 
-fn one_name_operand(operands: &[crate::content_stream::InstructionOperand]) -> Option<Vec<u8>> {
+fn one_name_operand<'a>(
+    instruction: &'a hayro_syntax::content::Instruction<'_, '_>,
+) -> Option<&'a [u8]> {
+    let mut operands = instruction.operands();
     if operands.len() != 1 {
         return None;
     }
-    operands[0].name.clone()
+    operands.next().and_then(operand_name)
 }
 
 fn resolved_name_is_image(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<bool> {
