@@ -2245,7 +2245,7 @@ mod tests {
                 ),
                 (b"Unchanged".to_vec(), OwnedObject::String(vec![1; 4096])),
             ]),
-            data: crate::StreamData::Owned(payload),
+            data: crate::StreamData::Owned(payload.into()),
         }));
         let Some(catalog) = document.edit_handle(existing(1))?.as_dictionary_mut() else {
             return Err(Error::Invalid("missing fixture catalog".to_owned()));

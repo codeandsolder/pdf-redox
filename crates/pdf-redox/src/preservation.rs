@@ -637,7 +637,7 @@ fn ensure_indirect_owned(document: &mut EditDocument, object: OwnedObject) -> Co
 fn new_content_stream(document: &mut EditDocument, data: Vec<u8>) -> CowObjectHandle {
     CowObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
-        data: StreamData::Owned(data),
+        data: StreamData::Owned(data.into()),
     }))
 }
 

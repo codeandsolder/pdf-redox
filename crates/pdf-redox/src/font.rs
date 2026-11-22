@@ -1918,7 +1918,7 @@ fn replace_current_stream_data(
             if plain_flate {
                 set_plain_flate(dictionary);
             }
-            *data = StreamData::Owned(encoded);
+            *data = StreamData::Owned(encoded.into());
             Ok(())
         }
         _ => Err(Error::Invalid(
@@ -2793,7 +2793,7 @@ mod tests {
             let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? else {
                 return Err(Error::Invalid("expected a font fixture stream".into()));
             };
-            *data = StreamData::Owned(bytes);
+            *data = StreamData::Owned(bytes.into());
             let Some(std::borrow::Cow::Borrowed(OwnedObject::Stream {
                 data: StreamData::Owned(borrowed),
                 ..

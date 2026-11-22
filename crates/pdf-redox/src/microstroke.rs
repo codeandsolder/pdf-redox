@@ -1140,7 +1140,7 @@ pub fn rasterize_pathological_microstrokes(
         for candidate in &candidates {
             let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: candidate.dictionary.clone(),
-                data: StreamData::Owned(candidate.data.clone()),
+                data: StreamData::Owned(candidate.data.clone().into()),
             }));
             installed.push((candidate.name.clone(), handle));
         }

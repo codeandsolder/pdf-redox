@@ -1541,7 +1541,7 @@ struct PathOccurrence {
 #[derive(Debug)]
 struct PagePathData {
     page: ObjectHandle,
-    decoded: Vec<u8>,
+    decoded: std::sync::Arc<Vec<u8>>,
 }
 
 // Semantic grouping needs only the first occurrence's source offset until a
@@ -1927,7 +1927,7 @@ fn factor_repeated_path_forms(
     for (bytes, _, bounds, _) in &selected {
         let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: path_form_dictionary(*bounds),
-            data: StreamData::Owned(bytes.clone()),
+            data: StreamData::Owned(bytes.clone().into()),
         }));
         form_handles.push(handle);
     }
@@ -1936,7 +1936,7 @@ fn factor_repeated_path_forms(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        if rewritten != page.decoded {
+        if rewritten.as_slice() != page.decoded.as_slice() {
             replace_page_content(document, page.page, rewritten)?;
             rewritten_page_handles.insert(page.page);
         }
@@ -2145,7 +2145,7 @@ fn factor_repeated_transformed_blocks(
     for (bytes, _, bounds, _, _) in &selected {
         let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: path_form_dictionary(*bounds),
-            data: StreamData::Owned(bytes.clone()),
+            data: StreamData::Owned(bytes.clone().into()),
         }));
         form_handles.push(handle);
     }
@@ -2153,7 +2153,7 @@ fn factor_repeated_transformed_blocks(
         let Some(page) = page_data.get(page_index) else {
             continue;
         };
-        if rewritten != page.decoded {
+        if rewritten.as_slice() != page.decoded.as_slice() {
             replace_page_content(document, page.page, rewritten)?;
         }
     }
@@ -2538,7 +2538,7 @@ const fn same_rect(left: Rect, right: Rect) -> bool {
 
 struct SharedPageData {
     page: ObjectHandle,
-    decoded: Vec<u8>,
+    decoded: std::sync::Arc<Vec<u8>>,
     blocks: Vec<SharedQBlock>,
     bounds: Rect,
 }
@@ -2874,7 +2874,7 @@ fn factor_shared_q_prefix_runs(
         form_handles.push(ObjectHandle::New(document.add_object(
             OwnedObject::Stream {
                 dictionary: shared_form_dictionary(run.candidate.bounds, &run.resources),
-                data: StreamData::Owned(run.body.clone()),
+                data: StreamData::Owned(run.body.clone().into()),
             },
         )));
     }
@@ -3254,8 +3254,7 @@ fn canonicalize_page_path_coordinates(
             continue;
         };
         let contents_handle = contents.reference();
-        let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
+        let decoded = decoded_content_value(document, contents)?;
         let candidate = match cached {
             Some(Some(plan)) => Some((plan.canonicalized, plan.coordinates_canonicalized)),
             Some(None) => None,
@@ -3326,7 +3325,7 @@ fn compact_processing_fill_tail(
         let resources = effective_page_resources(document, page)?;
         let ext_gstates = ext_gstate_patches(document, &resources)?;
         let (compacted, stats) = compact_content_with_ext_gstates(&decoded, &ext_gstates);
-        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded {
+        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded.as_slice() {
             continue;
         }
         let before_flate = flate_lengths.encoded_len(&decoded, flate_level)?;
@@ -3599,7 +3598,7 @@ pub fn compact_vector_paths_with_flate_cache(
                 None,
             )
         };
-        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded {
+        if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded.as_slice() {
             if let Some(factor_cache) = factor_cache {
                 pre_scanned_processing.insert(page, factor_cache);
             }
@@ -3683,11 +3682,11 @@ mod tests {
         let pages = vec![
             PagePathData {
                 page: ObjectHandle::Existing(ObjectId::new(3, 0)),
-                decoded: b"prefix 0 0 10 10 re f suffix".to_vec(),
+                decoded: b"prefix 0 0 10 10 re f suffix".to_vec().into(),
             },
             PagePathData {
                 page: ObjectHandle::Existing(ObjectId::new(4, 0)),
-                decoded: b"prefix 0 0 10 10 re f suffix".to_vec(),
+                decoded: b"prefix 0 0 10 10 re f suffix".to_vec().into(),
             },
         ];
         let occurrence = |page_index, start, end| PathOccurrence {
@@ -4485,7 +4484,7 @@ mod tests {
         let second = b"q 0 0 m 2 2 l S Q";
         let make_page = |number, input: &[u8]| SharedPageData {
             page: ObjectHandle::Existing(ObjectId::new(number, 0)),
-            decoded: input.to_vec(),
+            decoded: input.to_vec().into(),
             blocks: factorable_shared_q_blocks(input, &targets),
             bounds: Rect {
                 x0: 0.0,
@@ -4523,7 +4522,7 @@ mod tests {
         let pages = [1, 2].map(|number| SharedPageData {
             page: ObjectHandle::Existing(ObjectId::new(number, 0)),
             blocks: factorable_shared_q_blocks(&input, &targets),
-            decoded: input.clone(),
+            decoded: input.clone().into(),
             bounds,
         });
         assert_eq!(pages[0].blocks.len(), 20_000);

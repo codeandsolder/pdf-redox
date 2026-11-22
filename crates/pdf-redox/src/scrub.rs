@@ -643,7 +643,7 @@ fn scrub_jpeg_metadata(
         };
         let object = document.edit_handle(handle)?;
         if let OwnedObject::Stream { data, .. } = object {
-            *data = StreamData::Owned(clean);
+            *data = StreamData::Owned(clean.into());
             stats.bump("jpeg-metadata-stream");
             stats.jpeg_metadata_bytes_removed += removed;
         }

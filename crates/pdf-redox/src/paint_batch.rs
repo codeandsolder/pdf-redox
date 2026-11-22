@@ -1155,7 +1155,7 @@ fn compact_collinear_form_paths(
             continue;
         };
         crate::stream_codec::set_plain_flate(dictionary);
-        *data = StreamData::Owned(candidate.encoded);
+        *data = StreamData::Owned(candidate.encoded.into());
         stats.forms_rewritten = stats.forms_rewritten.saturating_add(1);
         stats.vertices_removed = stats
             .vertices_removed
@@ -1880,7 +1880,7 @@ fn stroke_form_replacement(
 #[derive(Debug, Clone)]
 struct StrokeFormPageData {
     page: ObjectHandle,
-    decoded: Vec<u8>,
+    decoded: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2048,7 +2048,7 @@ pub fn factor_repeated_stroke_forms(
         };
         let form = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary,
-            data: StreamData::Owned(plan.body.clone()),
+            data: StreamData::Owned(plan.body.clone().into()),
         }));
         bindings.extend(
             plan.occurrences
@@ -2210,7 +2210,7 @@ fn outlined_glyph_font_dictionary(
         let glyph_name = format!("G{code}").into_bytes();
         let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: OwnedDictionary::new(),
-            data: StreamData::Owned(shape.charproc.clone()),
+            data: StreamData::Owned(shape.charproc.clone().into()),
         }));
         charprocs.insert(glyph_name.clone(), OwnedObject::Reference(stream));
         differences.push(OwnedObject::Name(glyph_name));
@@ -2746,11 +2746,9 @@ mod tests {
         let Some(contents) = dictionary.get(b"Contents".as_slice()) else {
             return Err(crate::Error::Invalid("test page lost Contents".to_owned()));
         };
-        let mut decoded = Vec::new();
-        crate::content::decoded_content_value(
+        let decoded = crate::content::decoded_content_value(
             &document,
             crate::source::CurrentValue::Owned(contents),
-            &mut decoded,
         )?;
         assert!(!decoded.contains(&b'%'));
         assert_eq!(operator_count(&decoded, b"l"), 4000);

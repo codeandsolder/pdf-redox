@@ -517,7 +517,7 @@ fn install_indexed_form_wrapper(
                 )])),
             ),
         ]),
-        data: StreamData::Owned(content),
+        data: StreamData::Owned(content.into()),
     };
     Ok(())
 }
@@ -553,7 +553,7 @@ fn install_local_layered_indexed_transform(
                     OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
                 ),
             ]),
-            data: StreamData::Owned(layer.encoded),
+            data: StreamData::Owned(layer.encoded.into()),
         }));
         resources.insert(name.clone(), OwnedObject::Reference(child));
         content.push(b'/');
@@ -592,7 +592,7 @@ fn install_residual_indexed_transform(
                 OwnedObject::Name(b"FlateDecode".to_vec()),
             ),
         ]),
-        data: StreamData::Owned(transform.base_encoded),
+        data: StreamData::Owned(transform.base_encoded.into()),
     }));
     let residual = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::from([
@@ -611,7 +611,7 @@ fn install_residual_indexed_transform(
                 OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
             ),
         ]),
-        data: StreamData::Owned(transform.residual_encoded),
+        data: StreamData::Owned(transform.residual_encoded.into()),
     }));
     let resources = OwnedDictionary::from([
         (base_name.clone(), OwnedObject::Reference(base)),
@@ -683,7 +683,7 @@ fn install_transform(
     }
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
-    *data = StreamData::Owned(transform.encoded);
+    *data = StreamData::Owned(transform.encoded.into());
     Ok(())
 }
 
@@ -1682,7 +1682,7 @@ mod tests {
             };
             let raw = overlay.source().stream_data(id)?.into_owned();
             if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
-                *data = StreamData::Owned(raw);
+                *data = StreamData::Owned(raw.into());
             }
             assert_image_overlay_borrowed(&overlay, handle)?;
             assert_eq!(
@@ -2124,7 +2124,7 @@ mod tests {
             ));
         };
         assert_eq!(
-            content,
+            content.as_slice(),
             b"/PdfRedoxResidualBase Do\n/PdfRedoxResidualCorrection Do\n"
         );
         let Some(OwnedObject::Dictionary(resources)) = dictionary.get(b"Resources".as_slice())

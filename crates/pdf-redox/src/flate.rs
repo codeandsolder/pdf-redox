@@ -224,7 +224,7 @@ fn collect_unfiltered_candidate(
                 dictionary.remove(b"Filter".as_slice());
                 dictionary.remove(b"DecodeParms".as_slice());
                 dictionary.remove(b"Length".as_slice());
-                *data = crate::StreamData::Owned(Vec::new());
+                *data = crate::StreamData::Owned(Vec::new().into());
             }
         }
         return Ok(None);
@@ -434,7 +434,7 @@ fn flush_filtered_batch(
         let object = document.edit_handle(candidate.handle)?;
         if let crate::OwnedObject::Stream { dictionary, data } = object {
             set_plain_flate(dictionary);
-            *data = crate::StreamData::Owned(encoded.bytes);
+            *data = crate::StreamData::Owned(encoded.bytes.into());
             stats.streams_selected = stats.streams_selected.saturating_add(1);
             stats.estimated_savings_bytes = stats.estimated_savings_bytes.saturating_add(saving);
         }
@@ -545,7 +545,7 @@ fn flush_unfiltered_batch(
             );
             dictionary.remove(b"DecodeParms".as_slice());
             dictionary.remove(b"Length".as_slice());
-            *data = crate::StreamData::Owned(encoded.bytes);
+            *data = crate::StreamData::Owned(encoded.bytes.into());
             stats.streams_selected = stats.streams_selected.saturating_add(1);
             stats.estimated_savings_bytes = stats
                 .estimated_savings_bytes
@@ -644,7 +644,7 @@ mod tests {
         }
         let handle = crate::ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary,
-            data: StreamData::Owned(data.to_vec()),
+            data: StreamData::Owned(data.to_vec().into()),
         }));
         let page = document.edit_object(crate::ObjectId::new(3, 0))?;
         let page = page
@@ -774,7 +774,7 @@ mod tests {
                         _ => return Err(crate::Error::Invalid("missing source data".into())),
                     };
                     if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
-                        *data = StreamData::Owned(raw);
+                        *data = StreamData::Owned(raw.into());
                     }
                 }
 
@@ -1202,7 +1202,7 @@ mod tests {
             };
             let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary,
-                data: StreamData::Owned(data),
+                data: StreamData::Owned(data.into()),
             }));
             handles.push(handle);
             decoded_payloads.push(decoded);
@@ -1376,7 +1376,7 @@ mod tests {
         }
         let stream = OwnedObject::Stream {
             dictionary,
-            data: StreamData::Owned(encoded.to_vec()),
+            data: StreamData::Owned(encoded.to_vec().into()),
         };
         let handle = ObjectHandle::New(document.add_object(stream));
         let page = document.edit_object(crate::ObjectId::new(3, 0))?;

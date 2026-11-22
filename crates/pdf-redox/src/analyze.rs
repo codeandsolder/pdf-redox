@@ -2012,7 +2012,7 @@ mod tests {
         )]));
         let content_object = OwnedObject::Stream {
             dictionary: BTreeMap::from([(b"Length".to_vec(), OwnedObject::Reference(metadata))]),
-            data: crate::StreamData::Owned(vec![0_u8; 1024]),
+            data: crate::StreamData::Owned(vec![0_u8; 1024].into()),
         };
         let objects = [
             (page, &page_object),

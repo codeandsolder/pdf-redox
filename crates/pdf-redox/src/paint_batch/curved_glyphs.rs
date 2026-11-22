@@ -587,7 +587,7 @@ const MIN_OCR_USEFUL_OCCURRENCES: usize = 64;
 struct PageContents {
     page: ObjectHandle,
     page_number: usize,
-    decoded: Vec<u8>,
+    decoded: std::sync::Arc<Vec<u8>>,
 }
 
 struct CurvedPlan {
@@ -1370,11 +1370,9 @@ mod tests {
             .ok_or_else(|| crate::Error::Invalid("dictionary".to_owned()))?
             .get(b"Contents".as_slice())
             .ok_or_else(|| crate::Error::Invalid("contents".to_owned()))?;
-        let mut rendered = Vec::new();
-        crate::content::decoded_content_value(
+        let rendered = crate::content::decoded_content_value(
             &doc,
             crate::source::CurrentValue::Owned(contents),
-            &mut rendered,
         )?;
         assert!(rendered.windows(b" Tj ET".len()).any(|w| w == b" Tj ET"));
         assert!(!rendered.windows(b" 1.5 ".len()).any(|w| w == b" 1.5 "));

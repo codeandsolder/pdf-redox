@@ -334,12 +334,7 @@ pub fn apply_glyph_labels(
         let Some(contents) = dict.get(b"Contents".as_slice()) else {
             continue;
         };
-        let mut decoded = Vec::new();
-        decoded_content_value(
-            &doc,
-            crate::source::CurrentValue::Owned(contents),
-            &mut decoded,
-        )?;
+        let decoded = decoded_content_value(&doc, crate::source::CurrentValue::Owned(contents))?;
         if let Some(rewritten) =
             amend_page(&decoded, page_index + 1, &context, &mut seen, &mut report)?
         {

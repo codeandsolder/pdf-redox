@@ -2,7 +2,10 @@ use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     source::{CurrentValue, PageBoxCoordinates, into_owned_dictionary},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Debug, Default)]
 pub struct PageRewriteResult<S> {
@@ -16,8 +19,7 @@ pub struct PageRewriteResult<S> {
 pub fn decoded_content_value(
     document: &EditDocument,
     value: CurrentValue<'_>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<Arc<Vec<u8>>> {
     enum Task<'a> {
         Visit(CurrentValue<'a>),
         Array(crate::source::CurrentArrayIter<'a>),
@@ -28,6 +30,7 @@ pub fn decoded_content_value(
     let mut pending = smallvec::SmallVec::<[Task<'_>; 4]>::new();
     pending.push(Task::Visit(value));
     let mut active_references = BTreeSet::new();
+    let mut out: Option<Arc<Vec<u8>>> = None;
     while let Some(task) = pending.pop() {
         let value = match task {
             Task::Visit(value) => value,
@@ -50,11 +53,8 @@ pub fn decoded_content_value(
                 ));
             }
             match document.content_read(handle)? {
-                Some(crate::source::ContentRead::Decoded(decoded)) => {
-                    append_decoded_content(out, &decoded);
-                }
-                Some(crate::source::ContentRead::Cached(decoded)) => {
-                    append_decoded_content(out, &decoded);
+                Some(crate::source::ContentRead::Bytes(decoded)) => {
+                    append_decoded_content(&mut out, decoded);
                 }
                 Some(crate::source::ContentRead::Other(resolved)) => {
                     active_references.insert(handle);
@@ -66,18 +66,31 @@ pub fn decoded_content_value(
         } else if let Some(items) = value.array_items() {
             pending.push(Task::Array(items));
         } else if value.is_stream() {
-            let decoded = document.decoded_stream_value(&value)?;
-            append_decoded_content(out, &decoded);
+            let decoded = document.content_snapshot(&value)?;
+            append_decoded_content(&mut out, decoded);
         }
     }
-    Ok(())
+    Ok(out.unwrap_or_default())
 }
 
-fn append_decoded_content(out: &mut Vec<u8>, decoded: &[u8]) {
-    if !out.is_empty() && out.last() != Some(&b'\n') {
-        out.push(b'\n');
+fn append_decoded_content(out: &mut Option<Arc<Vec<u8>>>, decoded: Arc<Vec<u8>>) {
+    let Some(previous) = out else {
+        *out = Some(decoded);
+        return;
+    };
+    if previous.is_empty() {
+        *previous = decoded;
+        return;
     }
-    out.extend_from_slice(decoded);
+    let separator = previous.last() != Some(&b'\n');
+    if !separator && decoded.is_empty() {
+        return;
+    }
+    let output = Arc::make_mut(previous);
+    if separator {
+        output.push(b'\n');
+    }
+    output.extend_from_slice(&decoded);
 }
 
 pub fn resolved_number_value(
@@ -197,23 +210,21 @@ pub fn resolved_dictionary(
 pub fn page_content_if_present(
     document: &EditDocument,
     page: ObjectHandle,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Arc<Vec<u8>>>> {
     let Some(page) = document.current_value(page)? else {
         return Ok(None);
     };
     let Some(contents) = page.dictionary_entry(b"Contents") else {
         return Ok(None);
     };
-    let mut decoded = Vec::new();
-    decoded_content_value(document, contents, &mut decoded)?;
-    Ok(Some(decoded))
+    Ok(Some(decoded_content_value(document, contents)?))
 }
 
-pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Vec<u8>> {
+pub fn page_content(document: &EditDocument, page: ObjectHandle) -> Result<Arc<Vec<u8>>> {
     Ok(page_content_if_present(document, page)?.unwrap_or_default())
 }
 
-pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Vec<u8>> {
+pub fn form_content(document: &EditDocument, form: ObjectHandle) -> Result<Arc<Vec<u8>>> {
     document.decoded_content_stream_data(form)
 }
 
@@ -427,7 +438,7 @@ pub fn replace_page_content_with_handle(
 ) -> Result<ObjectHandle> {
     let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: OwnedDictionary::new(),
-        data: StreamData::Owned(bytes),
+        data: StreamData::Owned(bytes.into()),
     }));
     let object = document.edit_handle(page)?;
     if let Some(dictionary) = object.as_dictionary_mut() {
@@ -460,7 +471,7 @@ pub fn replace_page_content_flate(
     );
     let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary,
-        data: StreamData::Owned(encoded),
+        data: StreamData::Owned(encoded.into()),
     }));
     let object = document.edit_handle(page)?;
     if let Some(dict) = object.as_dictionary_mut() {
@@ -588,12 +599,11 @@ mod tests {
             OwnedObject::Reference(ObjectHandle::New(second_alias)),
             OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
-                data: StreamData::Owned(b"BT ET".to_vec()),
+                data: StreamData::Owned(b"BT ET".to_vec().into()),
             },
         ]);
-        let mut decoded = Vec::new();
-        decoded_content_value(&document, CurrentValue::Owned(&contents), &mut decoded)?;
-        assert_eq!(decoded, b"q Q\nq Q\nq Q\nBT ET");
+        let decoded = decoded_content_value(&document, CurrentValue::Owned(&contents))?;
+        assert_eq!(decoded.as_slice(), b"q Q\nq Q\nq Q\nBT ET");
         Ok(())
     }
 
@@ -626,14 +636,16 @@ mod tests {
             document.content_read(existing(5))?,
             Some(ContentRead::Other(CurrentValue::Source(..)))
         ));
-        assert_eq!(page_content(&document, page)?, expected);
-        assert!(matches!(
-            document.content_read(existing(4))?,
-            Some(ContentRead::Cached(_))
+        assert_eq!(page_content(&document, page)?.as_slice(), expected);
+        let direct = document.decoded_content_stream_data(existing(4))?;
+        assert!(Arc::ptr_eq(
+            &direct,
+            &document.decoded_content_stream_data(existing(4))?
         ));
-        assert!(matches!(
-            document.content_read(existing(7))?,
-            Some(ContentRead::Decoded(_))
+        let indirect = document.decoded_content_stream_data(existing(7))?;
+        assert!(!Arc::ptr_eq(
+            &indirect,
+            &document.decoded_content_stream_data(existing(7))?
         ));
         assert!(document.overlay().is_empty());
 
@@ -644,10 +656,10 @@ mod tests {
             document.content_read(existing(5))?,
             Some(ContentRead::Other(CurrentValue::Owned(_)))
         ));
-        assert_eq!(page_content(&document, page)?, expected);
+        assert_eq!(page_content(&document, page)?.as_slice(), expected);
         *document.edit_handle(existing(8))? = OwnedObject::Stream {
             dictionary: OwnedDictionary::new(),
-            data: StreamData::Owned(Vec::new()),
+            data: StreamData::Owned(Vec::new().into()),
         };
         assert!(matches!(
             page_content(&document, page),
@@ -665,9 +677,8 @@ mod tests {
         pdf.object(4, b"[5 0 R]")?;
         pdf.object(5, b"[4 0 R]")?;
         let document = EditDocument::from_bytes(pdf.finish(1)?)?;
-        let mut decoded = Vec::new();
         assert!(matches!(
-            decoded_content_value(&document, CurrentValue::Owned(&content_reference(4)), &mut decoded),
+            decoded_content_value(&document, CurrentValue::Owned(&content_reference(4))),
             Err(crate::Error::Invalid(message)) if message.contains("cyclic indirect reference")
         ));
         Ok(())
@@ -682,14 +693,48 @@ mod tests {
         let document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let mut content = OwnedObject::Stream {
             dictionary: OwnedDictionary::new(),
-            data: StreamData::Owned(b"q Q".to_vec()),
+            data: StreamData::Owned(b"q Q".to_vec().into()),
         };
         for _ in 0..2048 {
             content = OwnedObject::Array(vec![content]);
         }
-        let mut decoded = Vec::new();
-        decoded_content_value(&document, CurrentValue::Owned(&content), &mut decoded)?;
-        assert_eq!(decoded, b"q Q");
+        let decoded = decoded_content_value(&document, CurrentValue::Owned(&content))?;
+        assert_eq!(decoded.as_slice(), b"q Q");
+        Ok(())
+    }
+
+    #[test]
+    fn page_content_snapshot_shares_single_stream_and_copies_only_for_concatenation() -> Result<()>
+    {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(
+            5,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R 6 0 R 4 0 R] >>",
+        )?;
+        pdf.stream(6, b"", b"")?;
+        let mut doc = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = doc.page_handles()?;
+        let first = page_content(&doc, pages[0])?;
+        let again = page_content(&doc, pages[0])?;
+        let source =
+            doc.decoded_content_stream_data(ObjectHandle::Existing(ObjectId::new(4, 0)))?;
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(&first, &source));
+        let joined = page_content(&doc, pages[1])?;
+        assert_eq!(joined.as_slice(), b"q Q\nq Q");
+        assert_eq!(first.as_slice(), b"q Q");
+        replace_page_content(&mut doc, pages[0], b"BT ET".to_vec())?;
+        let rewritten = page_content(&doc, pages[0])?;
+        assert!(Arc::ptr_eq(&rewritten, &page_content(&doc, pages[0])?));
+        assert_eq!(rewritten.as_slice(), b"BT ET");
+        assert_eq!(first.as_slice(), b"q Q");
         Ok(())
     }
 
@@ -766,10 +811,10 @@ mod tests {
         let pages = document.page_handles()?;
         assert_eq!(
             page_content_if_present(&document, pages[0])?,
-            Some(Vec::new())
+            Some(Arc::default())
         );
         assert_eq!(page_content_if_present(&document, pages[1])?, None);
-        assert_eq!(page_content(&document, pages[1])?, Vec::<u8>::new());
+        assert_eq!(page_content(&document, pages[1])?.as_slice(), b"");
 
         let first = page_xobject_bindings(&document, pages[0])?;
         assert_eq!(first, page_xobject_bindings(&document, pages[1])?);
@@ -820,7 +865,7 @@ mod tests {
         normalize_page_contents(&mut document, &pages)?;
         assert_eq!(
             page_content_if_present(&document, pages[0])?,
-            Some(Vec::new())
+            Some(Arc::default())
         );
         assert_eq!(page_content_if_present(&document, pages[1])?, None);
         Ok(())
