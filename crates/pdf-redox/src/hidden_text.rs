@@ -1,7 +1,7 @@
 use crate::config::HiddenTextPolicy;
 use crate::content::{
-    PageRewriteResult, page_box_numbers, page_content, replace_page_content, resolved_dictionary,
-    resolved_name, resolved_number_value,
+    PageRewriteResult, effective_page_resources, page_box_numbers, page_content,
+    replace_page_content, resolved_dictionary, resolved_name, resolved_number_value,
 };
 use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::report::{
@@ -1814,20 +1814,8 @@ fn build_properties(
     Ok(out)
 }
 
-fn build_resources(
-    document: &EditDocument,
-    resources_value: Option<OwnedObject>,
-    _ocg: &OptionalContentState,
-) -> Result<Resources> {
-    let resources = match resources_value {
-        Some(value) => document.resolve_owned_value(&value)?,
-        None => None,
-    };
-    let dictionary = resources
-        .as_ref()
-        .and_then(OwnedObject::as_dictionary)
-        .cloned()
-        .unwrap_or_default();
+fn build_page_resources(document: &EditDocument, page: CowObjectHandle) -> Result<Resources> {
+    let dictionary = effective_page_resources(document, page)?;
     Ok(Resources {
         fonts: build_fonts(document, &dictionary)?,
         ext_gstates: build_ext_gstates(document, &dictionary)?,
@@ -1953,11 +1941,7 @@ impl<'a> PhysicalHiddenTextScanner<'a> {
         shared_context: &'a HiddenTextSharedContext,
     ) -> Result<Self> {
         let crop = page_crop(document, page)?;
-        let resources = build_resources(
-            document,
-            document.inherited_page_value(page, b"Resources")?,
-            &shared_context.ocg,
-        )?;
+        let resources = build_page_resources(document, page)?;
         Ok(Self {
             scanner: PageScanner::new(
                 page_number,
@@ -1990,11 +1974,7 @@ fn scan_page(
     ocg: &OptionalContentState,
 ) -> Result<ScannedPage> {
     let crop = page_crop(document, page)?;
-    let resources = build_resources(
-        document,
-        document.inherited_page_value(page, b"Resources")?,
-        ocg,
-    )?;
+    let resources = build_page_resources(document, page)?;
     let content = page_content(document, page)?;
     let mut scanner = PageScanner::new(
         page_number,

@@ -267,20 +267,66 @@ pub fn page_resources(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<Option<OwnedDictionary>> {
-    resolved_current_dictionary(
-        document,
-        document.inherited_page_raw_value(page, b"Resources")?,
-    )
+    Ok(document
+        .inherited_page_resources(page)?
+        .and_then(|resources| into_owned_dictionary(resources.into_cow())))
 }
 
-fn xobject_dictionary_handles(xobjects: OwnedDictionary) -> BTreeMap<Vec<u8>, ObjectHandle> {
-    xobjects
-        .into_iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(handle) => Some((name, handle)),
-            _ => None,
-        })
-        .collect()
+#[derive(Debug, PartialEq, Eq)]
+pub struct XObjectBindings {
+    pub handles: BTreeMap<Vec<u8>, ObjectHandle>,
+    pub complete: bool,
+}
+
+fn xobject_dictionary_bindings(
+    document: &EditDocument,
+    value: Option<CurrentValue<'_>>,
+    mut complete: bool,
+) -> Result<XObjectBindings> {
+    let mut handles = BTreeMap::new();
+    if let Some(value) = value
+        && let Some(value) = document.resolve_current_value(value)?
+        && !value.is_null()
+    {
+        complete &= value.is_dictionary();
+        if let Some(entries) = value.dictionary_entries() {
+            for (name, value) in entries {
+                if let Some(handle) = value.reference() {
+                    handles.insert(name.as_ref().to_vec(), handle);
+                } else {
+                    complete = false;
+                }
+            }
+        }
+    }
+    Ok(XObjectBindings { handles, complete })
+}
+
+/// Inspect only a resource scope's `XObject` category; completeness is separate
+/// from the mapping so callers that require a proof can reject invalid values.
+/// Missing resources have no local bindings; explicit malformed resources
+/// are incomplete, not equivalent to an inherited Form scope.
+pub fn resource_xobject_bindings(
+    document: &EditDocument,
+    resources: Option<CurrentValue<'_>>,
+) -> Result<XObjectBindings> {
+    let Some(resources) = resources else {
+        return Ok(XObjectBindings {
+            handles: BTreeMap::new(),
+            complete: true,
+        });
+    };
+    let Some(resources) = document.resolve_current_value(resources)? else {
+        return Ok(XObjectBindings {
+            handles: BTreeMap::new(),
+            complete: false,
+        });
+    };
+    xobject_dictionary_bindings(
+        document,
+        resources.dictionary_entry(b"XObject"),
+        resources.is_dictionary(),
+    )
 }
 
 /// Resolve the name -> object handle mapping of referenced `XObjects`.
@@ -288,30 +334,31 @@ pub fn xobject_handles(
     document: &EditDocument,
     resources: &OwnedDictionary,
 ) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(xobject_dictionary_handles(xobjects))
+    Ok(xobject_dictionary_bindings(
+        document,
+        resources
+            .get(b"XObject".as_slice())
+            .map(CurrentValue::Owned),
+        true,
+    )?
+    .handles)
 }
 
-/// Read only the inherited resource dictionary's `XObject` category.
-pub fn page_xobject_handles(
+/// Read only the effective inherited resource dictionary's `XObject` category.
+pub fn page_xobject_bindings(
     document: &EditDocument,
     page: ObjectHandle,
-) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(resources) = document.inherited_page_raw_value(page, b"Resources")? else {
-        return Ok(BTreeMap::new());
+) -> Result<XObjectBindings> {
+    resource_xobject_bindings(document, document.inherited_page_resources(page)?)
+}
+
+pub fn object_subtype(document: &EditDocument, handle: ObjectHandle) -> Result<Option<Vec<u8>>> {
+    let Some(object) = document.current_value(handle)? else {
+        return Ok(None);
     };
-    let Some(resources) = document.resolve_current_value(resources)? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) =
-        resolved_current_dictionary(document, resources.dictionary_entry(b"XObject"))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(xobject_dictionary_handles(xobjects))
+    Ok(object
+        .resolved_entry(document, b"Subtype")?
+        .and_then(|value| value.name().map(<[u8]>::to_vec)))
 }
 
 pub fn form_resources(
@@ -531,10 +578,51 @@ mod tests {
         assert_eq!(page_content_if_present(&document, pages[1])?, None);
         assert_eq!(page_content(&document, pages[1])?, Vec::<u8>::new());
 
-        let first = page_xobject_handles(&document, pages[0])?;
-        assert_eq!(first, page_xobject_handles(&document, pages[1])?);
-        assert_eq!(first.len(), 1);
-        assert!(first.contains_key(b"Im".as_slice()));
+        let first = page_xobject_bindings(&document, pages[0])?;
+        assert_eq!(first, page_xobject_bindings(&document, pages[1])?);
+        assert_eq!(
+            first.handles,
+            BTreeMap::from([(
+                b"Im".to_vec(),
+                ObjectHandle::Existing(crate::ObjectId::new(5, 0))
+            )])
+        );
+        assert!(!first.complete);
+        // Direct and indirect resource views share the same binding evidence.
+        let root = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let map = ObjectHandle::Existing(crate::ObjectId::new(7, 0));
+        let _ = document.edit_handle(root)?;
+        let _ = document.edit_handle(map)?;
+        assert_eq!(page_xobject_bindings(&document, pages[0])?, first);
+        *document.edit_handle(map)? = OwnedObject::Dictionary(OwnedDictionary::from([(
+            b"Im".to_vec(),
+            content_reference(5),
+        )]));
+        let complete = page_xobject_bindings(&document, pages[1])?;
+        assert_eq!(complete.handles, first.handles);
+        assert!(complete.complete);
+        *document.edit_handle(map)? = OwnedObject::Name(b"Invalid".to_vec());
+        assert_eq!(
+            page_xobject_bindings(&document, pages[0])?,
+            XObjectBindings {
+                handles: BTreeMap::new(),
+                complete: false,
+            }
+        );
+        *document.edit_handle(map)? = OwnedObject::Null;
+        assert_eq!(
+            page_xobject_bindings(&document, pages[0])?,
+            XObjectBindings {
+                handles: BTreeMap::new(),
+                complete: true,
+            }
+        );
+        // Explicit malformed form Resources must not become an inherited scope.
+        assert!(
+            !resource_xobject_bindings(&document, Some(CurrentValue::Owned(&OwnedObject::Null)))?
+                .complete
+        );
+        assert!(resource_xobject_bindings(&document, None)?.complete);
 
         normalize_page_contents(&mut document, &pages)?;
         assert_eq!(

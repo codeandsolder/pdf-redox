@@ -1,6 +1,9 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
-    content::{resolved_name, resolved_non_null, resolved_number},
+    content::{
+        object_subtype, page_xobject_bindings, resolved_name, resolved_non_null, resolved_number,
+        resource_xobject_bindings,
+    },
     paper_indexed,
     stream_codec::{decode_image_stream, decode_stream, encode_flate, is_unfiltered_or_lone_flate},
 };
@@ -224,53 +227,6 @@ fn is_image_value(document: &EditDocument, object: &OwnedObject) -> Result<bool>
     )
 }
 
-fn object_subtype(document: &EditDocument, handle: ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let Some(object) = document.current_owned_object_cow(handle)? else {
-        return Ok(None);
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(None);
-    };
-    let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
-        return Ok(None);
-    };
-    Ok(match document.resolve_owned_value(subtype)? {
-        Some(OwnedObject::Name(name)) => Some(name),
-        _ => None,
-    })
-}
-
-fn xobject_bindings(
-    document: &EditDocument,
-    resources: Option<OwnedObject>,
-) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(resources) = resources else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(resources) = document.resolve_owned_value(&resources)? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(resources) = resources.as_dictionary() else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) = resources.get(b"XObject".as_slice()) else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) = document.resolve_owned_value(xobjects)? else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(xobjects) = xobjects.as_dictionary() else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(xobjects
-        .iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(handle) => Some((name.clone(), *handle)),
-            _ => None,
-        })
-        .collect())
-}
-
 fn accumulate_xobject_bindings(
     document: &EditDocument,
     xobjects: &BTreeMap<Vec<u8>, ObjectHandle>,
@@ -293,8 +249,7 @@ fn image_binding_counts(
 ) -> Result<BTreeMap<ObjectHandle, usize>> {
     let mut counts = BTreeMap::new();
     for &page in pages {
-        let page_xobjects =
-            xobject_bindings(document, document.inherited_page_value(page, b"Resources")?)?;
+        let page_xobjects = page_xobject_bindings(document, page)?.handles;
         let mut forms = VecDeque::new();
         accumulate_xobject_bindings(document, &page_xobjects, &mut counts, &mut forms)?;
         let mut seen_forms = HashSet::new();
@@ -302,14 +257,14 @@ fn image_binding_counts(
             if !seen_forms.insert(form) {
                 continue;
             }
-            let Some(object) = document.current_owned_object_cow(form)? else {
+            let Some(object) = document.current_value(form)? else {
                 continue;
             };
-            let Some(dictionary) = object.as_dictionary() else {
+            if !object.has_dictionary() {
                 continue;
-            };
-            let xobjects = if let Some(resources) = dictionary.get(b"Resources".as_slice()) {
-                xobject_bindings(document, Some(resources.clone()))?
+            }
+            let xobjects = if let Some(resources) = object.dictionary_entry(b"Resources") {
+                resource_xobject_bindings(document, Some(resources))?.handles
             } else {
                 inherited_xobjects
             };

@@ -1,7 +1,7 @@
 use crate::geometry::Matrix;
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, Result,
-    content::{PageRewriteResult, page_content, page_xobject_handles, replace_page_content},
+    content::{PageRewriteResult, page_content, page_xobject_bindings, replace_page_content},
 };
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
@@ -518,7 +518,7 @@ pub fn repeated_page_objects_prefix_possible(
     let mut candidates = Vec::new();
     for (page_index, &page) in pages.iter().take(seed_pages).enumerate() {
         let content = page_content(document, page)?;
-        let xobjects = page_xobject_handles(document, page)?;
+        let xobjects = page_xobject_bindings(document, page)?.handles;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
@@ -541,7 +541,7 @@ pub fn remove_repeated_page_objects(
     let seed_pages = pages.len().min(MIN_SUPPORT_PAGES.saturating_add(1));
     for (page_index, &page) in pages.iter().take(seed_pages).enumerate() {
         let content = page_content(document, page)?;
-        let xobjects = page_xobject_handles(document, page)?;
+        let xobjects = page_xobject_bindings(document, page)?.handles;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
@@ -557,7 +557,7 @@ pub fn remove_repeated_page_objects(
     }
     for (page_index, &page) in pages.iter().enumerate().skip(seed_pages) {
         let content = page_content(document, page)?;
-        let xobjects = page_xobject_handles(document, page)?;
+        let xobjects = page_xobject_bindings(document, page)?.handles;
         let mut scanner = PageScanner::new(page_index, &xobjects);
         if scanner.scan(&content).is_ok() {
             candidates.extend(scanner.candidates);
