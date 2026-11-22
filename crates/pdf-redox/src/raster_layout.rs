@@ -30,14 +30,9 @@ use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::Instant,
 };
-
-static DEBUG_RASTER: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_RASTER").is_some());
-static DEBUG_VECTOR: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_VECTOR").is_some());
 
 const POINTS_PER_MM: f64 = 72.0 / 25.4;
 const MATRIX_EPSILON: f64 = 1.0e-7;
@@ -1286,7 +1281,7 @@ struct ScannedTarget {
 
 enum TargetLoadResult {
     MissingResources,
-    Incomplete { content_len: usize },
+    Incomplete,
     Complete(Box<ScannedTarget>),
 }
 
@@ -1460,9 +1455,7 @@ fn load_scanned_target(
         page_numbers,
     };
     let Some(scan) = scan_context.scan(target, &resources, &content, page_state)? else {
-        return Ok(TargetLoadResult::Incomplete {
-            content_len: content.len(),
-        });
+        return Ok(TargetLoadResult::Incomplete);
     };
     page_state.record_vector(target, scan.vector_analysis);
     Ok(TargetLoadResult::Complete(Box::new(ScannedTarget {
@@ -1510,11 +1503,8 @@ impl RasterTargetScanStage<'_> {
                 stats.invalidate_target_scan(target);
                 return Ok(None);
             }
-            TargetLoadResult::Incomplete { content_len } => {
+            TargetLoadResult::Incomplete => {
                 stats.invalidate_target_scan(target);
-                if *DEBUG_RASTER {
-                    eprintln!("raster-target {target:?}: scanner incomplete content={content_len}");
-                }
                 return Ok(None);
             }
             TargetLoadResult::Complete(scanned) => *scanned,
@@ -1574,7 +1564,7 @@ impl RasterTargetScanStage<'_> {
                 page_state,
             )?;
             scanned = match rescanned {
-                TargetLoadResult::MissingResources | TargetLoadResult::Incomplete { .. } => {
+                TargetLoadResult::MissingResources | TargetLoadResult::Incomplete => {
                     stats.invalidate_target_scan(target);
                     return Ok(None);
                 }
@@ -1590,13 +1580,6 @@ impl RasterTargetScanStage<'_> {
         }
 
         stats.record_target_scan(target, &scanned.scanner);
-        if matches!(target, ContentTarget::Page(_)) && *DEBUG_VECTOR {
-            eprintln!(
-                "vector-proof target={target:?} rect_fills={} candidate={}",
-                scanned.scanner.rect_fills.len(),
-                scanned.scanner.vector_merge_candidate
-            );
-        }
         Ok(Some(scanned))
     }
 }
@@ -1749,9 +1732,10 @@ struct SampleImage {
 struct RasterImageDecodeCache {
     entries: HashMap<(ObjectHandle, bool), Option<SampleImage>>,
     decoded_bytes: usize,
+    #[cfg(test)]
     hits: usize,
+    #[cfg(test)]
     misses: usize,
-    clears: usize,
 }
 
 impl RasterImageDecodeCache {
@@ -1765,7 +1749,6 @@ impl RasterImageDecodeCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.decoded_bytes = 0;
-        self.clears = self.clears.saturating_add(1);
     }
 
     fn get_or_decode(
@@ -1776,11 +1759,17 @@ impl RasterImageDecodeCache {
     ) -> Result<Option<SampleImage>> {
         let key = (handle, bake_masks);
         if let Some(cached) = self.entries.get(&key) {
-            self.hits = self.hits.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.hits = self.hits.saturating_add(1);
+            }
             return Ok(cached.clone());
         }
 
-        self.misses = self.misses.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.misses = self.misses.saturating_add(1);
+        }
         let decoded = image_info(document, handle, bake_masks)?;
         let bytes = decoded.as_ref().map_or(0, Self::image_bytes);
 
@@ -1806,11 +1795,6 @@ impl RasterImageDecodeCache {
 struct DeferredTile {
     draw_index: usize,
     source: ObjectHandle,
-    resource_name: Vec<u8>,
-    original_range: (usize, usize),
-    source_size: (u32, u32),
-    page_rect: Rect,
-    effective_ppi: (f64, f64),
 }
 
 impl DeferredTile {
@@ -1827,14 +1811,9 @@ impl DeferredTile {
         }
         let ppi_x = 72.0 * f64::from(image.width) / width_pt;
         let ppi_y = 72.0 * f64::from(image.height) / height_pt;
-        (ppi_x.is_finite() && ppi_y.is_finite() && ppi_x > 0.0 && ppi_y > 0.0).then(|| Self {
+        (ppi_x.is_finite() && ppi_y.is_finite() && ppi_x > 0.0 && ppi_y > 0.0).then_some(Self {
             draw_index,
             source: draw.target,
-            resource_name: draw.resource_name.clone(),
-            original_range: (draw.range_start, draw.range_end),
-            source_size: (image.width, image.height),
-            page_rect,
-            effective_ppi: (ppi_x, ppi_y),
         })
     }
 }
@@ -1953,15 +1932,9 @@ fn decode_mask_stream(
     if !matches!(bpc, 1 | 2 | 4 | 8) {
         return Ok(None);
     }
-    let decoded = match document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
-    {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            if *DEBUG_RASTER {
-                eprintln!("raster-layout: skipping undecodable mask stream: {error}");
-            }
-            return Ok(None);
-        }
+    let Ok(decoded) = document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
+    else {
+        return Ok(None);
     };
     let Some(mut alpha) = unpack_mask_samples(&decoded, width, height, bpc) else {
         return Ok(None);
@@ -2359,16 +2332,11 @@ fn image_info(
     if bpc != 8 && !indexed && !device_gray {
         return Ok(None);
     }
-    let raw_decoded =
-        match document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object)) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                if *DEBUG_RASTER {
-                    eprintln!("raster-layout: skipping undecodable image {handle:?}: {error}");
-                }
-                return Ok(None);
-            }
-        };
+    let Ok(raw_decoded) =
+        document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
+    else {
+        return Ok(None);
+    };
     let mut decoded = if (indexed || device_gray) && bpc != 8 {
         let Some(samples) = unpack_packed_samples(&raw_decoded, width, height, bpc) else {
             return Ok(None);
@@ -4375,7 +4343,6 @@ fn build_pixel_cluster_plan(
     config: &RasterLayoutConfig,
     native_pitch: Option<(f64, f64)>,
 ) -> Option<MergePlan> {
-    let debug = *DEBUG_RASTER;
     let first = *members.first()?;
     let first_info = infos.get(&draws[first].target)?;
     let mut bounds = Rect::from_ctm(draws[first].ctm);
@@ -4398,16 +4365,6 @@ fn build_pixel_cluster_plan(
                 .as_ref()
                 .is_some_and(|alpha| alpha.width != info.width || alpha.height != info.height)
         {
-            if debug {
-                eprintln!(
-                    "pixel-build reject=source-compat index={index} size={}x{} mask={}x{} alpha={:?}",
-                    info.width,
-                    info.height,
-                    info.mask_width,
-                    info.mask_height,
-                    info.alpha.as_ref().map(|a| (a.width, a.height))
-                );
-            }
             return None;
         }
         let rect = Rect::from_ctm(draw.ctm);
@@ -4429,16 +4386,6 @@ fn build_pixel_cluster_plan(
         || pitch_y <= MATRIX_EPSILON
     {
         return None;
-    }
-    if debug {
-        let member_count = members.len();
-        let x0 = bounds.x0;
-        let y0 = bounds.y0;
-        let x1 = bounds.x1;
-        let y1 = bounds.y1;
-        eprintln!(
-            "pixel-build n={member_count} bounds=({x0:.6},{y0:.6})-({x1:.6},{y1:.6}) pitch=({pitch_x:.9},{pitch_y:.9})"
-        );
     }
     let width = ((bounds.x1 - bounds.x0) / pitch_x).round().max(1.0);
     let height = ((bounds.y1 - bounds.y0) / pitch_y).round().max(1.0);
@@ -4469,23 +4416,12 @@ fn build_pixel_cluster_plan(
         let y_from_top = rounded_nonnegative_u32((bounds.y1 - rect.y1) / pitch_y)?;
         let y_bottom = rounded_nonnegative_u32((bounds.y1 - rect.y0) / pitch_y)?;
         if x1 <= x0 || y_bottom <= y_from_top {
-            if debug {
-                eprintln!(
-                    "pixel-build reject=quantized-empty index={index} rect=({:.6},{:.6})-({:.6},{:.6}) q=({x0},{y_from_top})-({x1},{y_bottom})",
-                    rect.x0, rect.y0, rect.x1, rect.y1
-                );
-            }
             return None;
         }
         let target_width = x1.checked_sub(x0)?;
         let target_height = y_bottom.checked_sub(y_from_top)?;
         let y0 = y_from_top;
         if x0.checked_add(target_width)? > width || y0.checked_add(target_height)? > height {
-            if debug {
-                eprintln!(
-                    "pixel-build reject=outside index={index} pos={x0},{y0} size={target_width}x{target_height} canvas={width}x{height}"
-                );
-            }
             return None;
         }
         let source = resize_nearest(
@@ -4533,9 +4469,6 @@ fn build_pixel_cluster_plan(
             }
         }
         if has_partial_overlap {
-            if debug {
-                eprintln!("pixel-build reject=partial-overlap index={index}");
-            }
             return None;
         }
     }
@@ -4603,12 +4536,6 @@ fn raster_draw_insertion_member(draws: &[RasterDraw], members: &[usize]) -> Opti
                 after += 1;
             }
             if before > 0 && after > 0 {
-                if *DEBUG_RASTER {
-                    eprintln!(
-                        "raster-z-blocker index={index} target={:?} overlaps_before={before} overlaps_after={after} rect=({:.4},{:.4})-({:.4},{:.4})",
-                        draw.target, rect.x0, rect.y0, rect.x1, rect.y1
-                    );
-                }
                 return None;
             }
         }
@@ -4769,21 +4696,8 @@ fn find_native_fragment_plans(
         }
     }
 
-    if *DEBUG_RASTER {
-        let eligible = groups.values().map(Vec::len).sum::<usize>();
-        let anchored = groups
-            .values()
-            .filter(|entries| entries.iter().any(|entry| entry.2))
-            .map(Vec::len)
-            .sum::<usize>();
-        eprintln!(
-            "native-fragment target={target:?} groups={} eligible_paints={eligible} anchored_group_paints={anchored}",
-            groups.len()
-        );
-    }
     let max_gap = f64::from(config.pixel_cluster_max_gap_mm) * POINTS_PER_MM;
     let mut candidates = Vec::<MergePlan>::new();
-    let mut debug_components = [0usize; 6];
     for ((_, _, _, _, axis_id), mut entries) in groups {
         if !entries.iter().any(|entry| entry.1) {
             continue;
@@ -4823,7 +4737,6 @@ fn find_native_fragment_plans(
             components.entry(root).or_default().push(local);
         }
         for locals in components.into_values() {
-            debug_components[0] += 1;
             let anchor = locals
                 .iter()
                 .copied()
@@ -4839,9 +4752,7 @@ fn find_native_fragment_plans(
             if fragment_count < config.pixel_cluster_min_paints {
                 continue;
             }
-            debug_components[2] += 1;
             let anchor_pitch = if let Some(anchor) = anchor {
-                debug_components[1] += 1;
                 entries[anchor].3
             } else {
                 // With no intact anchor, require a much stronger fragmentation signal
@@ -4870,7 +4781,6 @@ fn find_native_fragment_plans(
             {
                 continue;
             }
-            debug_components[3] += 1;
             let fragment_draws = locals
                 .iter()
                 .filter(|&&local| entries[local].1)
@@ -4892,28 +4802,15 @@ fn find_native_fragment_plans(
                 if subgroup_fragments < config.pixel_cluster_min_paints {
                     continue;
                 }
-                debug_components[4] += 1;
                 if let Some(mut plan) =
                     build_pixel_cluster_plan(draws, infos, &subgroup, config, Some(anchor_pitch))
                 {
                     plan.first_member = insertion_member;
                     plan.kind = MergeKind::NativeFragment;
                     candidates.push(plan);
-                    debug_components[5] += 1;
                 }
             }
         }
-    }
-    if *DEBUG_RASTER {
-        eprintln!(
-            "native-fragment funnel target={target:?} components={} anchored={} enough_fragments={} pitch_coherent={} zsafe={} built={}",
-            debug_components[0],
-            debug_components[1],
-            debug_components[2],
-            debug_components[3],
-            debug_components[4],
-            debug_components[5]
-        );
     }
 
     // A square tiny sprite may participate in both horizontal and vertical
@@ -4932,10 +4829,6 @@ fn find_native_fragment_plans(
     out
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "cluster discovery and candidate validation share spatial-index and source-compatibility state"
-)]
 fn find_pixel_cluster_plans(
     target: ContentTarget,
     draws: &[RasterDraw],
@@ -4978,15 +4871,6 @@ fn find_pixel_cluster_plans(
             .push(index);
     }
 
-    if *DEBUG_RASTER {
-        let mut sizes = groups.values().map(Vec::len).collect::<Vec<_>>();
-        sizes.sort_unstable_by(|a, b| b.cmp(a));
-        eprintln!(
-            "pixel-groups target={target:?} epochs={} largest={:?}",
-            groups.len(),
-            sizes.into_iter().take(12).collect::<Vec<_>>()
-        );
-    }
     let max_gap = f64::from(config.pixel_cluster_max_gap_mm) * POINTS_PER_MM;
     let mut plans = Vec::new();
     for (_, mut indices) in groups {
@@ -5025,16 +4909,6 @@ fn find_pixel_cluster_plans(
             let root = dsu.find(local);
             components.entry(root).or_default().push(index);
         }
-        if *DEBUG_RASTER {
-            let mut cs = components.values().map(Vec::len).collect::<Vec<_>>();
-            cs.sort_unstable_by(|a, b| b.cmp(a));
-            if cs.first().copied().unwrap_or(0) >= config.pixel_cluster_min_paints {
-                eprintln!(
-                    "pixel-components target={target:?} largest={:?}",
-                    cs.into_iter().take(12).collect::<Vec<_>>()
-                );
-            }
-        }
         for mut members in components.into_values() {
             if members.len() < config.pixel_cluster_min_paints {
                 continue;
@@ -5044,41 +4918,12 @@ fn find_pixel_cluster_plans(
             // on the same side. Pick an insertion member satisfying all resulting
             // before/after constraints rather than requiring stream adjacency.
             let insertion_member = raster_draw_insertion_member(draws, &members);
-            if *DEBUG_RASTER {
-                eprintln!(
-                    "pixel-candidate target={target:?} n={} insertion={insertion_member:?}",
-                    members.len()
-                );
-            }
             let Some(insertion_member) = insertion_member else {
                 continue;
             };
             if let Some(mut plan) = build_pixel_cluster_plan(draws, infos, &members, config, None) {
                 plan.first_member = insertion_member;
-                if *DEBUG_RASTER {
-                    eprintln!(
-                        "pixel-plan target={target:?} n={} out={}x{}",
-                        members.len(),
-                        plan.width,
-                        plan.height
-                    );
-                }
                 plans.push(plan);
-            } else if *DEBUG_RASTER {
-                let mut unique = HashSet::new();
-                let mut templates = HashSet::new();
-                for &i in &members {
-                    if let Some(info) = infos.get(&draws[i].target) {
-                        unique.insert((draws[i].target, info.width, info.height, info.components));
-                        templates.insert(info.semantic_key);
-                    }
-                }
-                let member_count = members.len();
-                let template_count = templates.len();
-                let first_template = templates.iter().next();
-                eprintln!(
-                    "pixel-plan-rejected target={target:?} n={member_count} sources={unique:?} templates={template_count} first_template={first_template:?}"
-                );
             }
         }
     }
@@ -5936,16 +5781,7 @@ impl RasterTargetTransaction<'_> {
         let apply_plans_us = elapsed_micros_u64(started);
         let plan_changed = applied.rewritten_content.is_some();
 
-        if let Some(budget) = self.rejected_inline_budget(&content, &applied)? {
-            if *DEBUG_RASTER {
-                eprintln!(
-                    "raster-inline payload rollback {:?}: candidate={} fallback={} image_payload={}",
-                    self.target,
-                    budget.candidate_payload,
-                    budget.fallback_payload,
-                    applied.added_image_payload_bytes
-                );
-            }
+        if self.rejected_inline_budget(&content, &applied)?.is_some() {
             let rollback_resources = resources_for_inline_rollback.ok_or_else(|| {
                 Error::Invalid("missing pre-apply resources for staged inline rollback".to_owned())
             })?;
@@ -6190,41 +6026,6 @@ fn build_merge_plans_for_scanner(
     stats.image_materialize_us = stats
         .image_materialize_us
         .saturating_add(elapsed_micros_u64(image_materialize_started));
-    if *DEBUG_RASTER && !scanner.draws.is_empty() {
-        let max_dim = u32::from(config.pixel_cluster_max_source_dimension);
-        let tiny_draws = scanner
-            .draws
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !initial_used.contains(index))
-            .filter(|(_, draw)| {
-                infos
-                    .get(&draw.target)
-                    .is_some_and(|info| info.width <= max_dim && info.height <= max_dim)
-            })
-            .map(|(_, draw)| draw)
-            .collect::<Vec<_>>();
-        let tiny = tiny_draws.len();
-        let mut clip_none = 0usize;
-        let mut clip_full = 0usize;
-        let mut clip_partial = 0usize;
-        let mut clip_complex = 0usize;
-        for draw in tiny_draws {
-            if draw.clip_complex {
-                clip_complex += 1;
-                continue;
-            }
-            match draw.clip {
-                None => clip_none += 1,
-                Some(clip) if clip.contains(Rect::from_ctm(draw.ctm), 1.0e-6) => clip_full += 1,
-                Some(_) => clip_partial += 1,
-            }
-        }
-        let decoded_images = infos.len();
-        eprintln!(
-            "raster-target {target:?}: decoded_images={decoded_images} tiny_draws={tiny} clips none/full/partial/complex={clip_none}/{clip_full}/{clip_partial}/{clip_complex}"
-        );
-    }
     let max_dim = u32::from(config.pixel_cluster_max_source_dimension);
     let deferred_tiles = scanner
         .draws
@@ -6241,31 +6042,6 @@ fn build_merge_plans_for_scanner(
     stats.deferred_tile_candidates = stats
         .deferred_tile_candidates
         .saturating_add(deferred_tiles.len());
-    if *DEBUG_RASTER && !deferred_tiles.is_empty() {
-        let (min_ppi, max_ppi) =
-            deferred_tiles
-                .iter()
-                .fold((f64::INFINITY, 0.0_f64), |(min_ppi, max_ppi), tile| {
-                    let ppi = tile.effective_ppi.0.min(tile.effective_ppi.1);
-                    (min_ppi.min(ppi), max_ppi.max(ppi))
-                });
-        let first = &deferred_tiles[0];
-        eprintln!(
-            "deferred-tiles target={target:?} n={} effective_ppi={min_ppi:.1}..{max_ppi:.1} first=index:{} source:{:?} name:{} size:{}x{} range:{}..{} rect=({:.3},{:.3})-({:.3},{:.3})",
-            deferred_tiles.len(),
-            first.draw_index,
-            first.source,
-            String::from_utf8_lossy(&first.resource_name),
-            first.source_size.0,
-            first.source_size.1,
-            first.original_range.0,
-            first.original_range.1,
-            first.page_rect.x0,
-            first.page_rect.y0,
-            first.page_rect.x1,
-            first.page_rect.y1,
-        );
-    }
     if infos.is_empty() {
         return Ok(Vec::new());
     }
@@ -6468,13 +6244,6 @@ impl RasterTargetPlanStage<'_> {
                 pending_pruned_content = Some(rewritten);
                 pruned_draws = removed;
             }
-        }
-        if *DEBUG_RASTER && !scanner.draws.is_empty() {
-            eprintln!(
-                "raster-target {target:?}: content={} image_draws={}",
-                content.len(),
-                scanner.draws.len()
-            );
         }
         let user_unit = match target {
             ContentTarget::Page(page) => {
@@ -6864,16 +6633,6 @@ impl<'cfg, 'vector> RasterNormalizationPass<'cfg, 'vector> {
             &mut self.page_state,
             &mut self.stats,
         )?;
-        if *DEBUG_RASTER {
-            eprintln!(
-                "raster image decode cache: hits={} misses={} entries={} decoded_bytes={} clears={}",
-                self.image_cache.hits,
-                self.image_cache.misses,
-                self.image_cache.entries.len(),
-                self.image_cache.decoded_bytes,
-                self.image_cache.clears
-            );
-        }
         Ok(self.stats)
     }
 }
@@ -6886,16 +6645,6 @@ pub fn normalize_raster_layout(
     normalize_content_for_budget: bool,
     vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
 ) -> Result<RasterLayoutStats> {
-    if *DEBUG_RASTER {
-        eprintln!(
-            "raster-layout entry enabled={} reconstruct_pixels={} fragment_threshold={} pixel_gap_mm={}",
-            config.enabled,
-            config.reconstruct_pixel_clusters,
-            config.fragmented_paint_threshold,
-            config.pixel_cluster_max_gap_mm
-        );
-    }
-
     // Tiny Image XObjects used as individual raster pixels/fragments are a
     // structural pathology, not a quality policy. Reconstruct those in every
     // profile, but when full raster-layout normalization is disabled keep this

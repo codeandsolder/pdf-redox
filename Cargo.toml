@@ -71,6 +71,6 @@ strip = "none"
 [profile.validation]
 inherits = "release"
 codegen-units = 16
-incremental = true
+incremental = false
 lto = false
 strip = "none"
