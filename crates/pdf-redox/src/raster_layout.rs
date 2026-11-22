@@ -9,7 +9,7 @@ use crate::{
         xobject_handles,
     },
     content_stream::{
-        InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
+        InstructionOperand, instruction_operands_into, normalize_content_stream, operand_numbers,
         resource_type_for_operator,
     },
     cos_fingerprint::exact_projected_dictionary_fingerprint,
@@ -997,7 +997,7 @@ impl RasterScanner {
         let needs_operands =
             !self.analysis_only_no_images || resource_type_for_operator(operator).is_some();
         if needs_operands {
-            self.operands = instruction_operands(instruction);
+            instruction_operands_into(instruction, &mut self.operands);
         }
         let span = instruction.operator_span();
         self.operator(operator, span.start, span.len());
@@ -7974,7 +7974,8 @@ mod tests {
                         reference.mark_other_paint();
                         reference.barrier();
                     } else {
-                        reference.operands = instruction_operands(instruction);
+                        reference.operands =
+                            crate::content_stream::instruction_operands(instruction);
                         let span = instruction.operator_span();
                         reference.operator(&instruction.operator[..], span.start, span.len());
                         reference.operands.clear();
