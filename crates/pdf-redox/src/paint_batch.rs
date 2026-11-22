@@ -1954,12 +1954,6 @@ fn stroke_form_replacement(
 }
 
 #[derive(Debug, Clone)]
-struct StrokeFormPageData {
-    page: ObjectHandle,
-    decoded: std::sync::Arc<Vec<u8>>,
-}
-
-#[derive(Debug, Clone)]
 struct StrokeFormPageOccurrence {
     page_index: usize,
     occurrence: StrokeFormOccurrence,
@@ -1984,7 +1978,7 @@ pub fn factor_repeated_stroke_forms(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
 ) -> Result<StrokeFormFactorStats> {
-    let mut page_data = Vec::<StrokeFormPageData>::new();
+    let mut page_data = Vec::<ObjectHandle>::new();
     let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
     let mut occupied_names = BTreeSet::<Vec<u8>>::new();
 
@@ -1998,11 +1992,6 @@ pub fn factor_repeated_stroke_forms(
         let Some(occurrences) = stroke_form_occurrences(&decoded) else {
             continue;
         };
-        let resources = effective_page_resources(document, page)?;
-        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-        {
-            occupied_names.extend(xobjects.keys().cloned());
-        }
         let page_index = page_data.len();
         for occurrence in occurrences {
             groups
@@ -2013,24 +2002,53 @@ pub fn factor_repeated_stroke_forms(
                     occurrence,
                 });
         }
-        page_data.push(StrokeFormPageData { page, decoded });
+        page_data.push(page);
+    }
+
+    // Keep only signatures and spans during discovery. Resolve resource names
+    // across all complete eligible pages exactly as before, but only if a
+    // repeated group can actually produce a Form.
+    groups.retain(|_, occurrences| {
+        occurrences.len() >= 2
+            && occurrences[0]
+                .occurrence
+                .body_end
+                .saturating_sub(occurrences[0].occurrence.body_start)
+                >= MIN_STROKE_FORM_BODY_BYTES
+    });
+    if groups.is_empty() {
+        return Ok(StrokeFormFactorStats::default());
+    }
+
+    for &page in &page_data {
+        let resources = effective_page_resources(document, page)?;
+        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
+        {
+            occupied_names.extend(xobjects.keys().cloned());
+        }
+    }
+
+    let candidate_pages = groups
+        .values()
+        .flatten()
+        .map(|item| item.page_index)
+        .collect::<BTreeSet<_>>();
+    let mut payloads = BTreeMap::new();
+    for index in candidate_pages {
+        let Some(decoded) = page_content_if_present(document, page_data[index])? else {
+            return Ok(StrokeFormFactorStats::default());
+        };
+        payloads.insert(index, decoded);
     }
 
     let mut plans = Vec::<StrokeFormPlan>::new();
     let mut form_index = 0usize;
     for occurrences in groups.into_values() {
-        if occurrences.len() < 2 {
-            continue;
-        }
         let canonical_page = occurrences[0].page_index;
         let canonical = occurrences[0].occurrence.clone();
-        let body_len = canonical.body_end.saturating_sub(canonical.body_start);
-        if body_len < MIN_STROKE_FORM_BODY_BYTES {
-            continue;
-        }
-        let Some(body) = page_data
-            .get(canonical_page)
-            .and_then(|page| page.decoded.get(canonical.body_start..canonical.body_end))
+        let Some(body) = payloads
+            .get(&canonical_page)
+            .and_then(|decoded| decoded.get(canonical.body_start..canonical.body_end))
             .map(ToOwned::to_owned)
         else {
             continue;
@@ -2076,55 +2094,35 @@ pub fn factor_repeated_stroke_forms(
         }
     }
 
-    let affected_pages = replacements_by_page
+    let pages = replacements_by_page
         .iter()
         .enumerate()
-        .filter_map(|(index, replacements)| (!replacements.is_empty()).then_some(index))
-        .collect::<Vec<_>>();
-    let mut before_flate = 0usize;
-    let mut after_flate = 0usize;
-    let mut rewritten_pages = BTreeMap::<usize, Vec<u8>>::new();
-    for &page_index in &affected_pages {
-        let page = &page_data[page_index];
-        before_flate = before_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &page.decoded,
-            flate_level,
-        )?);
-        let Some(rewritten) = crate::content_stream::apply_replacements(
-            &page.decoded,
-            &replacements_by_page[page_index],
-        ) else {
-            return Ok(StrokeFormFactorStats::default());
-        };
-        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &rewritten,
-            flate_level,
-        )?);
-        rewritten_pages.insert(page_index, rewritten);
-    }
-    for plan in &plans {
-        after_flate = after_flate.saturating_add(crate::stream_codec::flate_encoded_len(
-            &plan.body,
-            flate_level,
-        )?);
-    }
-    after_flate = after_flate
-        .saturating_add(plans.len().saturating_mul(STROKE_FORM_OVERHEAD_BYTES))
+        .filter(|(_, replacements)| !replacements.is_empty())
+        .map(|(index, replacements)| (index, payloads[&index].as_slice(), replacements.as_slice()));
+    let overhead = plans
+        .len()
+        .saturating_mul(STROKE_FORM_OVERHEAD_BYTES)
         .saturating_add(occurrence_count.saturating_mul(STROKE_FORM_OCCURRENCE_OVERHEAD_BYTES));
-    if before_flate <= after_flate
-        || before_flate.saturating_sub(after_flate) < MIN_STROKE_FORM_ESTIMATED_SAVINGS
-    {
+    let Some(measured) = crate::content_stream::measure_form_rewrites(
+        pages,
+        plans.iter().map(|plan| plan.body.as_slice()),
+        overhead,
+        MIN_STROKE_FORM_ESTIMATED_SAVINGS,
+        |bytes, cap| crate::stream_codec::flate_capped_encoded_len(bytes, cap, flate_level),
+    )?
+    else {
         return Ok(StrokeFormFactorStats::default());
-    }
+    };
+    let pages_rewritten = measured.pages.len();
 
     let mut bindings = Vec::new();
-    for plan in &plans {
+    for plan in &mut plans {
         let Some(dictionary) = stroke_form_dictionary(plan.bounds, plan.bbox_margin_grid) else {
             return Ok(StrokeFormFactorStats::default());
         };
         let form = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary,
-            data: StreamData::Owned(plan.body.clone().into()),
+            data: StreamData::Owned(std::mem::take(&mut plan.body).into()),
         }));
         bindings.extend(
             plan.occurrences
@@ -2132,20 +2130,20 @@ pub fn factor_repeated_stroke_forms(
                 .map(|item| item.page_index)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .map(|page_index| (page_data[page_index].page, plan.name.as_slice(), form)),
+                .map(|page_index| (page_data[page_index], plan.name.as_slice(), form)),
         );
     }
     install_page_resource_bindings(document, b"XObject", bindings)?;
-    for (page_index, rewritten) in rewritten_pages {
-        replace_page_content(document, page_data[page_index].page, rewritten)?;
+    for (page_index, rewritten) in measured.pages {
+        replace_page_content(document, page_data[page_index], rewritten)?;
     }
 
     Ok(StrokeFormFactorStats {
-        pages_rewritten: affected_pages.len(),
+        pages_rewritten,
         forms_created: plans.len(),
         occurrences_replaced: occurrence_count,
         decoded_bytes_factored: decoded_factored,
-        estimated_flate_bytes_saved: before_flate.saturating_sub(after_flate),
+        estimated_flate_bytes_saved: measured.savings,
     })
 }
 
@@ -3000,6 +2998,55 @@ mod tests {
             "translation"
         );
         assert_eq!(replacement, b"q\n1 0 0 1 10 0 cm\n/PdfRedoxStroke0 Do\nQ\n");
+    }
+
+    #[test]
+    fn stroke_admission_preserves_names_on_pages_without_candidates() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        use std::io::Write as _;
+
+        let mut strokes = Vec::new();
+        for translation in 0..100 {
+            let x = translation * 1013;
+            let y = translation * 97;
+            writeln!(&mut strokes, "q {x} {y} m")?;
+            for point in 1..200 {
+                let dx = (point * 163) % 997;
+                let dy = (point * point * 47) % 991;
+                writeln!(&mut strokes, "{} {} l", x + dx, y + dy)?;
+            }
+            writeln!(&mut strokes, "S Q")?;
+        }
+        let other = b"q Q\n".repeat(MIN_PAGE_CONTENT_BYTES / 4 + 1);
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120000 12000] /Resources << >> /Contents 5 0 R >>")?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /PdfRedoxStroke0 7 0 R >> >> /Contents 6 0 R >>")?;
+        pdf.stream(5, b"", &strokes)?;
+        pdf.stream(6, b"", &other)?;
+        pdf.stream(7, b"/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b"q Q")?;
+
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        let stats =
+            factor_repeated_stroke_forms(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+        assert_eq!(stats.pages_rewritten, 1);
+        assert_eq!(stats.forms_created, 1);
+        assert_eq!(stats.occurrences_replaced, 100);
+        assert!(stats.estimated_flate_bytes_saved >= MIN_STROKE_FORM_ESTIMATED_SAVINGS);
+        let rewritten = page_content_if_present(&document, pages[0])?
+            .ok_or_else(|| crate::Error::Invalid("missing rewritten stroke page".into()))?;
+        assert_eq!(operator_count(&rewritten, b"Do"), 100);
+        assert!(
+            rewritten
+                .windows(b"/PdfRedoxStroke1".len())
+                .any(|name| name == b"/PdfRedoxStroke1")
+        );
+        let untouched = page_content_if_present(&document, pages[1])?
+            .ok_or_else(|| crate::Error::Invalid("missing non-candidate page".into()))?;
+        assert_eq!(untouched.as_slice(), other.as_slice());
+        Ok(())
     }
 
     #[test]

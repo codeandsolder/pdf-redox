@@ -9,7 +9,7 @@ use crate::{
         page_box_numbers_matching, page_user_unit, replace_page_content,
         replace_page_content_with_handle,
     },
-    content_stream::{operand_name, operand_number},
+    content_stream::{measure_form_rewrites, operand_name, operand_number},
     flate::FlateReuseCache,
 };
 use num_traits::ToPrimitive;
@@ -1649,55 +1649,6 @@ struct PathFactoringOutcome {
 
 type PageReplacement<'a> = (usize, usize, &'a [u8]);
 
-struct MeasuredFormRewrites {
-    pages: Vec<(usize, Vec<u8>)>,
-    savings: usize,
-}
-
-/// Use a single decreasing compressed byte budget for the whole speculative
-/// factoring transaction. Every accepted size is exact; a cap failure proves
-/// that the remaining page streams and Form bodies cannot make it profitable.
-fn measure_form_rewrites<'a>(
-    pages: impl Iterator<Item = (usize, &'a [u8], &'a [PageReplacement<'a>])> + Clone,
-    bodies: impl Iterator<Item = &'a [u8]>,
-    fixed_overhead: usize,
-    level: crate::FlateLevel,
-    flate_lengths: &mut VectorFlateLengthMemo,
-) -> Result<Option<MeasuredFormRewrites>> {
-    let before = pages.clone().try_fold(0_usize, |total, (_, input, _)| {
-        flate_lengths
-            .encoded_len(input, level)
-            .map(|size| total.saturating_add(size))
-    })?;
-    let Some(mut remaining) = before
-        .checked_sub(fixed_overhead)
-        .and_then(|budget| budget.checked_sub(1))
-    else {
-        return Ok(None);
-    };
-    let mut rewritten_pages = Vec::new();
-    for (index, input, replacements) in pages {
-        let Some(rewritten) = crate::content_stream::apply_replacements(input, replacements) else {
-            return Ok(None);
-        };
-        let Some(length) = flate_lengths.capped_len(&rewritten, level, remaining)? else {
-            return Ok(None);
-        };
-        remaining -= length;
-        rewritten_pages.push((index, rewritten));
-    }
-    for body in bodies {
-        let Some(length) = flate_lengths.capped_len(body, level, remaining)? else {
-            return Ok(None);
-        };
-        remaining -= length;
-    }
-    Ok(Some(MeasuredFormRewrites {
-        pages: rewritten_pages,
-        savings: remaining + 1,
-    }))
-}
-
 struct SelectedPathForm<'a> {
     body: &'a [u8],
     name: Vec<u8>,
@@ -1796,8 +1747,8 @@ fn apply_path_form_plan(
         pages,
         selected.iter().map(|form| form.body),
         fixed_overhead,
-        level,
-        flate_lengths,
+        1,
+        |bytes, cap| flate_lengths.capped_len(bytes, level, cap),
     )?
     else {
         return Ok(None);
@@ -2860,8 +2811,8 @@ fn factor_shared_q_prefix_runs(
         pages,
         std::iter::empty(),
         fixed_overhead,
-        flate_level,
-        flate_lengths,
+        1,
+        |bytes, cap| flate_lengths.capped_len(bytes, flate_level, cap),
     )?
     else {
         return Ok(VectorCompactionStats::default());
@@ -3760,8 +3711,8 @@ mod tests {
                 pages.into_iter(),
                 std::iter::once(body.as_slice()),
                 before - after - 1,
-                level,
-                &mut memo,
+                1,
+                |bytes, cap| memo.capped_len(bytes, level, cap),
             )?
             .ok_or_else(|| crate::Error::Invalid("one-byte exact saving rejected".into()))?;
             assert_eq!(accepted.savings, 1);
@@ -3771,8 +3722,31 @@ mod tests {
                     pages.into_iter(),
                     std::iter::once(body.as_slice()),
                     before - after,
-                    level,
-                    &mut memo
+                    1,
+                    |bytes, cap| memo.capped_len(bytes, level, cap),
+                )?
+                .is_none()
+            );
+            let owned_edits = [(0, input.len(), b"q Q".to_vec())];
+            let owned_pages = [(0, input.as_slice(), owned_edits.as_slice())];
+            let minimum = 7;
+            let accepted = measure_form_rewrites(
+                owned_pages.into_iter(),
+                std::iter::once(body.as_slice()),
+                before - after - minimum,
+                minimum,
+                |bytes, cap| memo.capped_len(bytes, level, cap),
+            )?
+            .ok_or_else(|| crate::Error::Invalid("minimum exact saving rejected".into()))?;
+            assert_eq!(accepted.savings, minimum);
+            assert_eq!(accepted.pages, [(0, b"q Q".to_vec())]);
+            assert!(
+                measure_form_rewrites(
+                    owned_pages.into_iter(),
+                    std::iter::once(body.as_slice()),
+                    before - after - minimum + 1,
+                    minimum,
+                    |bytes, cap| memo.capped_len(bytes, level, cap),
                 )?
                 .is_none()
             );
@@ -3782,8 +3756,8 @@ mod tests {
                     [(0, input.as_slice(), invalid.as_slice())].into_iter(),
                     std::iter::once(body.as_slice()),
                     0,
-                    level,
-                    &mut memo
+                    1,
+                    |bytes, cap| memo.capped_len(bytes, level, cap),
                 )?
                 .is_none()
             );

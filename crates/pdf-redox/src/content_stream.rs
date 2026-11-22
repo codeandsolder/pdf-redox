@@ -196,6 +196,56 @@ pub fn apply_replacements<B: AsRef<[u8]>>(
     apply_ordered_replacements(input, ordered.into_iter().map(project))
 }
 
+pub struct MeasuredFormRewrites {
+    pub pages: Vec<(usize, Vec<u8>)>,
+    pub savings: usize,
+}
+
+/// Use a single decreasing compressed byte budget for the whole speculative
+/// factoring transaction. Every accepted size is exact; a cap failure proves
+/// that the remaining page streams and Form bodies cannot make it profitable.
+pub fn measure_form_rewrites<'a, B: AsRef<[u8]> + 'a>(
+    pages: impl Iterator<Item = (usize, &'a [u8], &'a [(usize, usize, B)])> + Clone,
+    bodies: impl Iterator<Item = &'a [u8]>,
+    fixed_overhead: usize,
+    minimum_savings: usize,
+    mut measure: impl FnMut(&[u8], usize) -> Result<Option<usize>>,
+) -> Result<Option<MeasuredFormRewrites>> {
+    let before = pages.clone().try_fold(0_usize, |total, (_, input, _)| {
+        let size = measure(input, usize::MAX)?
+            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".into()))?;
+        Ok::<_, crate::Error>(total.saturating_add(size))
+    })?;
+    let minimum_savings = minimum_savings.max(1);
+    let Some(mut remaining) = before
+        .checked_sub(fixed_overhead)
+        .and_then(|budget| budget.checked_sub(minimum_savings))
+    else {
+        return Ok(None);
+    };
+    let mut rewritten_pages = Vec::new();
+    for (index, input, replacements) in pages {
+        let Some(rewritten) = apply_replacements(input, replacements) else {
+            return Ok(None);
+        };
+        let Some(length) = measure(&rewritten, remaining)? else {
+            return Ok(None);
+        };
+        remaining -= length;
+        rewritten_pages.push((index, rewritten));
+    }
+    for body in bodies {
+        let Some(length) = measure(body, remaining)? else {
+            return Ok(None);
+        };
+        remaining -= length;
+    }
+    Ok(Some(MeasuredFormRewrites {
+        pages: rewritten_pages,
+        savings: remaining + minimum_savings,
+    }))
+}
+
 /// Canonicalize ordinary content-stream token spacing using Hayro's parsed spans.
 ///
 /// Return no normalized representation for inline images or incomplete parses.
