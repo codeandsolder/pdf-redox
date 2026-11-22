@@ -2249,11 +2249,13 @@ fn shared_resource_name(resource: SharedResourceRef) -> Vec<u8> {
     format!("PdfRedoxShared{}{suffix}", resource.kind.name_prefix()).into_bytes()
 }
 
+type ResourceTargets = BTreeMap<Vec<u8>, Option<ObjectHandle>>;
+
 #[derive(Debug, Clone, Default)]
 struct SharedResourceTargets {
-    color_spaces: BTreeMap<Vec<u8>, ObjectHandle>,
-    ext_gstates: BTreeMap<Vec<u8>, ObjectHandle>,
-    xobjects: BTreeMap<Vec<u8>, ObjectHandle>,
+    color_spaces: ResourceTargets,
+    ext_gstates: ResourceTargets,
+    xobjects: ResourceTargets,
 }
 
 impl SharedResourceTargets {
@@ -2263,24 +2265,26 @@ impl SharedResourceTargets {
             SharedResourceKind::ExtGState => &self.ext_gstates,
             SharedResourceKind::XObject => &self.xobjects,
         };
-        map.get(name).copied()
+        map.get(name).copied().flatten()
     }
 }
 
-fn indirect_resource_targets(
+/// Read only selected resource names and direct reference identities.
+/// Non-reference entries are retained as occupied names, never resolved as
+/// factorable resource targets.
+fn resource_target_projection(
     document: &EditDocument,
-    resources: &OwnedDictionary,
+    resources: &crate::source::CurrentValue<'_>,
     key: &[u8],
-) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-    let Some(dictionary) = resolved_dictionary(document, resources.get(key))? else {
+) -> Result<ResourceTargets> {
+    let Some(value) = resources.resolved_entry(document, key)? else {
         return Ok(BTreeMap::new());
     };
-    Ok(dictionary
-        .into_iter()
-        .filter_map(|(name, value)| match value {
-            OwnedObject::Reference(target) => Some((name, target)),
-            _ => None,
-        })
+    let Some(entries) = value.dictionary_entries() else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(entries
+        .map(|(name, value)| (name.as_ref().to_vec(), value.reference()))
         .collect())
 }
 
@@ -2288,11 +2292,13 @@ fn shared_resource_targets(
     document: &EditDocument,
     page: ObjectHandle,
 ) -> Result<SharedResourceTargets> {
-    let resources = effective_page_resources(document, page)?;
+    let Some(resources) = document.inherited_page_resources(page)? else {
+        return Ok(SharedResourceTargets::default());
+    };
     Ok(SharedResourceTargets {
-        color_spaces: indirect_resource_targets(document, &resources, b"ColorSpace")?,
-        ext_gstates: indirect_resource_targets(document, &resources, b"ExtGState")?,
-        xobjects: indirect_resource_targets(document, &resources, b"XObject")?,
+        color_spaces: resource_target_projection(document, &resources, b"ColorSpace")?,
+        ext_gstates: resource_target_projection(document, &resources, b"ExtGState")?,
+        xobjects: resource_target_projection(document, &resources, b"XObject")?,
     })
 }
 
@@ -2309,6 +2315,7 @@ struct SharedQBlock {
     end: usize,
     digest: [u8; 32],
     resource_uses: Vec<SharedResourceUse>,
+    contiguous_from_previous: bool,
 }
 
 /// Stream the canonical byte representation through one sink. Resource uses
@@ -2416,7 +2423,12 @@ impl<'a> SharedQBlockScanner<'a> {
             })
             .is_some()
         {
+            let contiguous_from_previous = self.blocks.last().is_some_and(|previous| {
+                previous.end <= start
+                    && self.input.get(previous.end..start).is_some_and(trivia_only)
+            });
             self.blocks.push(SharedQBlock {
+                contiguous_from_previous,
                 start,
                 end,
                 digest: hasher.finalize().into(),
@@ -2438,6 +2450,9 @@ impl<'a> SharedQBlockScanner<'a> {
                 self.block_valid = true;
                 self.resource_uses.clear();
             }
+            return;
+        }
+        if !self.block_valid && !matches!(operator, b"q" | b"Q") {
             return;
         }
         match operator {
@@ -2529,68 +2544,65 @@ struct SharedRunCandidate {
     bounds: Rect,
 }
 
-fn shared_blocks_contiguous(page: &SharedPageData, left: usize, right: usize) -> bool {
-    let Some(left) = page.blocks.get(left) else {
-        return false;
-    };
-    let Some(right) = page.blocks.get(right) else {
-        return false;
-    };
-    left.end <= right.start
-        && trivia_only(page.decoded.get(left.end..right.start).unwrap_or_default())
+/// Explicit depth-first work stack. A shared prefix can split at every
+/// nontrivia gap, so recursion depth is not bounded by the page count.
+fn enqueue_shared_groups(
+    page_data: &[SharedPageData],
+    pages: &[usize],
+    cursor: usize,
+    pending: &mut Vec<(Vec<usize>, usize)>,
+) {
+    let mut groups = BTreeMap::<[u8; 32], Vec<usize>>::new();
+    for &page_index in pages {
+        if let Some(block) = page_data[page_index].blocks.get(cursor) {
+            groups.entry(block.digest).or_default().push(page_index);
+        }
+    }
+    // Preserve the original sorted depth-first candidate order.
+    pending.extend(
+        groups
+            .into_values()
+            .rev()
+            .filter(|group| group.len() >= 2)
+            .map(|group| (group, cursor)),
+    );
 }
 
 fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunCandidate> {
-    fn recurse(
-        page_data: &[SharedPageData],
-        page_indices: &[usize],
-        cursor: usize,
-        out: &mut Vec<SharedRunCandidate>,
-    ) {
-        let mut groups = BTreeMap::<[u8; 32], Vec<usize>>::new();
-        for &page_index in page_indices {
-            if let Some(block) = page_data[page_index].blocks.get(cursor) {
-                groups.entry(block.digest).or_default().push(page_index);
-            }
-        }
-        for group in groups.into_values().filter(|group| group.len() >= 2) {
-            let reference = group[0];
-            let mut end = cursor.saturating_add(1);
-            while let Some(reference_block) = page_data[reference].blocks.get(end) {
-                if !shared_blocks_contiguous(&page_data[reference], end - 1, end) {
-                    break;
-                }
-                let all_match = group.iter().all(|&page_index| {
-                    page_data[page_index]
-                        .blocks
-                        .get(end)
-                        .is_some_and(|block| block.digest == reference_block.digest)
-                        && shared_blocks_contiguous(&page_data[page_index], end - 1, end)
-                });
-                if !all_match {
-                    break;
-                }
-                end = end.saturating_add(1);
-            }
-            let bounds = page_data[reference].bounds;
-            if group
-                .iter()
-                .all(|&page_index| same_rect(page_data[page_index].bounds, bounds))
-            {
-                out.push(SharedRunCandidate {
-                    page_indices: group.clone(),
-                    start_block: cursor,
-                    end_block: end,
-                    bounds,
-                });
-            }
-            recurse(page_data, &group, end, out);
-        }
-    }
-
     let mut out = Vec::new();
     let all_pages = (0..page_data.len()).collect::<Vec<_>>();
-    recurse(page_data, &all_pages, 0, &mut out);
+    let mut pending = Vec::new();
+    enqueue_shared_groups(page_data, &all_pages, 0, &mut pending);
+    while let Some((group, cursor)) = pending.pop() {
+        let reference = group[0];
+        let mut end = cursor + 1;
+        while let Some(reference_block) = page_data[reference].blocks.get(end) {
+            if !reference_block.contiguous_from_previous {
+                break;
+            }
+            if !group.iter().all(|&page_index| {
+                page_data[page_index].blocks.get(end).is_some_and(|block| {
+                    block.contiguous_from_previous && block.digest == reference_block.digest
+                })
+            }) {
+                break;
+            }
+            end += 1;
+        }
+        let bounds = page_data[reference].bounds;
+        enqueue_shared_groups(page_data, &group, end, &mut pending);
+        if group
+            .iter()
+            .all(|&page_index| same_rect(page_data[page_index].bounds, bounds))
+        {
+            out.push(SharedRunCandidate {
+                page_indices: group,
+                start_block: cursor,
+                end_block: end,
+                bounds,
+            });
+        }
+    }
     out
 }
 
@@ -2739,11 +2751,7 @@ fn factor_shared_q_prefix_runs(
         if blocks.is_empty() {
             continue;
         }
-        let resources = effective_page_resources(document, page)?;
-        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-        {
-            occupied_names.extend(xobjects.keys().cloned());
-        }
+        occupied_names.extend(targets.xobjects.into_keys());
         page_data.push(SharedPageData {
             page,
             decoded,
@@ -4380,14 +4388,14 @@ mod tests {
         let state = ObjectHandle::Existing(ObjectId::new(4, 0));
         let image = ObjectHandle::Existing(ObjectId::new(5, 0));
         let first_targets = SharedResourceTargets {
-            color_spaces: BTreeMap::from([(b"CSA".to_vec(), color)]),
-            ext_gstates: BTreeMap::from([(b"GSA".to_vec(), state)]),
-            xobjects: BTreeMap::from([(b"ImA".to_vec(), image)]),
+            color_spaces: BTreeMap::from([(b"CSA".to_vec(), Some(color))]),
+            ext_gstates: BTreeMap::from([(b"GSA".to_vec(), Some(state))]),
+            xobjects: BTreeMap::from([(b"ImA".to_vec(), Some(image))]),
         };
         let second_targets = SharedResourceTargets {
-            color_spaces: BTreeMap::from([(b"OtherCS".to_vec(), color)]),
-            ext_gstates: BTreeMap::from([(b"OtherGS".to_vec(), state)]),
-            xobjects: BTreeMap::from([(b"OtherImage".to_vec(), image)]),
+            color_spaces: BTreeMap::from([(b"OtherCS".to_vec(), Some(color))]),
+            ext_gstates: BTreeMap::from([(b"OtherGS".to_vec(), Some(state))]),
+            xobjects: BTreeMap::from([(b"OtherImage".to_vec(), Some(image))]),
         };
         let first =
             b"q 0 0 m 10 0 l 10 10 l h W* n /CSA cs 1 1 1 scn /GSA gs q 1 0 0 1 2 3 cm /ImA Do Q Q";
@@ -4456,6 +4464,70 @@ mod tests {
             .ok_or_else(|| crate::Error::Invalid("shared run fixture".into()))?;
         assert!(shared_run_matches(&first, &candidate, &body, &resources));
         assert!(!shared_run_matches(&second, &candidate, &body, &resources));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_run_traversal_handles_long_nontrivia_gap_chains() {
+        let input = b"q 0 0 m 1 1 l S Q 0 0 m n ".repeat(20_000);
+        let targets = SharedResourceTargets::default();
+        let bounds = Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 10.0,
+        };
+        let pages = [1, 2].map(|number| SharedPageData {
+            page: ObjectHandle::Existing(ObjectId::new(number, 0)),
+            blocks: factorable_shared_q_blocks(&input, &targets),
+            decoded: input.clone(),
+            bounds,
+        });
+        assert_eq!(pages[0].blocks.len(), 20_000);
+        let candidates = collect_shared_run_candidates(&pages);
+        assert_eq!(candidates.len(), 20_000);
+        for (i, candidate) in candidates.iter().enumerate() {
+            assert_eq!(candidate.page_indices, [0, 1]);
+            assert_eq!(candidate.start_block, i);
+            assert_eq!(candidate.end_block, i + 1);
+        }
+    }
+
+    #[test]
+    fn shared_q_adjacency_and_invalid_scope_recovery() {
+        let data = b"q 0 0 m 1 1 l S Q % trivia\n q 0 0 m 1 1 l S Q q BT /F1 10 Tf q /Missing Do Q ET Q q 0 0 m 1 1 l S Q";
+        let blocks = factorable_shared_q_blocks(data, &SharedResourceTargets::default());
+        assert_eq!(blocks.len(), 3);
+        assert!(!blocks[0].contiguous_from_previous);
+        assert!(blocks[1].contiguous_from_previous);
+        assert!(!blocks[2].contiguous_from_previous);
+        assert_eq!(blocks[0].digest, blocks[2].digest);
+    }
+
+    #[test]
+    fn shared_resource_projection_reserves_direct_names_without_accepting_them() -> Result<()> {
+        let mut pdf = crate::test_support::ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2,b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Direct << /A 1 >> /Ref 4 0 R >> /ExtGState << /GS 5 0 R >> >> >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.object(4, b"<< /Type /XObject /Subtype /Form >>")?;
+        pdf.object(5, b"<< /Type /ExtGState >>")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let page = ObjectHandle::Existing(ObjectId::new(3, 0));
+        let projected = shared_resource_targets(&document, page)?;
+        assert!(projected.xobjects.contains_key(b"Direct".as_slice()));
+        assert_eq!(
+            projected.target(SharedResourceKind::XObject, b"Direct"),
+            None
+        );
+        assert_eq!(
+            projected.target(SharedResourceKind::XObject, b"Ref"),
+            Some(ObjectHandle::Existing(ObjectId::new(4, 0)))
+        );
+        assert_eq!(
+            projected.target(SharedResourceKind::ExtGState, b"GS"),
+            Some(ObjectHandle::Existing(ObjectId::new(5, 0)))
+        );
         Ok(())
     }
 
