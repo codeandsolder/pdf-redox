@@ -459,7 +459,7 @@ impl FillScanner {
         self.barrier();
     }
 
-    fn unknown_fill_color(&mut self) {
+    const fn unknown_fill_color(&mut self) {
         self.fill_safety.simple_fill_color = false;
         self.barrier();
     }
