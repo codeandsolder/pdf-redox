@@ -25,9 +25,10 @@ fn opaque_number(document: &EditDocument, value: Option<&OwnedObject>) -> Result
     let Some(value) = value else {
         return Ok(None);
     };
-    Ok(Some(resolved_number_value(document, value)?.is_some_and(
-        |value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12,
-    )))
+    Ok(Some(
+        resolved_number_value(document, crate::source::CurrentValue::Owned(value))?
+            .is_some_and(|value| value.is_finite() && (value - 1.0).abs() <= 1.0e-12),
+    ))
 }
 
 fn disabled_bool(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<bool>> {

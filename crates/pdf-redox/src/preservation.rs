@@ -759,7 +759,8 @@ fn appearance_as_form(
 }
 
 fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<Option<Rectangle>> {
-    let Some([x0, y0, x1, y1]) = resolved_number_array::<4>(document, value)? else {
+    let Some([x0, y0, x1, y1]) = resolved_number_array::<4>(document, CurrentValue::Owned(value))?
+    else {
         return Ok(None);
     };
     Ok(Some(Rectangle::new(
@@ -774,7 +775,10 @@ fn appearance_matrix(document: &EditDocument, dictionary: &OwnedDictionary) -> R
     let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
         return Ok(Matrix::default());
     };
-    Ok(resolved_number_array::<6>(document, value)?.map_or_default(Matrix::from))
+    Ok(
+        resolved_number_array::<6>(document, CurrentValue::Owned(value))?
+            .map_or_default(Matrix::from),
+    )
 }
 
 fn appearance_content(

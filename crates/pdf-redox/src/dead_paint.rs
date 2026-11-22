@@ -167,13 +167,14 @@ fn form_contains_only_opaque_image(
     let Some(bounds) = dictionary.get(b"BBox".as_slice()) else {
         return Ok(false);
     };
-    if !resolved_finite_number_array::<4>(document, bounds)?
+    if !resolved_finite_number_array::<4>(document, crate::source::CurrentValue::Owned(bounds))?
         .is_some_and(|bbox| bbox[2] > bbox[0] && bbox[3] > bbox[1])
     {
         return Ok(false);
     }
     if let Some(matrix) = dictionary.get(b"Matrix".as_slice())
-        && resolved_finite_number_array::<6>(document, matrix)?.is_none()
+        && resolved_finite_number_array::<6>(document, crate::source::CurrentValue::Owned(matrix))?
+            .is_none()
     {
         return Ok(false);
     }
