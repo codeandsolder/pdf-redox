@@ -192,6 +192,18 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+// Fingerprints are in-memory equivalence keys, not a persisted format.
+// Containers are prefix-free sequences: a value tag or dictionary-entry tag
+// starts each element, and a reserved end tag closes the container. Scalar
+// lengths are still explicit. This permits a single pass over lazy COS cursors.
+const COS_END: [u8; 1] = [0x09];
+const COS_DICTIONARY_ENTRY: [u8; 1] = [0x0a];
+
+fn hash_dictionary_key(hasher: &mut Sha256, key: &[u8]) {
+    hasher.update(COS_DICTIONARY_ENTRY);
+    hash_len_prefixed(hasher, key);
+}
+
 fn hash_cow_handle(hasher: &mut Sha256, handle: CowObjectHandle) {
     match handle {
         CowObjectHandle::Existing(id) => {
@@ -257,12 +269,19 @@ enum FingerprintFrame<'a> {
 impl<'a> FingerprintFrame<'a> {
     fn next_value(&mut self, hasher: &mut Sha256) -> Option<CurrentValue<'a>> {
         match self {
-            Self::Array(values) => values.next(),
+            Self::Array(values) => {
+                let next = values.next();
+                if next.is_none() {
+                    hasher.update(COS_END);
+                }
+                next
+            }
             Self::Dictionary { entries, data } => {
                 if let Some((key, value)) = entries.next() {
-                    hash_len_prefixed(hasher, key.as_ref());
+                    hash_dictionary_key(hasher, key.as_ref());
                     Some(value)
                 } else {
+                    hasher.update(COS_END);
                     if let Some(data) = data.take() {
                         hash_stream_identity(hasher, data);
                     }
@@ -302,16 +321,12 @@ fn hash_cos_header<'a>(
             CosScalar::Reference(handle) => references.hash(hasher, handle, is_root),
         }
         None
-    } else if let (Some(len), Some(values)) = (object.array_len(), object.array_items()) {
+    } else if let Some(values) = object.array_items() {
         hasher.update([0x06]);
-        hasher.update((len as u64).to_le_bytes());
         Some(FingerprintFrame::Array(values))
-    } else if let (Some(len), Some(entries)) =
-        (object.dictionary_len(), object.dictionary_entries())
-    {
+    } else if let Some(entries) = object.dictionary_entries() {
         let data = object.stream_identity();
         hasher.update([if data.is_some() { 0x08 } else { 0x07 }]);
-        hasher.update((len as u64).to_le_bytes());
         Some(FingerprintFrame::Dictionary { entries, data })
     } else {
         unreachable!("non-scalar COS value must be a container")
@@ -405,16 +420,12 @@ fn hash_dictionary_entries<'a>(
             "expected dictionary projection".to_owned(),
         ));
     };
-    hasher.update((entries.filter(&include).count() as u64).to_le_bytes());
-    let Some(entries) = object.dictionary_entries() else {
-        return Err(crate::Error::Invalid(
-            "expected dictionary projection".to_owned(),
-        ));
-    };
+    hasher.update([0x07]);
     for (key, value) in entries.filter(include) {
-        hash_len_prefixed(hasher, key.as_ref());
+        hash_dictionary_key(hasher, key.as_ref());
         hash_value(hasher, key.as_ref(), value)?;
     }
+    hasher.update(COS_END);
     Ok(())
 }
 
@@ -1555,11 +1566,11 @@ pub fn exact_projected_dictionary_fingerprint(
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
     hasher.update([0x07]);
-    hasher.update((entries.len() as u64).to_le_bytes());
     for (key, value) in entries {
-        hash_len_prefixed(&mut hasher, key);
+        hash_dictionary_key(&mut hasher, key);
         hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
     }
+    hasher.update(COS_END);
     hasher.finalize().into()
 }
 
@@ -1879,11 +1890,9 @@ fn hash_resolved_dictionary_projection<'a>(
             && let Some(resolved) = document.resolve_current_value(indirect)?
             && resolved.has_dictionary()
         {
-            hasher.update([0x07]);
             return hash_dictionary_entries(hasher, &resolved, |_| true, hash_value);
         }
     } else if value.has_dictionary() {
-        hasher.update([0x07]);
         return hash_dictionary_entries(hasher, value, |_| true, hash_value);
     }
     hash_cos_value(hasher, value, FingerprintReferences::Exact);
@@ -2408,7 +2417,7 @@ mod tests {
     use crate::{SourcePdf, test_support::ClassicPdfBuilder};
 
     #[test]
-    fn cos_fingerprint_preserves_exact_and_projected_encodings() -> Result<()> {
+    fn cos_fingerprint_has_prefix_free_exact_and_projected_encodings() -> Result<()> {
         let mut document = EditDocument::from_bytes(duplicate_image_fixture()?)?;
         let existing = |number, generation| {
             CowObjectHandle::Existing(crate::ObjectId::new(number, generation))
@@ -2451,30 +2460,30 @@ mod tests {
             hash_cos_value(&mut hasher, &CurrentValue::Owned(object), mode);
             <[u8; 32]>::from(hasher.finalize())
         };
-        // Frozen digest values from the previous exact and recursive byte protocols,
-        // including stream dictionary-before-payload order.
+        // Independently encoded exact and recursive byte protocols, including
+        // explicit container terminators and dictionary-before-payload order.
         assert_eq!(
             digest(&value, FingerprintReferences::Exact),
             [
-                0x26, 0x4d, 0x87, 0x6d, 0x7c, 0xd9, 0xbb, 0xf0, 0x1f, 0x8a, 0xd8, 0x98, 0x61, 0x3a,
-                0x6e, 0xa7, 0x79, 0xd1, 0x2c, 0xb4, 0x8b, 0xb9, 0xb6, 0x2d, 0x27, 0xbf, 0x5b, 0x8d,
-                0xc1, 0xc7, 0xe1, 0x0e
+                0x26, 0x04, 0xc7, 0x86, 0x0b, 0x54, 0x65, 0xda, 0x94, 0xa0, 0xd6, 0xe0, 0x5f, 0x53,
+                0xc9, 0x66, 0xcc, 0xf5, 0x4a, 0x11, 0xc3, 0x45, 0x28, 0x72, 0xca, 0x7e, 0x7b, 0xe8,
+                0xaa, 0x57, 0x88, 0x4a
             ]
         );
         assert_eq!(
             digest(&value, FingerprintReferences::Recursive(&redirects)),
             [
-                0xd3, 0x10, 0x66, 0xfb, 0xb6, 0x9f, 0xe9, 0xbd, 0x06, 0xfe, 0xc0, 0x63, 0x04, 0xd2,
-                0x88, 0x1b, 0x42, 0x49, 0x34, 0x04, 0x08, 0xb6, 0x36, 0xdb, 0x9c, 0xd5, 0x96, 0xc5,
-                0x1b, 0x1f, 0xc5, 0x0a
+                0xd3, 0xd9, 0x6c, 0xfb, 0x2d, 0xea, 0x0a, 0x05, 0x43, 0x94, 0x26, 0x06, 0xfe, 0x4d,
+                0xd5, 0x44, 0x4a, 0x53, 0x4b, 0xe1, 0x81, 0x82, 0x4e, 0xb1, 0xc0, 0x22, 0xc1, 0xc8,
+                0x7d, 0x34, 0xe3, 0x51
             ]
         );
         assert_eq!(
             digest(&value, FingerprintReferences::TopLevel(&redirects)),
             [
-                0x26, 0x4d, 0x87, 0x6d, 0x7c, 0xd9, 0xbb, 0xf0, 0x1f, 0x8a, 0xd8, 0x98, 0x61, 0x3a,
-                0x6e, 0xa7, 0x79, 0xd1, 0x2c, 0xb4, 0x8b, 0xb9, 0xb6, 0x2d, 0x27, 0xbf, 0x5b, 0x8d,
-                0xc1, 0xc7, 0xe1, 0x0e
+                0x26, 0x04, 0xc7, 0x86, 0x0b, 0x54, 0x65, 0xda, 0x94, 0xa0, 0xd6, 0xe0, 0x5f, 0x53,
+                0xc9, 0x66, 0xcc, 0xf5, 0x4a, 0x11, 0xc3, 0x45, 0x28, 0x72, 0xca, 0x7e, 0x7b, 0xe8,
+                0xaa, 0x57, 0x88, 0x4a
             ]
         );
         assert_eq!(
@@ -2489,6 +2498,49 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn cos_container_framing_distinguishes_nested_empty_values_and_marker_bytes() {
+        let values = [
+            OwnedObject::Array(vec![OwnedObject::Array(vec![]), OwnedObject::Null]),
+            OwnedObject::Array(vec![OwnedObject::Array(vec![OwnedObject::Null])]),
+            OwnedObject::Array(vec![OwnedObject::Array(vec![])]),
+            OwnedObject::Array(vec![OwnedObject::String(vec![0x09, 0x0a, 0x00])]),
+            OwnedObject::Dictionary(OwnedDictionary::new()),
+            OwnedObject::Dictionary(OwnedDictionary::from([(vec![], OwnedObject::Null)])),
+            OwnedObject::Dictionary(OwnedDictionary::from([(
+                vec![0x09, 0x0a],
+                OwnedObject::String(vec![0x09]),
+            )])),
+            OwnedObject::Stream {
+                dictionary: OwnedDictionary::new(),
+                data: StreamData::Owned(vec![0x09]),
+            },
+        ];
+        let mut seen = HashSet::new();
+        for value in values {
+            let mut hasher = Sha256::new();
+            hash_cos_value(
+                &mut hasher,
+                &CurrentValue::Owned(&value),
+                FingerprintReferences::Exact,
+            );
+            assert!(seen.insert(<[u8; 32]>::from(hasher.finalize())));
+            if let OwnedObject::Dictionary(entries) = &value {
+                let projected = entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), CurrentValue::Owned(v)))
+                    .collect();
+                assert_eq!(
+                    exact_dictionary_fingerprint(&CurrentValue::Owned(&value), b"projection"),
+                    Some(exact_projected_dictionary_fingerprint(
+                        &projected,
+                        b"projection"
+                    ))
+                );
+            }
+        }
     }
 
     #[test]
@@ -2563,9 +2615,11 @@ mod tests {
         let mut expected = Sha256::new();
         for _ in 0..depth {
             expected.update([0x06]);
-            expected.update(1u64.to_le_bytes());
         }
         expected.update([0x00]);
+        for _ in 0..depth {
+            expected.update(COS_END);
+        }
         let mut actual = Sha256::new();
         hash_cos_value(
             &mut actual,

@@ -686,26 +686,6 @@ impl<'a> CurrentValue<'a> {
         }
     }
 
-    /// Number of readable array entries, matching materialized COS semantics.
-    pub fn array_len(&self) -> Option<usize> {
-        match self {
-            Self::Source(MaybeRef::NotRef(Object::Array(array)), _) => {
-                Some(array.raw_iter().count())
-            }
-            Self::Owned(OwnedObject::Array(array)) => Some(array.len()),
-            _ => None,
-        }
-    }
-
-    /// Count entries in the editable dictionary view (source stream Length
-    /// omitted; duplicate and unparseable source entries handled by Hayro).
-    pub fn dictionary_len(&self) -> Option<usize> {
-        match self {
-            Self::Owned(value) => value.as_dictionary().map(BTreeMap::len),
-            Self::Source(..) => self.dictionary_entries().map(Iterator::count),
-        }
-    }
-
     pub fn reference(&self) -> Option<ObjectHandle> {
         match self {
             Self::Source(MaybeRef::Ref(reference), _) => {
