@@ -724,6 +724,19 @@ impl<'a> CurrentValue<'a> {
         )
     }
 
+    /// References in the exact editable representation: source stream Length
+    /// is omitted, while explicit overlay Length values remain visible.
+    pub fn editable_indirect_references(&self) -> impl Iterator<Item = ObjectHandle> + 'a {
+        self.reference().into_iter().chain(
+            walk_current_descendants(self.editable_children(), Self::editable_children)
+                .filter_map(|value| value.reference()),
+        )
+    }
+
+    pub fn editable_children(&self) -> Option<CurrentChildren<'a>> {
+        self.children(matches!(self, Self::Source(..)))
+    }
+
     pub fn contains_indirect_reference(&self) -> bool {
         self.reference().is_some()
             || current_descendants(self.children(false), false)
@@ -1016,9 +1029,9 @@ fn source_children<'a>(
 
 /// Walk direct descendants with one iterator per nesting level. No paths,
 /// payload materialization, reference resolution or broad sibling stack.
-fn current_descendants<'a>(
+fn walk_current_descendants<'a>(
     children: Option<CurrentChildren<'a>>,
-    skip_stream_length: bool,
+    child_cursor: impl Fn(&CurrentValue<'a>) -> Option<CurrentChildren<'a>> + 'a,
 ) -> impl Iterator<Item = CurrentValue<'a>> {
     let mut frames = SmallVec::<[CurrentChildren<'a>; 4]>::new();
     if let Some(children) = children {
@@ -1027,7 +1040,7 @@ fn current_descendants<'a>(
     std::iter::from_fn(move || {
         loop {
             if let Some((_, value)) = frames.last_mut()?.next() {
-                if let Some(children) = value.children(skip_stream_length) {
+                if let Some(children) = child_cursor(&value) {
                     frames.push(children);
                 }
                 return Some(value);
@@ -1035,6 +1048,13 @@ fn current_descendants<'a>(
             frames.pop();
         }
     })
+}
+
+fn current_descendants(
+    children: Option<CurrentChildren<'_>>,
+    skip_stream_length: bool,
+) -> impl Iterator<Item = CurrentValue<'_>> {
+    walk_current_descendants(children, move |value| value.children(skip_stream_length))
 }
 
 const MAX_DECODED_CONTENT_CACHE_BYTES: usize = 256 * 1024 * 1024;

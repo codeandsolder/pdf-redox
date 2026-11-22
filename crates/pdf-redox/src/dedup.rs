@@ -338,17 +338,6 @@ fn hash_cos_value(
     }
 }
 
-fn editable_children<'a>(value: &CurrentValue<'a>) -> Option<CurrentChildren<'a>> {
-    value
-        .dictionary_entries()
-        .map(CurrentChildren::Dictionary)
-        .or_else(|| {
-            value
-                .array_items()
-                .map(|items| CurrentChildren::Array(items.enumerate()))
-        })
-}
-
 type EqualityFrame<'a, 'b> = (CurrentChildren<'a>, CurrentChildren<'b>);
 
 fn compare_cos_node<'a, 'b>(
@@ -366,7 +355,7 @@ fn compare_cos_node<'a, 'b>(
     {
         return false;
     }
-    match (editable_children(left), editable_children(right)) {
+    match (left.editable_children(), right.editable_children()) {
         (Some(left), Some(right)) => {
             frames.push((left, right));
             true
@@ -405,6 +394,30 @@ pub fn exact_cos_equal(left: &CurrentValue<'_>, right: &CurrentValue<'_>) -> boo
     true
 }
 
+fn hash_dictionary_entries<'a>(
+    hasher: &mut Sha256,
+    object: &CurrentValue<'a>,
+    include: impl Fn(&(crate::source::CurrentKey<'a>, CurrentValue<'a>)) -> bool,
+    mut hash_value: impl FnMut(&mut Sha256, &[u8], CurrentValue<'a>) -> Result<()>,
+) -> Result<()> {
+    let Some(entries) = object.dictionary_entries() else {
+        return Err(crate::Error::Invalid(
+            "expected dictionary projection".to_owned(),
+        ));
+    };
+    hasher.update((entries.filter(&include).count() as u64).to_le_bytes());
+    let Some(entries) = object.dictionary_entries() else {
+        return Err(crate::Error::Invalid(
+            "expected dictionary projection".to_owned(),
+        ));
+    };
+    for (key, value) in entries.filter(include) {
+        hash_len_prefixed(hasher, key.as_ref());
+        hash_value(hasher, key.as_ref(), value)?;
+    }
+    Ok(())
+}
+
 /// Hash source and overlay stream data in place using one reference policy,
 /// without copying encoded payloads or collecting a temporary entry vector.
 fn hash_stream_with_keys(
@@ -424,20 +437,15 @@ fn hash_stream_with_keys(
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
-    let include = |(key, _): &(crate::source::CurrentKey<'_>, CurrentValue<'_>)| {
-        key.as_ref() != b"Length" && !ignored_dictionary_keys.contains(&key.as_ref())
-    };
-    let Some(entries) = object.dictionary_entries() else {
-        return Ok(None);
-    };
-    hasher.update((entries.filter(include).count() as u64).to_le_bytes());
-    let Some(entries) = object.dictionary_entries() else {
-        return Ok(None);
-    };
-    for (key, value) in entries.filter(include) {
-        hash_len_prefixed(&mut hasher, key.as_ref());
-        hash_cos_value(&mut hasher, &value, references);
-    }
+    hash_dictionary_entries(
+        &mut hasher,
+        &object,
+        |(key, _)| key.as_ref() != b"Length" && !ignored_dictionary_keys.contains(&key.as_ref()),
+        |hasher, _, value| {
+            hash_cos_value(hasher, &value, references);
+            Ok(())
+        },
+    )?;
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
@@ -469,37 +477,35 @@ fn source_font_program_fingerprint(
     program: CowObjectHandle,
     key: &[u8],
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object_cow(program)? else {
+    let Some(object) = document.current_value(program)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+    if !object.is_stream() {
         return Ok(None);
-    };
-    let raw = data.bytes(document.source())?;
+    }
+    let raw = object.stream_bytes(document.source())?;
     let mut hasher = Sha256::new();
     let domain = [b"/".as_slice(), key].concat();
     hash_len_prefixed(&mut hasher, &domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
-
-    hasher.update((dictionary.len() as u64).to_le_bytes());
-    for (dict_key, value) in dictionary {
-        hash_len_prefixed(&mut hasher, dict_key);
-        if matches!(dict_key.as_slice(), b"Length1" | b"Length2" | b"Length3")
-            && let Some(OwnedObject::Integer(integer)) = document.resolve_owned_value(value)?
-        {
-            hash_cos_value(
-                &mut hasher,
-                &CurrentValue::Owned(&OwnedObject::Integer(integer)),
-                FingerprintReferences::Exact,
-            );
-        } else {
-            hash_cos_value(
-                &mut hasher,
-                &CurrentValue::Owned(value),
-                FingerprintReferences::Exact,
-            );
-        }
-    }
+    hash_dictionary_entries(
+        &mut hasher,
+        &object,
+        |_| true,
+        |hasher, key, value| {
+            if matches!(key, b"Length1" | b"Length2" | b"Length3")
+                && let Some(handle) = value.reference()
+                && let Some(indirect) = document.current_value(handle)?
+                && let Some(resolved) = document.resolve_current_value(indirect)?
+                && matches!(resolved.number(), Some(NumericValue::Integer(_)))
+            {
+                hash_cos_value(hasher, &resolved, FingerprintReferences::Exact);
+            } else {
+                hash_cos_value(hasher, &value, FingerprintReferences::Exact);
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
@@ -1351,60 +1357,34 @@ fn hash_non_stream_object_with_redirects(
     Ok(Some(hasher.finalize().into()))
 }
 
-fn collect_form_resource_handles_from_value(
-    document: &EditDocument,
-    value: &OwnedObject,
-    seen: &mut BTreeSet<CowObjectHandle>,
-    handles: &mut BTreeSet<CowObjectHandle>,
-) -> Result<()> {
-    match value {
-        OwnedObject::Reference(handle) => {
-            if !seen.insert(*handle) {
-                return Ok(());
-            }
-            let Some(object) = document.current_owned_object_cow(*handle)? else {
-                return Ok(());
-            };
-            if matches!(
-                object.as_ref(),
-                OwnedObject::Dictionary(_) | OwnedObject::Array(_)
-            ) {
-                handles.insert(*handle);
-            }
-            collect_form_resource_handles_from_value(document, &object, seen, handles)?;
-        }
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            for child in dictionary.values() {
-                collect_form_resource_handles_from_value(document, child, seen, handles)?;
-            }
-        }
-        OwnedObject::Array(values) => {
-            for child in values {
-                collect_form_resource_handles_from_value(document, child, seen, handles)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 fn form_resource_handles(
     document: &EditDocument,
     forms: &[CowObjectHandle],
 ) -> Result<Vec<CowObjectHandle>> {
     let mut seen = BTreeSet::new();
     let mut handles = BTreeSet::new();
+    let mut pending = Vec::new();
     for &form in forms {
-        let Some(object) = document.current_owned_object_cow(form)? else {
+        let Some(object) = document.current_value(form)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
+        if object.is_stream()
+            && let Some(resources) = object.dictionary_entry(b"Resources")
+        {
+            pending.extend(resources.editable_indirect_references());
+        }
+    }
+    while let Some(handle) = pending.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+        let Some(object) = document.current_value(handle)? else {
             continue;
         };
-        let Some(resources) = dictionary.get(b"Resources".as_slice()) else {
-            continue;
-        };
-        collect_form_resource_handles_from_value(document, resources, &mut seen, &mut handles)?;
+        if object.is_dictionary() || object.array_items().is_some() {
+            handles.insert(handle);
+        }
+        pending.extend(object.editable_indirect_references());
     }
     Ok(handles.into_iter().collect())
 }
@@ -1817,140 +1797,128 @@ fn virtual_form_image_redirects(
     })
 }
 
-fn redirect_reference_value(
-    value: &OwnedObject,
-    redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-) -> OwnedObject {
-    match value {
-        OwnedObject::Reference(handle) => {
-            OwnedObject::Reference(canonical_cow_redirect(*handle, redirects))
-        }
-        _ => value.clone(),
-    }
+#[derive(Clone, Copy)]
+struct FormResourceProjection<'a> {
+    exact: &'a HashMap<CowObjectHandle, CowObjectHandle>,
+    fonts: &'a HashMap<CowObjectHandle, CowObjectHandle>,
+    images: &'a HashMap<CowObjectHandle, CowObjectHandle>,
+    forms: &'a HashMap<CowObjectHandle, CowObjectHandle>,
 }
 
-fn normalized_named_form_resource(
-    document: &EditDocument,
-    value: &OwnedObject,
-    resource_kind: &[u8],
-    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-) -> Result<OwnedObject> {
-    let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
-        return Ok(value.clone());
-    };
-    let normalized = dictionary
-        .into_iter()
-        .map(|(name, target)| {
-            let target = match resource_kind {
-                b"Font" => redirect_reference_value(&target, font_redirects),
-                b"XObject" => match &target {
-                    OwnedObject::Reference(handle) if form_redirects.contains_key(handle) => {
-                        redirect_reference_value(&target, form_redirects)
-                    }
-                    OwnedObject::Reference(_) => redirect_reference_value(&target, image_redirects),
-                    _ => target,
-                },
-                b"ColorSpace" | b"ExtGState" | b"Properties" => {
-                    redirect_reference_value(&target, exact_redirects)
-                }
-                _ => target,
-            };
-            (name, target)
-        })
-        .collect();
-    Ok(OwnedObject::Dictionary(normalized))
-}
-
-fn normalized_form_resources(
-    document: &EditDocument,
-    value: &OwnedObject,
-    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-) -> Result<OwnedObject> {
-    let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
-        return Ok(value.clone());
-    };
-    let mut normalized = OwnedDictionary::new();
-    for (key, value) in dictionary {
-        let value = match key.as_slice() {
-            b"Font" | b"XObject" | b"ColorSpace" | b"ExtGState" | b"Properties" => {
-                normalized_named_form_resource(
-                    document,
-                    &value,
-                    &key,
-                    exact_redirects,
-                    font_redirects,
-                    image_redirects,
-                    form_redirects,
-                )?
+impl<'a> FormResourceProjection<'a> {
+    fn named_reference_policy(
+        self,
+        resource_kind: &[u8],
+        target: &CurrentValue<'_>,
+    ) -> FingerprintReferences<'a> {
+        let redirects = match resource_kind {
+            b"Font" => self.fonts,
+            b"XObject"
+                if target
+                    .reference()
+                    .is_some_and(|handle| self.forms.contains_key(&handle)) =>
+            {
+                self.forms
             }
-            b"ProcSet" => redirect_reference_value(&value, exact_redirects),
-            _ => value,
+            b"XObject" => self.images,
+            b"ColorSpace" | b"ExtGState" | b"Properties" => self.exact,
+            _ => return FingerprintReferences::Exact,
         };
-        normalized.insert(key, value);
+        FingerprintReferences::TopLevel(redirects)
     }
-    Ok(OwnedObject::Dictionary(normalized))
+
+    fn hash_named(
+        self,
+        document: &EditDocument,
+        hasher: &mut Sha256,
+        resource_kind: &[u8],
+        value: &CurrentValue<'_>,
+    ) -> Result<()> {
+        hash_resolved_dictionary_projection(document, hasher, value, |hasher, _, target| {
+            hash_cos_value(
+                hasher,
+                &target,
+                self.named_reference_policy(resource_kind, &target),
+            );
+            Ok(())
+        })
+    }
+
+    fn hash_resources(
+        self,
+        document: &EditDocument,
+        hasher: &mut Sha256,
+        value: &CurrentValue<'_>,
+    ) -> Result<()> {
+        hash_resolved_dictionary_projection(document, hasher, value, |hasher, key, value| {
+            match key {
+                b"Font" | b"XObject" | b"ColorSpace" | b"ExtGState" | b"Properties" => {
+                    self.hash_named(document, hasher, key, &value)?;
+                }
+                b"ProcSet" => {
+                    hash_cos_value(hasher, &value, FingerprintReferences::TopLevel(self.exact));
+                }
+                _ => hash_cos_value(hasher, &value, FingerprintReferences::Exact),
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Project a resolved dictionary without retaining its entries. The historical
+/// dictionary resolver accepts both real dictionaries and stream dictionaries;
+/// unresolved/non-dictionary values retain their exact original COS identity.
+fn hash_resolved_dictionary_projection<'a>(
+    document: &'a EditDocument,
+    hasher: &mut Sha256,
+    value: &CurrentValue<'a>,
+    hash_value: impl FnMut(&mut Sha256, &[u8], CurrentValue<'a>) -> Result<()>,
+) -> Result<()> {
+    if let Some(handle) = value.reference() {
+        if let Some(indirect) = document.current_value(handle)?
+            && let Some(resolved) = document.resolve_current_value(indirect)?
+            && resolved.has_dictionary()
+        {
+            hasher.update([0x07]);
+            return hash_dictionary_entries(hasher, &resolved, |_| true, hash_value);
+        }
+    } else if value.has_dictionary() {
+        hasher.update([0x07]);
+        return hash_dictionary_entries(hasher, value, |_| true, hash_value);
+    }
+    hash_cos_value(hasher, value, FingerprintReferences::Exact);
+    Ok(())
 }
 
 fn source_form_fingerprint(
     document: &EditDocument,
     form: CowObjectHandle,
     ignored_dictionary_keys: &[&[u8]],
-    exact_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    font_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    image_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
-    form_redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
+    projection: FormResourceProjection<'_>,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object_cow(form)? else {
+    let Some(object) = document.current_value(form)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
-        return Ok(None);
-    };
-    let Some(subtype) = dictionary.get(b"Subtype".as_slice()) else {
-        return Ok(None);
-    };
-    if !matches!(document.resolve_owned_value(subtype)?, Some(OwnedObject::Name(name)) if name == b"Form")
-    {
+    if !object.is_stream() || !object.resolved_name_is(document, b"Subtype", b"Form")? {
         return Ok(None);
     }
-    let raw = data.bytes(document.source())?;
+    let raw = object.stream_bytes(document.source())?;
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, b"form-xobject");
     hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary.iter().filter(|(key, _)| {
-        key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-    });
-    hasher.update((entries.clone().count() as u64).to_le_bytes());
-    for (key, value) in entries {
-        hash_len_prefixed(&mut hasher, key);
-        if key.as_slice() == b"Resources" {
-            let normalized = normalized_form_resources(
-                document,
-                value,
-                exact_redirects,
-                font_redirects,
-                image_redirects,
-                form_redirects,
-            )?;
-            hash_cos_value(
-                &mut hasher,
-                &CurrentValue::Owned(&normalized),
-                FingerprintReferences::Exact,
-            );
-        } else {
-            hash_cos_value(
-                &mut hasher,
-                &CurrentValue::Owned(value),
-                FingerprintReferences::Exact,
-            );
-        }
-    }
+    hash_dictionary_entries(
+        &mut hasher,
+        &object,
+        |(key, _)| key.as_ref() != b"Length" && !ignored_dictionary_keys.contains(&key.as_ref()),
+        |hasher, key, value| {
+            if key == b"Resources" {
+                projection.hash_resources(document, hasher, &value)?;
+            } else {
+                hash_cos_value(hasher, &value, FingerprintReferences::Exact);
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
 
@@ -1969,10 +1937,12 @@ fn fixed_point_form_redirects(
                 document,
                 form,
                 ignored_dictionary_keys,
-                exact_redirects,
-                font_redirects,
-                image_redirects,
-                &redirects,
+                FormResourceProjection {
+                    exact: exact_redirects,
+                    fonts: font_redirects,
+                    images: image_redirects,
+                    forms: &redirects,
+                },
             )?
             .map(|(fingerprint, _)| fingerprint))
         })?;
@@ -2038,13 +2008,13 @@ struct FormDependencyRedirects {
 fn stream_payloads_may_repeat(document: &EditDocument, forms: &[CowObjectHandle]) -> Result<bool> {
     let mut seen = HashSet::<[u8; 32]>::new();
     for &form in forms {
-        let Some(object) = document.current_owned_object_cow(form)? else {
+        let Some(object) = document.current_value(form)? else {
             continue;
         };
-        let OwnedObject::Stream { data, .. } = object.as_ref() else {
+        if !object.is_stream() {
             continue;
-        };
-        let raw = data.bytes(document.source())?;
+        }
+        let raw = object.stream_bytes(document.source())?;
         let fingerprint: [u8; 32] = Sha256::digest(raw.as_ref()).into();
         if !seen.insert(fingerprint) {
             // Hash collisions only cause a conservative fallback to the exact
@@ -2237,10 +2207,10 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
     let mut duplicate_raw_bytes = 0_usize;
     for &form in &dependencies.form_streams {
         if dependencies.forms.contains_key(&form)
-            && let Some(object) = document.current_owned_object_cow(form)?
-            && let OwnedObject::Stream { data, .. } = object.as_ref()
+            && let Some(object) = document.current_value(form)?
+            && object.is_stream()
         {
-            duplicate_raw_bytes += data.bytes(document.source())?.len();
+            duplicate_raw_bytes += object.stream_bytes(document.source())?.len();
         }
     }
     let xobject_targets = dictionary_targets(document, b"XObject")?;
@@ -2313,10 +2283,12 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
                 document,
                 appearance_ref,
                 &[],
-                &dependencies.exact,
-                &dependencies.fonts,
-                &dependencies.images,
-                &dependencies.forms,
+                FormResourceProjection {
+                    exact: &dependencies.exact,
+                    fonts: &dependencies.fonts,
+                    images: &dependencies.images,
+                    forms: &dependencies.forms,
+                },
             )?
             else {
                 continue;
@@ -3045,6 +3017,65 @@ mod tests {
     }
 
     #[test]
+    fn form_resource_fingerprint_projects_only_named_reference_bindings() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"", b"q Q")?;
+        pdf.object(5, b"<< /Font 30 0 R /XObject << /Form 40 0 R /Image 43 0 R /Nested [40 0 R] >> /ExtGState << /G 50 0 R >> /ProcSet 50 0 R /ColorSpace 70 0 R /Properties 60 0 R /Pattern << /P 50 0 R >> >>")?;
+        pdf.object(6, b"<< /Font << /F 33 0 R /Nested [31 0 R] >> /XObject << /Form 41 0 R /Image 44 0 R /Nested [40 0 R] >> /ExtGState << /G 51 0 R >> /ProcSet 51 0 R /ColorSpace 70 0 R /Properties 60 0 R /Pattern << /P 50 0 R >> >>")?;
+        pdf.object(30, b"<< /F 31 0 R /Nested [31 0 R] >>")?;
+        pdf.object(70, b"17")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let handle = |id| CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+        let exact = HashMap::from([(handle(50), handle(51))]);
+        let fonts = HashMap::from([(handle(31), handle(32)), (handle(32), handle(33))]);
+        let images = HashMap::from([(handle(40), handle(42)), (handle(43), handle(44))]);
+        let forms = HashMap::from([(handle(40), handle(41))]);
+        let projection = FormResourceProjection {
+            exact: &exact,
+            fonts: &fonts,
+            images: &images,
+            forms: &forms,
+        };
+        let expected = document
+            .current_owned_object(handle(6))?
+            .ok_or_else(|| crate::Error::Invalid("missing expected resources".to_owned()))?;
+        let mut expected_hash = Sha256::new();
+        hash_cos_value(
+            &mut expected_hash,
+            &CurrentValue::Owned(&expected),
+            FingerprintReferences::Exact,
+        );
+        let expected_hash = expected_hash.finalize();
+
+        for materialized in [false, true] {
+            if materialized {
+                let _ = document.edit_handle(handle(5))?;
+                let _ = document.edit_handle(handle(30))?;
+            }
+            let Some(value) = document.current_value(handle(5))? else {
+                return Err(crate::Error::Invalid("missing resource fixture".to_owned()));
+            };
+            let mut hash = Sha256::new();
+            projection.hash_resources(&document, &mut hash, &value)?;
+            assert_eq!(hash.finalize(), expected_hash);
+
+            // A dictionary resolved through an indirect Resources entry must
+            // hash identically to the direct source/overlay representation.
+            let reference = OwnedObject::Reference(handle(5));
+            let mut hash = Sha256::new();
+            projection.hash_resources(&document, &mut hash, &CurrentValue::Owned(&reference))?;
+            assert_eq!(hash.finalize(), expected_hash);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn owned_form_metadata_dedup_preserves_hashes_and_output() -> Result<()> {
         let (input, _) = metadata_variant_form_fixture(false)?;
         let mut source = EditDocument::from_bytes(input.clone())?;
@@ -3060,9 +3091,15 @@ mod tests {
                 form_last_modified(&overlay, handle)?
             );
             let empty = HashMap::new();
+            let projection = FormResourceProjection {
+                exact: &empty,
+                fonts: &empty,
+                images: &empty,
+                forms: &empty,
+            };
             assert_eq!(
-                source_form_fingerprint(&source, handle, &[], &empty, &empty, &empty, &empty)?,
-                source_form_fingerprint(&overlay, handle, &[], &empty, &empty, &empty, &empty)?
+                source_form_fingerprint(&source, handle, &[], projection)?,
+                source_form_fingerprint(&overlay, handle, &[], projection)?
             );
         }
         assert_eq!(
