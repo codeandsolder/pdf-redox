@@ -522,6 +522,39 @@ fn install_indexed_form_wrapper(
     Ok(())
 }
 
+/// Install one indexed image layer in a palette Form.
+fn install_indexed_image_layer(
+    document: &mut EditDocument,
+    width: u32,
+    height: u32,
+    color_space: OwnedObject,
+    encoded: Vec<u8>,
+    transparent_zero: bool,
+) -> ObjectHandle {
+    let mut dictionary = OwnedDictionary::from([
+        (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
+        (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
+        (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
+        (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
+        (b"ColorSpace".to_vec(), color_space),
+        (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
+        (
+            b"Filter".to_vec(),
+            OwnedObject::Name(b"FlateDecode".to_vec()),
+        ),
+    ]);
+    if transparent_zero {
+        dictionary.insert(
+            b"Mask".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
+        );
+    }
+    ObjectHandle::New(document.add_object(OwnedObject::Stream {
+        dictionary,
+        data: StreamData::Owned(encoded.into()),
+    }))
+}
+
 fn install_local_layered_indexed_transform(
     document: &mut EditDocument,
     handle: ObjectHandle,
@@ -536,25 +569,8 @@ fn install_local_layered_indexed_transform(
         let name = format!("PdfRedoxLocalPalette{index}").into_bytes();
         let color_space =
             indexed_color_space_with_transparent_zero(base_color_space.clone(), &layer.palette)?;
-        let child = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-            dictionary: OwnedDictionary::from([
-                (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-                (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-                (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-                (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-                (b"ColorSpace".to_vec(), color_space),
-                (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
-                (
-                    b"Filter".to_vec(),
-                    OwnedObject::Name(b"FlateDecode".to_vec()),
-                ),
-                (
-                    b"Mask".to_vec(),
-                    OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
-                ),
-            ]),
-            data: StreamData::Owned(layer.encoded.into()),
-        }));
+        let child =
+            install_indexed_image_layer(document, width, height, color_space, layer.encoded, true);
         resources.insert(name.clone(), OwnedObject::Reference(child));
         content.push(b'/');
         content.extend_from_slice(&name);
@@ -579,40 +595,22 @@ fn install_residual_indexed_transform(
         transform.base_color_space,
         &transform.residual_palette,
     )?;
-    let base = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-        dictionary: OwnedDictionary::from([
-            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-            (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-            (b"ColorSpace".to_vec(), base_color_space),
-            (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
-            (
-                b"Filter".to_vec(),
-                OwnedObject::Name(b"FlateDecode".to_vec()),
-            ),
-        ]),
-        data: StreamData::Owned(transform.base_encoded.into()),
-    }));
-    let residual = ObjectHandle::New(document.add_object(OwnedObject::Stream {
-        dictionary: OwnedDictionary::from([
-            (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
-            (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
-            (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
-            (b"Height".to_vec(), OwnedObject::Integer(i64::from(height))),
-            (b"ColorSpace".to_vec(), residual_color_space),
-            (b"BitsPerComponent".to_vec(), OwnedObject::Integer(8)),
-            (
-                b"Filter".to_vec(),
-                OwnedObject::Name(b"FlateDecode".to_vec()),
-            ),
-            (
-                b"Mask".to_vec(),
-                OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
-            ),
-        ]),
-        data: StreamData::Owned(transform.residual_encoded.into()),
-    }));
+    let base = install_indexed_image_layer(
+        document,
+        width,
+        height,
+        base_color_space,
+        transform.base_encoded,
+        false,
+    );
+    let residual = install_indexed_image_layer(
+        document,
+        width,
+        height,
+        residual_color_space,
+        transform.residual_encoded,
+        true,
+    );
     let resources = OwnedDictionary::from([
         (base_name.clone(), OwnedObject::Reference(base)),
         (residual_name.clone(), OwnedObject::Reference(residual)),
