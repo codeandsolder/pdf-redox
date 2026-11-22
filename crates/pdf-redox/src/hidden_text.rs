@@ -260,8 +260,9 @@ impl OperandObject {
         }
     }
 
-    const fn as_real(&self) -> Option<f64> {
+    fn number(&self) -> Option<f64> {
         match self {
+            Self::Integer(value) => crate::source::exact_i64_to_f64(*value),
             Self::Real(value) => Some(*value),
             _ => None,
         }
@@ -314,26 +315,19 @@ fn operand_from_maybe_ref(value: HayroMaybeRef<HayroObject<'_>>) -> OperandObjec
             number: reference.obj_number,
             generation: reference.gen_number,
         }),
-        HayroMaybeRef::NotRef(value) => operand_from_source(&value, None),
+        HayroMaybeRef::NotRef(value) => operand_from_source(&value),
     }
 }
 
-fn operand_from_source(object: &HayroObject<'_>, raw: Option<&[u8]>) -> OperandObject {
+fn operand_from_source(object: &HayroObject<'_>) -> OperandObject {
     match object {
         HayroObject::Null(_) | HayroObject::Boolean(_) | HayroObject::Stream(_) => {
             OperandObject::Null
         }
-        HayroObject::Number(number) => {
-            if let Some(raw) = raw
-                && !raw.contains(&b'.')
-                && let Ok(text) = std::str::from_utf8(raw)
-                && let Ok(value) = text.parse::<i64>()
-            {
-                OperandObject::Integer(value)
-            } else {
-                OperandObject::Real(number.as_f64())
-            }
-        }
+        HayroObject::Number(number) => number.as_integer().map_or_else(
+            || OperandObject::Real(number.as_f64()),
+            OperandObject::Integer,
+        ),
         HayroObject::String(value) => OperandObject::String(value.as_bytes().to_vec()),
         HayroObject::Name(value) => OperandObject::Name(value.as_ref().to_vec()),
         HayroObject::Array(value) => {
@@ -348,17 +342,14 @@ fn operand_from_source(object: &HayroObject<'_>, raw: Option<&[u8]>) -> OperandO
     }
 }
 
-fn instruction_operands(
-    input: &[u8],
+fn read_instruction_operands(
     instruction: &hayro_syntax::content::Instruction<'_, '_>,
-) -> Vec<OperandSpan> {
-    instruction
-        .operands()
-        .zip(instruction.operand_spans())
-        .map(|(object, span)| OperandSpan {
-            object: operand_from_source(object, input.get(span)),
-        })
-        .collect()
+    operands: &mut Vec<OperandSpan>,
+) {
+    operands.clear();
+    operands.extend(instruction.operands().map(|object| OperandSpan {
+        object: operand_from_source(object),
+    }));
 }
 
 #[derive(Debug, Clone)]
@@ -462,17 +453,10 @@ impl<'a> PageScanner<'a> {
         }
     }
 
-    fn number(object: &OperandObject) -> Option<f64> {
-        object
-            .as_integer()
-            .and_then(crate::source::exact_i64_to_f64)
-            .or_else(|| object.as_real())
-    }
-
     fn numbers(&self) -> Option<SmallVec<[f64; 6]>> {
         let mut values = SmallVec::new();
         for operand in &self.operands {
-            values.push(Self::number(&operand.object)?);
+            values.push(operand.object.number()?);
         }
         Some(values)
     }
@@ -606,7 +590,7 @@ impl<'a> PageScanner<'a> {
                 }
                 pending_adjustment = 0.0;
                 strings.push(bytes.to_vec());
-            } else if let Some(value) = Self::number(item) {
+            } else if let Some(value) = item.number() {
                 pending_adjustment =
                     ((-value / 1000.0) * self.text.font_size).mul_add(hscale, pending_adjustment);
             }
@@ -727,7 +711,7 @@ impl<'a> PageScanner<'a> {
                     if let Some(font) = self.name_at(0) {
                         self.text.font = font.to_vec();
                     }
-                    if let Some(size) = Self::number(&self.operands[1].object) {
+                    if let Some(size) = self.operands[1].object.number() {
                         self.text.font_size = size;
                     }
                 }
@@ -809,10 +793,10 @@ impl<'a> PageScanner<'a> {
             }
             b"\"" => {
                 if self.operands.len() >= 3 {
-                    if let Some(value) = Self::number(&self.operands[0].object) {
+                    if let Some(value) = self.operands[0].object.number() {
                         self.text.word_spacing = value;
                     }
-                    if let Some(value) = Self::number(&self.operands[1].object) {
+                    if let Some(value) = self.operands[1].object.number() {
                         self.text.char_spacing = value;
                     }
                     self.new_line();
@@ -1048,15 +1032,11 @@ fn classify_hidden_text(
 }
 
 impl PageScanner<'_> {
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        read_instruction_operands(instruction, &mut self.operands);
         let span = instruction.span();
         self.apply_operator(&instruction.operator[..], span.start, span.end);
         self.operands.clear();
@@ -1065,7 +1045,7 @@ impl PageScanner<'_> {
 
     fn scan(&mut self, input: &[u8]) -> Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })
     }
@@ -1130,17 +1110,10 @@ struct LargeDiagonalTextScanner {
 }
 
 impl LargeDiagonalTextScanner {
-    fn number(object: &OperandObject) -> Option<f64> {
-        object
-            .as_integer()
-            .and_then(crate::source::exact_i64_to_f64)
-            .or_else(|| object.as_real())
-    }
-
     fn numbers(&self) -> Option<SmallVec<[f64; 6]>> {
         let mut values = SmallVec::new();
         for operand in &self.operands {
-            values.push(Self::number(&operand.object)?);
+            values.push(operand.object.number()?);
         }
         Some(values)
     }
@@ -1288,7 +1261,7 @@ impl LargeDiagonalTextScanner {
             }
             b"Tf" => {
                 if self.operands.len() >= 2
-                    && let Some(size) = Self::number(&self.operands[1].object)
+                    && let Some(size) = self.operands[1].object.number()
                 {
                     self.text.font_size = size;
                 }
@@ -1345,15 +1318,11 @@ impl LargeDiagonalTextScanner {
 }
 
 impl LargeDiagonalTextScanner {
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             return;
         }
-        self.operands = instruction_operands(input, instruction);
+        read_instruction_operands(instruction, &mut self.operands);
         let span = instruction.span();
         self.apply_operator(&instruction.operator[..], span.start, span.end);
         self.operands.clear();
@@ -1361,7 +1330,7 @@ impl LargeDiagonalTextScanner {
 
     fn scan(&mut self, input: &[u8]) -> Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })
     }
@@ -1965,12 +1934,8 @@ impl<'a> PhysicalHiddenTextScanner<'a> {
         })
     }
 
-    pub fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        self.scanner.instruction(input, instruction);
+    pub fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        self.scanner.instruction(instruction);
     }
 
     pub fn finish(self) -> Vec<(usize, usize)> {

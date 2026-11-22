@@ -332,11 +332,7 @@ impl MicroStrokeScanner {
         }
     }
 
-    fn instruction(
-        &mut self,
-        content: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             self.invalidate_frame();
             self.operands.clear();
@@ -344,12 +340,8 @@ impl MicroStrokeScanner {
         }
         self.operands = instruction
             .operands()
-            .zip(instruction.operand_spans())
-            .map(|(object, span)| Operand {
-                number: crate::content_stream::operand_number(
-                    object,
-                    content.get(span).unwrap_or_default(),
-                ),
+            .map(|object| Operand {
+                number: crate::content_stream::operand_number(object),
                 name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
             })
             .collect();
@@ -359,7 +351,7 @@ impl MicroStrokeScanner {
 
     fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
         let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            self.instruction(content, instruction);
+            self.instruction(instruction);
             Ok(())
         })?;
         if incomplete {

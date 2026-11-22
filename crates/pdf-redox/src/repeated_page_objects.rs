@@ -88,7 +88,9 @@ impl OperandValue {
     fn from_hayro(object: &hayro_syntax::object::Object<'_>) -> Self {
         use hayro_syntax::object::{MaybeRef, Object};
         match object {
-            Object::Number(value) => Self::Number(value.as_f64()),
+            Object::Number(_) => {
+                crate::content_stream::operand_number(object).map_or(Self::Other, Self::Number)
+            }
             Object::Name(value) => Self::Name(value.as_ref().to_vec()),
             Object::String(value) => Self::String(value.as_bytes().to_vec()),
             Object::Array(array) => Self::ArrayStrings(

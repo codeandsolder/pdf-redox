@@ -189,7 +189,7 @@ impl<'a> PageClassifier<'a> {
     fn scan_content(&mut self, content: &[u8], resources: &OwnedDictionary) -> Result<bool> {
         crate::content_stream::visit_instructions(content, |instruction| {
             let operator = &instruction.operator[..];
-            let operands = instruction_operands(content, instruction);
+            let operands = instruction_operands(instruction);
             self.observe_operator(operator, &operands, resources)
         })
     }

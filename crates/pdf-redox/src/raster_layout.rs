@@ -981,11 +981,7 @@ impl RasterScanner {
         }
     }
 
-    pub(crate) fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    pub(crate) fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             self.inline_occurrences = self.inline_occurrences.saturating_add(1);
             self.mark_other_paint();
@@ -1000,7 +996,7 @@ impl RasterScanner {
         let needs_operands =
             !self.analysis_only_no_images || resource_type_for_operator(operator).is_some();
         if needs_operands {
-            self.operands = instruction_operands(input, instruction);
+            self.operands = instruction_operands(instruction);
         }
         let span = instruction.operator_span();
         self.operator(operator, span.start, span.len());
@@ -1019,7 +1015,7 @@ impl RasterScanner {
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
         let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })?;
         self.finish_scan();
@@ -1050,7 +1046,7 @@ impl RasterVectorScanner {
 
     fn scan(&mut self, content: &[u8]) -> Result<bool> {
         let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            self.raster.instruction(content, instruction);
+            self.raster.instruction(instruction);
             self.vector.instruction(content, instruction);
             Ok(())
         })?;
@@ -1064,9 +1060,9 @@ impl RasterVectorScanner {
         hidden: &mut PhysicalHiddenTextScanner<'_>,
     ) -> Result<bool> {
         let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            self.raster.instruction(content, instruction);
+            self.raster.instruction(instruction);
             self.vector.instruction(content, instruction);
-            hidden.instruction(content, instruction);
+            hidden.instruction(instruction);
             Ok(())
         })?;
         self.raster.finish_scan();
@@ -1419,8 +1415,8 @@ impl TargetScanContext<'_> {
             let mut hidden =
                 PhysicalHiddenTextScanner::new(self.document, page, page_number, context)?;
             let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-                scanner.instruction(content, instruction);
-                hidden.instruction(content, instruction);
+                scanner.instruction(instruction);
+                hidden.instruction(instruction);
                 Ok(())
             })?;
             scanner.finish_scan();
@@ -8047,7 +8043,7 @@ mod tests {
                         reference.mark_other_paint();
                         reference.barrier();
                     } else {
-                        reference.operands = instruction_operands(pdf_content, instruction);
+                        reference.operands = instruction_operands(instruction);
                         let span = instruction.operator_span();
                         reference.operator(&instruction.operator[..], span.start, span.len());
                         reference.operands.clear();

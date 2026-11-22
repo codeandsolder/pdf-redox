@@ -148,10 +148,7 @@ fn events_for(input: &[u8], _context: &str) -> Option<Vec<Event>> {
             .map(|(object, span)| {
                 (
                     span.start,
-                    crate::content_stream::operand_number(
-                        object,
-                        input.get(span).unwrap_or_default(),
-                    ),
+                    crate::content_stream::operand_number(object),
                     crate::content_stream::operand_name(object).map(ToOwned::to_owned),
                 )
             })

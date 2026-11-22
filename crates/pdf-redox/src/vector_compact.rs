@@ -287,6 +287,29 @@ impl FillSafety {
     }
 }
 
+trait VectorInstructionScanner {
+    fn operand_buffer(&mut self) -> &mut Vec<Operand>;
+    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize);
+    fn inline_image(&mut self);
+
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        if &instruction.operator[..] == b"BI" {
+            self.inline_image();
+            return;
+        }
+        instruction_operands_into(instruction, self.operand_buffer());
+        let span = instruction.operator_span();
+        self.process_operator(&instruction.operator[..], span.start, span.len());
+    }
+
+    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
+        crate::content_stream::visit_instructions(input, |instruction| {
+            self.instruction(instruction);
+            Ok(())
+        })
+    }
+}
+
 struct FillScanner {
     operands: Vec<Operand>,
     current_rect: Option<Rect>,
@@ -411,6 +434,12 @@ impl FillScanner {
         }
         self.barrier();
     }
+}
+
+impl VectorInstructionScanner for FillScanner {
+    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
+        &mut self.operands
+    }
 
     fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
         let end = offset.saturating_add(length);
@@ -446,25 +475,9 @@ impl FillScanner {
         }
     }
 
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        if &instruction.operator[..] == b"BI" {
-            self.barrier();
-            return;
-        }
-        instruction_operands_into(input, instruction, &mut self.operands);
-        let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len());
-    }
-
-    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
-        crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
-            Ok(())
-        })
+    fn inline_image(&mut self) {
+        self.barrier();
+        self.operands.clear();
     }
 }
 
@@ -1234,13 +1247,6 @@ impl TransformedBlockScanner {
         }
     }
 
-    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
-        let operands = std::mem::take(&mut self.operands);
-        self.process_operator_with_operands(operator, offset, length, &operands);
-        self.operands = operands;
-        self.operands.clear();
-    }
-
     fn close_frame(&mut self, q_offset: usize) {
         let Some(frame) = self.frames.pop() else {
             return;
@@ -1260,29 +1266,25 @@ impl TransformedBlockScanner {
             });
         }
     }
+}
 
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        if &instruction.operator[..] == b"BI" {
-            if let Some(frame) = self.frames.last_mut() {
-                frame.valid = false;
-            }
-            self.operands.clear();
-            return;
-        }
-        instruction_operands_into(input, instruction, &mut self.operands);
-        let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len());
+impl VectorInstructionScanner for TransformedBlockScanner {
+    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
+        &mut self.operands
     }
 
-    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
-        crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
-            Ok(())
-        })
+    fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
+        let operands = std::mem::take(&mut self.operands);
+        self.process_operator_with_operands(operator, offset, length, &operands);
+        self.operands = operands;
+        self.operands.clear();
+    }
+
+    fn inline_image(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.valid = false;
+        }
+        self.operands.clear();
     }
 }
 
@@ -1301,7 +1303,7 @@ fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
         if &instruction.operator[..] == b"BI" {
             scanner.unsupported_operator_state(false);
         } else {
-            let operands = crate::content_stream::instruction_operands(input, instruction);
+            let operands = crate::content_stream::instruction_operands(instruction);
             let span = instruction.operator_span();
             scanner.process_operator_with_operands(
                 &instruction.operator[..],
@@ -1332,6 +1334,12 @@ impl ProcessingFactorScanner {
             transformed: TransformedBlockScanner::new(),
         }
     }
+}
+
+impl VectorInstructionScanner for ProcessingFactorScanner {
+    fn operand_buffer(&mut self) -> &mut Vec<Operand> {
+        &mut self.operands
+    }
 
     fn process_operator(&mut self, operator: &[u8], offset: usize, length: usize) {
         self.path
@@ -1347,27 +1355,6 @@ impl ProcessingFactorScanner {
             frame.valid = false;
         }
         self.operands.clear();
-    }
-
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        if &instruction.operator[..] == b"BI" {
-            self.inline_image();
-            return;
-        }
-        instruction_operands_into(input, instruction, &mut self.operands);
-        let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len());
-    }
-
-    fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
-        crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
-            Ok(())
-        })
     }
 }
 
@@ -1474,8 +1461,8 @@ impl ProcessingPageScanner {
         if let Some(path_coordinates) = &mut self.path_coordinates {
             path_coordinates.instruction(input, instruction);
         }
-        self.fill.instruction(input, instruction);
-        self.factor.instruction(input, instruction);
+        self.fill.instruction(instruction);
+        self.factor.instruction(instruction);
     }
 
     pub(crate) fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
@@ -3237,10 +3224,7 @@ impl PathCoordinateScanner {
         self.operands
             .extend(instruction.operands().zip(instruction.operand_spans()).map(
                 |(object, span)| PathCoordinateOperand {
-                    value: crate::content_stream::operand_number(
-                        object,
-                        input.get(span.clone()).unwrap_or_default(),
-                    ),
+                    value: crate::content_stream::operand_number(object),
                     offset: span.start,
                     length: span.len(),
                 },

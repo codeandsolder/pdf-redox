@@ -80,18 +80,6 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
-fn matrix_operands(
-    decoded: &[u8],
-    instruction: &hayro_syntax::content::Instruction<'_, '_>,
-) -> Option<[f64; 6]> {
-    let operands = crate::content_stream::instruction_operands(decoded, instruction);
-    let values: Vec<f64> = operands
-        .into_iter()
-        .map(|x| x.number)
-        .collect::<Option<_>>()?;
-    values.try_into().ok()
-}
-
 fn unit_quad(matrix: [f64; 6]) -> [[f64; 2]; 4] {
     let [xx, yx, xy, yy, tx, ty] = matrix;
     [
@@ -196,7 +184,7 @@ fn amend_page(
                     .ok_or_else(|| invalid("unbalanced graphics stack"))?;
             }
             b"cm" => {
-                let matrix = matrix_operands(decoded, instruction)
+                let matrix = crate::content_stream::instruction_number_array::<6>(instruction)
                     .ok_or_else(|| invalid("invalid page-space graphics transform"))?;
                 ctm = compose_affine_matrix(ctm, matrix);
             }
@@ -205,7 +193,7 @@ fn amend_page(
                     if mark.page_quad.is_some() {
                         mark.ambiguous = true;
                     }
-                    let matrix = matrix_operands(decoded, instruction)
+                    let matrix = crate::content_stream::instruction_number_array::<6>(instruction)
                         .ok_or_else(|| invalid("invalid Type3 text transform"))?;
                     mark.page_quad = Some(unit_quad(compose_affine_matrix(ctm, matrix)));
                 }

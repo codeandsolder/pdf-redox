@@ -85,22 +85,17 @@ impl CowPlacementScanner {
         }
     }
 
-    fn instruction(
-        &mut self,
-        content: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
-        let operands = instruction.operands().collect::<Vec<_>>();
-        let operand_spans = instruction.operand_spans().collect::<Vec<_>>();
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        let operand_count = instruction.operand_spans().len();
         match &instruction.operator[..] {
             b"q" => {
-                if !operands.is_empty() {
+                if operand_count != 0 {
                     self.complete = false;
                 }
                 self.stack.push(self.ctm);
             }
             b"Q" => {
-                if !operands.is_empty() {
+                if operand_count != 0 {
                     self.complete = false;
                 }
                 if let Some(ctm) = self.stack.pop() {
@@ -110,34 +105,24 @@ impl CowPlacementScanner {
                 }
             }
             b"cm" => {
-                if operands.len() != 6 {
-                    self.complete = false;
-                    return;
-                }
-                let values = operands
-                    .iter()
-                    .zip(&operand_spans)
-                    .map(|(operand, span)| {
-                        crate::content_stream::operand_number(
-                            operand,
-                            content.get(span.clone()).unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Option<Vec<_>>>();
-                if let Some(values) = values {
-                    self.ctm.concat(Matrix::new(
-                        values[0], values[1], values[2], values[3], values[4], values[5],
-                    ));
+                if let Some(values) =
+                    crate::content_stream::instruction_number_array::<6>(instruction)
+                {
+                    self.ctm.concat(Matrix::from(values));
                 } else {
                     self.complete = false;
                 }
             }
             b"Do" => {
-                if operands.len() != 1 {
+                if operand_count != 1 {
                     self.complete = false;
                     return;
                 }
-                let Some(name) = crate::content_stream::operand_name(operands[0]) else {
+                let Some(name) = instruction
+                    .operands()
+                    .next()
+                    .and_then(crate::content_stream::operand_name)
+                else {
                     self.complete = false;
                     return;
                 };
@@ -156,7 +141,7 @@ impl CowPlacementScanner {
 
     fn scan(&mut self, content: &[u8]) -> crate::Result<()> {
         let incomplete = crate::content_stream::visit_instructions(content, |instruction| {
-            self.instruction(content, instruction);
+            self.instruction(instruction);
             Ok(())
         })?;
         if incomplete || !self.stack.is_empty() {
