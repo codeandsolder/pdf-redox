@@ -64,46 +64,18 @@ impl BilevelRaster {
     }
 
     pub(crate) fn from_image_mask_alpha(data: &[u8], width: u32, height: u32) -> Option<Self> {
-        let width_usize = usize::try_from(width).ok()?;
-        let height_usize = usize::try_from(height).ok()?;
-        if data.len() != width_usize.checked_mul(height_usize)?
-            || !data.iter().all(|&value| matches!(value, 0 | 255))
-        {
-            return None;
-        }
-
-        let mut raster = Self::transparent(width, height)?;
-        for y in 0..height_usize {
-            for x in 0..width_usize {
-                if data[y * width_usize + x] != 0 {
-                    raster.paint(x, y);
-                }
-            }
-        }
-        Some(raster)
-    }
-
-    pub(crate) fn from_binary_gray_samples(data: &[u8], width: u32, height: u32) -> Option<Self> {
-        let width_usize = usize::try_from(width).ok()?;
-        let height_usize = usize::try_from(height).ok()?;
-        if data.len() != width_usize.checked_mul(height_usize)?
-            || !data.iter().all(|&value| matches!(value, 0 | 255))
-        {
-            return None;
-        }
-        let row_bytes = usize::try_from(width.div_ceil(8)).ok()?;
-        let mut packed = vec![0u8; row_bytes.checked_mul(height_usize)?];
-        for y in 0..height_usize {
-            for x in 0..width_usize {
-                if data[y * width_usize + x] == 255 {
-                    packed[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
-                }
-            }
-        }
         Some(Self {
             width,
             height,
-            packed,
+            packed: pack_binary_samples::<true>(data, width, height, 1)?,
+        })
+    }
+
+    pub(crate) fn from_binary_gray_samples(data: &[u8], width: u32, height: u32) -> Option<Self> {
+        Some(Self {
+            width,
+            height,
+            packed: pack_binary_samples::<false>(data, width, height, 1)?,
         })
     }
 
@@ -140,6 +112,63 @@ impl BilevelRaster {
             data: encoded.data,
         })
     }
+}
+
+/// Validate and collect the low bits of eight binary bytes in one word.
+/// Multiplication by 255 expands each spaced low bit into its own byte;
+/// equality proves that every original sample was either 0 or 255.
+const fn binary_byte(samples: [u8; 8]) -> Option<u8> {
+    let word = u64::from_le_bytes(samples);
+    let low_bits = word & 0x0101_0101_0101_0101;
+    if low_bits * 255 != word {
+        return None;
+    }
+    // The diagonal products put sample i into bit 63-i. All cross
+    // products are below the top byte or wrap out, without carries.
+    Some(low_bits.wrapping_mul(0x8040_2010_0804_0201).to_le_bytes()[7])
+}
+
+/// Pack one bit per sample, preserving row boundaries for arbitrary
+/// component counts. The stencil polarity inverts only active samples,
+/// never the unused low padding bits of a row's final byte.
+pub fn pack_binary_samples<const INVERT: bool>(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    components: usize,
+) -> Option<Vec<u8>> {
+    let samples_per_row = usize::try_from(width).ok()?.checked_mul(components)?;
+    let height = usize::try_from(height).ok()?;
+    if components == 0 || data.len() != samples_per_row.checked_mul(height)? {
+        return None;
+    }
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut packed = Vec::with_capacity(samples_per_row.div_ceil(8).checked_mul(height)?);
+    let polarity = if INVERT { u8::MAX } else { 0 };
+    for row in data.chunks_exact(samples_per_row) {
+        let (groups, tail) = row.as_chunks::<8>();
+        for &group in groups {
+            packed.push(binary_byte(group)? ^ polarity);
+        }
+        if !tail.is_empty() {
+            let mut samples = [0; 8];
+            samples[..tail.len()].copy_from_slice(tail);
+            let active = u8::MAX << (8 - tail.len());
+            packed.push((binary_byte(samples)? ^ polarity) & active);
+        }
+    }
+    Some(packed)
+}
+
+/// Admission needs only a binary alpha proof, not an allocated mask.
+pub fn is_binary_sample_plane(data: &[u8], width: u32, height: u32) -> bool {
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(usize::try_from(height).ok()?))
+        == Some(data.len())
+        && data.iter().all(|&sample| matches!(sample, 0 | 255))
 }
 
 pub fn set_bilevel_filter(
@@ -251,6 +280,60 @@ mod tests {
             }
         }
         row
+    }
+
+    #[test]
+    fn binary_word_projection_is_exact_for_every_pattern() {
+        for pattern in 0..=255u8 {
+            let samples = std::array::from_fn(|i| if pattern & (0x80 >> i) == 0 { 0 } else { 255 });
+            assert_eq!(binary_byte(samples), Some(pattern));
+            for i in 0..8 {
+                let mut invalid = samples;
+                invalid[i] = 127;
+                assert_eq!(binary_byte(invalid), None);
+            }
+        }
+    }
+
+    #[test]
+    fn binary_packing_preserves_polarity_components_and_row_tail() {
+        for width in 0..=20u32 {
+            for height in 0..=3u32 {
+                for components in 1..=4 {
+                    let row_samples = usize::try_from(width).unwrap_or_default() * components;
+                    let data = (0..row_samples * usize::try_from(height).unwrap_or_default())
+                        .map(|i| if (i ^ (i >> 2)) % 3 == 0 { 255 } else { 0 })
+                        .collect::<Vec<_>>();
+                    for invert in [false, true] {
+                        let row_bytes = row_samples.div_ceil(8);
+                        let mut expected =
+                            vec![0; row_bytes * usize::try_from(height).unwrap_or_default()];
+                        if row_samples != 0 {
+                            for (y, row) in data.chunks_exact(row_samples).enumerate() {
+                                for (x, &sample) in row.iter().enumerate() {
+                                    if (sample == 255) != invert {
+                                        expected[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
+                                    }
+                                }
+                            }
+                        }
+                        let actual = if invert {
+                            pack_binary_samples::<true>(&data, width, height, components)
+                        } else {
+                            pack_binary_samples::<false>(&data, width, height, components)
+                        };
+                        assert_eq!(actual, Some(expected));
+                    }
+                }
+            }
+        }
+        assert_eq!(pack_binary_samples::<false>(&[], 1, 1, 0), None);
+        assert_eq!(pack_binary_samples::<false>(&[0, 127], 2, 1, 1), None);
+        assert_eq!(pack_binary_samples::<true>(&[0, 127], 2, 1, 1), None);
+        assert_eq!(pack_binary_samples::<true>(&[0], 2, 1, 1), None);
+        assert!(is_binary_sample_plane(&[0, 255], 2, 1));
+        assert!(!is_binary_sample_plane(&[0, 127], 2, 1));
+        assert!(!is_binary_sample_plane(&[0], 2, 1));
     }
 
     #[test]

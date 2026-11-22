@@ -2,7 +2,10 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
     StreamData,
-    bilevel::{BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, set_bilevel_filter},
+    bilevel::{
+        BilevelCodec, BilevelRaster, estimated_bilevel_stream_cost, is_binary_sample_plane,
+        pack_binary_samples, set_bilevel_filter,
+    },
     content::{
         form_content, form_resources, page_box_numbers_matching, page_content, page_resources,
         page_user_unit, resolved_bool, resolved_dictionary, resolved_non_null, resolved_number,
@@ -3001,38 +3004,6 @@ fn prune_hidden_raster_paints(
     })
 }
 
-fn pack_binary_samples(data: &[u8], width: u32, height: u32, components: usize) -> Option<Vec<u8>> {
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    let samples_per_row = width.checked_mul(components)?;
-    if components == 0
-        || data.len() != samples_per_row.checked_mul(height)?
-        || !data.iter().all(|&value| matches!(value, 0 | 255))
-    {
-        return None;
-    }
-
-    // PDF image rows start on byte boundaries. Within each row, component
-    // samples are packed consecutively MSB-first, including RGB/CMYK samples.
-    let row_bytes = samples_per_row.div_ceil(8);
-    let mut out = vec![0u8; row_bytes.checked_mul(height)?];
-    for y in 0..height {
-        let src_row = y * samples_per_row;
-        let dst_row = y * row_bytes;
-        for sample in 0..samples_per_row {
-            if data[src_row + sample] == 255 {
-                out[dst_row + sample / 8] |= 0x80 >> (sample % 8);
-            }
-        }
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-fn pack_binary_gray_samples(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    pack_binary_samples(data, width, height, 1)
-}
-
 fn is_device_gray(dictionary: &OwnedDictionary) -> bool {
     matches!(
         dictionary.get(b"ColorSpace".as_slice()),
@@ -3396,7 +3367,7 @@ fn encode_prepared_color(
             encoded_8bit
         }
     } else if binary_components == Some(3)
-        && let Some(packed) = pack_binary_samples(data, width, height, 3)
+        && let Some(packed) = pack_binary_samples::<false>(data, width, height, 3)
     {
         let encoded_1bit = crate::stream_codec::encode_flate(&packed, flate_level)?;
         if encoded_1bit.len() < encoded_8bit.len() {
@@ -5914,8 +5885,7 @@ fn find_constant_color_mask_stencil_plans(
             continue;
         }
         if constant_device_color(info, &info.data).is_none()
-            || BilevelRaster::from_image_mask_alpha(&alpha.data, alpha.width, alpha.height)
-                .is_none()
+            || !is_binary_sample_plane(&alpha.data, alpha.width, alpha.height)
         {
             continue;
         }
@@ -7231,24 +7201,24 @@ mod tests {
     fn binary_gray_samples_pack_msb_first_per_row() {
         let data = [255, 0, 255, 0, 0, 255, 0, 255, 255, 255];
         assert_eq!(
-            pack_binary_gray_samples(&data, 5, 2),
+            pack_binary_samples::<false>(&data, 5, 2, 1),
             Some(vec![0b1010_0000, 0b1011_1000])
         );
-        assert_eq!(pack_binary_gray_samples(&[0, 127], 2, 1), None);
+        assert_eq!(pack_binary_samples::<false>(&[0, 127], 2, 1, 1), None);
     }
 
     #[test]
     fn binary_rgb_samples_pack_components_msb_first_and_pad_each_row() {
         assert_eq!(
-            pack_binary_samples(&[0, 0, 0, 255, 255, 255], 2, 1, 3),
+            pack_binary_samples::<false>(&[0, 0, 0, 255, 255, 255], 2, 1, 3),
             Some(vec![0b0001_1100])
         );
         assert_eq!(
-            pack_binary_samples(&[0, 0, 0, 255, 255, 255], 1, 2, 3),
+            pack_binary_samples::<false>(&[0, 0, 0, 255, 255, 255], 1, 2, 3),
             Some(vec![0b0000_0000, 0b1110_0000])
         );
-        assert_eq!(pack_binary_samples(&[0, 0, 127], 1, 1, 3), None);
-        assert_eq!(pack_binary_samples(&[0, 0], 1, 1, 3), None);
+        assert_eq!(pack_binary_samples::<false>(&[0, 0, 127], 1, 1, 3), None);
+        assert_eq!(pack_binary_samples::<false>(&[0, 0], 1, 1, 3), None);
     }
 
     #[test]
