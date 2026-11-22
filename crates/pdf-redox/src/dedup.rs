@@ -1,6 +1,11 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    StreamData, content::resolved_dictionary, source::CurrentValue,
+    StreamData,
+    content::resolved_dictionary,
+    source::{
+        CosScalar, CurrentArrayIter, CurrentChildKey, CurrentChildren, CurrentDictionaryIter,
+        CurrentValue, NumericValue, StreamIdentity,
+    },
 };
 use hayro_syntax::PdfVersion;
 use sha2::{Digest, Sha256};
@@ -225,16 +230,16 @@ impl FingerprintReferences<'_> {
     }
 }
 
-fn hash_stream_identity(hasher: &mut Sha256, data: &StreamData) {
+fn hash_stream_identity(hasher: &mut Sha256, data: StreamIdentity<'_>) {
     match data {
-        StreamData::Source(id) => {
+        StreamIdentity::Source(id) => {
             hasher.update([0x80]);
             hasher.update(id.number().to_le_bytes());
             hasher.update(id.generation().to_le_bytes());
         }
-        StreamData::Owned(bytes) => {
+        StreamIdentity::Inline(bytes) => {
             hasher.update([0x81]);
-            hash_len_prefixed(hasher, bytes);
+            hash_len_prefixed(hasher, bytes.as_ref());
         }
     }
 }
@@ -242,20 +247,20 @@ fn hash_stream_identity(hasher: &mut Sha256, data: &StreamData) {
 // A frame holds only unvisited siblings. Stream identities are emitted after
 // the dictionary, not before it, preserving the unambiguous COS encoding.
 enum FingerprintFrame<'a> {
-    Array(std::slice::Iter<'a, OwnedObject>),
+    Array(CurrentArrayIter<'a>),
     Dictionary {
-        entries: std::collections::btree_map::Iter<'a, Vec<u8>, OwnedObject>,
-        data: Option<&'a StreamData>,
+        entries: CurrentDictionaryIter<'a>,
+        data: Option<StreamIdentity<'a>>,
     },
 }
 
 impl<'a> FingerprintFrame<'a> {
-    fn next_value(&mut self, hasher: &mut Sha256) -> Option<&'a OwnedObject> {
+    fn next_value(&mut self, hasher: &mut Sha256) -> Option<CurrentValue<'a>> {
         match self {
             Self::Array(values) => values.next(),
             Self::Dictionary { entries, data } => {
                 if let Some((key, value)) = entries.next() {
-                    hash_len_prefixed(hasher, key);
+                    hash_len_prefixed(hasher, key.as_ref());
                     Some(value)
                 } else {
                     if let Some(data) = data.take() {
@@ -268,63 +273,136 @@ impl<'a> FingerprintFrame<'a> {
     }
 }
 
-fn hash_cos_value(hasher: &mut Sha256, root: &OwnedObject, references: FingerprintReferences<'_>) {
-    let mut frames = SmallVec::<[FingerprintFrame<'_>; 4]>::new();
-    let mut next = Some(root);
-    loop {
-        if let Some(object) = next.take() {
-            match object {
-                OwnedObject::Null => hasher.update([0x00]),
-                OwnedObject::Boolean(value) => hasher.update([0x01, u8::from(*value)]),
-                OwnedObject::Integer(value) => {
-                    hasher.update([0x02]);
-                    hasher.update(value.to_le_bytes());
-                }
-                OwnedObject::Real(value) => {
-                    hasher.update([0x03]);
-                    hasher.update(value.to_bits().to_le_bytes());
-                }
-                OwnedObject::Name(value) => {
-                    hasher.update([0x04]);
-                    hash_len_prefixed(hasher, value);
-                }
-                OwnedObject::String(value) => {
-                    hasher.update([0x05]);
-                    hash_len_prefixed(hasher, value);
-                }
-                OwnedObject::Reference(handle) => {
-                    references.hash(hasher, *handle, frames.is_empty());
-                }
-                OwnedObject::Array(values) => {
-                    hasher.update([0x06]);
-                    hasher.update((values.len() as u64).to_le_bytes());
-                    frames.push(FingerprintFrame::Array(values.iter()));
-                }
-                OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-                    let data = match object {
-                        OwnedObject::Stream { data, .. } => Some(data),
-                        _ => None,
-                    };
-                    hasher.update([if data.is_some() { 0x08 } else { 0x07 }]);
-                    hasher.update((dictionary.len() as u64).to_le_bytes());
-                    frames.push(FingerprintFrame::Dictionary {
-                        entries: dictionary.iter(),
-                        data,
-                    });
-                }
+fn hash_cos_header<'a>(
+    hasher: &mut Sha256,
+    object: &CurrentValue<'a>,
+    references: FingerprintReferences<'_>,
+    is_root: bool,
+) -> Option<FingerprintFrame<'a>> {
+    if let Some(scalar) = object.scalar() {
+        match scalar {
+            CosScalar::Null => hasher.update([0x00]),
+            CosScalar::Boolean(value) => hasher.update([0x01, u8::from(value)]),
+            CosScalar::Number(NumericValue::Integer(value)) => {
+                hasher.update([0x02]);
+                hasher.update(value.to_le_bytes());
             }
+            CosScalar::Number(NumericValue::Real(value)) => {
+                hasher.update([0x03]);
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+            CosScalar::Name(value) => {
+                hasher.update([0x04]);
+                hash_len_prefixed(hasher, value);
+            }
+            CosScalar::String(value) => {
+                hasher.update([0x05]);
+                hash_len_prefixed(hasher, value);
+            }
+            CosScalar::Reference(handle) => references.hash(hasher, handle, is_root),
         }
-        while let Some(frame) = frames.last_mut() {
-            if let Some(value) = frame.next_value(hasher) {
-                next = Some(value);
-                break;
+        None
+    } else if let (Some(len), Some(values)) = (object.array_len(), object.array_items()) {
+        hasher.update([0x06]);
+        hasher.update((len as u64).to_le_bytes());
+        Some(FingerprintFrame::Array(values))
+    } else if let (Some(len), Some(entries)) =
+        (object.dictionary_len(), object.dictionary_entries())
+    {
+        let data = object.stream_identity();
+        hasher.update([if data.is_some() { 0x08 } else { 0x07 }]);
+        hasher.update((len as u64).to_le_bytes());
+        Some(FingerprintFrame::Dictionary { entries, data })
+    } else {
+        unreachable!("non-scalar COS value must be a container")
+    }
+}
+
+fn hash_cos_value(
+    hasher: &mut Sha256,
+    root: &CurrentValue<'_>,
+    references: FingerprintReferences<'_>,
+) {
+    let mut frames = SmallVec::<[FingerprintFrame<'_>; 4]>::new();
+    if let Some(frame) = hash_cos_header(hasher, root, references, true) {
+        frames.push(frame);
+    }
+    while let Some(frame) = frames.last_mut() {
+        if let Some(value) = frame.next_value(hasher) {
+            if let Some(frame) = hash_cos_header(hasher, &value, references, false) {
+                frames.push(frame);
             }
+        } else {
             frames.pop();
         }
-        if next.is_none() {
-            return;
+    }
+}
+
+fn editable_children<'a>(value: &CurrentValue<'a>) -> Option<CurrentChildren<'a>> {
+    value
+        .dictionary_entries()
+        .map(CurrentChildren::Dictionary)
+        .or_else(|| {
+            value
+                .array_items()
+                .map(|items| CurrentChildren::Array(items.enumerate()))
+        })
+}
+
+type EqualityFrame<'a, 'b> = (CurrentChildren<'a>, CurrentChildren<'b>);
+
+fn compare_cos_node<'a, 'b>(
+    left: &CurrentValue<'a>,
+    right: &CurrentValue<'b>,
+    frames: &mut SmallVec<[EqualityFrame<'a, 'b>; 4]>,
+) -> bool {
+    match (left.scalar(), right.scalar()) {
+        (Some(left), Some(right)) => return left == right,
+        (None, None) => {}
+        _ => return false,
+    }
+    if left.stream_identity() != right.stream_identity()
+        || left.is_dictionary() != right.is_dictionary()
+    {
+        return false;
+    }
+    match (editable_children(left), editable_children(right)) {
+        (Some(left), Some(right)) => {
+            frames.push((left, right));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Compare the exact editable COS structures, regardless of storage.
+/// Hash equality is only a candidate filter; equality never follows references.
+pub fn exact_cos_equal(left: &CurrentValue<'_>, right: &CurrentValue<'_>) -> bool {
+    let mut frames = SmallVec::<[EqualityFrame<'_, '_>; 4]>::new();
+    if !compare_cos_node(left, right, &mut frames) {
+        return false;
+    }
+    while let Some((left, right)) = frames.last_mut() {
+        match (left.next(), right.next()) {
+            (None, None) => {
+                frames.pop();
+            }
+            (Some((left_key, left)), Some((right_key, right))) => {
+                let keys_match = match (left_key, right_key) {
+                    (CurrentChildKey::Array(left), CurrentChildKey::Array(right)) => left == right,
+                    (CurrentChildKey::Dictionary(left), CurrentChildKey::Dictionary(right)) => {
+                        left.as_ref() == right.as_ref()
+                    }
+                    _ => false,
+                };
+                if !keys_match || !compare_cos_node(&left, &right, &mut frames) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
+    true
 }
 
 /// Hash source and overlay stream data in place using one reference policy,
@@ -336,23 +414,29 @@ fn hash_stream_with_keys(
     ignored_dictionary_keys: &[&[u8]],
     references: FingerprintReferences<'_>,
 ) -> Result<Option<([u8; 32], usize)>> {
-    let Some(object) = document.current_owned_object_cow(stream)? else {
+    let Some(object) = document.current_value(stream)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+    if !object.is_stream() {
         return Ok(None);
-    };
-    let raw = data.bytes(document.source())?;
+    }
+    let raw = object.stream_bytes(document.source())?;
     let mut hasher = Sha256::new();
     hash_len_prefixed(&mut hasher, domain);
     hash_len_prefixed(&mut hasher, raw.as_ref());
-    let entries = dictionary.iter().filter(|(key, _)| {
-        key.as_slice() != b"Length" && !ignored_dictionary_keys.contains(&key.as_slice())
-    });
-    hasher.update((entries.clone().count() as u64).to_le_bytes());
-    for (key, value) in entries {
-        hash_len_prefixed(&mut hasher, key);
-        hash_cos_value(&mut hasher, value, references);
+    let include = |(key, _): &(crate::source::CurrentKey<'_>, CurrentValue<'_>)| {
+        key.as_ref() != b"Length" && !ignored_dictionary_keys.contains(&key.as_ref())
+    };
+    let Some(entries) = object.dictionary_entries() else {
+        return Ok(None);
+    };
+    hasher.update((entries.filter(include).count() as u64).to_le_bytes());
+    let Some(entries) = object.dictionary_entries() else {
+        return Ok(None);
+    };
+    for (key, value) in entries.filter(include) {
+        hash_len_prefixed(&mut hasher, key.as_ref());
+        hash_cos_value(&mut hasher, &value, references);
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
 }
@@ -405,11 +489,15 @@ fn source_font_program_fingerprint(
         {
             hash_cos_value(
                 &mut hasher,
-                &OwnedObject::Integer(integer),
+                &CurrentValue::Owned(&OwnedObject::Integer(integer)),
                 FingerprintReferences::Exact,
             );
         } else {
-            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
+            hash_cos_value(
+                &mut hasher,
+                &CurrentValue::Owned(value),
+                FingerprintReferences::Exact,
+            );
         }
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
@@ -975,15 +1063,23 @@ fn pattern_payload_fingerprint(
     for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
         hash_len_prefixed(&mut hasher, key);
         if let Some(value) = dictionary.get(key) {
-            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
+            hash_cos_value(
+                &mut hasher,
+                &CurrentValue::Owned(value),
+                FingerprintReferences::Exact,
+            );
         } else {
             hasher.update([0]);
         }
     }
-    hash_cos_value(&mut hasher, bbox, FingerprintReferences::Exact);
     hash_cos_value(
         &mut hasher,
-        &OwnedObject::Dictionary(resources),
+        &CurrentValue::Owned(bbox),
+        FingerprintReferences::Exact,
+    );
+    hash_cos_value(
+        &mut hasher,
+        &CurrentValue::Owned(&OwnedObject::Dictionary(resources)),
         FingerprintReferences::Exact,
     );
     Ok(Some((hasher.finalize().into(), raw.len())))
@@ -1239,16 +1335,10 @@ fn hash_non_stream_object_with_redirects(
     domain: &[u8],
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(object) = document.current_owned_object_cow(handle)? else {
+    let Some(object) = document.current_value(handle)? else {
         return Ok(None);
     };
-    if matches!(object.as_ref(), OwnedObject::Stream { .. }) {
-        return Ok(None);
-    }
-    if !matches!(
-        object.as_ref(),
-        OwnedObject::Dictionary(_) | OwnedObject::Array(_)
-    ) {
+    if !object.is_dictionary() && object.array_items().is_none() {
         return Ok(None);
     }
     let mut hasher = Sha256::new();
@@ -1466,8 +1556,8 @@ pub fn canonicalize_sampled_function_streams(
     })
 }
 
-pub fn exact_dictionary_fingerprint(object: &OwnedObject, domain: &[u8]) -> Option<[u8; 32]> {
-    if !matches!(object, OwnedObject::Dictionary(_)) {
+pub fn exact_dictionary_fingerprint(object: &CurrentValue<'_>, domain: &[u8]) -> Option<[u8; 32]> {
+    if !object.is_dictionary() {
         return None;
     }
     let mut hasher = Sha256::new();
@@ -1481,30 +1571,34 @@ fn exact_dictionary_redirects(
     handles: impl IntoIterator<Item = CowObjectHandle>,
     domain: &[u8],
 ) -> Result<HashMap<CowObjectHandle, CowObjectHandle>> {
-    // Store borrowed overlay dictionaries without a deep clone; source-only
-    // dictionaries are materialized once and retained for collision checks.
-    let mut canonical_by_fingerprint =
-        HashMap::<[u8; 32], Vec<(CowObjectHandle, std::borrow::Cow<'_, OwnedObject>)>>::new();
+    // Retain only canonical handles. Re-read a borrowed candidate when the
+    // hash matches and verify its exact structure without materialization.
+    let mut canonical_by_fingerprint = HashMap::<[u8; 32], Vec<CowObjectHandle>>::new();
     let mut redirects = HashMap::new();
 
     for handle in handles {
-        let Some(object) = document.current_owned_object_cow(handle)? else {
+        let Some(object) = document.current_value(handle)? else {
             continue;
         };
         let Some(fingerprint) = exact_dictionary_fingerprint(&object, domain) else {
             continue;
         };
-
         let candidates = canonical_by_fingerprint.entry(fingerprint).or_default();
-        if let Some((canonical, _)) = candidates
-            .iter()
-            .find(|(_, candidate)| *candidate == object)
-        {
-            if *canonical != handle {
-                redirects.insert(handle, *canonical);
+        let mut matched = None;
+        for &canonical in &*candidates {
+            if let Some(candidate) = document.current_value(canonical)?
+                && exact_cos_equal(&candidate, &object)
+            {
+                matched = Some(canonical);
+                break;
+            }
+        }
+        if let Some(canonical) = matched {
+            if canonical != handle {
+                redirects.insert(handle, canonical);
             }
         } else {
-            candidates.push((handle, object));
+            candidates.push(handle);
         }
     }
 
@@ -1517,7 +1611,7 @@ pub fn has_exact_duplicate_extgstate_dictionaries(
 ) -> Result<bool> {
     let mut fingerprints = HashSet::new();
     for handle in handles {
-        let Some(object) = document.current_owned_object_cow(*handle)? else {
+        let Some(object) = document.current_value(*handle)? else {
             continue;
         };
         let Some(fingerprint) =
@@ -1814,9 +1908,17 @@ fn source_form_fingerprint(
                 image_redirects,
                 form_redirects,
             )?;
-            hash_cos_value(&mut hasher, &normalized, FingerprintReferences::Exact);
+            hash_cos_value(
+                &mut hasher,
+                &CurrentValue::Owned(&normalized),
+                FingerprintReferences::Exact,
+            );
         } else {
-            hash_cos_value(&mut hasher, value, FingerprintReferences::Exact);
+            hash_cos_value(
+                &mut hasher,
+                &CurrentValue::Owned(value),
+                FingerprintReferences::Exact,
+            );
         }
     }
     Ok(Some((hasher.finalize().into(), raw.len())))
@@ -2344,7 +2446,7 @@ mod tests {
         ]));
         let digest = |object: &OwnedObject, mode| {
             let mut hasher = Sha256::new();
-            hash_cos_value(&mut hasher, object, mode);
+            hash_cos_value(&mut hasher, &CurrentValue::Owned(object), mode);
             <[u8; 32]>::from(hasher.finalize())
         };
         // Frozen digest values from the previous exact and recursive byte protocols,
@@ -2388,6 +2490,68 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_cos_fingerprint_matches_materialized_source_and_mixed_overlay() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        )?;
+        pdf.stream(4, b"/Z [true null /A#20B (abc) <00ff> 9007199254740993 9223372036854775808.0 -0.0 5 0 R] /A << /X 3 /X 7 /Y 1.25 >>", b"q Q")?;
+        pdf.object(5, b"<< /Z [true null /A#20B (abc) <00ff> 9007199254740993 9223372036854775808.0 -0.0 5 0 R] /A << /Y 1.25 /X 3 >> >>")?;
+        pdf.object(6, b"<< /A << /X 3 /Y 1.25 >> /Z [true null /A#20B (abc) <00ff> 9007199254740993 9223372036854775808.0 0 5 0 R] >>")?;
+        pdf.object(7, b"<< /A << /X 3 /Y 1.25 >> /Z [true null /A#20B (abc) <00ff> 9007199254740992 9223372036854775808.0 0 5 0 R] >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let handle = |id| CowObjectHandle::Existing(crate::ObjectId::new(id, 0));
+        let redirects = HashMap::from([(handle(5), handle(6))]);
+        for id in 4..=7 {
+            let Some(source) = document.current_value(handle(id))? else {
+                return Err(crate::Error::Invalid("missing source COS fixture".into()));
+            };
+            let Some(materialized) = document.current_owned_object_cow(handle(id))? else {
+                return Err(crate::Error::Invalid(
+                    "missing materialized COS fixture".into(),
+                ));
+            };
+            let owned = CurrentValue::Owned(&materialized);
+            assert!(exact_cos_equal(&source, &owned));
+            for policy in [
+                FingerprintReferences::Exact,
+                FingerprintReferences::Recursive(&redirects),
+                FingerprintReferences::TopLevel(&redirects),
+            ] {
+                let mut left = Sha256::new();
+                let mut right = Sha256::new();
+                hash_cos_value(&mut left, &source, policy);
+                hash_cos_value(&mut right, &owned, policy);
+                assert_eq!(left.finalize(), right.finalize(), "object {id}");
+            }
+        }
+        let _ = document.edit_handle(handle(6))?;
+        let expected = HashMap::from([(handle(6), handle(5))]);
+        assert_eq!(
+            exact_dictionary_redirects(&document, [handle(5), handle(6), handle(7)], b"mixed")?,
+            expected
+        );
+        let Some(stream) = document.current_value(handle(4))? else {
+            return Err(crate::Error::Invalid("missing source stream".into()));
+        };
+        let mut changed = stream.into_cow().into_owned();
+        let OwnedObject::Stream { data, .. } = &mut changed else {
+            return Err(crate::Error::Invalid("expected stream".into()));
+        };
+        *data = StreamData::Owned(b"q Q".to_vec());
+        let Some(stream) = document.current_value(handle(4))? else {
+            return Err(crate::Error::Invalid("missing source stream".into()));
+        };
+        // Whole-COS identity includes the source handle, even when the raw bytes
+        // are identical. Stream-specific dedup predicates use payload bytes instead.
+        assert!(!exact_cos_equal(&stream, &CurrentValue::Owned(&changed)));
+        Ok(())
+    }
+
+    #[test]
     fn cos_fingerprint_handles_deep_owned_nesting() -> Result<()> {
         let depth = 20_000;
         let mut value = OwnedObject::Null;
@@ -2401,8 +2565,16 @@ mod tests {
         }
         expected.update([0x00]);
         let mut actual = Sha256::new();
-        hash_cos_value(&mut actual, &value, FingerprintReferences::Exact);
+        hash_cos_value(
+            &mut actual,
+            &CurrentValue::Owned(&value),
+            FingerprintReferences::Exact,
+        );
         assert_eq!(actual.finalize(), expected.finalize());
+        assert!(exact_cos_equal(
+            &CurrentValue::Owned(&value),
+            &CurrentValue::Owned(&value)
+        ));
         // The separate owned-object destructor is recursive; dismantle
         // the synthetic input after exercising the iterative encoder.
         for _ in 0..depth {
