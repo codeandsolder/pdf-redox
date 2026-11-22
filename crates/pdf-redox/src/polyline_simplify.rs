@@ -12,7 +12,7 @@ use crate::content::page_content_if_present;
 use crate::{
     EditDocument, Result,
     content::{page_user_unit, replace_page_content},
-    content_stream::{instruction_operands, operand_numbers},
+    content_stream::instruction_number_array,
     geometry::Matrix,
 };
 
@@ -168,44 +168,54 @@ impl<'a> Scanner<'a> {
     }
 
     fn curve_operator(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) -> bool {
-        let operator = &instruction.operator[..];
-        let operands = instruction_operands(instruction);
-        let count = if operator == b"c" { 6 } else { 4 };
-        let Some(values) = operand_numbers(&operands)
-            .filter(|values| values.len() == count && values.iter().all(|value| value.is_finite()))
-        else {
-            return false;
-        };
-        let Some(end) = self.page_point(values[count - 2], values[count - 1]) else {
-            return false;
-        };
-        if operator == b"c"
-            && let Some(start) = self.current_point
-            && let (Some(first), Some(second)) = (
-                self.page_point(values[0], values[1]),
-                self.page_point(values[2], values[3]),
+        let (end, controls) = if &instruction.operator[..] == b"c" {
+            let Some(values) = instruction_number_array::<6>(instruction)
+                .filter(|values| values.iter().all(|value| value.is_finite()))
+            else {
+                return false;
+            };
+            (
+                self.page_point(values[4], values[5]),
+                Some((
+                    self.page_point(values[0], values[1]),
+                    self.page_point(values[2], values[3]),
+                )),
             )
+        } else {
+            let Some(values) = instruction_number_array::<4>(instruction)
+                .filter(|values| values.iter().all(|value| value.is_finite()))
+            else {
+                return false;
+            };
+            (self.page_point(values[2], values[3]), None)
+        };
+        let Some(end) = end else {
+            return false;
+        };
+        if let Some((Some(first), Some(second))) = controls
+            && let Some(start) = self.current_point
             && Self::near_linear_cubic(start, first, second, end)
         {
-            let spans = instruction.operand_spans().collect::<Vec<_>>();
-            if spans.len() != 6 {
-                return false;
-            }
-            let mut simplified = Vec::new();
-            let Some(x) = self.input.get(spans[4].clone()) else {
+            let mut spans = instruction.operand_spans();
+            let Some(first_span) = spans.next() else {
                 return false;
             };
-            let Some(y) = self.input.get(spans[5].clone()) else {
+            let Some(x) = spans.nth(3).and_then(|span| self.input.get(span)) else {
                 return false;
             };
+            let Some(y) = spans.next().and_then(|span| self.input.get(span)) else {
+                return false;
+            };
+            let mut simplified =
+                Vec::with_capacity(x.len().saturating_add(y.len()).saturating_add(3));
             simplified.extend_from_slice(x);
             simplified.push(b' ');
             simplified.extend_from_slice(y);
             simplified.extend_from_slice(b" l");
             let end_offset = instruction.operator_span().end;
-            if end_offset.saturating_sub(spans[0].start) > simplified.len() {
+            if end_offset.saturating_sub(first_span.start) > simplified.len() {
                 self.curve_pending
-                    .push((spans[0].start, end_offset, simplified));
+                    .push((first_span.start, end_offset, simplified));
             }
         }
         self.current_point = Some(end);
@@ -217,15 +227,8 @@ impl<'a> Scanner<'a> {
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
         deletable: bool,
     ) -> Option<Vertex> {
-        let operands = instruction_operands(instruction);
-        let values = operand_numbers(&operands).filter(|values| values.len() == 2)?;
-        let ctm = self.ctm?;
-        let (x, y) = ctm.transform(values[0], values[1]);
-        let page_x = x * self.user_unit;
-        let page_y = y * self.user_unit;
-        if !page_x.is_finite() || !page_y.is_finite() {
-            return None;
-        }
+        let [x, y] = instruction_number_array::<2>(instruction)?;
+        let (page_x, page_y) = self.page_point(x, y)?;
         let operator = instruction.operator_span();
         let start = instruction
             .operand_spans()
@@ -241,33 +244,41 @@ impl<'a> Scanner<'a> {
     }
 
     fn concat_ctm(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
-        let operands = instruction_operands(instruction);
-        let matrix = operand_numbers(&operands)
-            .filter(|values| values.len() == 6)
+        let matrix = instruction_number_array::<6>(instruction)
             .filter(|values| values.iter().all(|value| value.is_finite()))
-            .map(|values| {
-                Matrix::new(
-                    values[0], values[1], values[2], values[3], values[4], values[5],
-                )
-            });
+            .map(|[a, b, c, d, e, f]| Matrix::new(a, b, c, d, e, f));
         match (&mut self.ctm, matrix) {
             (Some(ctm), Some(matrix)) => ctm.concat(matrix),
             _ => self.ctm = None,
         }
     }
 
-    fn point_segment_distance(point: Vertex, first: Vertex, last: Vertex) -> f64 {
-        let dx = last.page_x - first.page_x;
-        let dy = last.page_y - first.page_y;
+    fn farthest_interior_vertex(run: &[Vertex], first: usize, last: usize) -> Option<(usize, f64)> {
+        let origin = run[first];
+        let dx = run[last].page_x - origin.page_x;
+        let dy = run[last].page_y - origin.page_y;
         let length_sq = dx.mul_add(dx, dy * dy);
-        if length_sq <= f64::EPSILON {
-            return (point.page_x - first.page_x).hypot(point.page_y - first.page_y);
+        let distance = |point: &Vertex| {
+            if length_sq <= f64::EPSILON {
+                return (point.page_x - origin.page_x).hypot(point.page_y - origin.page_y);
+            }
+            let dot =
+                (point.page_y - origin.page_y).mul_add(dy, (point.page_x - origin.page_x) * dx);
+            let t = (dot / length_sq).clamp(0.0, 1.0);
+            let nearest_x = dx.mul_add(t, origin.page_x);
+            let nearest_y = dy.mul_add(t, origin.page_y);
+            (point.page_x - nearest_x).hypot(point.page_y - nearest_y)
+        };
+        let mut best = None;
+        let mut best_distance = -1.0_f64;
+        for (offset, point) in run[first + 1..last].iter().enumerate() {
+            let distance = distance(point);
+            if distance > best_distance {
+                best_distance = distance;
+                best = Some(first + 1 + offset);
+            }
         }
-        let dot = (point.page_y - first.page_y).mul_add(dy, (point.page_x - first.page_x) * dx);
-        let t = (dot / length_sq).clamp(0.0, 1.0);
-        let nearest_x = dx.mul_add(t, first.page_x);
-        let nearest_y = dy.mul_add(t, first.page_y);
-        (point.page_x - nearest_x).hypot(point.page_y - nearest_y)
+        best.map(|index| (index, best_distance))
     }
 
     fn simplified_keep(run: &[Vertex]) -> Vec<bool> {
@@ -285,17 +296,8 @@ impl<'a> Scanner<'a> {
             if last <= first + 1 {
                 continue;
             }
-            let mut best_index = None;
-            let mut best_distance = -1.0f64;
-            for index in first + 1..last {
-                let distance = Self::point_segment_distance(run[index], run[first], run[last]);
-                if distance > best_distance {
-                    best_distance = distance;
-                    best_index = Some(index);
-                }
-            }
-            if best_distance > MAX_POLYLINE_PAGE_ERROR_PT
-                && let Some(index) = best_index
+            if let Some((index, distance)) = Self::farthest_interior_vertex(run, first, last)
+                && distance > MAX_POLYLINE_PAGE_ERROR_PT
             {
                 keep[index] = true;
                 stack.push((first, index));
@@ -433,18 +435,21 @@ pub fn simplify_page_polylines(
             continue;
         };
         let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_flate = crate::stream_codec::flate_encoded_len(&simplified, flate_level)?;
-        let savings = before_flate.saturating_sub(after_flate);
-        if savings < MIN_FLATE_SAVINGS_BYTES {
+        let Some(budget) = before_flate.checked_sub(MIN_FLATE_SAVINGS_BYTES) else {
             continue;
-        }
-        replace_page_content(document, page, simplified.clone())?;
+        };
+        let Some(after_flate) =
+            crate::stream_codec::flate_capped_encoded_len(&simplified, budget, flate_level)?
+        else {
+            continue;
+        };
+        let savings = before_flate - after_flate;
+        let removed_bytes = decoded.len().saturating_sub(simplified.len());
+        replace_page_content(document, page, simplified)?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.vertices_removed = stats.vertices_removed.saturating_add(vertices_removed);
         stats.cubics_simplified = stats.cubics_simplified.saturating_add(cubics_simplified);
-        stats.decoded_bytes_removed = stats
-            .decoded_bytes_removed
-            .saturating_add(decoded.len().saturating_sub(simplified.len()));
+        stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(removed_bytes);
         stats.estimated_flate_bytes_saved =
             stats.estimated_flate_bytes_saved.saturating_add(savings);
     }
