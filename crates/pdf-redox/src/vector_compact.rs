@@ -1609,7 +1609,6 @@ type ProcessingFactorBlocks = BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<Transf
 
 struct PathFactoringOutcome {
     stats: VectorCompactionStats,
-    cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
     reusable_blocks: ProcessingFactorBlocks,
     rewritten_pages: BTreeSet<ObjectHandle>,
 }
@@ -1629,6 +1628,62 @@ fn measured_span_replacement(
     };
     let after = flate_lengths.encoded_len(&rewritten, level)?;
     Ok(Some((before, after, rewritten)))
+}
+
+/// Preference uses the first semantic representative, not the largest
+/// lexical body among equivalent paths.
+fn preferred_transformed_keys<'a>(
+    blocks: impl Iterator<Item = &'a TransformedBlock>,
+) -> HashSet<SemanticKey> {
+    let mut counts = HashMap::<SemanticKey, (usize, usize, usize)>::new();
+    for block in blocks {
+        let entry = counts.entry(block.semantic_key).or_insert_with(|| {
+            (
+                0,
+                block.operator_count,
+                block.body_end.saturating_sub(block.body_start),
+            )
+        });
+        entry.0 = entry.0.saturating_add(1);
+    }
+    counts
+        .into_iter()
+        .filter_map(|(key, (count, operators, body_len))| {
+            processing_transformed_factor_candidate(body_len, operators, count).then_some(key)
+        })
+        .collect()
+}
+
+/// Prefix maxima of sorted interval endpoints answer containment even
+/// when the original intervals are nested or overlapping.
+struct PreferredBodyIndex {
+    intervals: Vec<(usize, usize)>,
+}
+
+impl PreferredBodyIndex {
+    fn new(blocks: &[TransformedBlock], preferred: &HashSet<SemanticKey>) -> Self {
+        let mut intervals = blocks
+            .iter()
+            .filter(|block| preferred.contains(&block.semantic_key))
+            .map(|block| (block.body_start, block.body_end))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable_by_key(|&(start, _)| start);
+        let mut max_end = 0;
+        for (_, end) in &mut intervals {
+            max_end = max_end.max(*end);
+            *end = max_end;
+        }
+        Self { intervals }
+    }
+
+    fn contains(&self, start: usize, end: usize) -> bool {
+        let count = self
+            .intervals
+            .partition_point(|&(outer_start, _)| outer_start <= start);
+        count
+            .checked_sub(1)
+            .is_some_and(|index| self.intervals[index].1 >= end)
+    }
 }
 
 fn cached_path_factoring_is_impossible_after_transformed_preference(
@@ -1651,59 +1706,26 @@ fn cached_path_factoring_is_impossible_after_transformed_preference(
         return Ok(false);
     }
 
-    let mut transformed_counts = HashMap::<SemanticKey, (usize, usize, usize)>::new();
+    let mut scanned = Vec::with_capacity(pages.len());
     for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
+        let Some(object) = document.current_value(page)? else {
             continue;
         };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Contents".as_slice()) {
+        if object.dictionary_entry(b"Contents").is_none() {
             continue;
         }
-        let Some((_, transformed_blocks)) = pre_scanned.get(&page) else {
+        let Some(blocks) = pre_scanned.get(&page) else {
             return Ok(false);
         };
-        for block in transformed_blocks {
-            let body_len = block.body_end.saturating_sub(block.body_start);
-            let entry = transformed_counts.entry(block.semantic_key).or_insert((
-                0,
-                block.operator_count,
-                body_len,
-            ));
-            entry.0 = entry.0.saturating_add(1);
-        }
+        scanned.push(blocks);
     }
-    let preferred_transformed = transformed_counts
-        .iter()
-        .filter(|(_, (count, operators, body_len))| {
-            processing_transformed_factor_candidate(*body_len, *operators, *count)
-        })
-        .map(|(key, _)| *key)
-        .collect::<HashSet<_>>();
-
+    let preferred_transformed =
+        preferred_transformed_keys(scanned.iter().flat_map(|(_, transformed)| transformed));
     let mut path_keys = HashSet::<SemanticKey>::new();
-    for &page in pages {
-        let Some(object) = document.current_owned_object(page)? else {
-            continue;
-        };
-        let Some(dictionary) = object.as_dictionary() else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Contents".as_slice()) {
-            continue;
-        }
-        let Some((path_blocks, transformed_blocks)) = pre_scanned.get(&page) else {
-            return Ok(false);
-        };
+    for (path_blocks, transformed_blocks) in scanned {
+        let preferred = PreferredBodyIndex::new(transformed_blocks, &preferred_transformed);
         for block in path_blocks {
-            let nested_in_preferred = transformed_blocks.iter().any(|outer| {
-                preferred_transformed.contains(&outer.semantic_key)
-                    && outer.body_start <= block.start
-                    && block.end <= outer.body_end
-            });
-            if nested_in_preferred {
+            if preferred.contains(block.start, block.end) {
                 continue;
             }
             if !path_keys.insert(block.semantic_key) {
@@ -1733,25 +1755,18 @@ fn factor_repeated_path_forms(
         if *DEBUG_VECTOR {
             eprintln!("path-forms cached-proof=skip");
         }
-        let cached_transformed = pre_scanned
-            .iter()
-            .map(|(&page, (_, transformed))| (page, transformed.clone()))
-            .collect();
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
-            cached_transformed,
             reusable_blocks: pre_scanned,
             rewritten_pages: BTreeSet::new(),
         });
     }
 
     let mut page_data = Vec::with_capacity(pages.len());
-    let mut page_blocks =
-        Vec::<(Vec<PathBlock>, Vec<TransformedBlock>)>::with_capacity(pages.len());
+    let mut reusable_blocks = ProcessingFactorBlocks::new();
     let mut groups = FormGroups::new();
     let mut occupied_names = BTreeSet::new();
     let mut scanned_blocks = 0usize;
-    let mut cached_transformed = BTreeMap::new();
 
     for &page in pages {
         let Some(decoded) = page_content_if_present(document, page)? else {
@@ -1766,50 +1781,24 @@ fn factor_repeated_path_forms(
             occupied_names.extend(xobjects.keys().cloned());
         }
         page_data.push(PagePathData { page, decoded });
-        page_blocks.push(blocks);
+        reusable_blocks.insert(page, blocks);
     }
 
     // Prefer a larger repeated transformed body over path candidates nested
     // inside it. Rewriting an inner path to a Form call makes that outer body
     // resource-dependent and intentionally ineligible for transformed-form
     // factoring later.
-    let mut transformed_counts = HashMap::<SemanticKey, (usize, usize, usize)>::new();
-    for (_, transformed_blocks) in &page_blocks {
-        for block in transformed_blocks {
-            let body_len = block.body_end.saturating_sub(block.body_start);
-            let entry = transformed_counts.entry(block.semantic_key).or_insert((
-                0,
-                block.operator_count,
-                body_len,
-            ));
-            entry.0 = entry.0.saturating_add(1);
-        }
-    }
-    let preferred_transformed = transformed_counts
-        .into_iter()
-        .filter(|(_, (count, operators, body_len))| {
-            processing_transformed_factor_candidate(*body_len, *operators, *count)
-        })
-        .map(|(key, _)| key)
-        .collect::<HashSet<_>>();
-
-    // Source offsets and semantic keys may be reused in the following
-    // iteration only if the page content is not changed in this iteration.
-    let reusable_blocks: ProcessingFactorBlocks = page_data
-        .iter()
-        .zip(&page_blocks)
-        .map(|(page, blocks)| (page.page, blocks.clone()))
-        .collect();
-    for (page_index, (path_blocks, transformed_blocks)) in page_blocks.into_iter().enumerate() {
-        let page = page_data[page_index].page;
+    let preferred_transformed = preferred_transformed_keys(
+        page_data
+            .iter()
+            .flat_map(|page| &reusable_blocks[&page.page].1),
+    );
+    for (page_index, page) in page_data.iter().enumerate() {
+        let (path_blocks, transformed_blocks) = &reusable_blocks[&page.page];
+        let preferred = PreferredBodyIndex::new(transformed_blocks, &preferred_transformed);
         for block in path_blocks {
             scanned_blocks = scanned_blocks.saturating_add(1);
-            let nested_in_preferred = transformed_blocks.iter().any(|outer| {
-                preferred_transformed.contains(&outer.semantic_key)
-                    && outer.body_start <= block.start
-                    && block.end <= outer.body_end
-            });
-            if nested_in_preferred {
+            if preferred.contains(block.start, block.end) {
                 continue;
             }
             let entry = groups
@@ -1822,7 +1811,6 @@ fn factor_repeated_path_forms(
                 bounds: block.bounds,
             });
         }
-        cached_transformed.insert(page, transformed_blocks);
     }
 
     let semantic_groups = groups.len();
@@ -1836,7 +1824,6 @@ fn factor_repeated_path_forms(
     if candidates.is_empty() {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
-            cached_transformed,
             reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
@@ -1866,7 +1853,6 @@ fn factor_repeated_path_forms(
     if selected.is_empty() {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
-            cached_transformed,
             reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
@@ -1894,7 +1880,6 @@ fn factor_repeated_path_forms(
         else {
             return Ok(PathFactoringOutcome {
                 stats: VectorCompactionStats::default(),
-                cached_transformed,
                 reusable_blocks,
                 rewritten_pages: BTreeSet::new(),
             });
@@ -1924,7 +1909,6 @@ fn factor_repeated_path_forms(
     if after_flate >= before_flate {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
-            cached_transformed,
             reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
@@ -1941,7 +1925,6 @@ fn factor_repeated_path_forms(
     if after_flate >= before_flate {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
-            cached_transformed,
             reusable_blocks,
             rewritten_pages: BTreeSet::new(),
         });
@@ -2016,7 +1999,6 @@ fn factor_repeated_path_forms(
             generated_page_xobjects,
             ..VectorCompactionStats::default()
         },
-        cached_transformed,
         reusable_blocks,
         rewritten_pages: rewritten_page_handles,
     })
@@ -2029,7 +2011,7 @@ fn factor_repeated_path_forms(
 fn factor_repeated_transformed_blocks(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
-    mut cached_transformed: BTreeMap<ObjectHandle, Vec<TransformedBlock>>,
+    reusable_blocks: &ProcessingFactorBlocks,
     rewritten_pages: &BTreeSet<ObjectHandle>,
     pages: &[ObjectHandle],
     flate_lengths: &mut VectorFlateLengthMemo,
@@ -2043,12 +2025,14 @@ fn factor_repeated_transformed_blocks(
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let blocks = if rewritten_pages.contains(&page) {
-            factorable_transformed_blocks(&decoded)
+        let scanned;
+        let blocks = if let Some((_, transformed)) = reusable_blocks.get(&page)
+            && !rewritten_pages.contains(&page)
+        {
+            transformed.as_slice()
         } else {
-            cached_transformed
-                .remove(&page)
-                .unwrap_or_else(|| factorable_transformed_blocks(&decoded))
+            scanned = factorable_transformed_blocks(&decoded);
+            &scanned
         };
         for block in blocks {
             scanned_blocks = scanned_blocks.saturating_add(1);
@@ -3452,14 +3436,13 @@ fn factor_processing_structural_forms(
 )> {
     let PathFactoringOutcome {
         stats: path_stats,
-        cached_transformed,
         mut reusable_blocks,
         rewritten_pages: path_rewritten,
     } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages, flate_lengths)?;
     let transformed = factor_repeated_transformed_blocks(
         document,
         flate_level,
-        cached_transformed,
+        &reusable_blocks,
         &path_rewritten,
         pages,
         flate_lengths,
@@ -3492,10 +3475,10 @@ fn close_processing_exact_factoring(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    mut pre_scanned: ProcessingFactorBlocks,
     flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
-    let mut pre_scanned = ProcessingFactorBlocks::new();
     loop {
         let (forms, rewritten, reusable_blocks) = factor_processing_structural_forms(
             document,
@@ -3535,7 +3518,7 @@ fn finish_processing_vector_compaction(
     for page in &vector_rewritten_pages {
         path_coordinate_plans.remove(page);
     }
-    let (factored, factored_pages, _) = factor_processing_structural_forms(
+    let (factored, factored_pages, mut reusable_blocks) = factor_processing_structural_forms(
         document,
         flate_level,
         pages,
@@ -3584,10 +3567,14 @@ fn finish_processing_vector_compaction(
     // coordinate rewriting and the fill tail. Close only the exact stages
     // that those mutations may expose, without rounding any path twice.
     if !late_rewritten_pages.is_empty() {
+        for page in &late_rewritten_pages {
+            reusable_blocks.remove(page);
+        }
         let closure = close_processing_exact_factoring(
             document,
             flate_level,
             pages,
+            reusable_blocks,
             &mut flate_state.lengths,
         )?;
         total.absorb(closure);
@@ -3726,6 +3713,34 @@ pub fn compact_vector_paths_with_flate_cache(
 mod tests {
     use super::*;
     use crate::ObjectId;
+
+    #[test]
+    fn preferred_body_index_matches_exhaustive_containment() {
+        let ranges = [(30, 50), (0, 10), (10, 45), (20, 22), (60, 70), (60, 90)];
+        let blocks = ranges.map(|(body_start, body_end)| TransformedBlock {
+            body_start,
+            body_end,
+            semantic_key: [1; 32],
+            operator_count: 10,
+            bounds: Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+        });
+        let preferred = HashSet::from([[1; 32]]);
+        let indexed = PreferredBodyIndex::new(&blocks, &preferred);
+        for start in 0..100 {
+            for end in start..100 {
+                assert_eq!(
+                    indexed.contains(start, end),
+                    ranges.iter().any(|&(a, b)| a <= start && end <= b),
+                    "{start}..{end}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn repeated_form_candidates_materialize_only_repeated_first_occurrence() {
