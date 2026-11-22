@@ -483,6 +483,27 @@ struct ClosedFillTransaction {
     fill_kind: FillKind,
 }
 
+/// Both closed-fill recognizers require the same adjacent, finite miter
+/// assignment inside a saved graphics-state scope.
+fn saved_miter_prefix<'a>(
+    input: &[u8],
+    table: &'a EventTable,
+    index: usize,
+) -> Option<(&'a Event, &'a Event, u64)> {
+    let save = table.records.get(index)?;
+    let miter = table.records.get(index + 1)?;
+    if save.operator.as_slice() != b"q"
+        || save.operand_count != 0
+        || miter.operator.as_slice() != b"M"
+        || miter.operand_count != 1
+        || !adjacent(input, save, miter)
+    {
+        return None;
+    }
+    let value = miter.sole_number(&table.numbers)?;
+    value.is_finite().then_some((save, miter, value.to_bits()))
+}
+
 fn closed_fill_transaction(
     input: &[u8],
     table: &EventTable,
@@ -490,20 +511,7 @@ fn closed_fill_transaction(
 ) -> Option<(ClosedFillTransaction, usize)> {
     let events = &table.records;
     let numbers = &table.numbers;
-    let q = events.get(index)?;
-    let miter = events.get(index + 1)?;
-    if q.operator.as_slice() != b"q"
-        || q.operand_count != 0
-        || miter.operator.as_slice() != b"M"
-        || miter.operand_count != 1
-        || !adjacent(input, q, miter)
-    {
-        return None;
-    }
-    let miter_value = miter.sole_number(numbers)?;
-    if !miter_value.is_finite() {
-        return None;
-    }
+    let (q, miter, miter_bits) = saved_miter_prefix(input, table, index)?;
 
     let first_path_index = index + 2;
     let first_path = events.get(first_path_index)?;
@@ -539,7 +547,7 @@ fn closed_fill_transaction(
             end: restore.end,
             miter_start: miter.start,
             miter_end: miter.end,
-            miter_bits: miter_value.to_bits(),
+            miter_bits,
             body_start: first_path.start,
             body_end: paint.start,
             body_already_closed: last_path.operator.as_slice() == b"h",
@@ -1566,20 +1574,7 @@ fn outlined_glyph_transaction(
 ) -> Option<(GlyphTransaction, usize)> {
     let events = &table.records;
     let numbers = &table.numbers;
-    let save = events.get(index)?;
-    let miter = events.get(index + 1)?;
-    if save.operator.as_slice() != b"q"
-        || save.operand_count != 0
-        || miter.operator.as_slice() != b"M"
-        || miter.operand_count != 1
-        || !adjacent(input, save, miter)
-    {
-        return None;
-    }
-    let miter_value = miter.sole_number(numbers)?;
-    if !miter_value.is_finite() {
-        return None;
-    }
+    let (save, _, miter_bits) = saved_miter_prefix(input, table, index)?;
 
     let mut cursor = index + 2;
     let mut ops = Vec::new();
@@ -1633,7 +1628,7 @@ fn outlined_glyph_transaction(
         GlyphTransaction {
             start: save.start,
             end: restore.end,
-            miter_bits: miter_value.to_bits(),
+            miter_bits,
             bounds: bounds?,
             ops,
             closes,
