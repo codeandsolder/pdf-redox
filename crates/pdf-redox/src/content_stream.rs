@@ -80,16 +80,7 @@ pub struct InstructionOperand {
     pub offset: usize,
 }
 
-/// Parse the scalar/name facets used by graphics-state and geometry scanners.
-pub fn instruction_operands(
-    instruction: &hayro_syntax::content::Instruction<'_, '_>,
-) -> Vec<InstructionOperand> {
-    let mut operands = Vec::new();
-    instruction_operands_into(instruction, &mut operands);
-    operands
-}
-
-/// Parse the same operand facets into an existing buffer, retaining capacity
+/// Parse scalar/name operand facets into an existing buffer, retaining capacity
 /// across instructions in long-running page scanners.
 pub fn instruction_operands_into(
     instruction: &hayro_syntax::content::Instruction<'_, '_>,
@@ -283,7 +274,8 @@ mod tests {
         let incomplete = visit_instructions(input, |instruction| {
             match count {
                 0 => {
-                    let values = instruction_operands(instruction);
+                    let mut values = Vec::new();
+                    instruction_operands_into(instruction, &mut values);
                     assert_eq!(values[0].number, None);
                     assert_eq!(values[1].number, Some(0.0));
                     assert_eq!(instruction_number_array::<2>(instruction), None);
@@ -318,19 +310,22 @@ mod tests {
     }
 
     #[test]
-    fn reusable_operand_buffer_matches_owned_parsing_and_reuses_capacity() -> Result<()> {
+    fn reusable_operand_buffer_preserves_parsed_facets_and_capacity() -> Result<()> {
         let input = b"/F1 12 Tf 5.123 8 m 1 0 0 rg q Q 10 20 l (literal text) Tj";
         let mut reused = Vec::with_capacity(16);
         let initial_pointer = reused.as_ptr();
         let mut instructions = 0;
         let incomplete = visit_instructions(input, |instruction| {
-            let owned = instruction_operands(instruction);
             instruction_operands_into(instruction, &mut reused);
-            assert_eq!(reused.len(), owned.len());
-            for (actual, expected) in reused.iter().zip(&owned) {
-                assert_eq!(actual.number, expected.number);
-                assert_eq!(actual.name, expected.name);
-                assert_eq!(actual.offset, expected.offset);
+            assert_eq!(reused.len(), instruction.operand_spans().len());
+            for ((actual, object), span) in reused
+                .iter()
+                .zip(instruction.operands())
+                .zip(instruction.operand_spans())
+            {
+                assert_eq!(actual.number, operand_number(object));
+                assert_eq!(actual.name.as_deref(), operand_name(object));
+                assert_eq!(actual.offset, span.start);
             }
             assert_eq!(reused.as_ptr(), initial_pointer);
             instructions += 1;
