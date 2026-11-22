@@ -1991,13 +1991,12 @@ fn factor_repeated_path_forms(
             .iter()
             .zip(form_handles)
             .flat_map(|((_, name, _, occurrences), handle)| {
-                occurrences.iter().map(move |occurrence| {
-                    (
-                        page_data[occurrence.page_index].page,
-                        name.as_slice(),
-                        handle,
-                    )
-                })
+                occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.page_index)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(move |page_index| (page_data[page_index].page, name.as_slice(), handle))
             }),
     )?;
 
@@ -2208,13 +2207,12 @@ fn factor_repeated_transformed_blocks(
             .iter()
             .zip(form_handles)
             .flat_map(|((_, name, _, _, occurrences), handle)| {
-                occurrences.iter().map(move |occurrence| {
-                    (
-                        page_data[occurrence.page_index].page,
-                        name.as_slice(),
-                        handle,
-                    )
-                })
+                occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.page_index)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(move |page_index| (page_data[page_index].page, name.as_slice(), handle))
             }),
     )?;
 
