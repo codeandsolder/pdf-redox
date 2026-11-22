@@ -594,6 +594,14 @@ impl<'a> CurrentValue<'a> {
         }
     }
 
+    /// Walk the references surviving conversion to the editable COS graph,
+    /// without allocating the corresponding owned values.
+    pub fn indirect_references(&self) -> impl Iterator<Item = ObjectHandle> + 'a {
+        self.reference().into_iter().chain(
+            current_descendants(self.children(true), true).filter_map(|value| value.reference()),
+        )
+    }
+
     pub fn dictionary_entry(&self, key: &[u8]) -> Option<Self> {
         match self {
             Self::Source(MaybeRef::NotRef(Object::Dict(dictionary)), _) => dictionary
@@ -1995,11 +2003,7 @@ fn collect_hayro_references(object: &Object<'_>, references: &mut BTreeSet<Objec
 }
 
 fn collect_owned_references(object: &OwnedObject, references: &mut BTreeSet<ObjectHandle>) {
-    let root = CurrentValue::Owned(object);
-    references.extend(root.reference());
-    references.extend(
-        current_descendants(root.children(true), true).filter_map(|value| value.reference()),
-    );
+    references.extend(CurrentValue::Owned(object).indirect_references());
 }
 
 #[expect(

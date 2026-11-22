@@ -665,22 +665,24 @@ fn rebuild_compact_page_tree_levels(
 
 // Rebuilding does not require copying the properties of the surviving root.
 // Relocate each needed property from a removed owner exactly once.
-struct InheritedValue {
-    value: OwnedObject,
+struct InheritedValue<T> {
+    value: T,
     users: usize,
 }
 
-#[derive(Default)]
-struct PageInheritancePlan {
+struct PageInheritancePlan<T> {
     root_needed: [bool; PAGE_INHERITABLE_KEYS.len()],
-    values: BTreeMap<(ObjectHandle, usize), InheritedValue>,
+    values: BTreeMap<(ObjectHandle, usize), InheritedValue<T>>,
 }
 
-fn plan_page_inheritance(
-    document: &EditDocument,
+fn plan_page_inheritance<'a>(
+    document: &'a EditDocument,
     plan: &PageTreePlan,
-) -> Result<PageInheritancePlan> {
-    let mut result = PageInheritancePlan::default();
+) -> Result<PageInheritancePlan<CurrentValue<'a>>> {
+    let mut result = PageInheritancePlan {
+        root_needed: [false; PAGE_INHERITABLE_KEYS.len()],
+        values: BTreeMap::new(),
+    };
     let mut counts = BTreeMap::<ObjectHandle, [usize; PAGE_INHERITABLE_KEYS.len()]>::new();
     for page in &plan.pages {
         for (index, owner) in page.inherited_from.into_iter().enumerate() {
@@ -710,25 +712,42 @@ fn plan_page_inheritance(
                     "validated inherited value disappeared".to_owned(),
                 ));
             };
-            result.values.insert(
-                (owner, index),
-                InheritedValue {
-                    value: value.into_cow().into_owned(),
-                    users,
-                },
-            );
+            result
+                .values
+                .insert((owner, index), InheritedValue { value, users });
         }
     }
     Ok(result)
 }
 
-impl PageInheritancePlan {
+impl PageInheritancePlan<CurrentValue<'_>> {
     fn references(&self) -> impl Iterator<Item = ObjectHandle> + '_ {
         self.values
             .values()
-            .flat_map(|entry| entry.value.references())
+            .flat_map(|entry| entry.value.indirect_references())
     }
 
+    fn into_owned(self) -> PageInheritancePlan<OwnedObject> {
+        PageInheritancePlan {
+            root_needed: self.root_needed,
+            values: self
+                .values
+                .into_iter()
+                .map(|(key, entry)| {
+                    (
+                        key,
+                        InheritedValue {
+                            value: entry.value.into_cow().into_owned(),
+                            users: entry.users,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PageInheritancePlan<OwnedObject> {
     fn apply(
         mut self,
         document: &mut EditDocument,
@@ -897,7 +916,7 @@ impl DirectObjectVisitor for RebuildReferenceVisitor<'_> {
 fn retained_page_tree_branches(
     document: &EditDocument,
     plan: &PageTreePlan,
-    inherited: &PageInheritancePlan,
+    inherited: &PageInheritancePlan<CurrentValue<'_>>,
 ) -> Result<BTreeSet<ObjectHandle>> {
     let mut pending = document.output_roots();
     pending.extend(plan.pages.iter().map(|page| page.handle));
@@ -975,25 +994,24 @@ fn compact_page_tree_from_plan(
 
     let mut protected = external_parent_dependencies(document, &plan)?;
     let inherited = if rebuild {
-        plan_page_inheritance(document, &plan)?
-    } else {
-        PageInheritancePlan::default()
-    };
-    let retained = if rebuild {
-        retained_page_tree_branches(document, &plan, &inherited)?
-    } else {
-        BTreeSet::new()
-    };
-    for branch in &retained {
-        if let Some(owners) = plan.owners.get(branch) {
-            protect_inherited_owners(*owners, &mut protected);
+        let inherited = plan_page_inheritance(document, &plan)?;
+        let retained = retained_page_tree_branches(document, &plan, &inherited)?;
+        for branch in &retained {
+            if let Some(owners) = plan.owners.get(branch) {
+                protect_inherited_owners(*owners, &mut protected);
+            }
         }
-    }
+        // Relocation values remain borrowed until reachability has admitted
+        // the rebuild. Materialize before changing any owner dictionary.
+        retained.is_empty().then(|| inherited.into_owned())
+    } else {
+        None
+    };
     stats.shadowed_page_tree_inherited_entries_removed =
         remove_unprotected_inheritance(document, plan.shadowed_entries, &protected)?;
-    if !rebuild || !retained.is_empty() {
+    let Some(inherited) = inherited else {
         return Ok(());
-    }
+    };
     stats.page_tree_nodes_after = after_nodes;
     let root = plan.root;
     let pages = plan.pages;
@@ -1617,6 +1635,63 @@ mod tests {
                 Some([0.0, 0.0, 20.0, 30.0])
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inheritance_admission_borrows_resources_and_keeps_relocated_branch_references() -> Result<()>
+    {
+        let mut document = shared_inheritance_fixture(false)?;
+        let plan = plan_page_tree(&document)?
+            .ok_or_else(|| Error::Invalid("missing page plan".to_owned()))?;
+        let inherited = plan_page_inheritance(&document, &plan)?;
+        assert_eq!(inherited.values.len(), 1);
+        let entry = inherited
+            .values
+            .values()
+            .next()
+            .ok_or_else(|| Error::Invalid("missing inherited resource".to_owned()))?;
+        assert!(matches!(entry.value, CurrentValue::Source(..)));
+        assert_eq!(entry.users, 2);
+        assert_eq!(
+            inherited.references().collect::<Vec<_>>(),
+            vec![existing(6)]
+        );
+        assert!(retained_page_tree_branches(&document, &plan, &inherited)?.is_empty());
+        drop(inherited);
+
+        // The resource itself makes its former owner reachable after the
+        // original Kids/Parent links are replaced.
+        let object = document.edit_handle(existing(5))?;
+        let resources = object
+            .as_dictionary_mut()
+            .and_then(|dictionary| dictionary.get_mut(b"Resources".as_slice()))
+            .and_then(OwnedObject::as_dictionary_mut)
+            .ok_or_else(|| Error::Invalid("missing fixture resources".to_owned()))?;
+        resources.insert(
+            b"BackReference".to_vec(),
+            OwnedObject::Array(vec![OwnedObject::Reference(existing(5))]),
+        );
+        let inherited = plan_page_inheritance(&document, &plan)?;
+        assert!(matches!(
+            inherited.values.values().next().map(|entry| &entry.value),
+            Some(CurrentValue::Owned(_))
+        ));
+        assert_eq!(
+            inherited.references().collect::<BTreeSet<_>>(),
+            BTreeSet::from([existing(5), existing(6)])
+        );
+        assert_eq!(
+            retained_page_tree_branches(&document, &plan, &inherited)?,
+            BTreeSet::from([existing(5)])
+        );
+        drop(inherited);
+
+        let checkpoint = document.new_object_checkpoint();
+        let mut stats = StructureCompactionStats::default();
+        compact_page_tree(&mut document, &mut stats)?;
+        assert_eq!(stats.page_tree_nodes_removed, 0);
+        assert_eq!(document.new_object_checkpoint(), checkpoint);
         Ok(())
     }
 
