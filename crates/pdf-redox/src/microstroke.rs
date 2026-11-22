@@ -405,31 +405,27 @@ impl MicroStrokeScanner {
                 }
                 self.concat_ctm(values);
             }
-            b"m" => {
+            b"m" | b"l" => {
                 self.path_nonempty = true;
                 if let Some(frame) = &mut self.frame {
-                    if frame.stage == BlockStage::ExpectMove {
-                        if let Some(values) = instruction_number_array::<2>(instruction) {
-                            frame.p0 = Some((frame.tx + values[0], frame.ty + values[1]));
-                            frame.stage = BlockStage::ExpectLine;
-                        } else {
-                            frame.stage = BlockStage::Invalid;
-                        }
+                    let (expected, next, point) = if operator == b"m" {
+                        (
+                            BlockStage::ExpectMove,
+                            BlockStage::ExpectLine,
+                            &mut frame.p0,
+                        )
                     } else {
-                        frame.stage = BlockStage::Invalid;
-                    }
-                }
-            }
-            b"l" => {
-                self.path_nonempty = true;
-                if let Some(frame) = &mut self.frame {
-                    if frame.stage == BlockStage::ExpectLine {
-                        if let Some(values) = instruction_number_array::<2>(instruction) {
-                            frame.p1 = Some((frame.tx + values[0], frame.ty + values[1]));
-                            frame.stage = BlockStage::ExpectStroke;
-                        } else {
-                            frame.stage = BlockStage::Invalid;
-                        }
+                        (
+                            BlockStage::ExpectLine,
+                            BlockStage::ExpectStroke,
+                            &mut frame.p1,
+                        )
+                    };
+                    if frame.stage == expected
+                        && let Some([x, y]) = instruction_number_array::<2>(instruction)
+                    {
+                        *point = Some((frame.tx + x, frame.ty + y));
+                        frame.stage = next;
                     } else {
                         frame.stage = BlockStage::Invalid;
                     }
@@ -459,9 +455,9 @@ impl MicroStrokeScanner {
                     .and_then(|values| values[0].is_finite().then_some(values[0]))
                     .unwrap_or(f64::NAN);
             }
-            b"J" => {
+            b"J" | b"j" => {
                 self.invalidate_frame();
-                self.state.cap = instruction_number_array::<1>(instruction)
+                let style = instruction_number_array::<1>(instruction)
                     .and_then(|values| match values[0] {
                         0.0 => Some(0),
                         1.0 => Some(1),
@@ -469,17 +465,11 @@ impl MicroStrokeScanner {
                         _ => None,
                     })
                     .unwrap_or(u8::MAX);
-            }
-            b"j" => {
-                self.invalidate_frame();
-                self.state.join = instruction_number_array::<1>(instruction)
-                    .and_then(|values| match values[0] {
-                        0.0 => Some(0),
-                        1.0 => Some(1),
-                        2.0 => Some(2),
-                        _ => None,
-                    })
-                    .unwrap_or(u8::MAX);
+                if operator == b"J" {
+                    self.state.cap = style;
+                } else {
+                    self.state.join = style;
+                }
             }
             b"d" => {
                 self.invalidate_frame();
