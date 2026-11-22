@@ -212,7 +212,7 @@ pub fn optimize_jpeg_entropy(
         drop(object);
         let object = document.edit_handle(handle)?;
         if let OwnedObject::Stream { data, .. } = object {
-            *data = StreamData::Owned(optimized);
+            *data = StreamData::Owned(optimized.into());
             stats.streams_optimized += 1;
             stats.original_encoded_bytes += original_len;
             stats.optimized_encoded_bytes += optimized_len;

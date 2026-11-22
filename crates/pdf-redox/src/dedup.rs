@@ -920,7 +920,7 @@ fn shared_pattern_form(
     // is turned into a wrapper; only genuinely owned inline data is copied.
     let data = match data {
         StreamIdentity::Source(id) => StreamData::Source(id),
-        StreamIdentity::Inline(bytes) => StreamData::Owned(bytes.into_owned()),
+        StreamIdentity::Inline(bytes) => StreamData::Owned(bytes.into_owned().into()),
     };
     Ok(Some(CowObjectHandle::New(document.add_object(
         OwnedObject::Stream {
@@ -956,7 +956,7 @@ fn rewrite_as_form_wrapper(
     dictionary.remove(b"Filter".as_slice());
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
-    *data = StreamData::Owned(commands.to_vec());
+    *data = StreamData::Owned(commands.to_vec().into());
     Ok(true)
 }
 
@@ -2170,7 +2170,7 @@ mod tests {
                 b"M".to_vec(),
                 OwnedObject::Stream {
                     dictionary: OwnedDictionary::new(),
-                    data: StreamData::Owned(b"q Q".to_vec()),
+                    data: StreamData::Owned(b"q Q".to_vec().into()),
                 },
             ),
             (b"Z".to_vec(), OwnedObject::Reference(original)),
@@ -2235,7 +2235,7 @@ mod tests {
             )])),
             OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
-                data: StreamData::Owned(vec![0x09]),
+                data: StreamData::Owned(vec![0x09].into()),
             },
         ];
         let mut seen = HashSet::new();
@@ -2315,7 +2315,7 @@ mod tests {
         let OwnedObject::Stream { data, .. } = &mut changed else {
             return Err(crate::Error::Invalid("expected stream".into()));
         };
-        *data = StreamData::Owned(b"q Q".to_vec());
+        *data = StreamData::Owned(b"q Q".to_vec().into());
         let Some(stream) = document.current_value(handle(4))? else {
             return Err(crate::Error::Invalid("missing source stream".into()));
         };
@@ -2654,7 +2654,7 @@ mod tests {
                 .stream_data(crate::ObjectId::new(id, 0))?
                 .into_owned();
             if let OwnedObject::Stream { data, .. } = overlay.edit_handle(handle)? {
-                *data = StreamData::Owned(bytes);
+                *data = StreamData::Owned(bytes.into());
             }
             let Some(std::borrow::Cow::Borrowed(OwnedObject::Stream {
                 data: StreamData::Owned(borrowed),

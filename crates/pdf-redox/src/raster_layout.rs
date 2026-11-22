@@ -1214,7 +1214,10 @@ fn convex_polygon_intersects_rect(points: &[(f64, f64)], rect: Rect) -> bool {
     false
 }
 
-fn target_content(document: &EditDocument, target: ContentTarget) -> Result<Vec<u8>> {
+fn target_content(
+    document: &EditDocument,
+    target: ContentTarget,
+) -> Result<std::sync::Arc<Vec<u8>>> {
     match target {
         ContentTarget::Page(page) => page_content(document, page),
         ContentTarget::Form(form) => form_content(document, form),
@@ -1277,7 +1280,7 @@ struct TargetScanResult {
 
 struct ScannedTarget {
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     scanner: RasterScanner,
     hidden_ranges: Option<Vec<(usize, usize)>>,
 }
@@ -3549,7 +3552,7 @@ fn install_prepared_image(
         }
         let alpha_stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: alpha_dictionary,
-            data: StreamData::Owned(alpha.data),
+            data: StreamData::Owned(alpha.data.into()),
         }));
         prepared
             .dictionary
@@ -3557,7 +3560,7 @@ fn install_prepared_image(
     }
     let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary: prepared.dictionary,
-        data: StreamData::Owned(prepared.data),
+        data: StreamData::Owned(prepared.data.into()),
     }));
     (handle, prepared.encoding)
 }
@@ -4950,7 +4953,7 @@ fn install_target(
     document: &mut EditDocument,
     target: ContentTarget,
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
 ) -> Result<()> {
     match target {
         ContentTarget::Page(page) => {
@@ -5644,7 +5647,7 @@ struct RasterTargetTransaction<'a> {
 
 struct RasterTargetTransactionInput {
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     plans: Vec<MergePlan>,
     prior_prune_changed: bool,
 }
@@ -5773,7 +5776,7 @@ impl RasterTargetTransaction<'_> {
 
         let target_changed = prior_prune_changed || plan_changed;
         if let Some(rewritten) = applied.rewritten_content.take() {
-            content = rewritten;
+            content = rewritten.into();
         }
         let removed_xobjects = if plan_changed && !applied.obsolete_resource_names.is_empty() {
             let (updated, removed) = prune_xobject_candidates_for_content(
@@ -6252,7 +6255,7 @@ struct RasterNoPlanTarget<'a> {
     target: ContentTarget,
     scanner: &'a RasterScanner,
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     pruned_draws: HashSet<usize>,
     shared_hidden_ranges: Option<Vec<(usize, usize)>>,
 }
@@ -6297,7 +6300,7 @@ impl RasterNoPlanTarget<'_> {
             page_state.invalidate_vector(target);
             stats.invalidate_page_vector_scan(target);
             let rewritten = remove_content_ranges(&content, removal_ranges)?;
-            install_target(document, target, resources, rewritten)?;
+            install_target(document, target, resources, rewritten.into())?;
         }
         Ok(())
     }
@@ -6360,7 +6363,7 @@ struct RasterPlannedTarget<'a> {
     target: ContentTarget,
     scanner: &'a RasterScanner,
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     plans: Vec<MergePlan>,
     pruned_draws: HashSet<usize>,
     prior_prune_changed: bool,
@@ -6478,7 +6481,7 @@ impl<'cfg, 'vector> RasterNormalizationPass<'cfg, 'vector> {
         let mut prior_prune_changed = false;
         if let Some(rewritten) = prepared.pending_pruned_content.take() {
             self.page_state.invalidate_vector(target);
-            content = rewritten;
+            content = rewritten.into();
             prior_prune_changed = true;
 
             // Mixed prune/reconstruction scopes rescan their exact new bytes.
@@ -7625,13 +7628,7 @@ mod tests {
         Ok(())
     }
 
-    fn no_plan_inventory_fixture() -> Result<(
-        EditDocument,
-        ContentTarget,
-        OwnedDictionary,
-        Vec<u8>,
-        RasterScanner,
-    )> {
+    fn no_plan_inventory_fixture() -> Result<(EditDocument, ContentTarget, ScannedTarget)> {
         use crate::test_support::ClassicPdfBuilder;
 
         let mut pdf = ClassicPdfBuilder::new();
@@ -7657,7 +7654,16 @@ mod tests {
         let scanner = scan_target(&document, &resources, &content)?
             .ok_or_else(|| Error::Invalid("fixture scanner incomplete".to_owned()))?;
         assert_eq!(scanner.draws.len(), 2);
-        Ok((document, target, resources, content, scanner))
+        Ok((
+            document,
+            target,
+            ScannedTarget {
+                resources,
+                content,
+                scanner,
+                hidden_ranges: None,
+            },
+        ))
     }
 
     #[test]
@@ -7807,7 +7813,16 @@ mod tests {
 
     #[test]
     fn no_plan_prune_combines_raster_and_hidden_text_ranges_and_inventory() -> Result<()> {
-        let (mut document, target, resources, content, scanner) = no_plan_inventory_fixture()?;
+        let (
+            mut document,
+            target,
+            ScannedTarget {
+                resources,
+                content,
+                scanner,
+                ..
+            },
+        ) = no_plan_inventory_fixture()?;
         let start = content
             .windows(3)
             .position(|bytes| bytes == b"BT ")
@@ -7864,7 +7879,7 @@ mod tests {
 
     #[test]
     fn plan_inventory_records_only_survivors_and_new_xobjects() -> Result<()> {
-        let (_, target, _, _, scanner) = no_plan_inventory_fixture()?;
+        let (_, target, ScannedTarget { scanner, .. }) = no_plan_inventory_fixture()?;
         let page = match target {
             ContentTarget::Page(page) => page,
             ContentTarget::Form(_) => unreachable!(),

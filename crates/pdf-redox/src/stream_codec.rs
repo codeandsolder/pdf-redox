@@ -114,6 +114,10 @@ impl<'a> InlineFilterConfiguration<'a> {
         Self::from_lookup(|key| dictionary.get(key).map(CurrentValue::Owned))
     }
 
+    pub const fn is_unfiltered(&self) -> bool {
+        self.filter.is_none()
+    }
+
     pub fn is_direct(&self) -> bool {
         self.filter
             .iter()

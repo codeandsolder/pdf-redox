@@ -407,8 +407,9 @@ pub type OwnedDictionary = BTreeMap<Vec<u8>, OwnedObject>;
 pub enum StreamData {
     /// Keep the encoded stream payload backed by the immutable source object.
     Source(ObjectId),
-    /// Store an encoded stream payload owned by the overlay.
-    Owned(Vec<u8>),
+    /// Store an immutable encoded payload shared by overlay snapshots.
+    /// The Vec allocation is moved into the Arc without copying payload bytes.
+    Owned(Arc<Vec<u8>>),
 }
 
 impl StreamData {
@@ -1051,7 +1052,7 @@ struct DecodedContentCache {
 }
 
 struct CachedContentStream {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     last_access: u64,
 }
 
@@ -1075,7 +1076,7 @@ impl DecodedContentCache {
         self.access_clock
     }
 
-    fn get(&mut self, id: ObjectId) -> Option<Arc<[u8]>> {
+    fn get(&mut self, id: ObjectId) -> Option<Arc<Vec<u8>>> {
         if !self.streams.contains_key(&id) {
             return None;
         }
@@ -1090,18 +1091,19 @@ impl DecodedContentCache {
     fn evict(&mut self, id: ObjectId) {
         if let Some(stream) = self.streams.remove(&id) {
             self.oldest_first.remove(&(stream.last_access, id));
-            self.bytes -= stream.bytes.len();
+            self.bytes -= stream.bytes.capacity();
         }
     }
 
-    fn insert(&mut self, id: ObjectId, decoded: &[u8], capacity: usize) {
-        // Replacement must invalidate an old entry even when the new data is
-        // too large to retain; otherwise the previous bytes could look fresh.
+    fn insert(&mut self, id: ObjectId, decoded: Arc<Vec<u8>>, capacity: usize) {
+        // Account for retained allocations, not merely their logical lengths.
+        // Replacement invalidates the old entry even if the new one won't fit.
         self.evict(id);
-        if decoded.len() > capacity {
+        let size = decoded.capacity();
+        if size > capacity {
             return;
         }
-        while capacity.saturating_sub(self.bytes) < decoded.len() {
+        while capacity.saturating_sub(self.bytes) < size {
             let Some(&(_, oldest_id)) = self.oldest_first.first() else {
                 return;
             };
@@ -1111,21 +1113,18 @@ impl DecodedContentCache {
         self.streams.insert(
             id,
             CachedContentStream {
-                bytes: Arc::from(decoded),
+                bytes: decoded,
                 last_access: age,
             },
         );
         self.oldest_first.insert((age, id));
-        self.bytes += decoded.len();
+        self.bytes += size;
     }
 }
 
-/// A content reference is a fresh stream, a shared cached stream, or a COS value.
-/// Cached bytes are reference-counted so consumers can append them directly
-/// without copying or holding an active borrow of the document's cache.
+/// Resolve a content reference to immutable bytes or a nonstream COS value.
 pub enum ContentRead<'a> {
-    Decoded(Vec<u8>),
-    Cached(Arc<[u8]>),
+    Bytes(Arc<Vec<u8>>),
     Other(CurrentValue<'a>),
 }
 
@@ -1381,11 +1380,44 @@ impl EditDocument {
         self.decoded_stream_value(&stream)
     }
 
-    /// Resolve a page/Form content reference, decoding streams in one pass.
+    /// Decode an immutable content snapshot, sharing unfiltered overlay data.
+    /// Only immutable source streams with direct filter configuration may be
+    /// inserted into the decoded source cache.
     ///
-    /// Cache lookup precedes source object inspection. A cache entry was
-    /// inserted only for an immutable source stream with direct filter values;
-    /// references into the mutable overlay are deliberately never cached.
+    /// # Errors
+    /// Returns errors for invalid or unsupported filter configurations and payloads.
+    pub fn content_snapshot(&self, stream: &CurrentValue<'_>) -> Result<Arc<Vec<u8>>> {
+        let configuration = InlineFilterConfiguration::from_stream(stream)?;
+        if configuration.is_unfiltered()
+            && let CurrentValue::Owned(OwnedObject::Stream {
+                data: StreamData::Owned(bytes),
+                ..
+            }) = stream
+        {
+            return Ok(Arc::clone(bytes));
+        }
+        let cache_id = match stream {
+            CurrentValue::Source(_, Some(id))
+                if self.overlay.change(*id).is_none() && configuration.is_direct() =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        };
+        let decoded = Arc::new(configuration.decode(self, stream.stream_bytes(self.source())?)?);
+        if let Some(id) = cache_id
+            && decoded.capacity() <= MAX_DECODED_CONTENT_STREAM_BYTES
+        {
+            self.decoded_content_stream_cache.borrow_mut().insert(
+                id,
+                Arc::clone(&decoded),
+                MAX_DECODED_CONTENT_CACHE_BYTES,
+            );
+        }
+        Ok(decoded)
+    }
+
+    /// Resolve a page/Form content reference without copying shared bytes.
     pub(crate) fn content_read(&self, handle: ObjectHandle) -> Result<Option<ContentRead<'_>>> {
         let unchanged_source_id = match handle {
             ObjectHandle::Existing(id) if self.overlay.change(id).is_none() => Some(id),
@@ -1394,39 +1426,21 @@ impl EditDocument {
         if let Some(id) = unchanged_source_id
             && let Some(decoded) = self.decoded_content_stream_cache.borrow_mut().get(id)
         {
-            return Ok(Some(ContentRead::Cached(decoded)));
+            return Ok(Some(ContentRead::Bytes(decoded)));
         }
-
         let Some(object) = self.current_value(handle)? else {
             return Ok(None);
         };
         if !object.is_stream() {
             return Ok(Some(ContentRead::Other(object)));
         }
-
-        let configuration = InlineFilterConfiguration::from_stream(&object)?;
-        let cache_id = unchanged_source_id.filter(|_| configuration.is_direct());
-        let decoded = configuration.decode(self, object.stream_bytes(self.source())?)?;
-        if let Some(id) = cache_id
-            && decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES
-        {
-            self.decoded_content_stream_cache.borrow_mut().insert(
-                id,
-                &decoded,
-                MAX_DECODED_CONTENT_CACHE_BYTES,
-            );
-        }
-        Ok(Some(ContentRead::Decoded(decoded)))
+        Ok(Some(ContentRead::Bytes(self.content_snapshot(&object)?)))
     }
 
-    /// Decode page/Form content while memoizing untouched source streams.
-    ///
-    /// The cache is content-specific: image and font decoding never retains
-    /// large payloads. Source edits bypass entries without invalidation.
-    pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
+    /// Read decoded content as a stable snapshot, including after later edits.
+    pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Arc<Vec<u8>>> {
         match self.content_read(handle)? {
-            Some(ContentRead::Decoded(bytes)) => Ok(bytes),
-            Some(ContentRead::Cached(bytes)) => Ok(bytes.as_ref().to_vec()),
+            Some(ContentRead::Bytes(bytes)) => Ok(bytes),
             Some(ContentRead::Other(_)) => Err(Error::Invalid("object is not a stream".to_owned())),
             None => Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
@@ -2143,7 +2157,7 @@ fn owned_from_hayro(object: Object<'_>, stream_id: Option<ObjectId>) -> OwnedObj
         Object::Stream(value) => OwnedObject::Stream {
             dictionary: owned_stream_dictionary(value.dict()),
             data: stream_id.map_or_else(
-                || StreamData::Owned(value.raw_data().into_owned()),
+                || StreamData::Owned(value.raw_data().into_owned().into()),
                 StreamData::Source,
             ),
         },
@@ -2298,7 +2312,7 @@ mod tests {
         // Recovery still recognizes the damaged leaf with Parent and no Kids.
         assert_eq!(document.page_handles()?, vec![existing(3), existing(5)]);
         assert_eq!(
-            crate::content::page_content(&document, existing(3))?,
+            crate::content::page_content(&document, existing(3))?.as_slice(),
             b"q Q"
         );
         assert_eq!(
@@ -2478,7 +2492,7 @@ mod tests {
                 b"Filter".to_vec(),
                 OwnedObject::Name(b"FlateDecode".to_vec()),
             )]),
-            data: StreamData::Owned(vec![0x78, 0x9c, 0x4b, 0x04]),
+            data: StreamData::Owned(vec![0x78, 0x9c, 0x4b, 0x04].into()),
         };
         assert_eq!(
             document.decoded_stream_value(&CurrentValue::Owned(&stream))?,
@@ -2514,16 +2528,16 @@ mod tests {
         let stream_id = ObjectId::new(4, 0);
         let handle = ObjectHandle::Existing(stream_id);
         let first = document.decoded_content_stream_data(handle)?;
-        assert_eq!(first, b"q Q");
+        assert_eq!(first.as_slice(), b"q Q");
         let stream = document.edit_object(stream_id)?;
         let OwnedObject::Stream { data, .. } = stream else {
             return Err(Error::Invalid(
                 "fixture object should be a stream".to_owned(),
             ));
         };
-        *data = StreamData::Owned(b"BT ET".to_vec());
+        *data = StreamData::Owned(b"BT ET".to_vec().into());
         let second = document.decoded_content_stream_data(handle)?;
-        assert_eq!(second, b"BT ET");
+        assert_eq!(second.as_slice(), b"BT ET");
         Ok(())
     }
 
@@ -2618,7 +2632,7 @@ mod tests {
         );
         let stream = OwnedObject::Stream {
             dictionary: stream_dict,
-            data: StreamData::Owned(Vec::new()),
+            data: StreamData::Owned(Vec::new().into()),
         };
 
         // Filter eligibility inspects all descendant entries, including
@@ -2636,7 +2650,7 @@ mod tests {
         );
         let direct = OwnedObject::Stream {
             dictionary: direct_dict,
-            data: StreamData::Owned(Vec::new()),
+            data: StreamData::Owned(Vec::new().into()),
         };
         assert!(InlineFilterConfiguration::from_stream(&CurrentValue::Owned(&direct))?.is_direct());
         assert!(!CurrentValue::Owned(&direct).contains_indirect_reference());
@@ -2653,9 +2667,9 @@ mod tests {
         let mut cache = DecodedContentCache::default();
         let capacity = 10;
 
-        cache.insert(one, b"one", capacity);
-        cache.insert(two, b"two", capacity);
-        cache.insert(three, b"four", capacity);
+        cache.insert(one, b"one".to_vec().into(), capacity);
+        cache.insert(two, b"two".to_vec().into(), capacity);
+        cache.insert(three, b"four".to_vec().into(), capacity);
         assert_eq!(cache.bytes, capacity);
         assert_eq!(cache.oldest_first.len(), 3);
 
@@ -2667,7 +2681,7 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&held, &again));
         // The oldest entry is now two, not one.
-        cache.insert(four, b"xx", capacity);
+        cache.insert(four, b"xx".to_vec().into(), capacity);
         assert!(cache.get(two).is_none());
         assert!(cache.get(one).is_some());
         assert!(cache.get(three).is_some());
@@ -2676,7 +2690,7 @@ mod tests {
         assert_eq!(cache.oldest_first.len(), 3);
 
         // Reinserting two evicts one (the least recently used after the reads).
-        cache.insert(two, b"long", capacity);
+        cache.insert(two, b"long".to_vec().into(), capacity);
         assert!(cache.get(one).is_none());
         assert_eq!(held.as_ref(), b"one"); // Held snapshots outlive eviction.
         assert_eq!(cache.bytes, 10);
@@ -2684,7 +2698,7 @@ mod tests {
 
         // A payload larger than the total capacity is not retained or allowed
         // to evict anything already useful.
-        cache.insert(one, b"larger than the capacity", capacity);
+        cache.insert(one, b"larger than the capacity".to_vec().into(), capacity);
         assert!(cache.get(one).is_none());
         assert_eq!(cache.bytes, 10);
 
@@ -2703,7 +2717,7 @@ mod tests {
 
         // Replacing an already cached stream with an oversized payload must
         // invalidate its previous data, not preserve a stale cache hit.
-        cache.insert(four, b"payload larger than ten", capacity);
+        cache.insert(four, b"payload larger than ten".to_vec().into(), capacity);
         assert!(cache.get(four).is_none());
         assert_eq!(cache.bytes, 4);
         assert_eq!(cache.oldest_first.len(), cache.streams.len());
@@ -2727,12 +2741,18 @@ mod tests {
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let first = ObjectHandle::Existing(ObjectId::new(4, 0));
         let second = ObjectHandle::Existing(ObjectId::new(5, 0));
-        assert_eq!(document.decoded_content_stream_data(first)?, b"q Q");
-        assert_eq!(document.decoded_content_stream_data(second)?, b"BT ET");
-        let Some(ContentRead::Cached(first_snapshot)) = document.content_read(first)? else {
+        assert_eq!(
+            document.decoded_content_stream_data(first)?.as_slice(),
+            b"q Q"
+        );
+        assert_eq!(
+            document.decoded_content_stream_data(second)?.as_slice(),
+            b"BT ET"
+        );
+        let Some(ContentRead::Bytes(first_snapshot)) = document.content_read(first)? else {
             return Err(Error::Invalid("expected first cached stream".to_owned()));
         };
-        let Some(ContentRead::Cached(second_snapshot)) = document.content_read(second)? else {
+        let Some(ContentRead::Bytes(second_snapshot)) = document.content_read(second)? else {
             return Err(Error::Invalid("expected second cached stream".to_owned()));
         };
         {
@@ -2751,7 +2771,7 @@ mod tests {
         let OwnedObject::Stream { data, .. } = document.edit_object(ObjectId::new(4, 0))? else {
             return Err(Error::Invalid("expected first source stream".to_owned()));
         };
-        *data = StreamData::Owned(b"q q Q".to_vec());
+        *data = StreamData::Owned(b"q q Q".to_vec().into());
         {
             let cache = document.decoded_content_stream_cache.borrow();
             assert_eq!(cache.streams.len(), 1);
@@ -2759,8 +2779,11 @@ mod tests {
             assert_eq!(cache.bytes, b"BT ET".len());
         }
         assert_eq!(first_snapshot.as_ref(), b"q Q");
-        assert_eq!(document.decoded_content_stream_data(first)?, b"q q Q");
-        let Some(ContentRead::Cached(second_again)) = document.content_read(second)? else {
+        assert_eq!(
+            document.decoded_content_stream_data(first)?.as_slice(),
+            b"q q Q"
+        );
+        let Some(ContentRead::Bytes(second_again)) = document.content_read(second)? else {
             return Err(Error::Invalid("unrelated cache entry was lost".to_owned()));
         };
         assert!(Arc::ptr_eq(&second_snapshot, &second_again));
@@ -2771,7 +2794,7 @@ mod tests {
             ObjectId::new(5, 0),
             OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
-                data: StreamData::Owned(b"ET".to_vec()),
+                data: StreamData::Owned(b"ET".to_vec().into()),
             },
         );
         let cache = document.decoded_content_stream_cache.borrow();
@@ -2779,7 +2802,10 @@ mod tests {
         assert_eq!(cache.bytes, 0);
         drop(cache);
         assert_eq!(second_snapshot.as_ref(), b"BT ET");
-        assert_eq!(document.decoded_content_stream_data(second)?, b"ET");
+        assert_eq!(
+            document.decoded_content_stream_data(second)?.as_slice(),
+            b"ET"
+        );
         Ok(())
     }
 
@@ -2789,16 +2815,18 @@ mod tests {
         let id = ObjectId::new(4, 0);
         let handle = ObjectHandle::Existing(id);
 
-        // The first read fills the cache without changing the owned stream API.
-        assert_eq!(document.decoded_content_stream_data(handle)?, b"q Q");
-        let Some(ContentRead::Cached(first)) = document.content_read(handle)? else {
+        // The initial decoded allocation is itself the cached snapshot.
+        let initial = document.decoded_content_stream_data(handle)?;
+        assert_eq!(initial.as_slice(), b"q Q");
+        let Some(ContentRead::Bytes(first)) = document.content_read(handle)? else {
             return Err(Error::Invalid("expected a cached stream".to_owned()));
         };
-        let Some(ContentRead::Cached(second)) = document.content_read(handle)? else {
+        let Some(ContentRead::Bytes(second)) = document.content_read(handle)? else {
             return Err(Error::Invalid("expected the same cached stream".to_owned()));
         };
+        assert!(Arc::ptr_eq(&initial, &first));
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.as_ref(), b"q Q");
+        assert_eq!(first.as_slice(), b"q Q");
 
         // Holding the shared payload does not lock the cache or prevent COW
         // edits; it remains an immutable snapshot after an overlay change.
@@ -2806,12 +2834,15 @@ mod tests {
         let OwnedObject::Stream { data, .. } = stream else {
             return Err(Error::Invalid("expected a stream".to_owned()));
         };
-        *data = StreamData::Owned(b"BT ET".to_vec());
+        *data = StreamData::Owned(b"BT ET".to_vec().into());
         assert_eq!(first.as_ref(), b"q Q");
-        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
+        assert_eq!(
+            document.decoded_content_stream_data(handle)?.as_slice(),
+            b"BT ET"
+        );
         assert!(matches!(
             document.content_read(handle)?,
-            Some(ContentRead::Decoded(bytes)) if bytes == b"BT ET"
+            Some(ContentRead::Bytes(bytes)) if bytes.as_slice() == b"BT ET"
         ));
         Ok(())
     }
@@ -2835,17 +2866,29 @@ mod tests {
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let plain = ObjectHandle::Existing(ObjectId::new(4, 0));
         let indirect = ObjectHandle::Existing(ObjectId::new(5, 0));
-        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
-        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
-        assert_eq!(document.decoded_content_stream_data(indirect)?, b"BT ET");
-        assert_eq!(document.decoded_content_stream_data(indirect)?, b"BT ET");
+        assert_eq!(
+            document.decoded_content_stream_data(plain)?.as_slice(),
+            b"q Q"
+        );
+        assert_eq!(
+            document.decoded_content_stream_data(plain)?.as_slice(),
+            b"q Q"
+        );
+        assert_eq!(
+            document.decoded_content_stream_data(indirect)?.as_slice(),
+            b"BT ET"
+        );
+        assert_eq!(
+            document.decoded_content_stream_data(indirect)?.as_slice(),
+            b"BT ET"
+        );
         let page = document.page_handles()?[0];
         assert_eq!(
-            crate::content::page_content(&document, page)?,
+            crate::content::page_content(&document, page)?.as_slice(),
             b"q Q\nBT ET"
         );
         assert_eq!(
-            crate::content::page_content(&document, page)?,
+            crate::content::page_content(&document, page)?.as_slice(),
             b"q Q\nBT ET"
         );
         {
@@ -2855,7 +2898,7 @@ mod tests {
                 cache
                     .streams
                     .get(&ObjectId::new(4, 0))
-                    .map(|entry| entry.bytes.as_ref()),
+                    .map(|entry| entry.bytes.as_slice()),
                 Some(b"q Q".as_slice())
             );
             assert!(!cache.streams.contains_key(&ObjectId::new(5, 0)));
@@ -2868,19 +2911,44 @@ mod tests {
         assert!(crate::content::page_content(&document, page).is_err());
         // Editing an unrelated filter does not invalidate a direct source's
         // cached bytes.
-        assert_eq!(document.decoded_content_stream_data(plain)?, b"q Q");
+        assert_eq!(
+            document.decoded_content_stream_data(plain)?.as_slice(),
+            b"q Q"
+        );
         Ok(())
     }
 
     #[test]
-    fn content_decode_borrows_new_overlay_streams_without_source_cache_entries() -> Result<()> {
+    fn content_snapshot_shares_overlay_bytes_and_survives_replacement() -> Result<()> {
         let mut document = EditDocument::from_bytes(sample_pdf())?;
+        let payload = Arc::new(b"BT ET".to_vec());
         let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: OwnedDictionary::new(),
-            data: StreamData::Owned(b"BT ET".to_vec()),
+            data: StreamData::Owned(Arc::clone(&payload)),
         }));
-        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
-        assert_eq!(document.decoded_content_stream_data(handle)?, b"BT ET");
+        let first = document.decoded_content_stream_data(handle)?;
+        let second = document.decoded_content_stream_data(handle)?;
+        assert!(Arc::ptr_eq(&payload, &first));
+        assert!(Arc::ptr_eq(&first, &second));
+        let original_object = document.current_owned_object(handle)?;
+        let Some(OwnedObject::Stream {
+            data: StreamData::Owned(cloned),
+            ..
+        }) = original_object
+        else {
+            return Err(Error::Invalid("overlay stream missing".into()));
+        };
+        assert!(Arc::ptr_eq(&payload, &cloned));
+        let updated = Arc::new(b"q Q".to_vec());
+        let OwnedObject::Stream { data, .. } = document.edit_handle(handle)? else {
+            return Err(Error::Invalid("overlay stream missing".into()));
+        };
+        *data = StreamData::Owned(Arc::clone(&updated));
+        assert!(Arc::ptr_eq(
+            &document.decoded_content_stream_data(handle)?,
+            &updated
+        ));
+        assert_eq!(first.as_slice(), b"BT ET");
         assert!(
             document
                 .decoded_content_stream_cache
@@ -2889,6 +2957,27 @@ mod tests {
                 .is_empty()
         );
         Ok(())
+    }
+
+    #[test]
+    fn decoded_cache_accounting_charges_capacity_not_length() {
+        let mut cache = DecodedContentCache::default();
+        let id = ObjectId::new(1, 0);
+        let mut payload = Vec::with_capacity(128);
+        payload.push(42);
+        let payload = Arc::new(payload);
+        cache.insert(id, Arc::clone(&payload), 64);
+        assert!(cache.get(id).is_none());
+        assert_eq!(cache.bytes, 0);
+        cache.insert(id, Arc::clone(&payload), payload.capacity());
+        assert_eq!(cache.bytes, payload.capacity());
+        assert!(
+            cache
+                .get(id)
+                .is_some_and(|cached| Arc::ptr_eq(&payload, &cached))
+        );
+        cache.evict(id);
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
@@ -3004,7 +3093,7 @@ mod tests {
                 "fixture object should be a stream".to_owned(),
             ));
         };
-        *data = StreamData::Owned(b"BT ET".to_vec());
+        *data = StreamData::Owned(b"BT ET".to_vec().into());
 
         let after = document.reachable_output_objects()?;
         assert_eq!(after, before);

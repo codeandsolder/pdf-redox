@@ -480,7 +480,11 @@ mod tests {
         builder.finish(1)
     }
 
-    fn check(content: &[u8], extra: &[u8], page_extra: &[u8]) -> Result<(DeadPaintStats, Vec<u8>)> {
+    fn check(
+        content: &[u8],
+        extra: &[u8],
+        page_extra: &[u8],
+    ) -> Result<(DeadPaintStats, std::sync::Arc<Vec<u8>>)> {
         let pdf = fixture(content, extra, page_extra, false)?;
         let mut document = EditDocument::from_bytes(pdf)?;
         let pages = document.page_handles()?;
@@ -768,7 +772,7 @@ mod tests {
             assert_eq!(stats.paints_removed, 1, "nested={nested}");
             let result = page_content(&doc, pages[0])?;
             assert_eq!(draw_count(&result)?, 1);
-            assert_eq!(result, b"\nq /Fm0 Do Q\n");
+            assert_eq!(result.as_slice(), b"\nq /Fm0 Do Q\n");
         }
         Ok(())
     }

@@ -426,19 +426,17 @@ pub fn apply_ocr_overlay(
         let Some(dict) = page_object.as_dictionary() else {
             return Err(invalid("invalid page"));
         };
-        let mut decoded = Vec::new();
-        if let Some(contents) = dict.get(b"Contents".as_slice()) {
-            decoded_content_value(
-                &doc,
-                crate::source::CurrentValue::Owned(contents),
-                &mut decoded,
-            )?;
-        }
+        let decoded = match dict.get(b"Contents".as_slice()) {
+            Some(contents) => {
+                decoded_content_value(&doc, crate::source::CurrentValue::Owned(contents))?
+            }
+            None => std::sync::Arc::default(),
+        };
         // Insert before original painting so overlays inherit neither the
         // source's potentially unbalanced CTM nor its text rendering mode.
         let mut new_bytes = overlay.into_bytes();
         new_bytes.extend_from_slice(b"\n");
-        new_bytes.extend(decoded);
+        new_bytes.extend_from_slice(&decoded);
         crate::content::replace_page_content_flate(
             &mut doc,
             handle,
@@ -570,7 +568,7 @@ mod tests {
         assert_eq!(stats.searchable_characters, 6);
         let output = EditDocument::from_bytes(annotated)?;
         let pages = output.page_handles()?;
-        assert_eq!(page_content(&output, pages[0])?, ink);
+        assert_eq!(page_content(&output, pages[0])?.as_slice(), ink);
         let changed = page_content(&output, pages[1])?;
         assert!(
             changed

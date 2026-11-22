@@ -1065,7 +1065,7 @@ struct PageScan {
 
 #[derive(Debug, Clone)]
 struct ScannedPage {
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     scan: PageScan,
 }
 

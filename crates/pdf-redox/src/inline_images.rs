@@ -49,7 +49,7 @@ pub enum ContentTarget {
 struct TargetSummary {
     target: ContentTarget,
     resources: OwnedDictionary,
-    content: Vec<u8>,
+    content: std::sync::Arc<Vec<u8>>,
     counts: HashMap<InlineImageFingerprint, (usize, usize)>,
 }
 
@@ -327,7 +327,7 @@ fn image_stream(
 ) -> ObjectHandle {
     ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary,
-        data: StreamData::Owned(data),
+        data: StreamData::Owned(data.into()),
     }))
 }
 
@@ -386,7 +386,7 @@ fn install_rewrite(
         ContentTarget::Page(page) => {
             let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: OwnedDictionary::new(),
-                data: StreamData::Owned(rewrite.content),
+                data: StreamData::Owned(rewrite.content.into()),
             }));
             let object = document.edit_handle(page)?;
             if let Some(dictionary) = object.as_dictionary_mut() {
@@ -401,7 +401,7 @@ fn install_rewrite(
                 dictionary.remove(b"Filter".as_slice());
                 dictionary.remove(b"DecodeParms".as_slice());
                 dictionary.remove(b"Length".as_slice());
-                *data = StreamData::Owned(rewrite.content);
+                *data = StreamData::Owned(rewrite.content.into());
             }
         }
     }
@@ -718,7 +718,7 @@ pub fn cleanup_fragmented_inline_staging(
                         dictionary.remove(b"Filter".as_slice());
                         dictionary.remove(b"DecodeParms".as_slice());
                         dictionary.remove(b"Length".as_slice());
-                        *data = StreamData::Owned(rewritten);
+                        *data = StreamData::Owned(rewritten.into());
                         result.occurrences_restored =
                             result.occurrences_restored.saturating_add(restored);
                         result.restored_targets.insert(target);
