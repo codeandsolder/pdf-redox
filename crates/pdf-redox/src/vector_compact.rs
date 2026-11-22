@@ -954,12 +954,68 @@ fn semantic_fingerprint(bytes: &[u8]) -> SemanticKey {
     Sha256::digest(bytes).into()
 }
 
+// The factor scanners project at most six numeric operands and use only
+// one- or two-byte operators. Preserve the original canonical byte encoding.
+const SEMANTIC_INSTRUCTION_BYTES: usize = 1 + 2 + 6 * size_of::<f64>();
+const PATH_HASH_CHUNK_BYTES: usize = 4096;
+
+fn encode_semantic_instruction<'a>(
+    bytes: &'a mut [u8; SEMANTIC_INSTRUCTION_BYTES],
+    operator: &[u8],
+    values: &[f64],
+) -> &'a [u8] {
+    let end = 1 + operator.len() + size_of_val(values);
+    let (header, numbers) = bytes[..end].split_at_mut(1 + operator.len());
+    header[0] = u8::try_from(operator.len()).unwrap_or(u8::MAX);
+    header[1..].copy_from_slice(operator);
+    for (slot, &value) in numbers.as_chunks_mut::<8>().0.iter_mut().zip(values) {
+        let normalized = if value == 0.0 { 0.0 } else { value };
+        *slot = normalized.to_bits().to_be_bytes();
+    }
+    &bytes[..end]
+}
+
 fn update_semantic_hasher(hasher: &mut Sha256, operator: &[u8], values: &[f64]) {
-    hasher.update([u8::try_from(operator.len()).unwrap_or(u8::MAX)]);
-    hasher.update(operator);
-    for value in values {
-        let normalized = if *value == 0.0 { 0.0 } else { *value };
-        hasher.update(normalized.to_bits().to_be_bytes());
+    let mut bytes = [0; SEMANTIC_INSTRUCTION_BYTES];
+    hasher.update(encode_semantic_instruction(&mut bytes, operator, values));
+}
+
+/// Short paths frequently end with stroke or no-paint operators. Avoid
+/// initializing/updating the digest for their discarded semantic records.
+/// Long paths are streamed in bounded chunks, retaining at most one chunk.
+struct PathSemanticHasher {
+    digest: Sha256,
+    pending: Vec<u8>,
+}
+
+impl PathSemanticHasher {
+    fn new() -> Self {
+        Self {
+            digest: Sha256::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, operator: &[u8], values: &[f64]) {
+        let mut bytes = [0; SEMANTIC_INSTRUCTION_BYTES];
+        let instruction = encode_semantic_instruction(&mut bytes, operator, values);
+        if self.pending.len() + instruction.len() > PATH_HASH_CHUNK_BYTES {
+            self.digest.update(&self.pending);
+            self.pending.clear();
+        }
+        self.pending.extend_from_slice(instruction);
+    }
+
+    fn finish(&self, operator: &[u8]) -> SemanticKey {
+        let mut digest = self.digest.clone();
+        digest.update(&self.pending);
+        update_semantic_hasher(&mut digest, operator, &[]);
+        digest.finalize().into()
+    }
+
+    fn reset(&mut self) {
+        self.digest.reset();
+        self.pending.clear();
     }
 }
 
@@ -976,7 +1032,7 @@ struct PathBlockScanner {
     path_start: Option<usize>,
     path_valid: bool,
     bounds: Option<Rect>,
-    semantic_hasher: Sha256,
+    semantic_hasher: PathSemanticHasher,
     operator_count: usize,
     blocks: Vec<PathBlock>,
     inside_text: bool,
@@ -988,7 +1044,7 @@ impl PathBlockScanner {
             path_start: None,
             path_valid: true,
             bounds: None,
-            semantic_hasher: Sha256::new(),
+            semantic_hasher: PathSemanticHasher::new(),
             operator_count: 0,
             blocks: Vec::new(),
             inside_text: false,
@@ -999,7 +1055,7 @@ impl PathBlockScanner {
         self.path_start = None;
         self.path_valid = true;
         self.bounds = None;
-        self.semantic_hasher = Sha256::new();
+        self.semantic_hasher.reset();
         self.operator_count = 0;
     }
 
@@ -1033,6 +1089,9 @@ impl PathBlockScanner {
         if self.inside_text {
             self.path_valid = false;
         }
+        if !self.path_valid {
+            return;
+        }
         if self.path_start.is_none() {
             if operator == b"h" {
                 self.path_valid = false;
@@ -1044,7 +1103,7 @@ impl PathBlockScanner {
             self.path_valid = false;
             return;
         };
-        update_semantic_hasher(&mut self.semantic_hasher, operator, values);
+        self.semantic_hasher.append(operator, values);
         self.operator_count = self.operator_count.saturating_add(1);
         if operator == b"re" {
             let x = values[0];
@@ -1074,9 +1133,7 @@ impl PathBlockScanner {
             && (block_len >= MIN_PATH_FORM_BYTES
                 || self.operator_count >= MIN_PROCESSING_PATH_FORM_OPERATORS)
         {
-            let mut hasher = self.semantic_hasher.clone();
-            update_semantic_hasher(&mut hasher, operator, &[]);
-            let semantic_key = hasher.finalize().into();
+            let semantic_key = self.semantic_hasher.finish(operator);
             self.blocks.push(PathBlock {
                 start,
                 end,
@@ -4319,6 +4376,56 @@ mod tests {
     fn transformed_block_factoring_rejects_nested_graphics_state() {
         let input = b"q 1 0 0 1 10 20 cm q 0 0 10 10 re f Q Q";
         assert!(factorable_transformed_blocks(input).is_empty());
+    }
+
+    #[test]
+    fn batched_semantic_hash_preserves_the_original_byte_encoding() {
+        let mut reference = Sha256::new();
+        let mut direct = Sha256::new();
+        let mut buffered = PathSemanticHasher::new();
+        for index in 0..2048 {
+            let index = f64::from(index);
+            for (operator, values) in [
+                (b"m".as_slice(), [index, -0.0].as_slice()),
+                (b"c", &[index, 1.25, -2.5, 0.0, f64::MAX, f64::MIN_POSITIVE]),
+                (b"h", &[]),
+            ] {
+                reference.update([u8::try_from(operator.len()).unwrap_or(u8::MAX)]);
+                reference.update(operator);
+                for &value in values {
+                    let canonical = if value == 0.0 { 0.0 } else { value };
+                    reference.update(canonical.to_bits().to_be_bytes());
+                }
+                update_semantic_hasher(&mut direct, operator, values);
+                buffered.append(operator, values);
+                assert!(buffered.pending.len() <= PATH_HASH_CHUNK_BYTES);
+            }
+        }
+        reference.update([2]);
+        reference.update(b"f*");
+        update_semantic_hasher(&mut direct, b"f*", &[]);
+        let expected: SemanticKey = reference.finalize().into();
+        assert_eq!(SemanticKey::from(direct.finalize()), expected);
+        assert_eq!(buffered.finish(b"f*"), expected);
+        buffered.reset();
+        assert_eq!(buffered.finish(b"f*"), semantic_fingerprint(b"\x02f*"));
+    }
+
+    #[test]
+    fn invalid_and_stroked_paths_do_not_poison_the_next_fill() {
+        let mut fill = b"0 0 m ".to_vec();
+        for index in 0..700 {
+            fill.extend_from_slice(format!("{} {} l ", index + 1, index + 2).as_bytes());
+        }
+        fill.extend_from_slice(b"f");
+        let expected = factorable_path_blocks(&fill);
+        let mut input = fill[..fill.len() - 1].to_vec();
+        input.extend_from_slice(b" S h 0 0 m 1 2 l f BT 1 2 m ET 1 2 l n ");
+        input.extend_from_slice(&fill);
+        let result = factorable_path_blocks(&input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].semantic_key, expected[0].semantic_key);
+        assert_eq!(result[0].operator_count, expected[0].operator_count);
     }
 
     #[test]
