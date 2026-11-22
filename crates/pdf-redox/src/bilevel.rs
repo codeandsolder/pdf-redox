@@ -1,4 +1,4 @@
-use crate::{Error, OwnedDictionary, OwnedObject, Result};
+use crate::{OwnedDictionary, OwnedObject, Result};
 use std::collections::BTreeMap;
 
 mod ccitt;
@@ -226,6 +226,7 @@ pub fn encode_best_image_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use fax::{
         Color, VecWriter,
         decoder::{decode_g4, pels},
