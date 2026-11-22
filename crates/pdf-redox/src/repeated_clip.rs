@@ -28,7 +28,7 @@ pub struct RepeatedClipStats {
     pub estimated_flate_bytes_saved: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClipBlock {
     start: usize,
     end: usize,
@@ -182,60 +182,96 @@ impl Scanner {
         self.clip_prefix_state = ClipPrefixState::Path;
     }
 
-    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+    /// Return true only when a new outer block starts with a clear path.
+    fn instruction(
+        &mut self,
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+        base: usize,
+    ) -> bool {
         let operator = &instruction.operator[..];
         let operator_span = instruction.operator_span();
-        let start = instruction
-            .operand_spans()
-            .next()
-            .map_or(operator_span.start, |span| span.start);
-        let end = operator_span.end;
-        let has_operands = instruction.operands().next().is_some();
+        let end = base + operator_span.end;
 
         if self.depth == 0 {
             if operator == b"Q" {
                 self.page_valid = false;
-                return;
+                return false;
             }
             self.track_path(operator);
-            if operator == b"q" && !has_operands {
-                self.open_outer_block(start);
+            if operator == b"q" && instruction.operand_spans().len() == 0 {
+                self.open_outer_block(base + operator_span.start);
+                return self.clip_prefix_state == ClipPrefixState::Path;
             }
-            return;
+            return false;
         }
 
         self.track_path(operator);
         self.track_clip_prefix(instruction, operator, end);
         match operator {
             b"q" => {
-                if has_operands {
+                if instruction.operand_spans().len() != 0 {
                     self.block_valid = false;
                 }
                 self.depth = self.depth.saturating_add(1);
             }
             b"Q" => {
-                if has_operands {
+                if instruction.operand_spans().len() != 0 {
                     self.block_valid = false;
                 }
                 self.depth = self.depth.saturating_sub(1);
                 if self.depth == 0 {
-                    self.close_outer_block(operator_span.start, end);
+                    self.close_outer_block(base + operator_span.start, end);
                 }
             }
             _ => {}
         }
+        false
     }
 
-    fn scan(input: &[u8]) -> Result<Option<Vec<ClipBlock>>> {
-        let mut scanner = Self::new();
-        let incomplete = crate::content_stream::visit_instructions(input, |instruction| {
-            scanner.instruction(instruction);
-            Ok(())
-        })?;
-        if incomplete || !scanner.page_valid || scanner.depth != 0 {
-            return Ok(None);
+    /// Reuse a previous fully parsed prefix only at an independently parsed
+    /// outer q with no pending path. The prefix ends in an operand-free n.
+    /// Require the following byte to terminate that operator in this copy too.
+    fn reuse_clip_prefix(&mut self, input: &[u8]) -> Option<usize> {
+        let start = self.block_start?;
+        let prefix = clip_prefix(input, self.blocks.last()?)?;
+        if prefix.len() < MIN_CLIP_PREFIX_BYTES {
+            return None;
         }
-        Ok(Some(scanner.blocks))
+        let suffix = input.get(start..)?.strip_prefix(prefix)?;
+        if suffix
+            .first()
+            .is_some_and(|&byte| !crate::content_stream::token_boundary(byte))
+        {
+            return None;
+        }
+        let end = input.len() - suffix.len();
+        self.clip_prefix_state = ClipPrefixState::Done(end);
+        self.path_state = PathState::Clear;
+        Some(end)
+    }
+
+    fn finish(self, incomplete: bool) -> Option<Vec<ClipBlock>> {
+        if incomplete || !self.page_valid || self.depth != 0 {
+            return None;
+        }
+        Some(self.blocks)
+    }
+
+    fn scan(input: &[u8]) -> Option<Vec<ClipBlock>> {
+        let mut scanner = Self::new();
+        let mut base = 0;
+        let mut iter = hayro_syntax::content::UntypedIter::new(input);
+        while let Some(instruction) = iter.next() {
+            if scanner.instruction(&instruction, base)
+                && let Some(end) = scanner.reuse_clip_prefix(input)
+            {
+                // The validated n ended with an empty operand stack. Restart
+                // at that instruction boundary and retain absolute byte spans.
+                base = end;
+                iter = hayro_syntax::content::UntypedIter::new(&input[base..]);
+            }
+        }
+        scanner.finish(!iter.is_at_end())
     }
 }
 
@@ -349,7 +385,7 @@ pub fn hoist_repeated_clip_prefixes(
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
-        let Some(blocks) = Scanner::scan(&decoded)? else {
+        let Some(blocks) = Scanner::scan(&decoded) else {
             continue;
         };
         let runs = repeated_runs(&decoded, &blocks);
@@ -429,10 +465,36 @@ mod tests {
     }
 
     #[test]
+    fn cached_clip_prefix_scan_matches_full_parser() -> Result<()> {
+        let clip = large_clip();
+        let trimmed = clip.trim_end();
+        let changed = clip.replacen("1 0 l", "2 0 l", 1);
+        let inputs = [
+            format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f Q q {clip}3 0 1 1 re f Q"),
+            format!("q {clip}0 0 1 1 re f Q %comment\nq {trimmed}%comment\n2 0 1 1 re f Q"),
+            format!("q {clip}0 0 1 1 re f Q q {trimmed}X 2 0 1 1 re f Q"),
+            format!("q {clip}0 0 1 1 re f Q q {changed}2 0 1 1 re f Q"),
+            format!("q {clip}0 0 m Q q {clip}2 0 1 1 re f Q"),
+            format!("q {clip}0 0 1 1 re f Q q {clip}q 2 0 1 1 re f Q Q"),
+            format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f"),
+        ];
+        for input in inputs {
+            let mut scanner = Scanner::new();
+            let incomplete =
+                crate::content_stream::visit_instructions(input.as_bytes(), |instruction| {
+                    scanner.instruction(instruction, 0);
+                    Ok(())
+                })?;
+            assert_eq!(Scanner::scan(input.as_bytes()), scanner.finish(incomplete));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn hoists_exact_repeated_clip_and_keeps_each_body_isolated() -> Result<()> {
         let clip = large_clip();
         let input = format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -502,7 +564,7 @@ mod tests {
     fn rejects_run_when_a_body_leaves_a_current_path() -> Result<()> {
         let clip = large_clip();
         let input = format!("q {clip}0 0 m Q q {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -517,7 +579,7 @@ mod tests {
     fn rejects_non_trivia_between_candidate_blocks() -> Result<()> {
         let clip = large_clip();
         let input = format!("q {clip}0 0 1 1 re f Q 1 0 0 rg q {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -531,7 +593,7 @@ mod tests {
     fn hoist_is_idempotent() -> Result<()> {
         let clip = large_clip();
         let input = format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -549,7 +611,7 @@ mod tests {
                 "clip fixture reparse failed".to_owned(),
             ));
         };
-        let Some(rewritten_blocks) = Scanner::scan(&rewritten)? else {
+        let Some(rewritten_blocks) = Scanner::scan(&rewritten) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not reparse".to_owned(),
             ));
@@ -562,7 +624,7 @@ mod tests {
     fn rejects_malformed_clip_operands() -> Result<()> {
         let clip = "0 0 m ".to_owned() + &"1 0 l ".repeat(3000) + "1 W* n ";
         let input = format!("q {clip}0 0 1 1 re f Q q {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -576,7 +638,7 @@ mod tests {
         let clip = large_clip();
         let input =
             format!("q 1 0 0 1 0 0 cm {clip}0 0 1 1 re f Q q 1 0 0 1 0 0 cm {clip}2 0 1 1 re f Q");
-        let Some(blocks) = Scanner::scan(input.as_bytes())? else {
+        let Some(blocks) = Scanner::scan(input.as_bytes()) else {
             return Err(crate::Error::Invalid(
                 "clip fixture did not parse".to_owned(),
             ));
@@ -586,10 +648,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbalanced_graphics_state() -> Result<()> {
+    fn rejects_unbalanced_graphics_state() {
         let clip = large_clip();
         let input = format!("q {clip}0 0 1 1 re f");
-        assert!(Scanner::scan(input.as_bytes())?.is_none());
-        Ok(())
+        assert!(Scanner::scan(input.as_bytes()).is_none());
     }
 }

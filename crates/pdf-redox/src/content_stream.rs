@@ -18,6 +18,28 @@ pub fn visit_instructions(
     Ok(!iter.is_at_end())
 }
 
+/// An operator/name token ends before PDF whitespace or a delimiter.
+pub const fn token_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        0 | b'\t'
+            | b'\n'
+            | 0x0c
+            | b'\r'
+            | b' '
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'/'
+            | b'%'
+    )
+}
+
 /// Whether bytes consist solely of PDF content whitespace and comments.
 pub const fn trivia_only(bytes: &[u8]) -> bool {
     let mut cursor = 0usize;
