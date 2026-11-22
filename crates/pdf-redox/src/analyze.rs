@@ -590,7 +590,7 @@ fn scan_content(
     crate::content_stream::visit_instructions(content, |instruction| {
         let operator = &instruction.operator[..];
         if let (Some(classifier), Some(resources)) = (classifier.as_deref_mut(), resources) {
-            let operands = crate::content_stream::instruction_operands(content, instruction);
+            let operands = crate::content_stream::instruction_operands(instruction);
             classifier.observe_operator(operator, &operands, resources)?;
         }
         if let Some(page) = page.as_deref_mut() {

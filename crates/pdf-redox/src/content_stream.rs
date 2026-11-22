@@ -60,25 +60,23 @@ pub struct InstructionOperand {
 
 /// Parse the scalar/name facets used by graphics-state and geometry scanners.
 pub fn instruction_operands(
-    input: &[u8],
     instruction: &hayro_syntax::content::Instruction<'_, '_>,
 ) -> Vec<InstructionOperand> {
     let mut operands = Vec::new();
-    instruction_operands_into(input, instruction, &mut operands);
+    instruction_operands_into(instruction, &mut operands);
     operands
 }
 
 /// Parse the same operand facets into an existing buffer, retaining capacity
 /// across instructions in long-running page scanners.
 pub fn instruction_operands_into(
-    input: &[u8],
     instruction: &hayro_syntax::content::Instruction<'_, '_>,
     operands: &mut Vec<InstructionOperand>,
 ) {
     operands.clear();
     operands.extend(instruction.operands().zip(instruction.operand_spans()).map(
         |(object, span)| InstructionOperand {
-            number: operand_number(object, input.get(span.clone()).unwrap_or_default()),
+            number: operand_number(object),
             name: operand_name(object).map(ToOwned::to_owned),
             offset: span.start,
         },
@@ -107,18 +105,30 @@ pub fn operand_string<'a>(object: &'a HayroObject<'_>) -> Option<&'a [u8]> {
 }
 
 /// Read a numeric content operand without silently rounding an exactly parsed PDF integer.
-pub fn operand_number(object: &HayroObject<'_>, raw: &[u8]) -> Option<f64> {
+pub fn operand_number(object: &HayroObject<'_>) -> Option<f64> {
     let HayroObject::Number(value) = object else {
         return None;
     };
-    if !raw.contains(&b'.')
-        && let Ok(text) = std::str::from_utf8(raw)
-        && let Ok(integer) = text.parse::<i64>()
-    {
-        crate::source::exact_i64_to_f64(integer)
-    } else {
-        Some(value.as_f64())
+    // The parser already determined the integer/real kind. Never rescan the
+    // original token, or round an exact integer through the parser's f64 view.
+    value
+        .as_integer()
+        .map_or_else(|| Some(value.as_f64()), crate::source::exact_i64_to_f64)
+}
+
+/// Read exactly N numeric operands without a heap allocation.
+pub fn instruction_number_array<const N: usize>(
+    instruction: &hayro_syntax::content::Instruction<'_, '_>,
+) -> Option<[f64; N]> {
+    if instruction.operand_spans().len() != N {
+        return None;
     }
+    let mut values = [0.0; N];
+    let mut operands = instruction.operands();
+    for value in &mut values {
+        *value = operand_number(operands.next()?)?;
+    }
+    operands.next().is_none().then_some(values)
 }
 
 /// Apply sorted, non-overlapping byte-range replacements to a content stream.
@@ -223,14 +233,55 @@ mod tests {
     }
 
     #[test]
+    fn parsed_numeric_operands_distinguish_exact_integers_and_reals() -> Result<()> {
+        let input = b"9007199254740993 0 m 9007199254740994 -0.0 l 1 0 0 1 1.25 -2.5 cm";
+        let mut count = 0;
+        let incomplete = visit_instructions(input, |instruction| {
+            match count {
+                0 => {
+                    let values = instruction_operands(instruction);
+                    assert_eq!(values[0].number, None);
+                    assert_eq!(values[1].number, Some(0.0));
+                    assert_eq!(instruction_number_array::<2>(instruction), None);
+                }
+                1 => {
+                    let values = instruction_number_array::<2>(instruction);
+                    assert_eq!(
+                        values.map(|values| values[0]),
+                        Some(9_007_199_254_740_994.0)
+                    );
+                    assert_eq!(
+                        values.map(|values| values[1].to_bits()),
+                        Some((-0.0_f64).to_bits())
+                    );
+                    assert_eq!(instruction_number_array::<6>(instruction), None);
+                }
+                2 => {
+                    assert_eq!(
+                        instruction_number_array::<6>(instruction),
+                        Some([1.0, 0.0, 0.0, 1.0, 1.25, -2.5])
+                    );
+                    assert_eq!(instruction_number_array::<2>(instruction), None);
+                }
+                _ => return Err(crate::Error::Invalid("unexpected instruction".to_owned())),
+            }
+            count += 1;
+            Ok(())
+        })?;
+        assert!(!incomplete);
+        assert_eq!(count, 3);
+        Ok(())
+    }
+
+    #[test]
     fn reusable_operand_buffer_matches_owned_parsing_and_reuses_capacity() -> Result<()> {
         let input = b"/F1 12 Tf 5.123 8 m 1 0 0 rg q Q 10 20 l (literal text) Tj";
         let mut reused = Vec::with_capacity(16);
         let initial_pointer = reused.as_ptr();
         let mut instructions = 0;
         let incomplete = visit_instructions(input, |instruction| {
-            let owned = instruction_operands(input, instruction);
-            instruction_operands_into(input, instruction, &mut reused);
+            let owned = instruction_operands(instruction);
+            instruction_operands_into(instruction, &mut reused);
             assert_eq!(reused.len(), owned.len());
             for (actual, expected) in reused.iter().zip(&owned) {
                 assert_eq!(actual.number, expected.number);

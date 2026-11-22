@@ -169,7 +169,7 @@ impl<'a> Scanner<'a> {
 
     fn curve_operator(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) -> bool {
         let operator = &instruction.operator[..];
-        let operands = instruction_operands(self.input, instruction);
+        let operands = instruction_operands(instruction);
         let count = if operator == b"c" { 6 } else { 4 };
         let Some(values) = operand_numbers(&operands)
             .filter(|values| values.len() == count && values.iter().all(|value| value.is_finite()))
@@ -217,7 +217,7 @@ impl<'a> Scanner<'a> {
         instruction: &hayro_syntax::content::Instruction<'_, '_>,
         deletable: bool,
     ) -> Option<Vertex> {
-        let operands = instruction_operands(self.input, instruction);
+        let operands = instruction_operands(instruction);
         let values = operand_numbers(&operands).filter(|values| values.len() == 2)?;
         let ctm = self.ctm?;
         let (x, y) = ctm.transform(values[0], values[1]);
@@ -241,7 +241,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn concat_ctm(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
-        let operands = instruction_operands(self.input, instruction);
+        let operands = instruction_operands(instruction);
         let matrix = operand_numbers(&operands)
             .filter(|values| values.len() == 6)
             .filter(|values| values.iter().all(|value| value.is_finite()))

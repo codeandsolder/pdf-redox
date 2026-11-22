@@ -37,7 +37,7 @@ struct Instruction {
 fn parsed_instructions(content: &[u8]) -> Result<Option<Vec<Instruction>>> {
     let mut result = Vec::new();
     let incomplete = visit_instructions(content, |ins| {
-        let operands = instruction_operands(content, ins);
+        let operands = instruction_operands(ins);
         result.push(Instruction {
             operator: ins.operator.to_vec(),
             start: ins.span().start,

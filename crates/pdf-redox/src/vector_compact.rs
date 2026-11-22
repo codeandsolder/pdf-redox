@@ -446,23 +446,19 @@ impl FillScanner {
         }
     }
 
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             self.barrier();
             return;
         }
-        instruction_operands_into(input, instruction, &mut self.operands);
+        instruction_operands_into(instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })
     }
@@ -1261,11 +1257,7 @@ impl TransformedBlockScanner {
         }
     }
 
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             if let Some(frame) = self.frames.last_mut() {
                 frame.valid = false;
@@ -1273,14 +1265,14 @@ impl TransformedBlockScanner {
             self.operands.clear();
             return;
         }
-        instruction_operands_into(input, instruction, &mut self.operands);
+        instruction_operands_into(instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })
     }
@@ -1301,7 +1293,7 @@ fn factorable_path_blocks(input: &[u8]) -> Vec<PathBlock> {
         if &instruction.operator[..] == b"BI" {
             scanner.unsupported_operator_state(false);
         } else {
-            let operands = crate::content_stream::instruction_operands(input, instruction);
+            let operands = crate::content_stream::instruction_operands(instruction);
             let span = instruction.operator_span();
             scanner.process_operator_with_operands(
                 &instruction.operator[..],
@@ -1349,23 +1341,19 @@ impl ProcessingFactorScanner {
         self.operands.clear();
     }
 
-    fn instruction(
-        &mut self,
-        input: &[u8],
-        instruction: &hayro_syntax::content::Instruction<'_, '_>,
-    ) {
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
         if &instruction.operator[..] == b"BI" {
             self.inline_image();
             return;
         }
-        instruction_operands_into(input, instruction, &mut self.operands);
+        instruction_operands_into(instruction, &mut self.operands);
         let span = instruction.operator_span();
         self.process_operator(&instruction.operator[..], span.start, span.len());
     }
 
     fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
         crate::content_stream::visit_instructions(input, |instruction| {
-            self.instruction(input, instruction);
+            self.instruction(instruction);
             Ok(())
         })
     }
@@ -1474,8 +1462,8 @@ impl ProcessingPageScanner {
         if let Some(path_coordinates) = &mut self.path_coordinates {
             path_coordinates.instruction(input, instruction);
         }
-        self.fill.instruction(input, instruction);
-        self.factor.instruction(input, instruction);
+        self.fill.instruction(instruction);
+        self.factor.instruction(instruction);
     }
 
     pub(crate) fn scan(&mut self, input: &[u8]) -> crate::Result<bool> {
@@ -3237,10 +3225,7 @@ impl PathCoordinateScanner {
         self.operands
             .extend(instruction.operands().zip(instruction.operand_spans()).map(
                 |(object, span)| PathCoordinateOperand {
-                    value: crate::content_stream::operand_number(
-                        object,
-                        input.get(span.clone()).unwrap_or_default(),
-                    ),
+                    value: crate::content_stream::operand_number(object),
                     offset: span.start,
                     length: span.len(),
                 },
