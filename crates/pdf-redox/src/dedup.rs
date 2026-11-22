@@ -155,8 +155,10 @@ impl DirectObjectVisitor for FontProgramHolderVisitor<'_> {
             }
             if let Some(target) = dictionary.reference(key) {
                 self.holders_by_key[index].push(DirectReferenceHolder {
-                    root,
-                    path: path.to_vec(),
+                    location: DirectObjectTarget {
+                        root,
+                        path: path.to_vec(),
+                    },
                     key: key.to_vec(),
                     target,
                 });
@@ -428,14 +430,13 @@ pub fn canonicalize_font_program_streams(
 }
 
 use crate::direct_object::{
-    DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
-    object_at_direct_path_mut, value_at_direct_path, walk_direct_output_objects,
+    DirectArrayView, DirectDictionaryView, DirectObjectTarget, DirectObjectVisitor, DirectPathStep,
+    DirectWalkControl, walk_direct_output_objects,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectReferenceHolder {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
+    location: DirectObjectTarget,
     key: Vec<u8>,
     target: CowObjectHandle,
 }
@@ -459,8 +460,10 @@ impl DirectObjectVisitor for DirectReferenceVisitor<'_> {
             return Ok(());
         }
         self.holders.push(DirectReferenceHolder {
-            root,
-            path: path[..path.len() - 1].to_vec(),
+            location: DirectObjectTarget {
+                root,
+                path: path[..path.len() - 1].to_vec(),
+            },
             key: self.key.to_vec(),
             target,
         });
@@ -492,11 +495,7 @@ fn rewrite_direct_reference_holder(
     holder: &DirectReferenceHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = document.edit_handle(holder.root)?;
-    let Some(holder_object) = object_at_direct_path_mut(root, &holder.path) else {
-        return Ok(false);
-    };
-    let Some(dictionary) = holder_object.as_dictionary_mut() else {
+    let Some(dictionary) = holder.location.dictionary_mut(document)? else {
         return Ok(false);
     };
     let Some(OwnedObject::Reference(current)) = dictionary.get(holder.key.as_slice()) else {
@@ -531,8 +530,7 @@ pub fn canonicalize_metadata_streams(document: &mut EditDocument) -> Result<Targ
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectArrayReferenceHolder {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
+    location: DirectObjectTarget,
     index: usize,
     target: CowObjectHandle,
 }
@@ -556,8 +554,10 @@ impl DirectObjectVisitor for IccArrayVisitor<'_> {
             return Ok(DirectWalkControl::Descend);
         };
         self.holders.push(DirectArrayReferenceHolder {
-            root,
-            path: path.to_vec(),
+            location: DirectObjectTarget {
+                root,
+                path: path.to_vec(),
+            },
             index: 1,
             target: profile,
         });
@@ -581,8 +581,7 @@ fn rewrite_direct_array_reference_holder(
     holder: &DirectArrayReferenceHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = document.edit_handle(holder.root)?;
-    let Some(array_object) = object_at_direct_path_mut(root, &holder.path) else {
+    let Some(array_object) = holder.location.edit(document)? else {
         return Ok(false);
     };
     let OwnedObject::Array(values) = array_object else {
@@ -620,59 +619,15 @@ pub fn canonicalize_to_unicode_cmaps(document: &mut EditDocument) -> Result<Targ
     canonicalize_named_stream_references(document, b"ToUnicode", b"to-unicode")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct DirectDictionaryTarget {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
-}
-
-impl DirectDictionaryTarget {
-    fn from_property(
-        root: CowObjectHandle,
-        path: &[DirectPathStep],
-        dictionary: DirectDictionaryView<'_, '_>,
-        key: &[u8],
-    ) -> Option<Self> {
-        let value = dictionary.raw_value(key)?;
-        if let Some(target) = value.reference() {
-            return Some(Self {
-                root: target,
-                path: Vec::new(),
-            });
-        }
-        value.is_dictionary().then(|| {
-            let mut path = path.to_vec();
-            path.push(DirectPathStep::DictKey(key.to_vec()));
-            Self { root, path }
-        })
-    }
-
-    fn current<'a>(&self, document: &'a EditDocument) -> Result<Option<CurrentValue<'a>>> {
-        Ok(document
-            .current_value(self.root)?
-            .and_then(|root| value_at_direct_path(root, &self.path))
-            .filter(CurrentValue::has_dictionary))
-    }
-
-    fn entries<'a>(
-        &self,
-        document: &'a EditDocument,
-    ) -> Result<Option<crate::source::CurrentDictionaryIter<'a>>> {
-        Ok(self
-            .current(document)?
-            .and_then(|dictionary| dictionary.dictionary_entries()))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HayroType3GlyphHolder {
-    target: DirectDictionaryTarget,
+    target: DirectObjectTarget,
     name: Vec<u8>,
     glyph: CowObjectHandle,
 }
 
 struct Type3TargetVisitor<'a> {
-    targets: &'a mut BTreeSet<DirectDictionaryTarget>,
+    targets: &'a mut BTreeSet<DirectObjectTarget>,
 }
 
 impl DirectObjectVisitor for Type3TargetVisitor<'_> {
@@ -685,7 +640,7 @@ impl DirectObjectVisitor for Type3TargetVisitor<'_> {
     ) -> Result<DirectWalkControl> {
         if dictionary.resolved_name_is(document, b"Subtype", b"Type3")?
             && let Some(target) =
-                DirectDictionaryTarget::from_property(root, path, dictionary, b"CharProcs")
+                DirectObjectTarget::from_dictionary_property(root, path, dictionary, b"CharProcs")
         {
             self.targets.insert(target);
         }
@@ -697,7 +652,7 @@ impl DirectObjectVisitor for Type3TargetVisitor<'_> {
     }
 }
 
-fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
+fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectObjectTarget>> {
     let mut targets = BTreeSet::new();
     walk_direct_output_objects(
         document,
@@ -711,7 +666,7 @@ fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectDict
 fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
     let mut holders = Vec::new();
     for target in type3_charproc_targets(document)? {
-        let Some(entries) = target.entries(document)? else {
+        let Some(entries) = target.dictionary_entries(document)? else {
             continue;
         };
         for (name, glyph) in entries {
@@ -733,11 +688,7 @@ fn rewrite_type3_glyph_holder(
     holder: &HayroType3GlyphHolder,
     canonical: CowObjectHandle,
 ) -> Result<bool> {
-    let root = document.edit_handle(holder.target.root)?;
-    let Some(charprocs) = object_at_direct_path_mut(root, &holder.target.path) else {
-        return Ok(false);
-    };
-    let Some(dictionary) = charprocs.as_dictionary_mut() else {
+    let Some(dictionary) = holder.target.dictionary_mut(document)? else {
         return Ok(false);
     };
     let Some(OwnedObject::Reference(current)) = dictionary.get(holder.name.as_slice()) else {
@@ -851,7 +802,7 @@ fn rewrite_dictionary_reference_keys(
 ) -> Result<usize> {
     rewrite_dictionary_target(
         document,
-        &DirectDictionaryTarget {
+        &DirectObjectTarget {
             root: handle,
             path: Vec::new(),
         },
@@ -862,7 +813,7 @@ fn rewrite_dictionary_reference_keys(
 
 struct DictionaryTargetVisitor<'a> {
     key: &'a [u8],
-    targets: &'a mut BTreeSet<DirectDictionaryTarget>,
+    targets: &'a mut BTreeSet<DirectObjectTarget>,
 }
 
 impl DirectObjectVisitor for DictionaryTargetVisitor<'_> {
@@ -874,7 +825,7 @@ impl DirectObjectVisitor for DictionaryTargetVisitor<'_> {
         dictionary: DirectDictionaryView<'_, '_>,
     ) -> Result<DirectWalkControl> {
         if let Some(target) =
-            DirectDictionaryTarget::from_property(root, path, dictionary, self.key)
+            DirectObjectTarget::from_dictionary_property(root, path, dictionary, self.key)
         {
             self.targets.insert(target);
         }
@@ -886,10 +837,7 @@ impl DirectObjectVisitor for DictionaryTargetVisitor<'_> {
     }
 }
 
-fn dictionary_targets(
-    document: &EditDocument,
-    key: &[u8],
-) -> Result<BTreeSet<DirectDictionaryTarget>> {
+fn dictionary_targets(document: &EditDocument, key: &[u8]) -> Result<BTreeSet<DirectObjectTarget>> {
     let mut targets = BTreeSet::new();
     walk_direct_output_objects(
         document,
@@ -903,16 +851,13 @@ fn dictionary_targets(
 
 fn apply_dictionary_redirect_changes(
     document: &mut EditDocument,
-    target: &DirectDictionaryTarget,
+    target: &DirectObjectTarget,
     changes: Vec<(Vec<u8>, CowObjectHandle)>,
 ) -> Result<usize> {
     if changes.is_empty() {
         return Ok(0);
     }
-    let root = document.edit_handle(target.root)?;
-    let Some(dictionary) =
-        object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
-    else {
+    let Some(dictionary) = target.dictionary_mut(document)? else {
         return Ok(0);
     };
     let count = changes.len();
@@ -924,11 +869,11 @@ fn apply_dictionary_redirect_changes(
 
 fn rewrite_dictionary_target(
     document: &mut EditDocument,
-    target: &DirectDictionaryTarget,
+    target: &DirectObjectTarget,
     selected_keys: Option<&[&[u8]]>,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
-    let Some(dictionary) = target.current(document)? else {
+    let Some(dictionary) = target.dictionary(document)? else {
         return Ok(0);
     };
     let mut changes = Vec::new();
@@ -957,7 +902,7 @@ fn rewrite_dictionary_target(
 
 fn rewrite_dictionary_target_entries(
     document: &mut EditDocument,
-    targets: &BTreeSet<DirectDictionaryTarget>,
+    targets: &BTreeSet<DirectObjectTarget>,
     selected_keys: Option<&[&[u8]]>,
     redirects: &HashMap<CowObjectHandle, CowObjectHandle>,
 ) -> Result<usize> {
@@ -1423,8 +1368,7 @@ fn exact_non_stream_resource_redirects(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RedirectReferenceHolder {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
+    location: DirectObjectTarget,
     target: CowObjectHandle,
 }
 
@@ -1437,8 +1381,10 @@ fn record_redirect_reference_holder(
 ) {
     if redirects.contains_key(&target) {
         holders.push(RedirectReferenceHolder {
-            root,
-            path: path.to_vec(),
+            location: DirectObjectTarget {
+                root,
+                path: path.to_vec(),
+            },
             target,
         });
     }
@@ -1503,8 +1449,7 @@ fn rewrite_all_references(
         if canonical == holder.target {
             continue;
         }
-        let root = document.edit_handle(holder.root)?;
-        let Some(value) = object_at_direct_path_mut(root, &holder.path) else {
+        let Some(value) = holder.location.edit(document)? else {
             continue;
         };
         let OwnedObject::Reference(current) = value else {
@@ -1620,7 +1565,7 @@ pub fn canonicalize_exact_extgstate_dictionaries(
     let targets = dictionary_targets(document, b"ExtGState")?;
     let mut handles = BTreeSet::new();
     for target in &targets {
-        let Some(entries) = target.entries(document)? else {
+        let Some(entries) = target.dictionary_entries(document)? else {
             continue;
         };
         handles.extend(entries.filter_map(|(_, value)| value.reference()));
@@ -1656,8 +1601,10 @@ pub fn canonicalize_exact_structure_attribute_dictionaries(
             return Ok(());
         };
         holders.push(DirectReferenceHolder {
-            root,
-            path: Vec::new(),
+            location: DirectObjectTarget {
+                root,
+                path: Vec::new(),
+            },
             key: b"A".to_vec(),
             target,
         });
@@ -1931,7 +1878,7 @@ fn fixed_point_form_redirects(
 }
 
 struct WidgetMkVisitor<'a> {
-    targets: &'a mut BTreeSet<DirectDictionaryTarget>,
+    targets: &'a mut BTreeSet<DirectObjectTarget>,
 }
 
 impl DirectObjectVisitor for WidgetMkVisitor<'_> {
@@ -1949,7 +1896,9 @@ impl DirectObjectVisitor for WidgetMkVisitor<'_> {
         {
             return Ok(DirectWalkControl::Descend);
         }
-        if let Some(target) = DirectDictionaryTarget::from_property(root, path, dictionary, b"MK") {
+        if let Some(target) =
+            DirectObjectTarget::from_dictionary_property(root, path, dictionary, b"MK")
+        {
             self.targets.insert(target);
         }
         Ok(DirectWalkControl::DescendExcept(&[b"MK"]))
@@ -1960,7 +1909,7 @@ impl DirectObjectVisitor for WidgetMkVisitor<'_> {
     }
 }
 
-fn widget_mk_targets(document: &EditDocument) -> Result<BTreeSet<DirectDictionaryTarget>> {
+fn widget_mk_targets(document: &EditDocument) -> Result<BTreeSet<DirectObjectTarget>> {
     let mut targets = BTreeSet::new();
     walk_direct_output_objects(
         document,
@@ -2204,13 +2153,11 @@ pub fn canonicalize_form_xobjects(document: &mut EditDocument) -> Result<Targete
     })
 }
 
-fn appearance_dictionary_targets(
-    document: &EditDocument,
-) -> Result<BTreeSet<DirectDictionaryTarget>> {
+fn appearance_dictionary_targets(document: &EditDocument) -> Result<BTreeSet<DirectObjectTarget>> {
     let mut targets = dictionary_targets(document, b"AP")?;
     let initial = targets.iter().cloned().collect::<Vec<_>>();
     for target in initial {
-        let Some(dictionary) = target.current(document)? else {
+        let Some(dictionary) = target.dictionary(document)? else {
             continue;
         };
         for key in [b"N".as_slice(), b"R".as_slice(), b"D".as_slice()] {
@@ -2222,7 +2169,7 @@ fn appearance_dictionary_targets(
                     .current_value(handle)?
                     .is_some_and(|object| object.is_dictionary())
                 {
-                    targets.insert(DirectDictionaryTarget {
+                    targets.insert(DirectObjectTarget {
                         root: handle,
                         path: Vec::new(),
                     });
@@ -2230,7 +2177,7 @@ fn appearance_dictionary_targets(
             } else if value.is_dictionary() {
                 let mut path = target.path.clone();
                 path.push(DirectPathStep::DictKey(key.to_vec()));
-                targets.insert(DirectDictionaryTarget {
+                targets.insert(DirectObjectTarget {
                     root: target.root,
                     path,
                 });
@@ -2248,7 +2195,7 @@ pub fn canonicalize_appearance_streams(document: &mut EditDocument) -> Result<Ta
     let dependencies = form_dependency_redirects(document, &[])?;
     let mut plan = FingerprintRedirectPlan::new();
     for holder in &holders {
-        let Some(entries) = holder.entries(document)? else {
+        let Some(entries) = holder.dictionary_entries(document)? else {
             continue;
         };
         for (_, appearance) in entries {
@@ -2319,8 +2266,10 @@ fn page_content_holders(
             };
             if resolved.is_stream() {
                 holders.push(PageContentHolder::Dictionary(DirectReferenceHolder {
-                    root: page,
-                    path: Vec::new(),
+                    location: DirectObjectTarget {
+                        root: page,
+                        path: Vec::new(),
+                    },
                     key: b"Contents".to_vec(),
                     target,
                 }));
@@ -2346,8 +2295,10 @@ fn page_content_holders(
                 .is_some_and(|object| object.is_stream())
             {
                 holders.push(PageContentHolder::Array(DirectArrayReferenceHolder {
-                    root,
-                    path: path.clone(),
+                    location: DirectObjectTarget {
+                        root,
+                        path: path.clone(),
+                    },
                     index,
                     target,
                 }));
@@ -2506,11 +2457,11 @@ mod tests {
         let existing = |number| CowObjectHandle::Existing(crate::ObjectId::new(number, 0));
         *document.edit_handle(existing(8))? = OwnedObject::Name(b"Widget".to_vec());
         let key = |key: &[u8]| DirectPathStep::DictKey(key.to_vec());
-        let widget = DirectDictionaryTarget {
+        let widget = DirectObjectTarget {
             root: existing(4),
             path: vec![key(b"Widget"), DirectPathStep::ArrayIndex(0), key(b"MK")],
         };
-        let nested_nonwidget = DirectDictionaryTarget {
+        let nested_nonwidget = DirectObjectTarget {
             root: existing(4),
             path: vec![
                 key(b"NonWidget"),
@@ -2519,7 +2470,7 @@ mod tests {
                 key(b"MK"),
             ],
         };
-        let indirect = DirectDictionaryTarget {
+        let indirect = DirectObjectTarget {
             root: existing(7),
             path: Vec::new(),
         };
@@ -2581,8 +2532,7 @@ mod tests {
         let holders = page_content_holders(&document, &pages)?;
         let array = |root, path, index, target| {
             PageContentHolder::Array(DirectArrayReferenceHolder {
-                root,
-                path,
+                location: DirectObjectTarget { root, path },
                 index,
                 target,
             })
@@ -2597,8 +2547,10 @@ mod tests {
                 array(existing(8), Vec::new(), 0, existing(5)),
                 array(existing(8), Vec::new(), 1, existing(6)),
                 PageContentHolder::Dictionary(DirectReferenceHolder {
-                    root: existing(9),
-                    path: Vec::new(),
+                    location: DirectObjectTarget {
+                        root: existing(9),
+                        path: Vec::new(),
+                    },
                     key: b"Contents".to_vec(),
                     target: existing(6)
                 }),
@@ -2704,14 +2656,14 @@ mod tests {
         let root = CowObjectHandle::Existing(crate::ObjectId::new(1, 0));
         let indirect = CowObjectHandle::Existing(crate::ObjectId::new(6, 0));
         let expected = BTreeSet::from([
-            DirectDictionaryTarget {
+            DirectObjectTarget {
                 root,
                 path: vec![
                     DirectPathStep::DictKey(b"Private".to_vec()),
                     DirectPathStep::DictKey(b"XObject".to_vec()),
                 ],
             },
-            DirectDictionaryTarget {
+            DirectObjectTarget {
                 root: indirect,
                 path: Vec::new(),
             },

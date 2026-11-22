@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
-    source::{CurrentChildKey, CurrentChildren, CurrentValue},
+    source::{CurrentChildKey, CurrentChildren, CurrentDictionaryIter, CurrentValue},
 };
 use hayro_syntax::object::{
     Array as HayroArray, Dict as HayroDict, MaybeRef as HayroMaybeRef, Object as HayroObject,
@@ -41,6 +41,67 @@ pub fn value_at_direct_path<'a>(
         };
     }
     Some(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DirectObjectTarget {
+    pub root: CowObjectHandle,
+    pub path: Vec<DirectPathStep>,
+}
+
+impl DirectObjectTarget {
+    pub fn from_dictionary_property(
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+        key: &[u8],
+    ) -> Option<Self> {
+        let value = dictionary.raw_value(key)?;
+        if let Some(target) = value.reference() {
+            return Some(Self {
+                root: target,
+                path: Vec::new(),
+            });
+        }
+        value.is_dictionary().then(|| {
+            let mut path = path.to_vec();
+            path.push(DirectPathStep::DictKey(key.to_vec()));
+            Self { root, path }
+        })
+    }
+
+    pub fn current<'a>(&self, document: &'a EditDocument) -> Result<Option<CurrentValue<'a>>> {
+        Ok(document
+            .current_value(self.root)?
+            .and_then(|root| value_at_direct_path(root, &self.path)))
+    }
+
+    pub fn dictionary<'a>(&self, document: &'a EditDocument) -> Result<Option<CurrentValue<'a>>> {
+        Ok(self.current(document)?.filter(CurrentValue::has_dictionary))
+    }
+
+    pub fn dictionary_entries<'a>(
+        &self,
+        document: &'a EditDocument,
+    ) -> Result<Option<CurrentDictionaryIter<'a>>> {
+        Ok(self
+            .dictionary(document)?
+            .and_then(|dictionary| dictionary.dictionary_entries()))
+    }
+
+    pub fn edit<'a>(&self, document: &'a mut EditDocument) -> Result<Option<&'a mut OwnedObject>> {
+        let root = document.edit_handle(self.root)?;
+        Ok(object_at_direct_path_mut(root, &self.path))
+    }
+
+    pub fn dictionary_mut<'a>(
+        &self,
+        document: &'a mut EditDocument,
+    ) -> Result<Option<&'a mut OwnedDictionary>> {
+        Ok(self
+            .edit(document)?
+            .and_then(OwnedObject::as_dictionary_mut))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +491,78 @@ endstream")?;
             [6, 7, 8, 9].map(|id| ObjectId::new(id, 0))
         );
         assert_eq!(owned.references(), [6, 7, 8, 9].map(reference));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_object_target_projects_and_edits_the_same_source_or_overlay_location() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Direct << /N 1 >> /Indirect 4 0 R /Array [4 0 R] >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R >>")?;
+        pdf.object(4, b"<< /N 2 >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let existing = |number| CowObjectHandle::Existing(ObjectId::new(number, 0));
+        let root = existing(1);
+        let (direct, indirect) = {
+            let HayroObject::Dict(dictionary) = document.source().object(ObjectId::new(1, 0))?
+            else {
+                return Err(Error::Invalid(
+                    "missing target fixture dictionary".to_owned(),
+                ));
+            };
+            let view = DirectDictionaryView::Source(&dictionary);
+            assert!(
+                DirectObjectTarget::from_dictionary_property(root, &[], view, b"Array").is_none()
+            );
+            let target = |key: &[u8]| {
+                DirectObjectTarget::from_dictionary_property(root, &[], view, key)
+                    .ok_or_else(|| Error::Invalid("missing property target".to_owned()))
+            };
+            (target(b"Direct")?, target(b"Indirect")?)
+        };
+        assert_eq!(direct.root, root);
+        assert_eq!(indirect.root, existing(4));
+        assert!(indirect.path.is_empty());
+        assert!(matches!(
+            direct.current(&document)?,
+            Some(CurrentValue::Source(..))
+        ));
+        for target in [&direct, &indirect] {
+            let Some(dictionary) = target.dictionary_mut(&mut document)? else {
+                return Err(Error::Invalid("missing target dictionary".to_owned()));
+            };
+            dictionary.insert(b"N".to_vec(), OwnedObject::Integer(42));
+            assert!(matches!(
+                target.current(&document)?,
+                Some(CurrentValue::Owned(..))
+            ));
+        }
+        let raw_reference = DirectObjectTarget {
+            root,
+            path: vec![
+                DirectPathStep::DictKey(b"Array".to_vec()),
+                DirectPathStep::ArrayIndex(0),
+            ],
+        };
+        assert_eq!(
+            raw_reference
+                .current(&document)?
+                .and_then(|value| value.reference()),
+            Some(existing(4))
+        );
+        assert!(raw_reference.dictionary(&document)?.is_none());
+        let Some(value) = raw_reference.edit(&mut document)? else {
+            return Err(Error::Invalid("missing direct reference target".to_owned()));
+        };
+        *value = OwnedObject::Null;
+        assert!(matches!(
+            raw_reference.current(&document)?,
+            Some(CurrentValue::Owned(OwnedObject::Null))
+        ));
         Ok(())
     }
 
