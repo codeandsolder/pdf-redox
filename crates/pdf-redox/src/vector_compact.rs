@@ -5,7 +5,7 @@ use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource,
+        decoded_content_value, effective_page_resources, install_page_resource_bindings,
         page_box_numbers_matching, page_user_unit, replace_page_content,
         replace_page_content_with_handle, resolved_dictionary,
     },
@@ -1650,7 +1650,13 @@ fn apply_span_replacements(
     input: &[u8],
     replacements: &[(usize, usize, Vec<u8>)],
 ) -> Option<Vec<u8>> {
-    apply_span_replacements_owned(input, replacements.to_vec())
+    apply_span_replacements_owned(
+        input,
+        replacements
+            .iter()
+            .map(|(start, end, bytes)| (*start, *end, bytes.as_slice()))
+            .collect(),
+    )
 }
 
 type ProcessingFactorBlocks = BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>;
@@ -1977,21 +1983,23 @@ fn factor_repeated_path_forms(
             rewritten_page_handles.insert(page.page);
         }
     }
-    for ((_, name, _, occurrences), handle) in selected.iter().zip(form_handles) {
-        let pages = occurrences
+    let page_data = &page_data;
+    install_page_resource_bindings(
+        document,
+        b"XObject",
+        selected
             .iter()
-            .map(|occurrence| occurrence.page_index)
-            .collect::<BTreeSet<_>>();
-        for page_index in pages {
-            install_page_resource(
-                document,
-                page_data[page_index].page,
-                b"XObject",
-                name.clone(),
-                handle,
-            )?;
-        }
-    }
+            .zip(form_handles)
+            .flat_map(|((_, name, _, occurrences), handle)| {
+                occurrences.iter().map(move |occurrence| {
+                    (
+                        page_data[occurrence.page_index].page,
+                        name.as_slice(),
+                        handle,
+                    )
+                })
+            }),
+    )?;
 
     let occurrences = selected
         .iter()
@@ -2192,21 +2200,23 @@ fn factor_repeated_transformed_blocks(
             replace_page_content(document, page.page, rewritten)?;
         }
     }
-    for ((_, name, _, _, occurrences), handle) in selected.iter().zip(form_handles) {
-        let pages = occurrences
+    let page_data = &page_data;
+    install_page_resource_bindings(
+        document,
+        b"XObject",
+        selected
             .iter()
-            .map(|occurrence| occurrence.page_index)
-            .collect::<BTreeSet<_>>();
-        for page_index in pages {
-            install_page_resource(
-                document,
-                page_data[page_index].page,
-                b"XObject",
-                name.clone(),
-                handle,
-            )?;
-        }
-    }
+            .zip(form_handles)
+            .flat_map(|((_, name, _, _, occurrences), handle)| {
+                occurrences.iter().map(move |occurrence| {
+                    (
+                        page_data[occurrence.page_index].page,
+                        name.as_slice(),
+                        handle,
+                    )
+                })
+            }),
+    )?;
 
     let occurrences = selected
         .iter()
@@ -2915,17 +2925,17 @@ fn factor_shared_q_prefix_runs(
     for (page_index, rewritten) in rewritten_pages {
         replace_page_content(document, page_data[page_index].page, rewritten)?;
     }
-    for (run, handle) in selected.iter().zip(form_handles) {
-        for &page_index in &run.candidate.page_indices {
-            install_page_resource(
-                document,
-                page_data[page_index].page,
-                b"XObject",
-                run.name.clone(),
-                handle,
-            )?;
-        }
-    }
+    let page_data = &page_data;
+    install_page_resource_bindings(
+        document,
+        b"XObject",
+        selected.iter().zip(form_handles).flat_map(|(run, handle)| {
+            run.candidate
+                .page_indices
+                .iter()
+                .map(move |&page_index| (page_data[page_index].page, run.name.as_slice(), handle))
+        }),
+    )?;
 
     let mut generated_page_xobjects = BTreeMap::<ObjectHandle, BTreeSet<Vec<u8>>>::new();
     let mut blocks_replaced = 0usize;

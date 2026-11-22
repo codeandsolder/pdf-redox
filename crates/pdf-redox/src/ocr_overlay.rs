@@ -4,7 +4,8 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     content::{
-        decoded_content_value, effective_page_resources, install_page_resource, resolved_dictionary,
+        decoded_content_value, effective_page_resources, install_page_resource_bindings,
+        resolved_dictionary,
     },
     digest::sha256_hex,
 };
@@ -444,12 +445,10 @@ pub fn apply_ocr_overlay(
             &new_bytes,
             crate::FlateLevel::PROCESSING,
         )?;
-        install_page_resource(
+        install_page_resource_bindings(
             &mut doc,
-            handle,
             b"Font",
-            name.as_bytes().to_vec(),
-            font_handle,
+            [(handle, name.as_bytes(), font_handle)],
         )?;
         report.pages_rewritten += 1;
     }

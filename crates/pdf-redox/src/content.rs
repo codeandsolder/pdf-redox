@@ -387,21 +387,35 @@ pub fn page_user_unit(document: &EditDocument, page: ObjectHandle) -> Result<Opt
     Ok((value.is_finite() && value > 0.0).then_some(value))
 }
 
-pub fn install_page_resource(
+/// Install a category of resource bindings in one transaction per page.
+/// Repeated names on a page use the last binding in input order. Existing
+/// inherited resources and unrelated categories are preserved.
+pub fn install_page_resource_bindings<'a>(
     document: &mut EditDocument,
-    page: ObjectHandle,
     resource_type: &[u8],
-    name: Vec<u8>,
-    target: ObjectHandle,
+    bindings: impl IntoIterator<Item = (ObjectHandle, &'a [u8], ObjectHandle)>,
 ) -> Result<()> {
-    let mut resources = effective_page_resources(document, page)?;
-    let mut entries =
-        resolved_dictionary(document, resources.get(resource_type))?.unwrap_or_default();
-    entries.insert(name, OwnedObject::Reference(target));
-    resources.insert(resource_type.to_vec(), OwnedObject::Dictionary(entries));
-    let object = document.edit_handle(page)?;
-    if let Some(dictionary) = object.as_dictionary_mut() {
-        dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+    let mut grouped = BTreeMap::<ObjectHandle, BTreeMap<&[u8], ObjectHandle>>::new();
+    for (page, name, target) in bindings {
+        grouped.entry(page).or_default().insert(name, target);
+    }
+    for (page, bindings) in grouped {
+        let mut resources = effective_page_resources(document, page)?;
+        let existing = resources.remove(resource_type);
+        let mut entries = match existing {
+            Some(OwnedObject::Dictionary(entries)) => entries,
+            other => resolved_dictionary(document, other.as_ref())?.unwrap_or_default(),
+        };
+        entries.extend(
+            bindings
+                .into_iter()
+                .map(|(name, target)| (name.to_vec(), OwnedObject::Reference(target))),
+        );
+        resources.insert(resource_type.to_vec(), OwnedObject::Dictionary(entries));
+        let object = document.edit_handle(page)?;
+        if let Some(dictionary) = object.as_dictionary_mut() {
+            dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+        }
     }
     Ok(())
 }
@@ -676,6 +690,56 @@ mod tests {
         let mut decoded = Vec::new();
         decoded_content_value(&document, CurrentValue::Owned(&content), &mut decoded)?;
         assert_eq!(decoded, b"q Q");
+        Ok(())
+    }
+
+    #[test]
+    fn resource_binding_batch_preserves_inheritance_and_last_binding() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F 5 0 R >> /XObject 6 0 R >> >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.object(5, b"<< /Type /Font >>")?;
+        pdf.object(6, b"<< /Existing 5 0 R /NonReference 42 >>")?;
+        let mut doc = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = doc.page_handles()?;
+        let inherited = effective_page_resources(&doc, pages[1])?;
+        let first = ObjectHandle::New(doc.add_object(OwnedObject::Null));
+        let last = ObjectHandle::New(doc.add_object(OwnedObject::Null));
+        install_page_resource_bindings(
+            &mut doc,
+            b"XObject",
+            [
+                (pages[0], b"Added".as_slice(), first),
+                (pages[0], b"Other".as_slice(), first),
+                (pages[0], b"Added".as_slice(), last),
+            ],
+        )?;
+        let resources = effective_page_resources(&doc, pages[0])?;
+        assert_eq!(
+            resources.get(b"Font".as_slice()),
+            inherited.get(b"Font".as_slice())
+        );
+        let entries = resolved_dictionary(&doc, resources.get(b"XObject".as_slice()))?
+            .ok_or_else(|| crate::Error::Invalid("missing resource category".into()))?;
+        assert_eq!(
+            entries.get(b"Existing".as_slice()),
+            Some(&content_reference(5))
+        );
+        assert_eq!(
+            entries.get(b"NonReference".as_slice()),
+            Some(&OwnedObject::Integer(42))
+        );
+        assert_eq!(
+            entries.get(b"Added".as_slice()),
+            Some(&OwnedObject::Reference(last))
+        );
+        assert_eq!(
+            entries.get(b"Other".as_slice()),
+            Some(&OwnedObject::Reference(first))
+        );
+        assert_eq!(effective_page_resources(&doc, pages[1])?, inherited);
         Ok(())
     }
 

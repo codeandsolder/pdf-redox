@@ -6,8 +6,8 @@ use crate::{
     EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
     bilevel::{BilevelCodec, BilevelImagePayload, BilevelRaster},
     content::{
-        effective_page_resources, install_page_resource, page_user_unit, replace_page_content,
-        resolved_dictionary,
+        effective_page_resources, install_page_resource_bindings, page_user_unit,
+        replace_page_content, resolved_dictionary,
     },
 };
 use hayro_syntax::content::Instruction;
@@ -1145,9 +1145,13 @@ pub fn rasterize_pathological_microstrokes(
             installed.push((candidate.name.clone(), handle));
         }
         replace_page_content(document, page, rewritten)?;
-        for (name, handle) in installed {
-            install_page_resource(document, page, b"XObject", name, handle)?;
-        }
+        install_page_resource_bindings(
+            document,
+            b"XObject",
+            installed
+                .iter()
+                .map(|(name, handle)| (page, name.as_slice(), *handle)),
+        )?;
 
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.runs_rasterized = stats.runs_rasterized.saturating_add(candidates.len());

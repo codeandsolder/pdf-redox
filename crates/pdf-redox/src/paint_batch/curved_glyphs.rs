@@ -5,8 +5,9 @@ use super::{
     BTreeMap, BTreeSet, EditDocument, Event, GlyphComponent, GlyphFontPlan, GlyphShapePlan,
     MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
     OutlinedGlyphFactorStats, Result, adjacent, effective_page_resources, events_for,
-    install_page_resource, outlined_glyph_estimated_after_flate, outlined_glyph_font_dictionary,
-    outlined_glyph_font_name, replace_page_content, resolved_dictionary,
+    install_page_resource_bindings, outlined_glyph_estimated_after_flate,
+    outlined_glyph_font_dictionary, outlined_glyph_font_name, replace_page_content,
+    resolved_dictionary,
 };
 use crate::content::page_content_if_present;
 use crate::geometry::compose_affine_matrix;
@@ -988,12 +989,16 @@ pub(super) fn factor(
         return Ok(stats);
     }
 
+    let mut bindings = Vec::new();
     for (plan, users) in plans.iter().zip(&font_pages) {
         let font = outlined_glyph_font_dictionary(doc, plan);
-        for &index in users {
-            install_page_resource(doc, sources[index].page, b"Font", plan.name.clone(), font)?;
-        }
+        bindings.extend(
+            users
+                .iter()
+                .map(|&index| (sources[index].page, plan.name.as_slice(), font)),
+        );
     }
+    install_page_resource_bindings(doc, b"Font", bindings)?;
     for (source, content) in sources.iter().zip(rewritten) {
         if let Some(content) = content {
             stats.decoded_bytes_removed += source.decoded.len().saturating_sub(content.len());
