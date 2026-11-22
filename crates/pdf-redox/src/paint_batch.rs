@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Weak},
 };
 
 mod curved_glyphs;
@@ -798,10 +799,11 @@ fn batch_strokes<'a>(
     Some((Cow::Owned(output), stats))
 }
 
-fn batch_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, ContentBatchStats)> {
-    let events = events_for(input, &[b"gs", b"d"])?;
-
-    let (filled, fill_stats) = batch_closed_fills(input, &events)?;
+fn batch_content<'a>(
+    input: &'a [u8],
+    events: &EventTable,
+) -> Option<(Cow<'a, [u8]>, ContentBatchStats)> {
+    let (filled, fill_stats) = batch_closed_fills(input, events)?;
     let (stroked, stroke_stats) = match filled {
         Cow::Borrowed(filled) => batch_strokes(filled, &events.records)?,
         Cow::Owned(filled) => {
@@ -1516,7 +1518,10 @@ fn fenced_stroke_form_occurrence(
 
 fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
     let events = events_for(input, &[b"gs", b"d"])?;
+    Some(project_stroke_form_occurrences(input, &events))
+}
 
+fn project_stroke_form_occurrences(input: &[u8], events: &EventTable) -> Vec<StrokeFormOccurrence> {
     let numbers = &events.numbers;
     let mut occurrences = Vec::new();
     let mut state = StrokeGraphicsState::default();
@@ -1528,7 +1533,7 @@ fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
         let event = &events.records[index];
         if event.operator.as_slice() == b"q"
             && let Some((occurrence, next)) =
-                fenced_stroke_form_occurrence(input, &events, index, !path_nonempty, state)
+                fenced_stroke_form_occurrence(input, events, index, !path_nonempty, state)
         {
             occurrences.push(occurrence);
             path_nonempty = false;
@@ -1564,7 +1569,7 @@ fn stroke_form_occurrences(input: &[u8]) -> Option<Vec<StrokeFormOccurrence>> {
         }
         index += 1;
     }
-    Some(occurrences)
+    occurrences
 }
 
 fn outlined_glyph_transaction(
@@ -1959,6 +1964,52 @@ fn stroke_form_replacement(
     Some(output)
 }
 
+/// A scan is reusable only for the exact immutable content allocation it
+/// inspected. A weak reference keeps allocation identity alive without
+/// retaining the decoded byte buffer or preventing ordinary cache eviction.
+struct StrokeFormPageScan {
+    snapshot: Weak<Vec<u8>>,
+    occurrences: Option<Vec<StrokeFormOccurrence>>,
+}
+
+#[derive(Default)]
+pub struct StrokeFormScanEvidence {
+    pages: BTreeMap<ObjectHandle, StrokeFormPageScan>,
+}
+
+impl StrokeFormScanEvidence {
+    fn remember(
+        &mut self,
+        page: ObjectHandle,
+        decoded: &Arc<Vec<u8>>,
+        events: Option<&EventTable>,
+    ) {
+        // A concatenated/uncached page with no other owner cannot keep this
+        // allocation alive until the next stage. Avoid speculative discovery.
+        if Arc::strong_count(decoded) <= 1 {
+            return;
+        }
+        let occurrences = events.map(|events| project_stroke_form_occurrences(decoded, events));
+        self.pages.insert(
+            page,
+            StrokeFormPageScan {
+                snapshot: Arc::downgrade(decoded),
+                occurrences,
+            },
+        );
+    }
+
+    fn take_for(
+        &mut self,
+        page: ObjectHandle,
+        decoded: &Arc<Vec<u8>>,
+    ) -> Option<StrokeFormPageScan> {
+        self.pages
+            .remove(&page)
+            .filter(|scan| scan.snapshot.ptr_eq(&Arc::downgrade(decoded)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StrokeFormPageOccurrence {
     page_index: usize,
@@ -1983,6 +2034,7 @@ pub fn factor_repeated_stroke_forms(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    evidence: &mut StrokeFormScanEvidence,
 ) -> Result<StrokeFormFactorStats> {
     let mut page_data = Vec::<ObjectHandle>::new();
     let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
@@ -1995,7 +2047,11 @@ pub fn factor_repeated_stroke_forms(
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
-        let Some(occurrences) = stroke_form_occurrences(&decoded) else {
+        let occurrences = evidence.take_for(page, &decoded).map_or_else(
+            || stroke_form_occurrences(&decoded),
+            |scan| scan.occurrences,
+        );
+        let Some(occurrences) = occurrences else {
             continue;
         };
         let page_index = page_data.len();
@@ -2432,23 +2488,28 @@ pub fn factor_outlined_glyphs(
 pub fn batch_page_paints(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
+    evidence: &mut StrokeFormScanEvidence,
 ) -> Result<PaintBatchStats> {
     let mut stats = PaintBatchStats::default();
     for &page in pages {
+        evidence.pages.remove(&page);
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
-        let Some((batched, page_stats)) = batch_content(&decoded) else {
+        let events = events_for(&decoded, &[b"gs", b"d"]);
+        let candidate = events
+            .as_ref()
+            .and_then(|events| batch_content(&decoded, events));
+        let Some((batched, page_stats)) = candidate.filter(|(batched, stats)| {
+            stats.paints_eliminated >= MIN_PAINTS_ELIMINATED
+                && batched.as_ref() != decoded.as_slice()
+        }) else {
+            evidence.remember(page, &decoded, events.as_ref());
             continue;
         };
-        if page_stats.paints_eliminated < MIN_PAINTS_ELIMINATED
-            || batched.as_ref() == decoded.as_slice()
-        {
-            continue;
-        }
         replace_page_content(document, page, batched.into_owned())?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.groups_created = stats
@@ -2477,6 +2538,11 @@ mod tests {
             };
             value
         }};
+    }
+
+    fn batch_content_test(input: &[u8]) -> Option<(Cow<'_, [u8]>, ContentBatchStats)> {
+        let events = events_for(input, &[b"gs", b"d"])?;
+        batch_content(input, &events)
     }
 
     fn batch_content_reparsed(input: &[u8]) -> Option<(Vec<u8>, ContentBatchStats)> {
@@ -2589,13 +2655,75 @@ mod tests {
     }
 
     #[test]
+    fn stroke_scan_evidence_requires_live_exact_snapshot() -> Result<()> {
+        let page = ObjectHandle::Existing(crate::ObjectId::new(1, 0));
+        let mut decoded = Arc::new(b"q 0 0 m 1 1 l S Q".to_vec());
+        let owner = Arc::clone(&decoded);
+        let events = events_for(&decoded, &[b"gs", b"d"])
+            .ok_or_else(|| crate::Error::Invalid("scan fixture did not parse".into()))?;
+        let mut evidence = StrokeFormScanEvidence::default();
+        evidence.remember(page, &decoded, Some(&events));
+        let original = evidence
+            .take_for(page, &decoded)
+            .and_then(|scan| scan.occurrences)
+            .ok_or_else(|| crate::Error::Invalid("exact snapshot should reuse scan".into()))?;
+        let reparsed = stroke_form_occurrences(&decoded)
+            .ok_or_else(|| crate::Error::Invalid("fixture did not reparse".into()))?;
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].signature, reparsed[0].signature);
+        assert_eq!(original[0].body_start, reparsed[0].body_start);
+        assert!(evidence.take_for(page, &decoded).is_none());
+
+        evidence.remember(page, &decoded, Some(&events));
+        let same_bytes_new_allocation = Arc::new(decoded.as_ref().clone());
+        assert!(
+            evidence
+                .take_for(page, &same_bytes_new_allocation)
+                .is_none()
+        );
+
+        evidence.remember(page, &decoded, Some(&events));
+        drop(owner);
+        Arc::make_mut(&mut decoded).extend_from_slice(b" q Q");
+        assert!(evidence.take_for(page, &decoded).is_none());
+        evidence.remember(page, &decoded, None);
+        assert!(
+            evidence.pages.is_empty(),
+            "do not retain uniquely owned decoded content"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stroke_scan_evidence_distinguishes_disqualified_and_incomplete_streams() -> Result<()> {
+        let page = ObjectHandle::Existing(crate::ObjectId::new(1, 0));
+        let mut evidence = StrokeFormScanEvidence::default();
+        for (input, complete) in [(b"/GS gs q Q".as_slice(), true), (b"/GS gs [1 2", false)] {
+            let decoded = Arc::new(input.to_vec());
+            let owner = Arc::clone(&decoded);
+            let events = events_for(&decoded, &[b"gs", b"d"]);
+            evidence.remember(page, &decoded, events.as_ref());
+            let scan = evidence
+                .take_for(page, &decoded)
+                .ok_or_else(|| crate::Error::Invalid("scan evidence missing".into()))?;
+            assert_eq!(scan.occurrences.is_some(), complete);
+            assert!(scan.occurrences.is_none_or(|items| items.is_empty()));
+            evidence.remember(page, &decoded, events.as_ref());
+            drop(decoded);
+            drop(owner);
+            assert!(evidence.pages[&page].snapshot.upgrade().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn same_snapshot_event_reuse_matches_reparsed_reference() {
         let inputs: [&[u8]; 2] = [
             b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S",
             b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 3 0 l 3 1 l h b Q 4 0 m 5 0 l S 6 0 m 7 0 l S",
         ];
         for input in inputs {
-            let optimized = some!(batch_content(input), "optimized parse");
+            let optimized = some!(batch_content_test(input), "optimized parse");
             let reparsed = some!(batch_content_reparsed(input), "reference parse");
             assert_eq!(optimized.0.as_ref(), reparsed.0.as_slice());
             assert_eq!(optimized.1, reparsed.1);
@@ -2640,7 +2768,7 @@ mod tests {
     #[test]
     fn batches_consecutive_strokes_without_reordering() {
         let input = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.source_paints_batched, 3);
         assert_eq!(stats.paints_eliminated, 2);
         assert_eq!(operator_count(&output, b"S"), 1);
@@ -2652,7 +2780,7 @@ mod tests {
     #[test]
     fn graphics_state_change_splits_stroke_batches() {
         let input = b"0 0 m 1 0 l S 2 w 2 0 m 3 0 l S";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output.as_ref(), &input[..]);
     }
@@ -2660,7 +2788,7 @@ mod tests {
     #[test]
     fn ext_gstate_disables_page_paint_batching() {
         let input = b"/GS1 gs 0 0 m 1 0 l S 2 0 m 3 0 l S";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output.as_ref(), &input[..]);
     }
@@ -2668,7 +2796,7 @@ mod tests {
     #[test]
     fn batches_same_winding_closed_fill_stroke_transactions() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 0.5 0 m 1.5 0 l 1.5 1 l h b Q";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.source_paints_batched, 2);
         assert_eq!(stats.paints_eliminated, 1);
         assert_eq!(operator_count(&output, b"B"), 1);
@@ -2678,7 +2806,7 @@ mod tests {
     #[test]
     fn opposite_winding_overlap_is_not_batched() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 0.5 0 m 0.5 1 l 1.5 1 l h b Q";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output.as_ref(), &input[..]);
     }
@@ -2686,7 +2814,7 @@ mod tests {
     #[test]
     fn opposite_winding_disjoint_paths_are_batched() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 2 1 l 3 1 l h b Q";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 1);
         assert_known_operators(&output);
     }
@@ -2694,7 +2822,7 @@ mod tests {
     #[test]
     fn zero_area_fill_can_join_any_winding() {
         let input = b"q 1 M 0 0 m 1 0 l h b Q q 1 M 0 0 m 1 0 l 1 1 l h b Q";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 1);
         assert_known_operators(&output);
     }
@@ -2702,7 +2830,7 @@ mod tests {
     #[test]
     fn differing_miter_limit_splits_closed_fill_batches() {
         let input = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 2 M 2 0 m 3 0 l 3 1 l h b Q";
-        let (output, stats) = some!(batch_content(input), "parse");
+        let (output, stats) = some!(batch_content_test(input), "parse");
         assert_eq!(stats.paints_eliminated, 0);
         assert_eq!(output.as_ref(), &input[..]);
     }
@@ -2719,7 +2847,7 @@ mod tests {
         }
         content.resize(MIN_PAGE_CONTENT_BYTES + 512, b' ');
 
-        let Some((batched, candidate_stats)) = batch_content(&content) else {
+        let Some((batched, candidate_stats)) = batch_content_test(&content) else {
             return Err(crate::Error::Invalid(
                 "test paint stream did not parse".to_owned(),
             ));
@@ -2742,7 +2870,11 @@ mod tests {
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let pages = document.page_handles()?;
-        let stats = batch_page_paints(&mut document, &pages)?;
+        let stats = batch_page_paints(
+            &mut document,
+            &pages,
+            &mut StrokeFormScanEvidence::default(),
+        )?;
         assert_eq!(stats.pages_rewritten, 1);
         assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
         Ok(())
@@ -2754,7 +2886,7 @@ mod tests {
         for index in 0..=MAX_SOURCE_PATHS_PER_BATCH {
             input.extend_from_slice(format!("{index} 0 m {index} 1 l S ").as_bytes());
         }
-        let (output, stats) = some!(batch_content(&input), "parse");
+        let (output, stats) = some!(batch_content_test(&input), "parse");
         assert_eq!(stats.source_paints_batched, MAX_SOURCE_PATHS_PER_BATCH + 1);
         assert_eq!(stats.paints_eliminated, MAX_SOURCE_PATHS_PER_BATCH - 1);
         assert_eq!(operator_count(&output, b"S"), 2);
@@ -3050,10 +3182,31 @@ mod tests {
         pdf.stream(6, b"", &other)?;
         pdf.stream(7, b"/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b"q Q")?;
 
-        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let fixture = pdf.finish(1)?;
+        let mut cold = EditDocument::from_bytes(fixture.clone())?;
+        let cold_pages = cold.page_handles()?;
+        let cold_stats = factor_repeated_stroke_forms(
+            &mut cold,
+            &cold_pages,
+            crate::FlateLevel::PROCESSING,
+            &mut StrokeFormScanEvidence::default(),
+        )?;
+
+        let mut document = EditDocument::from_bytes(fixture)?;
         let pages = document.page_handles()?;
-        let stats =
-            factor_repeated_stroke_forms(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+        let mut evidence = StrokeFormScanEvidence::default();
+        let batch_stats = batch_page_paints(&mut document, &pages, &mut evidence)?;
+        assert_eq!(batch_stats.pages_rewritten, 0);
+        assert_eq!(evidence.pages.len(), 2);
+        let stats = factor_repeated_stroke_forms(
+            &mut document,
+            &pages,
+            crate::FlateLevel::PROCESSING,
+            &mut evidence,
+        )?;
+        assert!(evidence.pages.is_empty());
+        assert_eq!(stats, cold_stats);
+        assert_eq!(document.write_compact()?, cold.write_compact()?);
         assert_eq!(stats.pages_rewritten, 1);
         assert_eq!(stats.forms_created, 1);
         assert_eq!(stats.occurrences_replaced, 100);
@@ -3089,16 +3242,16 @@ mod tests {
     #[test]
     fn paint_batching_is_idempotent() {
         let strokes = b"0 0 m 1 0 l S 2 0 m 3 0 l S 4 0 m 5 0 l S";
-        let (first, first_stats) = some!(batch_content(strokes), "parse");
+        let (first, first_stats) = some!(batch_content_test(strokes), "parse");
         assert!(first_stats.paints_eliminated > 0);
-        let (second, second_stats) = some!(batch_content(&first), "parse generated output");
+        let (second, second_stats) = some!(batch_content_test(&first), "parse generated output");
         assert_eq!(second_stats.paints_eliminated, 0);
         assert_eq!(second, first);
 
         let fills = b"q 1 M 0 0 m 1 0 l 1 1 l h b Q q 1 M 2 0 m 3 0 l 3 1 l h b Q";
-        let (first, first_stats) = some!(batch_content(fills), "parse");
+        let (first, first_stats) = some!(batch_content_test(fills), "parse");
         assert!(first_stats.paints_eliminated > 0);
-        let (second, second_stats) = some!(batch_content(&first), "parse generated output");
+        let (second, second_stats) = some!(batch_content_test(&first), "parse generated output");
         assert_eq!(second_stats.paints_eliminated, 0);
         assert_eq!(second, first);
     }
