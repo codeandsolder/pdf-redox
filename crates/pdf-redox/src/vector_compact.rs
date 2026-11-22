@@ -3562,13 +3562,13 @@ fn write_compacted_vector_page(
     // compression phase instead of recompressing unchanged page content.
     let after_encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
     let after_flate = after_encoded.len();
+    if goal == OptimizationGoal::Size && after_flate >= before_flate {
+        return Ok(None);
+    }
     let decoded_sha256 = Sha256::digest(&compacted).into();
     flate_state
         .lengths
         .remember_encoded_len(decoded_sha256, flate_level, after_flate);
-    if goal == OptimizationGoal::Size && after_flate >= before_flate {
-        return Ok(None);
-    }
     let replacement = replace_page_content_with_handle(document, page, compacted)?;
     flate_state
         .reuse
