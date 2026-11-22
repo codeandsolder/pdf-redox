@@ -526,7 +526,7 @@ endstream")?;
         };
         assert_eq!(direct.root, root);
         assert_eq!(indirect.root, existing(4));
-        assert!(indirect.path.is_empty());
+        assert_eq!(indirect.path, []);
         assert!(matches!(
             direct.current(&document)?,
             Some(CurrentValue::Source(..))

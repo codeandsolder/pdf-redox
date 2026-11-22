@@ -619,13 +619,6 @@ pub fn canonicalize_to_unicode_cmaps(document: &mut EditDocument) -> Result<Targ
     canonicalize_named_stream_references(document, b"ToUnicode", b"to-unicode")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HayroType3GlyphHolder {
-    target: DirectObjectTarget,
-    name: Vec<u8>,
-    glyph: CowObjectHandle,
-}
-
 struct Type3TargetVisitor<'a> {
     targets: &'a mut BTreeSet<DirectObjectTarget>,
 }
@@ -663,7 +656,7 @@ fn type3_charproc_targets(document: &EditDocument) -> Result<BTreeSet<DirectObje
     Ok(targets)
 }
 
-fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHolder>> {
+fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<DirectReferenceHolder>> {
     let mut holders = Vec::new();
     for target in type3_charproc_targets(document)? {
         let Some(entries) = target.dictionary_entries(document)? else {
@@ -673,32 +666,14 @@ fn type3_glyph_holders(document: &EditDocument) -> Result<Vec<HayroType3GlyphHol
             let Some(glyph) = glyph.reference() else {
                 continue;
             };
-            holders.push(HayroType3GlyphHolder {
-                target: target.clone(),
-                name: name.as_ref().to_vec(),
-                glyph,
+            holders.push(DirectReferenceHolder {
+                location: target.clone(),
+                key: name.as_ref().to_vec(),
+                target: glyph,
             });
         }
     }
     Ok(holders)
-}
-
-fn rewrite_type3_glyph_holder(
-    document: &mut EditDocument,
-    holder: &HayroType3GlyphHolder,
-    canonical: CowObjectHandle,
-) -> Result<bool> {
-    let Some(dictionary) = holder.target.dictionary_mut(document)? else {
-        return Ok(false);
-    };
-    let Some(OwnedObject::Reference(current)) = dictionary.get(holder.name.as_slice()) else {
-        return Ok(false);
-    };
-    if *current != holder.glyph {
-        return Ok(false);
-    }
-    dictionary.insert(holder.name.clone(), OwnedObject::Reference(canonical));
-    Ok(true)
 }
 
 pub fn canonicalize_type3_charprocs(document: &mut EditDocument) -> Result<TargetedDedupStats> {
@@ -706,10 +681,10 @@ pub fn canonicalize_type3_charprocs(document: &mut EditDocument) -> Result<Targe
     canonicalize_stream_holders(
         document,
         &holders,
-        |holder| holder.glyph,
-        |holder| holder.glyph,
-        |document, holder| source_stream_fingerprint(document, holder.glyph, b"type3-charproc"),
-        rewrite_type3_glyph_holder,
+        |holder| holder.target,
+        |holder| holder.target,
+        |document, holder| source_stream_fingerprint(document, holder.target, b"type3-charproc"),
+        rewrite_direct_reference_holder,
     )
 }
 
