@@ -4,6 +4,7 @@ use crate::{
         PageRewriteResult, form_content, form_resources, page_content, page_resources,
         replace_page_content,
     },
+    cos_fingerprint::{hash_len_prefixed, hash_resolved_owned_dictionary},
 };
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
 use sha2::{Digest as _, Sha256};
@@ -165,95 +166,17 @@ fn converted_inline_dictionary(
     Ok((out, color_space_resolved))
 }
 
-fn hash_owned_object(
-    document: &EditDocument,
-    object: &OwnedObject,
-    hasher: &mut Sha256,
-    depth: usize,
-) -> Result<bool> {
-    if depth > 128 {
-        return Ok(false);
-    }
-    match object {
-        OwnedObject::Reference(_) => {
-            let Some(resolved) = document.resolve_owned_value(object)? else {
-                return Ok(false);
-            };
-            hasher.update(b"R");
-            hash_owned_object(document, &resolved, hasher, depth + 1)
-        }
-        OwnedObject::Null => {
-            hasher.update(b"N");
-            Ok(true)
-        }
-        OwnedObject::Boolean(value) => {
-            hasher.update([b'B', u8::from(*value)]);
-            Ok(true)
-        }
-        OwnedObject::Integer(value) => {
-            hasher.update(b"I");
-            hasher.update(value.to_le_bytes());
-            Ok(true)
-        }
-        OwnedObject::Real(value) => {
-            hasher.update(b"F");
-            hasher.update(value.to_bits().to_le_bytes());
-            Ok(true)
-        }
-        OwnedObject::Name(value) => {
-            hasher.update(b"/");
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value);
-            Ok(true)
-        }
-        OwnedObject::String(value) => {
-            hasher.update(b"S");
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value);
-            Ok(true)
-        }
-        OwnedObject::Array(values) => {
-            hasher.update(b"A");
-            hasher.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                if !hash_owned_object(document, value, hasher, depth + 1)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            hasher.update(b"D");
-            hasher.update((dictionary.len() as u64).to_le_bytes());
-            for (key, value) in dictionary {
-                hasher.update((key.len() as u64).to_le_bytes());
-                hasher.update(key);
-                if !hash_owned_object(document, value, hasher, depth + 1)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        OwnedObject::Stream { .. } => Ok(false),
-    }
-}
-
 fn semantic_fingerprint(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     data: &[u8],
 ) -> Result<Option<InlineImageFingerprint>> {
     let mut hasher = Sha256::new();
-    if !hash_owned_object(
-        document,
-        &OwnedObject::Dictionary(dictionary.clone()),
-        &mut hasher,
-        0,
-    )? {
+    hash_len_prefixed(&mut hasher, b"inline-image-semantic");
+    if !hash_resolved_owned_dictionary(document, &mut hasher, dictionary)? {
         return Ok(None);
     }
-    hasher.update((data.len() as u64).to_le_bytes());
-    hasher.update(data);
+    hash_len_prefixed(&mut hasher, data);
     Ok(Some(hasher.finalize().into()))
 }
 

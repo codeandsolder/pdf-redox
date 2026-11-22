@@ -8,6 +8,7 @@ mod compression_corpus;
 mod config;
 mod content;
 pub(crate) mod content_stream;
+mod cos_fingerprint;
 mod dead_paint;
 mod dedup;
 mod digest;

@@ -1,6 +1,6 @@
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
-    dedup::{exact_projected_dictionary_equal, exact_projected_dictionary_fingerprint},
+    cos_fingerprint::{exact_projected_dictionary_equal, exact_projected_dictionary_fingerprint},
     direct_object::{
         DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep,
         DirectWalkControl, object_at_direct_path_mut, walk_direct_object,

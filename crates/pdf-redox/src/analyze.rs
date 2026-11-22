@@ -2,7 +2,7 @@ use crate::{
     EditDocument, ObjectHandle as CowObjectHandle, OwnedObject, PdfAnalysis, Result, RiskFinding,
     RiskKind,
     content::{page_content, page_resources},
-    dedup::exact_dictionary_fingerprint,
+    cos_fingerprint::exact_dictionary_fingerprint,
     hidden_text::analyze_hidden_text,
 };
 use sha2::{Digest, Sha256};

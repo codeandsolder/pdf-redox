@@ -12,6 +12,7 @@ use crate::{
         InstructionOperand, instruction_operands, normalize_content_stream, operand_numbers,
         resource_type_for_operator,
     },
+    cos_fingerprint::exact_projected_dictionary_fingerprint,
     hidden_text::{HiddenTextSharedContext, PhysicalHiddenTextScanner, hidden_text_shared_context},
     inline_images::{
         ContentTarget as InlineContentTarget, FragmentedInlineExternalizationStats,
@@ -19,13 +20,13 @@ use crate::{
         externalize_fragmented_inline_target,
     },
     prune::prune_xobject_candidates_for_content,
+    source::CurrentValue,
     vector_compact::{
         ProcessingPageScanner, ProcessingVectorAnalysis, compacted_rect_fill_len,
         merge_rect_fill_pair, rect_contains_rect,
     },
 };
 use num_traits::ToPrimitive;
-use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -2123,87 +2124,13 @@ fn expand_indexed_samples(
     Ok(Some((out, components)))
 }
 
-fn hash_semantic_bytes(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
-}
-
-fn hash_semantic_dictionary(hasher: &mut Sha256, dictionary: &OwnedDictionary) {
-    hasher.update((dictionary.len() as u64).to_le_bytes());
-    for (key, value) in dictionary {
-        hash_semantic_bytes(hasher, key);
-        hash_semantic_object(hasher, value);
-    }
-}
-
-fn hash_semantic_object(hasher: &mut Sha256, object: &OwnedObject) {
-    match object {
-        OwnedObject::Null => hasher.update([0]),
-        OwnedObject::Boolean(value) => hasher.update([1, u8::from(*value)]),
-        OwnedObject::Integer(value) => {
-            hasher.update([2]);
-            hasher.update(value.to_le_bytes());
-        }
-        OwnedObject::Real(value) => {
-            hasher.update([3]);
-            hasher.update(value.to_bits().to_le_bytes());
-        }
-        OwnedObject::Name(value) => {
-            hasher.update([4]);
-            hash_semantic_bytes(hasher, value);
-        }
-        OwnedObject::String(value) => {
-            hasher.update([5]);
-            hash_semantic_bytes(hasher, value);
-        }
-        OwnedObject::Reference(handle) => {
-            hasher.update([6]);
-            match handle {
-                ObjectHandle::Existing(id) => {
-                    hasher.update([0]);
-                    hasher.update(id.number().to_le_bytes());
-                    hasher.update(id.generation().to_le_bytes());
-                }
-                ObjectHandle::New(id) => {
-                    hasher.update([1]);
-                    hasher.update((id.index() as u64).to_le_bytes());
-                }
-            }
-        }
-        OwnedObject::Array(values) => {
-            hasher.update([7]);
-            hasher.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                hash_semantic_object(hasher, value);
-            }
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            hasher.update([8]);
-            hash_semantic_dictionary(hasher, dictionary);
-        }
-        OwnedObject::Stream { dictionary, data } => {
-            hasher.update([9]);
-            hash_semantic_dictionary(hasher, dictionary);
-            match data {
-                StreamData::Source(id) => {
-                    hasher.update([0]);
-                    hasher.update(id.number().to_le_bytes());
-                    hasher.update(id.generation().to_le_bytes());
-                }
-                StreamData::Owned(bytes) => {
-                    hasher.update([1]);
-                    hash_semantic_bytes(hasher, bytes);
-                }
-            }
-        }
-    }
-}
-
 fn semantic_dictionary_key(dictionary: &OwnedDictionary) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"pdf-redox-raster-semantic-v1");
-    hash_semantic_dictionary(&mut hasher, dictionary);
-    hasher.finalize().into()
+    exact_projected_dictionary_fingerprint(
+        dictionary
+            .iter()
+            .map(|(key, value)| (key, CurrentValue::Owned(value))),
+        b"pdf-redox-raster-semantic",
+    )
 }
 
 fn filter_contains_name(
