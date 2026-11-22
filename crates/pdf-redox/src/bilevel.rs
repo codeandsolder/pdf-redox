@@ -110,6 +110,43 @@ impl BilevelRaster {
         &self.packed
     }
 
+    /// Paint a sampled inclusive span with one row lookup and one update
+    /// per packed byte. Coverage is based on the predicate, even if the
+    /// destination bit was already painted by another stroke.
+    pub(crate) fn paint_sampled_span(
+        &mut self,
+        y: usize,
+        xs: std::ops::RangeInclusive<u32>,
+        mut paints: impl FnMut(u32) -> bool,
+    ) -> Option<bool> {
+        let (start, end) = (*xs.start(), *xs.end());
+        if start > end || end >= self.width {
+            return None;
+        }
+        let stride = usize::try_from(self.width.div_ceil(8)).ok()?;
+        let row = y.checked_mul(stride)?;
+        let first_byte = usize::try_from(start / 8).ok()?;
+        let last_byte = usize::try_from(end / 8).ok()?;
+        let bytes = self
+            .packed
+            .get_mut(row.checked_add(first_byte)?..=row.checked_add(last_byte)?)?;
+        let mut x = start;
+        let mut covered = false;
+        for byte in bytes {
+            let last = (x | 7).min(end);
+            let mut ink = 0u8;
+            for pixel in x..=last {
+                if paints(pixel) {
+                    ink |= 0x80 >> (pixel % 8);
+                }
+            }
+            *byte &= !ink;
+            covered |= ink != 0;
+            x = last + 1;
+        }
+        Some(covered)
+    }
+
     pub(crate) fn paint(&mut self, x: usize, y: usize) {
         let Ok(row_bytes) = usize::try_from(self.width.div_ceil(8)) else {
             return;
@@ -304,6 +341,34 @@ mod tests {
             }
         }
         row
+    }
+
+    #[test]
+    fn sampled_spans_match_individual_pixels_and_count_existing_ink() -> Result<()> {
+        for width in 1..=33u32 {
+            for start in 0..width {
+                for end in start..width {
+                    let mut packed = BilevelRaster::transparent(width, 2)
+                        .ok_or_else(|| Error::Invalid("test raster".into()))?;
+                    let mut reference = packed.clone();
+                    let predicate = |x: u32| x % 3 != 1;
+                    let expected = (start..=end).any(predicate);
+                    for x in (start..=end).filter(|&x| predicate(x)) {
+                        reference.paint(usize::try_from(x).unwrap_or_default(), 1);
+                    }
+                    for _ in 0..2 {
+                        assert_eq!(
+                            packed.paint_sampled_span(1, start..=end, predicate),
+                            Some(expected)
+                        );
+                        assert_eq!(packed, reference);
+                    }
+                    assert_eq!(packed.paint_sampled_span(2, start..=end, predicate), None);
+                    assert_eq!(packed.paint_sampled_span(0, start..=width, predicate), None);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -769,12 +769,64 @@ fn rasterize_run_at_pitch(
     )
 }
 
+/// The exact same per-pixel footprint is evaluated for every cap. The cap
+/// is selected outside the sample loop, and each row updates packed bytes
+/// directly instead of looking up the destination byte for every pixel.
+struct PixelStroke {
+    x0: f64,
+    y0: f64,
+    dx: f64,
+    dy: f64,
+    inv_len2: f64,
+    radius2: f64,
+    extension: f64,
+    square_cap_cross_limit: f64,
+}
+
+impl PixelStroke {
+    fn covers<const CAP: u8>(&self, px: f64, py: f64) -> bool {
+        let raw_t = (py - self.y0).mul_add(self.dy, (px - self.x0) * self.dx) * self.inv_len2;
+        if CAP == 0 && !(0.0..=1.0).contains(&raw_t) {
+            return false;
+        }
+        if CAP == 2 && (raw_t < -self.extension || raw_t > 1.0 + self.extension) {
+            return false;
+        }
+        let t = if CAP == 0 {
+            raw_t
+        } else {
+            raw_t.clamp(0.0, 1.0)
+        };
+        let qx = t.mul_add(self.dx, self.x0);
+        let qy = t.mul_add(self.dy, self.y0);
+        let ex = px - qx;
+        let ey = py - qy;
+        if CAP == 2 {
+            ey.mul_add(self.dx, ex * -self.dy).abs() <= self.square_cap_cross_limit
+        } else {
+            ey.mul_add(ey, ex * ex) <= self.radius2
+        }
+    }
+
+    fn paint<const CAP: u8>(
+        &self,
+        mask: &mut BilevelRaster,
+        xs: std::ops::RangeInclusive<u32>,
+        ys: std::ops::RangeInclusive<usize>,
+    ) -> Option<bool> {
+        let mut covered = false;
+        for y in ys {
+            let py = f64::from(u32::try_from(y).ok()?) + 0.5;
+            covered |= mask.paint_sampled_span(y, xs.clone(), |x| {
+                self.covers::<CAP>(f64::from(x) + 0.5, py)
+            })?;
+        }
+        Some(covered)
+    }
+}
+
 /// Render an already eligible geometry on one bounded grid. Source eligibility
 /// never depends on the requested image sampling pitch.
-#[expect(
-    clippy::too_many_lines,
-    reason = "bounded raster dimensions, cap geometry and source-stroke coverage are one cohesive raster operation"
-)]
 fn rasterize_run_on_grid(
     run: &MicroStrokeRun,
     geometry: MicroStrokeGeometry,
@@ -810,6 +862,7 @@ fn rasterize_run_on_grid(
     let height_u32 = u32::try_from(height).ok()?;
     let mut mask = BilevelRaster::transparent(width_u32, height_u32)?;
     let radius = run.state.width * scale * 0.5;
+    let radius2 = radius * radius;
 
     for &((ux0, uy0), (ux1, uy1)) in &run.lines {
         let x0 = (ux0 - xmin) * scale;
@@ -823,7 +876,6 @@ fn rasterize_run_on_grid(
             continue;
         }
         let inv_len2 = 1.0 / len2;
-        let radius2 = radius * radius;
         let length = if run.state.cap == 2 { len2.sqrt() } else { 0.0 };
         let extension = if run.state.cap == 2 {
             radius / length
@@ -849,51 +901,24 @@ fn rasterize_run_on_grid(
         // Require that every source segment has geometric raster coverage.
         // This tests the segment's own footprint, not the final mask (which
         // might already contain paint from a different segment).
-        let mut has_coverage = false;
-        for y in min_y..=max_y {
-            let py = f64::from(u32::try_from(y).ok()?) + 0.5;
-            for x in min_x..=max_x {
-                let px = f64::from(u32::try_from(x).ok()?) + 0.5;
-                let raw_t = (py - y0).mul_add(dy, (px - x0) * dx) * inv_len2;
-                let paints = match run.state.cap {
-                    0 => {
-                        if (0.0..=1.0).contains(&raw_t) {
-                            let qx = raw_t.mul_add(dx, x0);
-                            let qy = raw_t.mul_add(dy, y0);
-                            let ex = px - qx;
-                            let ey = py - qy;
-                            ey.mul_add(ey, ex * ex) <= radius2
-                        } else {
-                            false
-                        }
-                    }
-                    1 => {
-                        let t = raw_t.clamp(0.0, 1.0);
-                        let qx = t.mul_add(dx, x0);
-                        let qy = t.mul_add(dy, y0);
-                        let ex = px - qx;
-                        let ey = py - qy;
-                        ey.mul_add(ey, ex * ex) <= radius2
-                    }
-                    2 => {
-                        if raw_t < -extension || raw_t > 1.0 + extension {
-                            false
-                        } else {
-                            let t = raw_t.clamp(0.0, 1.0);
-                            let qx = t.mul_add(dx, x0);
-                            let qy = t.mul_add(dy, y0);
-                            let cross = (py - qy).mul_add(dx, (px - qx) * -dy).abs();
-                            cross <= square_cap_cross_limit
-                        }
-                    }
-                    _ => false,
-                };
-                if paints {
-                    has_coverage = true;
-                    mask.paint(x, y);
-                }
-            }
-        }
+        let stroke = PixelStroke {
+            x0,
+            y0,
+            dx,
+            dy,
+            inv_len2,
+            radius2,
+            extension,
+            square_cap_cross_limit,
+        };
+        let xs = u32::try_from(min_x).ok()?..=u32::try_from(max_x).ok()?;
+        let ys = min_y..=max_y;
+        let has_coverage = match run.state.cap {
+            0 => stroke.paint::<0>(&mut mask, xs, ys)?,
+            1 => stroke.paint::<1>(&mut mask, xs, ys)?,
+            2 => stroke.paint::<2>(&mut mask, xs, ys)?,
+            _ => false,
+        };
         if !has_coverage {
             return None;
         }
@@ -1237,6 +1262,56 @@ pub fn rasterize_pathological_microstrokes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specialized_caps_match_original_pixel_predicate() {
+        for (x0, y0, dx, dy) in [
+            (2.5, 3.5, 6.0, 0.0),
+            (8.5, 3.5, -6.0, 0.0),
+            (2.0, 1.0, 0.0, 8.0),
+            (1.25, 2.75, 6.5, -1.5),
+            (10.25, 9.75, -8.0, -3.0),
+            (4.5, 4.5, 0.125, 0.25),
+        ] {
+            for radius in [0.75, 1.0, 2.3, 4.5] {
+                let len2: f64 = f64::mul_add(dy, dy, dx * dx);
+                let stroke = PixelStroke {
+                    x0,
+                    y0,
+                    dx,
+                    dy,
+                    inv_len2: 1.0 / len2,
+                    radius2: radius * radius,
+                    extension: radius / len2.sqrt(),
+                    square_cap_cross_limit: radius * len2.sqrt(),
+                };
+                for y in 0..16 {
+                    for x in 0..16 {
+                        let px = f64::from(x) + 0.5;
+                        let py = f64::from(y) + 0.5;
+                        let raw_t = (py - y0).mul_add(dy, (px - x0) * dx) * stroke.inv_len2;
+                        let t = raw_t.clamp(0.0, 1.0);
+                        let qx = t.mul_add(dx, x0);
+                        let qy = t.mul_add(dy, y0);
+                        let ex = px - qx;
+                        let ey = py - qy;
+                        let round = ey.mul_add(ey, ex * ex) <= radius * radius;
+                        assert_eq!(
+                            stroke.covers::<0>(px, py),
+                            (0.0..=1.0).contains(&raw_t) && round
+                        );
+                        assert_eq!(stroke.covers::<1>(px, py), round);
+                        assert_eq!(
+                            stroke.covers::<2>(px, py),
+                            raw_t >= -stroke.extension
+                                && raw_t <= 1.0 + stroke.extension
+                                && ey.mul_add(dx, ex * -dy).abs() <= stroke.square_cap_cross_limit
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
