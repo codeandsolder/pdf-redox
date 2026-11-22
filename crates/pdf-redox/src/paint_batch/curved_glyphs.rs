@@ -381,7 +381,7 @@ fn independent_components(input: &[u8], original: &Shape) -> Option<Vec<Shape>> 
 }
 
 fn collect_compound(input: &[u8]) -> Option<(Vec<Shape>, Vec<CompoundFill>)> {
-    let events = events_for(input)?;
+    let events = events_for(input, &[])?;
     let (mut cursor, mut text, mut path_open) = (0, false, false);
     let mut ctm = [1., 0., 0., 1., 0., 0.];
     let mut stack = Vec::new();
