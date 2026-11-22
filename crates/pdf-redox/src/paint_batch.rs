@@ -856,9 +856,9 @@ fn coalesce_adjacent_ocg_content(input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)>
         return Some((Cow::Borrowed(input), 0));
     }
     Some((
-        Cow::Owned(crate::content_stream::apply_replacements_owned(
+        Cow::Owned(crate::content_stream::apply_replacements(
             input,
-            replacements,
+            &replacements,
         )?),
         count,
     ))
@@ -1082,9 +1082,9 @@ fn compact_collinear_line_points(input: &[u8]) -> Option<(Cow<'_, [u8]>, usize)>
         return Some((Cow::Borrowed(input), 0));
     }
     Some((
-        Cow::Owned(crate::content_stream::apply_replacements_owned(
+        Cow::Owned(crate::content_stream::apply_replacements(
             input,
-            replacements,
+            &replacements,
         )?),
         count,
     ))
