@@ -122,17 +122,26 @@ fn reachable_page_dictionaries(document: &EditDocument) -> Result<Vec<ObjectHand
     Ok(pages)
 }
 
-struct LivePageIdentity {
+#[derive(Default)]
+enum LivePageMatch {
+    #[default]
+    Unmatched,
+    Unique(ObjectHandle),
+    Ambiguous,
+}
+
+struct StalePageIdentity {
     properties: OwnedObject,
-    unique_page: Option<ObjectHandle>,
+    stale_pages: Vec<ObjectHandle>,
+    live_match: LivePageMatch,
 }
 
 #[derive(Default)]
-struct LivePageIdentityIndex {
-    by_fingerprint: BTreeMap<[u8; 32], Vec<LivePageIdentity>>,
+struct StalePageIdentityIndex {
+    by_fingerprint: BTreeMap<[u8; 32], Vec<StalePageIdentity>>,
 }
 
-impl LivePageIdentityIndex {
+impl StalePageIdentityIndex {
     fn fingerprint(properties: &OwnedObject) -> Result<[u8; 32]> {
         // Source materialization already canonicalizes both signs of zero to
         // integer zero, so the exact COS fingerprint agrees with structural
@@ -141,34 +150,58 @@ impl LivePageIdentityIndex {
             .ok_or_else(|| Error::Invalid("page identity is not a dictionary".to_owned()))
     }
 
-    fn insert(&mut self, page: ObjectHandle, properties: OwnedObject) -> Result<()> {
+    fn insert_stale(&mut self, page: ObjectHandle, properties: OwnedObject) -> Result<()> {
         let fingerprint = Self::fingerprint(&properties)?;
         let bucket = self.by_fingerprint.entry(fingerprint).or_default();
         if let Some(existing) = bucket
             .iter_mut()
             .find(|candidate| candidate.properties == properties)
         {
-            existing.unique_page = None;
+            existing.stale_pages.push(page);
         } else {
-            bucket.push(LivePageIdentity {
+            bucket.push(StalePageIdentity {
                 properties,
-                unique_page: Some(page),
+                stale_pages: vec![page],
+                live_match: LivePageMatch::Unmatched,
             });
         }
         Ok(())
     }
 
-    fn unique_match(&self, properties: &OwnedObject) -> Result<Option<ObjectHandle>> {
+    fn observe_live(&mut self, page: ObjectHandle, properties: &OwnedObject) -> Result<()> {
         let fingerprint = Self::fingerprint(properties)?;
-        Ok(self
+        if let Some(candidate) = self
             .by_fingerprint
-            .get(&fingerprint)
+            .get_mut(&fingerprint)
             .and_then(|bucket| {
                 bucket
-                    .iter()
+                    .iter_mut()
                     .find(|candidate| candidate.properties == *properties)
             })
-            .and_then(|candidate| candidate.unique_page))
+        {
+            candidate.live_match = match candidate.live_match {
+                LivePageMatch::Unmatched => LivePageMatch::Unique(page),
+                LivePageMatch::Unique(_) | LivePageMatch::Ambiguous => LivePageMatch::Ambiguous,
+            };
+        }
+        Ok(())
+    }
+
+    fn into_redirects(self) -> BTreeMap<ObjectHandle, ObjectHandle> {
+        self.by_fingerprint
+            .into_values()
+            .flatten()
+            .filter_map(|identity| match identity.live_match {
+                LivePageMatch::Unique(page) => Some(
+                    identity
+                        .stale_pages
+                        .into_iter()
+                        .map(move |stale| (stale, page)),
+                ),
+                LivePageMatch::Unmatched | LivePageMatch::Ambiguous => None,
+            })
+            .flatten()
+            .collect()
     }
 }
 
@@ -176,31 +209,27 @@ fn stale_page_destination_map_from_plan(
     document: &EditDocument,
     plan: &PageTreePlan,
 ) -> Result<BTreeMap<ObjectHandle, ObjectHandle>> {
-    let stale_pages = reachable_page_dictionaries(document)?
+    // Store only identities that need a match. Live pages can be scanned
+    // individually and dropped even when the document has many large pages.
+    let mut stale_identities = StalePageIdentityIndex::default();
+    for handle in reachable_page_dictionaries(document)?
         .into_iter()
         .filter(|handle| !plan.owners.contains_key(handle))
-        .collect::<Vec<_>>();
-    if stale_pages.is_empty() {
+    {
+        if let Some(identity) = source_page_identity(document, handle)? {
+            stale_identities.insert_stale(handle, identity)?;
+        }
+    }
+    if stale_identities.by_fingerprint.is_empty() {
         return Ok(BTreeMap::new());
     }
 
-    let mut live_identities = LivePageIdentityIndex::default();
     for page in &plan.pages {
         if let Some(identity) = source_page_identity(document, page.handle)? {
-            live_identities.insert(page.handle, identity)?;
+            stale_identities.observe_live(page.handle, &identity)?;
         }
     }
-
-    let mut redirects = BTreeMap::new();
-    for handle in stale_pages {
-        let Some(identity) = source_page_identity(document, handle)? else {
-            continue;
-        };
-        if let Some(canonical) = live_identities.unique_match(&identity)? {
-            redirects.insert(handle, canonical);
-        }
-    }
-    Ok(redirects)
+    Ok(stale_identities.into_redirects())
 }
 
 const fn is_destination_mode(name: &[u8]) -> bool {
@@ -2489,23 +2518,56 @@ mod tests {
         let Some(identity) = source_page_identity(&document, existing(3))? else {
             return Err(Error::Invalid("missing source identity".to_owned()));
         };
-        let mut index = LivePageIdentityIndex::default();
-        index.insert(existing(3), identity.clone())?;
+        let mut index = StalePageIdentityIndex::default();
+        index.insert_stale(existing(9), identity.clone())?;
+        index.insert_stale(existing(11), identity.clone())?;
         // A colliding bucket entry must never be eligible merely because of its hash.
-        let fingerprint = LivePageIdentityIndex::fingerprint(&identity)?;
+        let fingerprint = StalePageIdentityIndex::fingerprint(&identity)?;
         index.by_fingerprint.entry(fingerprint).or_default().insert(
             0,
-            LivePageIdentity {
+            StalePageIdentity {
                 properties: OwnedObject::Dictionary(OwnedDictionary::new()),
-                unique_page: Some(existing(10)),
+                stale_pages: vec![existing(10)],
+                live_match: LivePageMatch::Unmatched,
             },
         );
-        assert_eq!(index.unique_match(&identity)?, Some(existing(3)));
-        index.insert(existing(12), identity.clone())?;
-        assert_eq!(index.unique_match(&identity)?, None);
+        index.observe_live(existing(3), &identity)?;
+        assert!(matches!(
+            index.by_fingerprint[&fingerprint][0].live_match,
+            LivePageMatch::Unmatched
+        ));
+        assert!(
+            matches!(index.by_fingerprint[&fingerprint][1].live_match, LivePageMatch::Unique(page) if page == existing(3))
+        );
+        assert_eq!(index.by_fingerprint[&fingerprint][1].stale_pages.len(), 2);
+        index.observe_live(existing(12), &identity)?;
+        index.observe_live(existing(13), &identity)?;
         assert_eq!(
             index.by_fingerprint.get(&fingerprint).map(Vec::len),
             Some(2)
+        );
+        assert!(index.into_redirects().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_identity_index_redirects_all_equal_stale_pages_only_to_unique_live_match() -> Result<()>
+    {
+        let mut index = StalePageIdentityIndex::default();
+        let identity = OwnedObject::Dictionary(OwnedDictionary::from([(
+            b"Type".to_vec(),
+            OwnedObject::Name(b"Page".to_vec()),
+        )]));
+        let other = OwnedObject::Dictionary(OwnedDictionary::new());
+        index.insert_stale(existing(9), identity.clone())?;
+        index.insert_stale(existing(10), identity.clone())?;
+        index.insert_stale(existing(11), other.clone())?;
+        index.observe_live(existing(3), &identity)?;
+        index.observe_live(existing(4), &other)?;
+        index.observe_live(existing(5), &other)?;
+        assert_eq!(
+            index.into_redirects(),
+            BTreeMap::from([(existing(9), existing(3)), (existing(10), existing(3)),])
         );
         Ok(())
     }
