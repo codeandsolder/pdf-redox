@@ -1909,27 +1909,46 @@ fn factor_page_inventory(
     Ok(present)
 }
 
-/// Materialize page bytes and globally occupied `XObject` names only when
-/// a metadata candidate actually needs a transaction.
+/// Only pages with repeated candidate occurrences need decoded payloads.
+/// Preserve document-wide name exclusion, and compact the page indices in
+/// their original order so transaction and candidate ordering stay unchanged.
 fn load_factor_pages(
     document: &EditDocument,
     pages: &[ObjectHandle],
+    groups: &mut [RepeatedFormGroup],
 ) -> Result<(Vec<PagePathData>, BTreeSet<Vec<u8>>)> {
-    let mut page_data = Vec::with_capacity(pages.len());
+    let candidate_indices = groups
+        .iter()
+        .flat_map(|(_, occurrences)| occurrences.iter().map(|item| item.page_index))
+        .collect::<BTreeSet<_>>();
+    let mut page_data = Vec::with_capacity(candidate_indices.len());
+    let mut compact_indices = vec![None; pages.len()];
     let mut occupied = BTreeSet::new();
-    for &page in pages {
-        let Some(decoded) = page_content_if_present(document, page)? else {
-            return Err(crate::Error::Invalid(
-                "factor page disappeared after inventory".into(),
-            ));
-        };
+    for (index, &page) in pages.iter().enumerate() {
+        if candidate_indices.contains(&index) {
+            let Some(decoded) = page_content_if_present(document, page)? else {
+                return Err(crate::Error::Invalid(
+                    "factor page disappeared after inventory".into(),
+                ));
+            };
+            compact_indices[index] = Some(page_data.len());
+            page_data.push(PagePathData { page, decoded });
+        }
         if let Some(resources) = document.inherited_page_resources(page)?
             && let Some(xobjects) = resources.resolved_entry(document, b"XObject")?
             && let Some(entries) = xobjects.dictionary_entries()
         {
             occupied.extend(entries.map(|(name, _)| name.as_ref().to_vec()));
         }
-        page_data.push(PagePathData { page, decoded });
+    }
+    for (_, occurrences) in groups {
+        for occurrence in occurrences {
+            occurrence.page_index = compact_indices
+                .get(occurrence.page_index)
+                .copied()
+                .flatten()
+                .ok_or_else(|| crate::Error::Invalid("missing candidate factor page".into()))?;
+        }
     }
     Ok((page_data, occupied))
 }
@@ -1969,7 +1988,7 @@ fn factor_repeated_path_forms(
         }
     }
 
-    let repeated = repeated_form_groups(groups);
+    let mut repeated = repeated_form_groups(groups);
     if repeated.is_empty() {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
@@ -1977,7 +1996,7 @@ fn factor_repeated_path_forms(
             rewritten_pages: BTreeSet::new(),
         });
     }
-    let (page_data, mut occupied_names) = load_factor_pages(document, &present)?;
+    let (page_data, mut occupied_names) = load_factor_pages(document, &present, &mut repeated)?;
     let mut candidates = repeated_form_candidates(repeated, &page_data);
     candidates.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(bytes.len()));
     let selected = select_path_forms(candidates.into_iter(), &mut occupied_names, 0);
@@ -2041,7 +2060,7 @@ fn factor_repeated_transformed_blocks(
             });
         }
     }
-    let repeated = repeated_form_groups(groups);
+    let mut repeated = repeated_form_groups(groups);
     // Use first-representative metadata, not maxima of lexical variants.
     // Retain the original full candidate order for equal score sorting.
     if !repeated.iter().any(|(operators, occurrences)| {
@@ -2054,7 +2073,7 @@ fn factor_repeated_transformed_blocks(
     }) {
         return Ok(VectorCompactionStats::default());
     }
-    let (page_data, mut occupied_names) = load_factor_pages(document, &present)?;
+    let (page_data, mut occupied_names) = load_factor_pages(document, &present, &mut repeated)?;
     let mut candidates = repeated_form_candidates(repeated, &page_data);
     candidates.sort_unstable_by_key(|(bytes, operators, occurrences)| {
         std::cmp::Reverse(
@@ -3719,6 +3738,48 @@ mod tests {
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].page_index, 0);
         assert_eq!(occurrences[1].page_index, 1);
+    }
+
+    #[test]
+    fn factor_payloads_are_sparse_but_names_cover_all_pages() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>")?;
+        pdf.object(4, b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /XObject << /PdfRedoxPath0 9 0 R >> >> >>")?;
+        pdf.object(5, b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>")?;
+        let body = b"0 0 10 10 re f";
+        pdf.stream(6, b"", body)?;
+        pdf.stream(7, b"", b"BT (unrelated text) Tj ET")?;
+        pdf.stream(8, b"", body)?;
+        pdf.stream(9, b"/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b"q Q")?;
+
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        let occurrence = |page_index| PathOccurrence {
+            page_index,
+            start: 0,
+            end: body.len(),
+            bounds: Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 10.0,
+                y1: 10.0,
+            },
+        };
+        let mut groups = vec![(2, vec![occurrence(0), occurrence(2)])];
+        let (payloads, mut occupied) = load_factor_pages(&document, &pages, &mut groups)?;
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].page, pages[0]);
+        assert_eq!(payloads[1].page, pages[2]);
+        assert_eq!(groups[0].1[0].page_index, 0);
+        assert_eq!(groups[0].1[1].page_index, 1);
+        assert_eq!(path_form_name(0, &mut occupied), b"PdfRedoxPath1");
+        let candidates = repeated_form_candidates(groups, &payloads);
+        assert_eq!(candidates[0].0, body);
+        Ok(())
     }
 
     #[test]
