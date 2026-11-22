@@ -97,6 +97,57 @@ impl BilevelRaster {
         *byte &= !(0x80 >> (x % 8));
     }
 
+    /// Paint an inclusive horizontal span without inspecting existing ink.
+    pub(crate) fn paint_row_span(
+        &mut self,
+        y: u32,
+        xs: std::ops::RangeInclusive<u32>,
+    ) -> Option<()> {
+        let (start, end) = (*xs.start(), *xs.end());
+        if start > end || end >= self.width || y >= self.height {
+            return None;
+        }
+        let stride = usize::try_from(self.width.div_ceil(8)).ok()?;
+        let row = usize::try_from(y).ok()?.checked_mul(stride)?;
+        let first = row.checked_add(usize::try_from(start / 8).ok()?)?;
+        let last = row.checked_add(usize::try_from(end / 8).ok()?)?;
+        let first_mask = u8::MAX >> (start % 8);
+        let last_mask = u8::MAX << (7 - end % 8);
+        let bytes = self.packed.get_mut(first..=last)?;
+        if let [byte] = bytes {
+            *byte &= !(first_mask & last_mask);
+        } else if let [first, middle @ .., last] = bytes {
+            *first &= !first_mask;
+            middle.fill(0);
+            *last &= !last_mask;
+        }
+        Some(())
+    }
+
+    /// Paint an inclusive vertical span using the same bit in each row.
+    pub(crate) fn paint_column_span(
+        &mut self,
+        x: u32,
+        ys: std::ops::RangeInclusive<u32>,
+    ) -> Option<()> {
+        let (start, end) = (*ys.start(), *ys.end());
+        if start > end || end >= self.height || x >= self.width {
+            return None;
+        }
+        let stride = usize::try_from(self.width.div_ceil(8)).ok()?;
+        let column = usize::try_from(x / 8).ok()?;
+        let start = usize::try_from(start).ok()?.checked_mul(stride)?;
+        let end = usize::try_from(end)
+            .ok()?
+            .checked_add(1)?
+            .checked_mul(stride)?;
+        let mask = !(0x80 >> (x % 8));
+        for row in self.packed.get_mut(start..end)?.chunks_exact_mut(stride) {
+            row[column] &= mask;
+        }
+        Some(())
+    }
+
     pub(crate) fn encode(&self, flate_level: crate::FlateLevel) -> Result<BilevelEncodedData> {
         encode_best_bilevel_data(&self.packed, self.width, self.height, flate_level)
     }
