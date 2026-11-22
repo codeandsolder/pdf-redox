@@ -8,13 +8,7 @@ use crate::{
 };
 use hayro_syntax::{content::UntypedIter, object::Object as HayroObject};
 use sha2::{Digest as _, Sha256};
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    sync::LazyLock,
-};
-
-static DEBUG_RASTER: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_RASTER").is_some());
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 type InlineImageFingerprint = [u8; 32];
 
@@ -541,7 +535,6 @@ pub fn externalize_fragmented_inline_target(
     min_occurrences: usize,
 ) -> Result<FragmentedInlineExternalization> {
     let mut result = FragmentedInlineExternalization::default();
-    let debug = *DEBUG_RASTER;
     let resources = match target {
         ContentTarget::Page(page) => page_resources(document, page)?,
         ContentTarget::Form(form) => form_resources(document, form)?,
@@ -555,14 +548,6 @@ pub fn externalize_fragmented_inline_target(
     };
     let names = direct_resource_names(document, &resources)?;
     let rewrite = rewrite_inline_images(document, &resources, &content, names, None)?;
-    if debug && rewrite.externalized_occurrences > 0 {
-        eprintln!(
-            "raster-inline {target:?}: content={} inline={} unique={}",
-            content.len(),
-            rewrite.externalized_occurrences,
-            rewrite.images.len()
-        );
-    }
     if rewrite.externalized_occurrences < min_occurrences {
         return Ok(result);
     }
@@ -740,9 +725,6 @@ pub fn cleanup_fragmented_inline_staging(
                     }
                 }
             }
-        }
-        if *DEBUG_RASTER && restored != 0 {
-            eprintln!("raster-inline rollback {target:?}: restored={restored}");
         }
     }
     Ok(result)

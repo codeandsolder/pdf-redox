@@ -1015,9 +1015,8 @@ pub(super) fn factor(
 #[cfg(test)]
 mod tests {
     use super::{
-        BTreeMap, BTreeSet, EditDocument, GlyphCatalog, Group, Result, candidate_svg_path, collect,
-        collect_catalog, collect_compound, collect_sources, factor, group, prepare_plans,
-        replacement,
+        EditDocument, GlyphCatalog, Group, Result, candidate_svg_path, collect, collect_catalog,
+        collect_compound, collect_sources, factor, group, prepare_plans, replacement,
     };
     fn shape(width: f64, bulge: f64) -> Vec<u8> {
         format!("q 1 0 0 1 20 30 cm 0 0 m {width} 0 l {width} 1 l {width} 1.5 {width} {bulge} {width} 2 c {width} 3 l {width} 4 l 0 4 l 0 3 l 0 2 l h f Q\n").into_bytes()
@@ -1109,60 +1108,6 @@ mod tests {
         // Dimensions differ; a single canonical would violate the 0.02pt
         // transformed error budget on the 20x-scaled member.
         assert!(group(&both).is_empty());
-        Ok(())
-    }
-
-    /// Optional corpus probe: `PDF_REDOX_CORPUS_PDF=/path/to/file.pdf`.
-    /// Deliberately ignored in CI because no fixture PDF is checked in.
-    #[test]
-    #[ignore = "requires an external source PDF supplied via an environment variable"]
-    fn corpus_outline_coverage_diagnostic() -> Result<()> {
-        let Ok(path) = std::env::var("PDF_REDOX_CORPUS_PDF") else {
-            return Ok(());
-        };
-        let input = std::fs::read(&path)?;
-        let doc = EditDocument::from_bytes(input)?;
-        let pages = doc.page_handles()?;
-        let (sources, shapes, _fills) = collect_sources(&doc, &pages)?;
-        let groups = group(&shapes);
-        let all_members: usize = groups.iter().map(|g| g.members.len()).sum();
-        let unique_pages: BTreeSet<_> = shapes.iter().map(|s| s.page_index).collect();
-        eprintln!(
-            "CORPUS_OUTLINE_PROBE pdf={path} pages={} content_pages={} shapes={} \
-             groups={} grouped_occurrences={all_members} candidate_pages={}",
-            pages.len(),
-            sources.len(),
-            shapes.len(),
-            groups.len(),
-            unique_pages.len()
-        );
-        let mut operators = BTreeMap::<usize, usize>::new();
-        let mut sizes = BTreeMap::<usize, usize>::new();
-        for shape in &shapes {
-            *operators.entry(shape.ops.len()).or_default() += 1;
-            let dim = (shape.bounds[2] - shape.bounds[0]).max(shape.bounds[3] - shape.bounds[1]);
-            let bin = if dim < 2.0 {
-                0
-            } else if dim < 8.0 {
-                1
-            } else if dim < 16.0 {
-                2
-            } else if dim < 64.0 {
-                3
-            } else {
-                4
-            };
-            *sizes.entry(bin).or_default() += 1;
-        }
-        let shortest: usize = operators
-            .iter()
-            .filter(|(n, _)| **n < 8)
-            .map(|(_, v)| v)
-            .sum();
-        eprintln!(
-            "CORPUS_OUTLINE_PROBE short_ops={shortest} size_bins={sizes:?} most_common_ops={:?}",
-            operators.iter().rev().take(12).collect::<Vec<_>>()
-        );
         Ok(())
     }
 

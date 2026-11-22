@@ -15,13 +15,7 @@ use crate::{
 use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::LazyLock,
-};
-
-static DEBUG_VECTOR: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("PDF_REDOX_DEBUG_VECTOR").is_some());
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 // Only the encoded length is retained: no unbounded copies of source streams
 // or compressed payloads. A fixed FIFO makes worst-case retention O(1) per
@@ -36,8 +30,11 @@ struct VectorFlateLengthMemo {
     enabled: bool,
     lengths: HashMap<VectorFlateKey, usize>,
     insertion_order: VecDeque<VectorFlateKey>,
+    #[cfg(test)]
     hits: usize,
+    #[cfg(test)]
     misses: usize,
+    #[cfg(test)]
     evictions: usize,
 }
 
@@ -49,28 +46,22 @@ impl VectorFlateLengthMemo {
         }
     }
 
-    fn log_debug(&self) {
-        if *DEBUG_VECTOR && self.enabled {
-            eprintln!(
-                "vector-flate-lengths hits={} misses={} entries={} evictions={}",
-                self.hits,
-                self.misses,
-                self.lengths.len(),
-                self.evictions,
-            );
-        }
-    }
-
     fn encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
         if !self.enabled {
             return crate::stream_codec::flate_encoded_len(decoded, level);
         }
         let key = (level.value(), Sha256::digest(decoded).into());
         if let Some(&length) = self.lengths.get(&key) {
-            self.hits = self.hits.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.hits = self.hits.saturating_add(1);
+            }
             return Ok(length);
         }
-        self.misses = self.misses.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.misses = self.misses.saturating_add(1);
+        }
         let length = crate::stream_codec::flate_encoded_len(decoded, level)?;
         self.insert_length(key, length);
         Ok(length)
@@ -91,7 +82,10 @@ impl VectorFlateLengthMemo {
             && let Some(evicted) = self.insertion_order.pop_front()
         {
             self.lengths.remove(&evicted);
-            self.evictions = self.evictions.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.evictions = self.evictions.saturating_add(1);
+            }
         }
         self.insertion_order.push_back(key);
         self.lengths.insert(key, length);
@@ -815,15 +809,6 @@ fn compact_content_from_fill_scan(
         &rescanned_fills
     };
     let rewrites = build_rewrites(&covered_pruned, fills);
-    if *DEBUG_VECTOR {
-        eprintln!(
-            "vector-actual content={} fills={} covered_pruned={} rewrites={}",
-            input.len(),
-            fills.len(),
-            stats.covered_fills_pruned,
-            rewrites.len()
-        );
-    }
     if rewrites.is_empty() {
         return (covered_pruned, stats);
     }
@@ -1774,9 +1759,6 @@ fn factor_repeated_path_forms(
         &pre_scanned,
         pages,
     )? {
-        if *DEBUG_VECTOR {
-            eprintln!("path-forms cached-proof=skip");
-        }
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
             reusable_blocks: pre_scanned,
@@ -1788,7 +1770,6 @@ fn factor_repeated_path_forms(
     let mut reusable_blocks = ProcessingFactorBlocks::new();
     let mut groups = FormGroups::new();
     let mut occupied_names = BTreeSet::new();
-    let mut scanned_blocks = 0usize;
 
     for &page in pages {
         let Some(decoded) = page_content_if_present(document, page)? else {
@@ -1819,7 +1800,6 @@ fn factor_repeated_path_forms(
         let (path_blocks, transformed_blocks) = &reusable_blocks[&page.page];
         let preferred = PreferredBodyIndex::new(transformed_blocks, &preferred_transformed);
         for block in path_blocks {
-            scanned_blocks = scanned_blocks.saturating_add(1);
             if preferred.contains(block.start, block.end) {
                 continue;
             }
@@ -1835,14 +1815,7 @@ fn factor_repeated_path_forms(
         }
     }
 
-    let semantic_groups = groups.len();
     let mut candidates = repeated_form_candidates(groups, &page_data);
-    if *DEBUG_VECTOR {
-        let candidate_count = candidates.len();
-        eprintln!(
-            "path-forms scanned_blocks={scanned_blocks} semantic_groups={semantic_groups} repeated_candidates={candidate_count}"
-        );
-    }
     if candidates.is_empty() {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
@@ -1868,9 +1841,6 @@ fn factor_repeated_path_forms(
             ));
         }
         selected.push((bytes, name, bounds, occurrences));
-    }
-    if *DEBUG_VECTOR {
-        eprintln!("path-forms overhead-selected={}", selected.len());
     }
     if selected.is_empty() {
         return Ok(PathFactoringOutcome {
@@ -1937,9 +1907,6 @@ fn factor_repeated_path_forms(
     }
     for (bytes, _, _, _) in &selected {
         after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
-    }
-    if *DEBUG_VECTOR {
-        eprintln!("path-forms flate before={before_flate} after={after_flate}");
     }
     // As with transformed Forms, everything above is speculative. Refuse a
     // factoring rewrite that does not win after compressed stream bytes and
@@ -2041,7 +2008,6 @@ fn factor_repeated_transformed_blocks(
     let mut page_data = Vec::with_capacity(pages.len());
     let mut groups = FormGroups::new();
     let mut occupied_names = BTreeSet::new();
-    let mut scanned_blocks = 0usize;
 
     for &page in pages {
         let Some(decoded) = page_content_if_present(document, page)? else {
@@ -2057,7 +2023,6 @@ fn factor_repeated_transformed_blocks(
             &scanned
         };
         for block in blocks {
-            scanned_blocks = scanned_blocks.saturating_add(1);
             let entry = groups
                 .entry(block.semantic_key)
                 .or_insert_with(|| (block.operator_count, Vec::new()));
@@ -2076,14 +2041,7 @@ fn factor_repeated_transformed_blocks(
         page_data.push(PagePathData { page, decoded });
     }
 
-    let semantic_groups = groups.len();
     let mut candidates = repeated_form_candidates(groups, &page_data);
-    if *DEBUG_VECTOR {
-        let candidate_count = candidates.len();
-        eprintln!(
-            "transform-forms scanned_blocks={scanned_blocks} semantic_groups={semantic_groups} repeated_candidates={candidate_count}"
-        );
-    }
     if candidates.is_empty() {
         return Ok(VectorCompactionStats::default());
     }
@@ -2116,9 +2074,6 @@ fn factor_repeated_transformed_blocks(
             ));
         }
         selected.push((bytes, name, bounds, operator_count, occurrences));
-    }
-    if *DEBUG_VECTOR {
-        eprintln!("transform-forms selected={}", selected.len());
     }
     if selected.is_empty() {
         return Ok(VectorCompactionStats::default());
@@ -2173,9 +2128,6 @@ fn factor_repeated_transformed_blocks(
     }
     for (bytes, _, _, _, _) in &selected {
         after_flate = after_flate.saturating_add(flate_lengths.encoded_len(bytes, flate_level)?);
-    }
-    if *DEBUG_VECTOR {
-        eprintln!("transform-forms flate before={before_flate} after={after_flate}");
     }
     // All work above is still speculative. Do not materialize Forms or rewrite
     // pages unless factoring wins after charging both compressed stream bytes
@@ -3244,15 +3196,6 @@ fn canonicalize_path_coordinates(input: &[u8], user_unit: f64) -> Option<(Vec<u8
     }
     let mut scanner = PathCoordinateScanner::new(user_unit);
     let parsed = scanner.scan(input);
-    if *DEBUG_VECTOR {
-        eprintln!(
-            "path-coordinate-scan parsed={} stack={} replacements={} coordinates={}",
-            matches!(parsed, Ok(false)),
-            scanner.state_stack.len(),
-            scanner.replacements.len(),
-            scanner.coordinates_canonicalized
-        );
-    }
     if !matches!(parsed, Ok(false)) {
         return None;
     }
@@ -3322,13 +3265,6 @@ fn canonicalize_page_path_coordinates(
         let savings = before_flate.saturating_sub(after_flate);
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
             .max(before_flate / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
-        if *DEBUG_VECTOR {
-            eprintln!(
-                "path-coordinate page={page:?} candidates={coordinates} decoded={} -> {} flate={before_flate} -> {after_flate} savings={savings} required={required}",
-                decoded.len(),
-                canonicalized.len()
-            );
-        }
         if savings < required {
             if let OwnedObject::Reference(handle) = contents {
                 flate_state
@@ -3684,7 +3620,6 @@ pub fn compact_vector_paths_with_flate_cache(
             &mut flate_state,
         )?);
     }
-    flate_state.lengths.log_debug();
     Ok(total)
 }
 
