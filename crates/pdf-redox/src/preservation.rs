@@ -1,6 +1,6 @@
 use crate::direct_object::{
-    DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
-    object_at_direct_path_mut, value_at_direct_path, walk_direct_output_objects,
+    DirectDictionaryView, DirectObjectTarget, DirectObjectVisitor, DirectPathStep,
+    DirectWalkControl, value_at_direct_path, walk_direct_output_objects,
 };
 use crate::geometry::{Matrix, Rectangle};
 use crate::{
@@ -34,30 +34,6 @@ pub struct PreservationStats {
     pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PreservationDictionaryTarget {
-    root: CowObjectHandle,
-    path: Vec<DirectPathStep>,
-}
-
-fn preservation_target_view<'a>(
-    document: &'a EditDocument,
-    target: &PreservationDictionaryTarget,
-) -> Result<Option<CurrentValue<'a>>> {
-    let Some(root) = document.current_value(target.root)? else {
-        return Ok(None);
-    };
-    Ok(value_at_direct_path(root, &target.path))
-}
-
-fn preservation_target_mut<'a>(
-    document: &'a mut EditDocument,
-    target: &PreservationDictionaryTarget,
-) -> Result<Option<&'a mut OwnedDictionary>> {
-    let root = document.edit_handle(target.root)?;
-    Ok(object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut))
-}
-
 fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
     let Some(value) = value else {
         return Ok(None);
@@ -69,12 +45,12 @@ fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Op
 }
 
 struct PendingPageTreeValue<'a> {
-    target: PreservationDictionaryTarget,
+    target: DirectObjectTarget,
     value: CurrentValue<'a>,
 }
 
 struct PreservationArrayFrame<'a> {
-    target: PreservationDictionaryTarget,
+    target: DirectObjectTarget,
     children: std::iter::Enumerate<CurrentArrayIter<'a>>,
 }
 
@@ -84,7 +60,7 @@ impl<'a> PreservationArrayFrame<'a> {
         let mut path = self.target.path.clone();
         path.push(DirectPathStep::ArrayIndex(index));
         Some(PendingPageTreeValue {
-            target: PreservationDictionaryTarget {
+            target: DirectObjectTarget {
                 root: self.target.root,
                 path,
             },
@@ -96,8 +72,8 @@ impl<'a> PreservationArrayFrame<'a> {
 fn collect_page_tree_targets<'a>(
     document: &'a EditDocument,
     initial: PendingPageTreeValue<'a>,
-    pages: &mut BTreeSet<PreservationDictionaryTarget>,
-    nodes: &mut BTreeSet<PreservationDictionaryTarget>,
+    pages: &mut BTreeSet<DirectObjectTarget>,
+    nodes: &mut BTreeSet<DirectObjectTarget>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     let mut arrays = Vec::<PreservationArrayFrame<'a>>::new();
@@ -117,7 +93,7 @@ fn collect_page_tree_targets<'a>(
                 && let Some(value) = document.current_value(handle)?
             {
                 next = Some(PendingPageTreeValue {
-                    target: PreservationDictionaryTarget {
+                    target: DirectObjectTarget {
                         root: handle,
                         path: Vec::new(),
                     },
@@ -154,10 +130,7 @@ fn collect_page_tree_targets<'a>(
 
 fn preservation_page_tree_targets(
     document: &EditDocument,
-) -> Result<(
-    Vec<PreservationDictionaryTarget>,
-    Vec<PreservationDictionaryTarget>,
-)> {
+) -> Result<(Vec<DirectObjectTarget>, Vec<DirectObjectTarget>)> {
     let catalog_handle = CowObjectHandle::Existing(document.source().catalog_id());
     let Some(catalog_object) = document.current_value(catalog_handle)? else {
         return Ok((Vec::new(), Vec::new()));
@@ -171,7 +144,7 @@ fn preservation_page_tree_targets(
     collect_page_tree_targets(
         document,
         PendingPageTreeValue {
-            target: PreservationDictionaryTarget {
+            target: DirectObjectTarget {
                 root: catalog_handle,
                 path,
             },
@@ -181,7 +154,7 @@ fn preservation_page_tree_targets(
         &mut nodes,
     )?;
     for id in document.source().page_ids() {
-        pages.insert(PreservationDictionaryTarget {
+        pages.insert(DirectObjectTarget {
             root: CowObjectHandle::Existing(id),
             path: Vec::new(),
         });
@@ -196,9 +169,9 @@ enum AnnotationEntries<'a> {
 
 fn page_annotation_entries<'a>(
     document: &'a EditDocument,
-    page: &PreservationDictionaryTarget,
+    page: &DirectObjectTarget,
 ) -> Result<Option<AnnotationEntries<'a>>> {
-    let Some(page_object) = preservation_target_view(document, page)? else {
+    let Some(page_object) = page.current(document)? else {
         return Ok(None);
     };
     let Some(annots) = page_object.dictionary_entry(b"Annots") else {
@@ -213,7 +186,7 @@ fn page_annotation_entries<'a>(
 
 fn page_annotations(
     document: &EditDocument,
-    page: &PreservationDictionaryTarget,
+    page: &DirectObjectTarget,
 ) -> Result<Option<Vec<OwnedObject>>> {
     Ok(
         page_annotation_entries(document, page)?.map(|entries| match entries {
@@ -227,10 +200,10 @@ fn page_annotations(
 
 fn replace_page_annotations(
     document: &mut EditDocument,
-    page: &PreservationDictionaryTarget,
+    page: &DirectObjectTarget,
     annotations: Vec<OwnedObject>,
 ) -> Result<()> {
-    let Some(dictionary) = preservation_target_mut(document, page)? else {
+    let Some(dictionary) = page.dictionary_mut(document)? else {
         return Ok(());
     };
     if annotations.is_empty() {
@@ -277,7 +250,7 @@ fn annotation_is_protected(
 
 fn annotation_subtypes(
     document: &EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
 ) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for page in pages {
@@ -301,7 +274,7 @@ fn annotation_subtypes(
 
 fn filter_annotations(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
     policy: &PreservationConfig,
     preserve_other_annotations: bool,
 ) -> Result<usize> {
@@ -328,7 +301,7 @@ fn filter_annotations(
 
 fn detach_protected_annotations(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
     policy: &PreservationConfig,
 ) -> Result<Vec<Vec<OwnedObject>>> {
     let mut protected_by_page = Vec::with_capacity(pages.len());
@@ -354,7 +327,7 @@ fn detach_protected_annotations(
 
 fn restore_protected_annotations(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
     protected_by_page: Vec<Vec<OwnedObject>>,
 ) -> Result<()> {
     for (page, protected) in pages.iter().zip(protected_by_page) {
@@ -370,7 +343,7 @@ fn restore_protected_annotations(
 
 fn retain_link_visual_shells(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
 ) -> Result<usize> {
     const LINK_VISUAL_KEYS: &[&[u8]] = &[b"Rect", b"Border", b"BS", b"C", b"F", b"CA"];
     let mut retained = 0;
@@ -472,7 +445,7 @@ const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
 
 struct AuthoringRemovalVisitor {
     key: &'static [u8],
-    removals: BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
+    removals: BTreeMap<DirectObjectTarget, BTreeSet<Vec<u8>>>,
 }
 
 impl DirectObjectVisitor for AuthoringRemovalVisitor {
@@ -491,7 +464,7 @@ impl DirectObjectVisitor for AuthoringRemovalVisitor {
         if remove_key || remove_modified {
             let keys = self
                 .removals
-                .entry(PreservationDictionaryTarget {
+                .entry(DirectObjectTarget {
                     root,
                     path: path.to_vec(),
                 })
@@ -540,14 +513,11 @@ fn drop_authoring_metadata(
 
 fn apply_authoring_removals(
     document: &mut EditDocument,
-    removals: BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
+    removals: BTreeMap<DirectObjectTarget, BTreeSet<Vec<u8>>>,
     stats: &mut PreservationStats,
 ) -> Result<()> {
     for (target, keys) in removals {
-        let root = document.edit_handle(target.root)?;
-        let Some(dictionary) =
-            object_at_direct_path_mut(root, &target.path).and_then(OwnedObject::as_dictionary_mut)
-        else {
+        let Some(dictionary) = target.dictionary_mut(document)? else {
             continue;
         };
         for key in keys {
@@ -573,13 +543,13 @@ pub fn drop_private_authoring_data(
 
 fn prune_dictionary_target(
     document: &mut EditDocument,
-    target: &PreservationDictionaryTarget,
+    target: &DirectObjectTarget,
     keep: impl Fn(&[u8]) -> bool,
     splice_unknown_wrappers: bool,
     stats: &mut BTreeMap<String, usize>,
     spliced: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
-    let Some(snapshot) = preservation_target_view(document, target)? else {
+    let Some(snapshot) = target.current(document)? else {
         return Ok(());
     };
     let Some(keys) = snapshot.dictionary_keys() else {
@@ -627,7 +597,7 @@ fn prune_dictionary_target(
         }
     }
 
-    let Some(dictionary) = preservation_target_mut(document, target)? else {
+    let Some(dictionary) = target.dictionary_mut(document)? else {
         return Ok(());
     };
     for key in remove {
@@ -645,10 +615,10 @@ fn prune_dictionary_target(
 
 fn inherited_page_value(
     document: &EditDocument,
-    page: &PreservationDictionaryTarget,
+    page: &DirectObjectTarget,
     key: &[u8],
 ) -> Result<Option<OwnedObject>> {
-    let Some(object) = preservation_target_view(document, page)? else {
+    let Some(object) = page.current(document)? else {
         return Ok(None);
     };
     Ok(document
@@ -885,10 +855,7 @@ fn appearance_content(
     Ok(format!("q\n{placement} cm\n/{resource_name} Do\nQ\n").into_bytes())
 }
 
-fn page_resources(
-    document: &EditDocument,
-    page: &PreservationDictionaryTarget,
-) -> Result<OwnedDictionary> {
+fn page_resources(document: &EditDocument, page: &DirectObjectTarget) -> Result<OwnedDictionary> {
     let Some(resources) = inherited_page_value(document, page, b"Resources")? else {
         return Ok(OwnedDictionary::new());
     };
@@ -1015,10 +982,11 @@ fn content_references(
 
 fn wrap_page_contents(
     document: &mut EditDocument,
-    page: &PreservationDictionaryTarget,
+    page: &DirectObjectTarget,
     append_bytes: &[u8],
 ) -> Result<()> {
-    let old = preservation_target_view(document, page)?
+    let old = page
+        .current(document)?
         .and_then(|object| object.dictionary_entry(b"Contents"))
         .map(|value| value.into_cow().into_owned());
     let before = new_content_stream(document, b"q\n".to_vec());
@@ -1028,13 +996,13 @@ fn wrap_page_contents(
     let mut contents = vec![OwnedObject::Reference(before)];
     contents.extend(content_references(document, old)?);
     contents.push(OwnedObject::Reference(after));
-    if let Some(dictionary) = preservation_target_mut(document, page)? {
+    if let Some(dictionary) = page.dictionary_mut(document)? {
         dictionary.insert(b"Contents".to_vec(), OwnedObject::Array(contents));
     }
     Ok(())
 }
 
-fn page_rotate(document: &EditDocument, page: &PreservationDictionaryTarget) -> Result<i32> {
+fn page_rotate(document: &EditDocument, page: &DirectObjectTarget) -> Result<i32> {
     let Some(value) = inherited_page_value(document, page, b"Rotate")? else {
         return Ok(0);
     };
@@ -1046,7 +1014,7 @@ fn page_rotate(document: &EditDocument, page: &PreservationDictionaryTarget) -> 
 
 fn flatten_annotations(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
     required_flags: i64,
     forbidden_flags: i64,
 ) -> Result<usize> {
@@ -1132,7 +1100,7 @@ fn flatten_annotations(
         if !xobjects.is_empty() {
             resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
         }
-        if let Some(page_dictionary) = preservation_target_mut(document, page)? {
+        if let Some(page_dictionary) = page.dictionary_mut(document)? {
             page_dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
         }
         if changed_annotations {
@@ -1151,7 +1119,7 @@ fn flatten_annotations(
 
 fn process_annotations(
     document: &mut EditDocument,
-    pages: &[PreservationDictionaryTarget],
+    pages: &[DirectObjectTarget],
     policy: &PreservationConfig,
     stats: &mut PreservationStats,
 ) -> Result<()> {
@@ -1200,16 +1168,17 @@ pub fn drop_page_thumbnails(
     // so thumbnail cleanup must not make malformed page-tree references a new
     // failure mode.
     for id in document.source().page_ids() {
-        let page = PreservationDictionaryTarget {
+        let page = DirectObjectTarget {
             root: CowObjectHandle::Existing(id),
             path: Vec::new(),
         };
-        if preservation_target_view(document, &page)?
+        if page
+            .current(document)?
             .is_none_or(|value| value.dictionary_entry(b"Thumb").is_none())
         {
             continue;
         }
-        if let Some(dictionary) = preservation_target_mut(document, &page)?
+        if let Some(dictionary) = page.dictionary_mut(document)?
             && dictionary.remove(b"Thumb".as_slice()).is_some()
         {
             *stats
@@ -1265,7 +1234,7 @@ pub fn apply_preservation_policy_with_hints(
             &mut stats.spliced_unknown_wrapper_keys,
         )?;
     }
-    let catalog = PreservationDictionaryTarget {
+    let catalog = DirectObjectTarget {
         root: CowObjectHandle::Existing(document.source().catalog_id()),
         path: Vec::new(),
     };
@@ -1313,7 +1282,7 @@ mod tests {
         pdf.object(5, b"<< /Type /Annot /Subtype /Text >>")?;
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let root = CowObjectHandle::Existing(crate::ObjectId::new(2, 0));
-        let target = PreservationDictionaryTarget {
+        let target = DirectObjectTarget {
             root,
             path: vec![
                 DirectPathStep::DictKey(b"Kids".to_vec()),
@@ -1323,7 +1292,7 @@ mod tests {
         let (pages, _) = preservation_page_tree_targets(&document)?;
         assert!(pages.contains(&target));
         assert!(matches!(
-            preservation_target_view(&document, &target)?,
+            target.current(&document)?,
             Some(CurrentValue::Source(..))
         ));
         assert_eq!(
@@ -1346,8 +1315,7 @@ mod tests {
             &mut removed,
             &mut spliced,
         )?;
-        let Some(CurrentValue::Owned(object)) = preservation_target_view(&document, &target)?
-        else {
+        let Some(CurrentValue::Owned(object)) = target.current(&document)? else {
             return Err(Error::Invalid("missing edited direct page".to_owned()));
         };
         let Some(dictionary) = object.as_dictionary() else {
@@ -1454,7 +1422,7 @@ mod tests {
             OwnedObject::Array(vec![OwnedObject::Reference(child)]),
         );
 
-        let target = PreservationDictionaryTarget {
+        let target = DirectObjectTarget {
             root: direct_branch,
             path: vec![
                 DirectPathStep::DictKey(b"Kids".to_vec()),
@@ -1465,8 +1433,7 @@ mod tests {
         assert_eq!(nodes.len(), depth + 2);
         assert_eq!(pages.len(), 2);
         assert!(pages.contains(&target));
-        let Some(CurrentValue::Owned(object)) = preservation_target_view(&document, &target)?
-        else {
+        let Some(CurrentValue::Owned(object)) = target.current(&document)? else {
             return Err(Error::Invalid(
                 "direct overlay target was copied".to_owned(),
             ));
@@ -1505,7 +1472,7 @@ mod tests {
                 )])),
             )]),
         )));
-        let direct_target = PreservationDictionaryTarget {
+        let direct_target = DirectObjectTarget {
             root: wrapper,
             path: vec![DirectPathStep::DictKey(b"NestedPage".to_vec())],
         };
@@ -1543,7 +1510,7 @@ mod tests {
             return Err(Error::Invalid("missing cycle node".to_owned()));
         };
         first_dictionary.insert(b"Parent".to_vec(), OwnedObject::Reference(second));
-        let cycle_target = PreservationDictionaryTarget {
+        let cycle_target = DirectObjectTarget {
             root: second,
             path: Vec::new(),
         };
