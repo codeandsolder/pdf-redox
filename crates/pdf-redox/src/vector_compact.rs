@@ -7,7 +7,7 @@ use crate::{
     content::{
         decoded_content_value, effective_page_resources, install_page_resource_bindings,
         page_box_numbers_matching, page_user_unit, replace_page_content,
-        replace_page_content_with_handle, resolved_dictionary,
+        replace_page_content_with_handle,
     },
     content_stream::{operand_name, operand_number},
     flate::FlateReuseCache,
@@ -180,10 +180,6 @@ const MIN_PATH_FORM_BYTES: usize = 4 * 1024;
 const MIN_PROCESSING_PATH_FORM_BYTES: usize = 96;
 const MIN_PROCESSING_PATH_FORM_OPERATORS: usize = 12;
 const MIN_PATH_FORM_OCCURRENCES: usize = 2;
-// The cache-only no-path-candidate proof is meant for cheap no-op rejection,
-// not for path-heavy pages where the real factoring pass will likely do useful
-// work. Above this count, fall back immediately; this affects only runtime.
-const MAX_CACHED_PATH_PROOF_BLOCKS: usize = 4 * 1024;
 const PATH_FORM_BBOX_MARGIN: f64 = 1.0;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1349,6 +1345,7 @@ impl VectorInstructionScanner for TransformedBlockScanner {
     }
 }
 
+#[cfg(test)]
 fn factorable_transformed_blocks(input: &[u8]) -> Vec<TransformedBlock> {
     let mut scanner = TransformedBlockScanner::new();
     if !matches!(scanner.scan(input), Ok(false)) {
@@ -1556,17 +1553,33 @@ struct PagePathData {
 
 // Candidate bodies borrow the first semantic representative until the
 // complete document-level compressed-size admission succeeds.
-type FormGroups = BTreeMap<SemanticKey, (usize, Vec<PathOccurrence>)>;
-type FormCandidate<'a> = (Cow<'a, [u8]>, usize, Vec<PathOccurrence>);
+type FormGroups = HashMap<SemanticKey, (usize, SmallVec<[PathOccurrence; 1]>)>;
+type RepeatedFormGroup = (usize, Vec<PathOccurrence>);
+type FormCandidate<'a> = (&'a [u8], usize, Vec<PathOccurrence>);
 
-fn repeated_form_candidates(groups: FormGroups, pages: &[PagePathData]) -> Vec<FormCandidate<'_>> {
+fn repeated_form_groups(groups: FormGroups) -> Vec<RepeatedFormGroup> {
+    let mut repeated = groups
+        .into_iter()
+        .filter(|(_, (_, occurrences))| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
+        .collect::<Vec<_>>();
+    // Preserve the previous BTreeMap iteration order, including score ties.
+    repeated.sort_unstable_by_key(|(key, _)| *key);
+    repeated
+        .into_iter()
+        .map(|(_, (operators, occurrences))| (operators, occurrences.into_vec()))
+        .collect()
+}
+
+fn repeated_form_candidates(
+    groups: Vec<RepeatedFormGroup>,
+    pages: &[PagePathData],
+) -> Vec<FormCandidate<'_>> {
     groups
-        .into_values()
-        .filter(|(_, occurrences)| occurrences.len() >= MIN_PATH_FORM_OCCURRENCES)
+        .into_iter()
         .map(|(operator_count, occurrences)| {
             let first = &occurrences[0];
             let body = &pages[first.page_index].decoded[first.start..first.end];
-            (Cow::Borrowed(body), operator_count, occurrences)
+            (body, operator_count, occurrences)
         })
         .collect()
 }
@@ -1686,7 +1699,7 @@ fn measure_form_rewrites<'a>(
 }
 
 struct SelectedPathForm<'a> {
-    body: Cow<'a, [u8]>,
+    body: &'a [u8],
     name: Vec<u8>,
     replacement: Vec<u8>,
     bounds: Rect,
@@ -1781,7 +1794,7 @@ fn apply_path_form_plan(
         });
     let Some(measured) = measure_form_rewrites(
         pages,
-        selected.iter().map(|form| form.body.as_ref()),
+        selected.iter().map(|form| form.body),
         fixed_overhead,
         level,
         flate_lengths,
@@ -1794,7 +1807,7 @@ fn apply_path_form_plan(
         .map(|form| {
             ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: path_form_dictionary(form.bounds),
-                data: StreamData::Owned(form.body.as_ref().to_vec().into()),
+                data: StreamData::Owned(form.body.to_vec().into()),
             }))
         })
         .collect::<Vec<_>>();
@@ -1892,107 +1905,74 @@ impl PreferredBodyIndex {
     }
 }
 
-fn cached_path_factoring_is_impossible_after_transformed_preference(
+/// Complete the exact block inventory without decoding unchanged pages.
+fn factor_page_inventory(
     document: &EditDocument,
-    pre_scanned: &BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
     pages: &[ObjectHandle],
-) -> Result<bool> {
-    // Mirror the path-factor pass's transformed-body preference using only
-    // cached block metadata. This is a proof-only fast path: any missing cache
-    // or surviving repeated path key falls back to the full implementation.
-    // Refuse the proof before touching the document on path-heavy inputs.
-    let cached_path_blocks = pre_scanned
-        .values()
-        .map(|(path_blocks, _)| path_blocks.len())
-        .try_fold(0usize, |total, count| {
-            let total = total.saturating_add(count);
-            (total <= MAX_CACHED_PATH_PROOF_BLOCKS).then_some(total)
-        });
-    if cached_path_blocks.is_none() {
-        return Ok(false);
-    }
-
-    let mut scanned = Vec::with_capacity(pages.len());
+    blocks: &mut ProcessingFactorBlocks,
+) -> Result<Vec<ObjectHandle>> {
+    let mut present = Vec::with_capacity(pages.len());
     for &page in pages {
         let Some(object) = document.current_value(page)? else {
+            blocks.remove(&page);
             continue;
         };
-        if object.dictionary_entry(b"Contents").is_none() {
+        let Some(contents) = object.dictionary_entry(b"Contents") else {
+            blocks.remove(&page);
             continue;
-        }
-        let Some(blocks) = pre_scanned.get(&page) else {
-            return Ok(false);
         };
-        scanned.push(blocks);
-    }
-    let preferred_transformed =
-        preferred_transformed_keys(scanned.iter().flat_map(|(_, transformed)| transformed));
-    let mut path_keys = HashSet::<SemanticKey>::new();
-    for (path_blocks, transformed_blocks) in scanned {
-        let preferred = PreferredBodyIndex::new(transformed_blocks, &preferred_transformed);
-        for block in path_blocks {
-            if preferred.contains(block.start, block.end) {
-                continue;
-            }
-            if !path_keys.insert(block.semantic_key) {
-                return Ok(false);
-            }
+        if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(page) {
+            let decoded = decoded_content_value(document, contents)?;
+            entry.insert(factorable_processing_blocks(&decoded));
         }
+        present.push(page);
     }
-    Ok(true)
+    Ok(present)
+}
+
+/// Materialize page bytes and globally occupied `XObject` names only when
+/// a metadata candidate actually needs a transaction.
+fn load_factor_pages(
+    document: &EditDocument,
+    pages: &[ObjectHandle],
+) -> Result<(Vec<PagePathData>, BTreeSet<Vec<u8>>)> {
+    let mut page_data = Vec::with_capacity(pages.len());
+    let mut occupied = BTreeSet::new();
+    for &page in pages {
+        let Some(decoded) = page_content_if_present(document, page)? else {
+            return Err(crate::Error::Invalid(
+                "factor page disappeared after inventory".into(),
+            ));
+        };
+        if let Some(resources) = document.inherited_page_resources(page)?
+            && let Some(xobjects) = resources.resolved_entry(document, b"XObject")?
+            && let Some(entries) = xobjects.dictionary_entries()
+        {
+            occupied.extend(entries.map(|(name, _)| name.as_ref().to_vec()));
+        }
+        page_data.push(PagePathData { page, decoded });
+    }
+    Ok((page_data, occupied))
 }
 
 fn factor_repeated_path_forms(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
-    mut pre_scanned: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
+    mut reusable_blocks: ProcessingFactorBlocks,
     pages: &[ObjectHandle],
     flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<PathFactoringOutcome> {
-    if cached_path_factoring_is_impossible_after_transformed_preference(
-        document,
-        &pre_scanned,
-        pages,
-    )? {
-        return Ok(PathFactoringOutcome {
-            stats: VectorCompactionStats::default(),
-            reusable_blocks: pre_scanned,
-            rewritten_pages: BTreeSet::new(),
-        });
-    }
-
-    let mut page_data = Vec::with_capacity(pages.len());
-    let mut reusable_blocks = ProcessingFactorBlocks::new();
+    let present = factor_page_inventory(document, pages, &mut reusable_blocks)?;
     let mut groups = FormGroups::new();
-    let mut occupied_names = BTreeSet::new();
-
-    for &page in pages {
-        let Some(decoded) = page_content_if_present(document, page)? else {
-            continue;
-        };
-        let blocks = pre_scanned
-            .remove(&page)
-            .unwrap_or_else(|| factorable_processing_blocks(&decoded));
-        let resources = effective_page_resources(document, page)?;
-        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-        {
-            occupied_names.extend(xobjects.keys().cloned());
-        }
-        page_data.push(PagePathData { page, decoded });
-        reusable_blocks.insert(page, blocks);
-    }
 
     // Prefer a larger repeated transformed body over path candidates nested
     // inside it. Rewriting an inner path to a Form call makes that outer body
     // resource-dependent and intentionally ineligible for transformed-form
     // factoring later.
-    let preferred_transformed = preferred_transformed_keys(
-        page_data
-            .iter()
-            .flat_map(|page| &reusable_blocks[&page.page].1),
-    );
-    for (page_index, page) in page_data.iter().enumerate() {
-        let (path_blocks, transformed_blocks) = &reusable_blocks[&page.page];
+    let preferred_transformed =
+        preferred_transformed_keys(present.iter().flat_map(|page| &reusable_blocks[page].1));
+    for (page_index, page) in present.iter().enumerate() {
+        let (path_blocks, transformed_blocks) = &reusable_blocks[page];
         let preferred = PreferredBodyIndex::new(transformed_blocks, &preferred_transformed);
         for block in path_blocks {
             if preferred.contains(block.start, block.end) {
@@ -2000,7 +1980,7 @@ fn factor_repeated_path_forms(
             }
             let entry = groups
                 .entry(block.semantic_key)
-                .or_insert_with(|| (block.operator_count, Vec::new()));
+                .or_insert_with(|| (block.operator_count, SmallVec::new()));
             entry.1.push(PathOccurrence {
                 page_index,
                 start: block.start,
@@ -2010,7 +1990,16 @@ fn factor_repeated_path_forms(
         }
     }
 
-    let mut candidates = repeated_form_candidates(groups, &page_data);
+    let repeated = repeated_form_groups(groups);
+    if repeated.is_empty() {
+        return Ok(PathFactoringOutcome {
+            stats: VectorCompactionStats::default(),
+            reusable_blocks,
+            rewritten_pages: BTreeSet::new(),
+        });
+    }
+    let (page_data, mut occupied_names) = load_factor_pages(document, &present)?;
+    let mut candidates = repeated_form_candidates(repeated, &page_data);
     candidates.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(bytes.len()));
     let selected = select_path_forms(candidates.into_iter(), &mut occupied_names, 0);
     let Some(commit) =
@@ -2054,48 +2043,40 @@ fn factor_repeated_path_forms(
 fn factor_repeated_transformed_blocks(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
-    reusable_blocks: &ProcessingFactorBlocks,
-    rewritten_pages: &BTreeSet<ObjectHandle>,
+    reusable_blocks: &mut ProcessingFactorBlocks,
     pages: &[ObjectHandle],
     flate_lengths: &mut VectorFlateLengthMemo,
 ) -> Result<VectorCompactionStats> {
-    let mut page_data = Vec::with_capacity(pages.len());
+    let present = factor_page_inventory(document, pages, reusable_blocks)?;
     let mut groups = FormGroups::new();
-    let mut occupied_names = BTreeSet::new();
-
-    for &page in pages {
-        let Some(decoded) = page_content_if_present(document, page)? else {
-            continue;
-        };
-        let scanned;
-        let blocks = if let Some((_, transformed)) = reusable_blocks.get(&page)
-            && !rewritten_pages.contains(&page)
-        {
-            transformed.as_slice()
-        } else {
-            scanned = factorable_transformed_blocks(&decoded);
-            &scanned
-        };
-        for block in blocks {
+    for (page_index, page) in present.iter().enumerate() {
+        for block in &reusable_blocks[page].1 {
             let entry = groups
                 .entry(block.semantic_key)
-                .or_insert_with(|| (block.operator_count, Vec::new()));
+                .or_insert_with(|| (block.operator_count, SmallVec::new()));
             entry.1.push(PathOccurrence {
-                page_index: page_data.len(),
+                page_index,
                 start: block.body_start,
                 end: block.body_end,
                 bounds: block.bounds,
             });
         }
-        let resources = effective_page_resources(document, page)?;
-        if let Some(xobjects) = resolved_dictionary(document, resources.get(b"XObject".as_slice()))?
-        {
-            occupied_names.extend(xobjects.keys().cloned());
-        }
-        page_data.push(PagePathData { page, decoded });
     }
-
-    let mut candidates = repeated_form_candidates(groups, &page_data);
+    let repeated = repeated_form_groups(groups);
+    // Use first-representative metadata, not maxima of lexical variants.
+    // Retain the original full candidate order for equal score sorting.
+    if !repeated.iter().any(|(operators, occurrences)| {
+        let first = &occurrences[0];
+        processing_transformed_factor_candidate(
+            first.end - first.start,
+            *operators,
+            occurrences.len(),
+        )
+    }) {
+        return Ok(VectorCompactionStats::default());
+    }
+    let (page_data, mut occupied_names) = load_factor_pages(document, &present)?;
+    let mut candidates = repeated_form_candidates(repeated, &page_data);
     candidates.sort_unstable_by_key(|(bytes, operators, occurrences)| {
         std::cmp::Reverse(
             bytes
@@ -3302,11 +3283,13 @@ fn factor_processing_structural_forms(
         mut reusable_blocks,
         rewritten_pages: path_rewritten,
     } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages, flate_lengths)?;
+    for page in &path_rewritten {
+        reusable_blocks.remove(page);
+    }
     let transformed = factor_repeated_transformed_blocks(
         document,
         flate_level,
-        &reusable_blocks,
-        &path_rewritten,
+        &mut reusable_blocks,
         pages,
         flate_lengths,
     )?;
@@ -3628,22 +3611,25 @@ mod tests {
             end,
             bounds,
         };
-        let groups = BTreeMap::from([
+        let groups = HashMap::from([
             // A unique key must never be materialized, even if its stale span
             // cannot be indexed. No Form will be created from that group.
             (
                 semantic_fingerprint(b"unique"),
-                (1, vec![occurrence(99, 0, 999)]),
+                (1, smallvec::smallvec![occurrence(99, 0, 999)]),
             ),
             (
                 semantic_fingerprint(b"repeated"),
-                (4, vec![occurrence(0, 7, 21), occurrence(1, 7, 21)]),
+                (
+                    4,
+                    smallvec::smallvec![occurrence(0, 7, 21), occurrence(1, 7, 21)],
+                ),
             ),
         ]);
-        let candidates = repeated_form_candidates(groups, &pages);
+        let candidates = repeated_form_candidates(repeated_form_groups(groups), &pages);
         assert_eq!(candidates.len(), 1);
         let (body, operators, occurrences) = &candidates[0];
-        assert_eq!(body.as_ref(), b"0 0 10 10 re f");
+        assert_eq!(*body, b"0 0 10 10 re f");
         assert_eq!(*operators, 4);
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].page_index, 0);
