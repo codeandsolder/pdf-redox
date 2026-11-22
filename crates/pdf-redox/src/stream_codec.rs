@@ -336,7 +336,7 @@ pub fn flate_capped_encoded_len(
 }
 
 /// The ordinary zlib encoding, only if it fits the exact byte budget.
-pub(crate) fn encode_flate_capped(
+pub fn encode_flate_capped(
     decoded: &[u8],
     maximum_length: usize,
     level: crate::FlateLevel,

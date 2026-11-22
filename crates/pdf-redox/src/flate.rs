@@ -61,6 +61,7 @@ pub struct FlateReuseCache {
 }
 
 impl FlateReuseCache {
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         handle: ObjectHandle,

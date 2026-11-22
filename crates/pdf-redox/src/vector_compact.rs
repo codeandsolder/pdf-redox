@@ -4305,7 +4305,7 @@ mod tests {
         let input = b"636.43 216.22 63 15.72 re f* 699.43 216.22 4.68 15.72 re f*";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4313,7 +4313,7 @@ mod tests {
         let input = b"0 0 10 10 re f 10.01 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4321,7 +4321,7 @@ mod tests {
         let input = b"0 0 10 10 re f 9 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4350,7 +4350,7 @@ mod tests {
         let input = b"0 0 10 10 re f 2 2 1 1 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4358,7 +4358,7 @@ mod tests {
         let input = b"0 0 10 10 re f 0 0 10 10 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4366,7 +4366,7 @@ mod tests {
         let input = b"0.2 2 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4374,7 +4374,7 @@ mod tests {
         let input = b"0 7 1 1 re f 0 0 20 20 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4382,7 +4382,7 @@ mod tests {
         let input = b"/GS0 gs 0 0 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4398,7 +4398,7 @@ mod tests {
         let input = b"/Pattern cs /P0 scn 0 0 1 1 re f 0 0 10 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4406,7 +4406,7 @@ mod tests {
         let input = b"0 0 10 10 re f 1 0 0 rg 10 0 5 10 re f";
         let (output, stats) = compact_content(input);
         assert_eq!(stats.fill_groups_batched, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
     #[test]
     fn resolved_opaque_ext_gstate_allows_covered_fill_pruning() {
@@ -4446,7 +4446,7 @@ mod tests {
         let input = b"/Half gs /Normal gs 0 0 2 2 re f 0 0 10 10 re f";
         let (output, stats) = compact_content_with_ext_gstates(input, &ext_gstates);
         assert_eq!(stats.covered_fills_pruned, 0);
-        assert_eq!(output, input);
+        assert_eq!(output.as_ref(), input);
     }
 
     #[test]
@@ -4625,7 +4625,7 @@ mod tests {
     fn path_coordinate_canonicalization_can_expose_exact_fill_adjacency() -> crate::Result<()> {
         let input = b"0 0 10.004 10 re f 10.003 0 9.997 10 re f";
         let (before, before_stats) = compact_content(input);
-        assert_eq!(before, input);
+        assert_eq!(before.as_ref(), input);
         assert_eq!(before_stats.fill_groups_batched, 0);
 
         let (canonicalized, coordinates) =
