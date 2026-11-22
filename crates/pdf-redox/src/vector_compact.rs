@@ -2338,13 +2338,6 @@ fn shared_resource_targets(
     })
 }
 
-#[derive(Debug, Clone)]
-struct SharedOperand {
-    name: Option<Vec<u8>>,
-    offset: usize,
-    length: usize,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SharedResourceUse {
     start: usize,
@@ -2360,40 +2353,46 @@ struct SharedQBlock {
     resource_uses: Vec<SharedResourceUse>,
 }
 
+/// Stream the canonical byte representation through one sink. Resource uses
+/// are recorded in parser order, so no copied/sorted span table is necessary.
+fn visit_canonical_shared_span(
+    input: &[u8],
+    start: usize,
+    end: usize,
+    uses: &[SharedResourceUse],
+    mut visit: impl FnMut(&[u8]) -> Option<()>,
+) -> Option<()> {
+    let mut cursor = start;
+    for use_ in uses {
+        if use_.start < cursor || use_.end < use_.start || use_.end > end {
+            return None;
+        }
+        visit(input.get(cursor..use_.start)?)?;
+        visit(b"/")?;
+        visit(&shared_resource_name(use_.resource))?;
+        cursor = use_.end;
+    }
+    visit(input.get(cursor..end)?)
+}
+
+#[cfg(test)]
 fn canonicalized_shared_span(
     input: &[u8],
     start: usize,
     end: usize,
     uses: &[SharedResourceUse],
 ) -> Option<Vec<u8>> {
-    if start > end || end > input.len() {
-        return None;
-    }
-    let mut uses = uses
-        .iter()
-        .copied()
-        .filter(|use_| start <= use_.start && use_.end <= end)
-        .collect::<Vec<_>>();
-    uses.sort_unstable_by_key(|use_| use_.start);
-    let mut output = Vec::with_capacity(end.saturating_sub(start));
-    let mut cursor = start;
-    for use_ in uses {
-        if use_.start < cursor || use_.end < use_.start || use_.end > end {
-            return None;
-        }
-        output.extend_from_slice(input.get(cursor..use_.start)?);
-        output.push(b'/');
-        output.extend_from_slice(&shared_resource_name(use_.resource));
-        cursor = use_.end;
-    }
-    output.extend_from_slice(input.get(cursor..end)?);
-    Some(output)
+    let mut out = Vec::new();
+    visit_canonical_shared_span(input, start, end, uses, |bytes| {
+        out.extend_from_slice(bytes);
+        Some(())
+    })?;
+    Some(out)
 }
 
 struct SharedQBlockScanner<'a> {
     input: &'a [u8],
     targets: &'a SharedResourceTargets,
-    operands: Vec<SharedOperand>,
     depth: usize,
     block_start: Option<usize>,
     block_valid: bool,
@@ -2406,7 +2405,6 @@ impl<'a> SharedQBlockScanner<'a> {
         Self {
             input,
             targets,
-            operands: Vec::new(),
             depth: 0,
             block_start: None,
             block_valid: true,
@@ -2415,22 +2413,32 @@ impl<'a> SharedQBlockScanner<'a> {
         }
     }
 
-    fn record_resource(&mut self, kind: SharedResourceKind, operands: &[SharedOperand]) {
-        if operands.len() != 1 {
+    fn record_resource(
+        &mut self,
+        kind: SharedResourceKind,
+        instruction: &hayro_syntax::content::Instruction<'_, '_>,
+    ) {
+        let mut spans = instruction.operand_spans();
+        if spans.len() != 1 {
             self.block_valid = false;
             return;
         }
-        let Some(name) = operands[0].name.as_deref() else {
+        let Some(span) = spans.next() else {
             self.block_valid = false;
             return;
         };
-        let Some(target) = self.targets.target(kind, name) else {
+        let Some(target) = instruction
+            .operands()
+            .next()
+            .and_then(crate::content_stream::operand_name)
+            .and_then(|name| self.targets.target(kind, name))
+        else {
             self.block_valid = false;
             return;
         };
         self.resource_uses.push(SharedResourceUse {
-            start: operands[0].offset,
-            end: operands[0].offset.saturating_add(operands[0].length),
+            start: span.start,
+            end: span.end,
             resource: SharedResourceRef { kind, target },
         });
     }
@@ -2441,16 +2449,19 @@ impl<'a> SharedQBlockScanner<'a> {
             self.block_valid = true;
             return;
         };
+        let mut hasher = Sha256::new();
         if self.block_valid
             && end > start
-            && let Some(canonical) =
-                canonicalized_shared_span(self.input, start, end, &self.resource_uses)
+            && visit_canonical_shared_span(self.input, start, end, &self.resource_uses, |bytes| {
+                hasher.update(bytes);
+                Some(())
+            })
+            .is_some()
         {
-            let digest: [u8; 32] = Sha256::digest(&canonical).into();
             self.blocks.push(SharedQBlock {
                 start,
                 end,
-                digest,
+                digest: hasher.finalize().into(),
                 resource_uses: std::mem::take(&mut self.resource_uses),
             });
         } else {
@@ -2459,47 +2470,42 @@ impl<'a> SharedQBlockScanner<'a> {
         self.block_valid = true;
     }
 
-    fn process_operator(
-        &mut self,
-        operator: &[u8],
-        offset: usize,
-        length: usize,
-        operands: &[SharedOperand],
-    ) {
-        let end = offset.saturating_add(length);
+    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
+        let operator = &instruction.operator[..];
+        let span = instruction.operator_span();
         if self.depth == 0 {
-            if operator == b"q" && operands.is_empty() {
+            if operator == b"q" && instruction.operand_spans().len() == 0 {
                 self.depth = 1;
-                self.block_start = Some(offset);
+                self.block_start = Some(span.start);
                 self.block_valid = true;
                 self.resource_uses.clear();
             }
             return;
         }
-
         match operator {
             b"q" => {
-                if !operands.is_empty() {
+                if instruction.operand_spans().len() != 0 {
                     self.block_valid = false;
                 }
                 self.depth = self.depth.saturating_add(1);
             }
             b"Q" => {
-                if !operands.is_empty() {
+                if instruction.operand_spans().len() != 0 {
                     self.block_valid = false;
                 }
                 self.depth = self.depth.saturating_sub(1);
                 if self.depth == 0 {
-                    self.close_outer_block(end);
+                    self.close_outer_block(span.end);
                 }
             }
-            b"cs" | b"CS" => {
-                self.record_resource(SharedResourceKind::ColorSpace, operands);
-            }
-            b"gs" => self.record_resource(SharedResourceKind::ExtGState, operands),
-            b"Do" => self.record_resource(SharedResourceKind::XObject, operands),
+            b"cs" | b"CS" => self.record_resource(SharedResourceKind::ColorSpace, instruction),
+            b"gs" => self.record_resource(SharedResourceKind::ExtGState, instruction),
+            b"Do" => self.record_resource(SharedResourceKind::XObject, instruction),
             b"scn" | b"SCN" => {
-                if operands.iter().any(|operand| operand.name.is_some()) {
+                if instruction
+                    .operands()
+                    .any(|operand| crate::content_stream::operand_name(operand).is_some())
+                {
                     self.block_valid = false;
                 }
             }
@@ -2508,28 +2514,6 @@ impl<'a> SharedQBlockScanner<'a> {
             | b"j" | b"M" | b"d" | b"G" | b"g" | b"RG" | b"rg" | b"K" | b"k" | b"ri" | b"i" => {}
             _ => self.block_valid = false,
         }
-    }
-
-    fn instruction(&mut self, instruction: &hayro_syntax::content::Instruction<'_, '_>) {
-        if &instruction.operator[..] == b"BI" {
-            if self.depth > 0 {
-                self.block_valid = false;
-            }
-            self.operands.clear();
-            return;
-        }
-        self.operands = instruction
-            .operands()
-            .zip(instruction.operand_spans())
-            .map(|(object, span)| SharedOperand {
-                name: crate::content_stream::operand_name(object).map(ToOwned::to_owned),
-                offset: span.start,
-                length: span.len(),
-            })
-            .collect();
-        let operands = std::mem::take(&mut self.operands);
-        let span = instruction.operator_span();
-        self.process_operator(&instruction.operator[..], span.start, span.len(), &operands);
     }
 
     fn scan(&mut self) -> crate::Result<bool> {
@@ -2652,23 +2636,53 @@ fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunC
     out
 }
 
-fn shared_run_body(
+fn visit_shared_run(
     page: &SharedPageData,
     candidate: &SharedRunCandidate,
-) -> Option<(Vec<u8>, BTreeSet<SharedResourceRef>)> {
-    let mut body = Vec::new();
+    mut visit: impl FnMut(&[u8]) -> Option<()>,
+) -> Option<BTreeSet<SharedResourceRef>> {
     let mut resources = BTreeSet::new();
     for block in page
         .blocks
         .get(candidate.start_block..candidate.end_block)?
     {
-        let canonical =
-            canonicalized_shared_span(&page.decoded, block.start, block.end, &block.resource_uses)?;
-        body.extend_from_slice(&canonical);
-        body.push(b'\n');
+        visit_canonical_shared_span(
+            &page.decoded,
+            block.start,
+            block.end,
+            &block.resource_uses,
+            &mut visit,
+        )?;
+        visit(b"\n")?;
         resources.extend(block.resource_uses.iter().map(|use_| use_.resource));
     }
+    Some(resources)
+}
+
+fn shared_run_body(
+    page: &SharedPageData,
+    candidate: &SharedRunCandidate,
+) -> Option<(Vec<u8>, BTreeSet<SharedResourceRef>)> {
+    let mut body = Vec::new();
+    let resources = visit_shared_run(page, candidate, |bytes| {
+        body.extend_from_slice(bytes);
+        Some(())
+    })?;
     Some((body, resources))
+}
+
+fn shared_run_matches(
+    page: &SharedPageData,
+    candidate: &SharedRunCandidate,
+    body: &[u8],
+    resources: &BTreeSet<SharedResourceRef>,
+) -> bool {
+    let mut remaining = body;
+    let actual = visit_shared_run(page, candidate, |bytes| {
+        remaining = remaining.strip_prefix(bytes)?;
+        Some(())
+    });
+    remaining.is_empty() && actual.as_ref() == Some(resources)
 }
 
 fn shared_form_resources(resources: &BTreeSet<SharedResourceRef>) -> OwnedDictionary {
@@ -2798,6 +2812,13 @@ fn factor_shared_q_prefix_runs(
         else {
             continue;
         };
+        // Fingerprints only identify candidates. Compare the canonical bytes
+        // and exact resource identities before replacing any page content.
+        if !candidate.page_indices.iter().skip(1).all(|&page_index| {
+            shared_run_matches(&page_data[page_index], &candidate, &body, &resources)
+        }) {
+            continue;
+        }
         let compressed_body_bytes = flate_lengths.encoded_len(&body, flate_level)?;
         let conservative_overhead = 384usize
             .saturating_add(resources.len().saturating_mul(96))
@@ -4456,6 +4477,10 @@ mod tests {
         );
         assert!(canonical.is_some());
         let canonical = canonical.unwrap_or_default();
+        assert_eq!(
+            first_blocks[0].digest,
+            <[u8; 32]>::from(Sha256::digest(&canonical))
+        );
         assert!(
             canonical
                 .windows(b"PdfRedoxSharedCSO3G0".len())
@@ -4471,6 +4496,38 @@ mod tests {
                 .windows(b"PdfRedoxSharedXOO5G0".len())
                 .any(|window| { window == b"PdfRedoxSharedXOO5G0" })
         );
+    }
+
+    #[test]
+    fn shared_run_collision_proof_checks_exact_bytes_and_resource_identity() -> Result<()> {
+        let targets = SharedResourceTargets::default();
+        let first = b"q 0 0 m 1 1 l S Q";
+        let second = b"q 0 0 m 2 2 l S Q";
+        let make_page = |number, input: &[u8]| SharedPageData {
+            page: ObjectHandle::Existing(ObjectId::new(number, 0)),
+            decoded: input.to_vec(),
+            blocks: factorable_shared_q_blocks(input, &targets),
+            bounds: Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 10.0,
+                y1: 10.0,
+            },
+        };
+        let first = make_page(1, first);
+        let mut second = make_page(2, second);
+        second.blocks[0].digest = first.blocks[0].digest;
+        let candidate = SharedRunCandidate {
+            page_indices: vec![0, 1],
+            start_block: 0,
+            end_block: 1,
+            bounds: first.bounds,
+        };
+        let (body, resources) = shared_run_body(&first, &candidate)
+            .ok_or_else(|| crate::Error::Invalid("shared run fixture".into()))?;
+        assert!(shared_run_matches(&first, &candidate, &body, &resources));
+        assert!(!shared_run_matches(&second, &candidate, &body, &resources));
+        Ok(())
     }
 
     #[test]
