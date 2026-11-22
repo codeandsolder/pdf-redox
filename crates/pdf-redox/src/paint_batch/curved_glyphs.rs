@@ -1421,7 +1421,11 @@ mod tests {
             .get(b"Contents".as_slice())
             .ok_or_else(|| crate::Error::Invalid("contents".to_owned()))?;
         let mut rendered = Vec::new();
-        crate::content::decoded_content_value(&doc, contents, &mut rendered)?;
+        crate::content::decoded_content_value(
+            &doc,
+            crate::source::CurrentValue::Owned(contents),
+            &mut rendered,
+        )?;
         assert!(rendered.windows(b" Tj ET".len()).any(|w| w == b" Tj ET"));
         assert!(!rendered.windows(b" 1.5 ".len()).any(|w| w == b" 1.5 "));
         Ok(())

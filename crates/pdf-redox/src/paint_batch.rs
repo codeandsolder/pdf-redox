@@ -1075,7 +1075,8 @@ fn compact_collinear_form_paths(
         let Some(object) = document.current_owned_object(handle)? else {
             continue;
         };
-        let decoded = document.decoded_owned_stream_data(&object)?;
+        let decoded =
+            document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))?;
         if decoded.len() < MIN_PAGE_CONTENT_BYTES {
             continue;
         }
@@ -2703,7 +2704,11 @@ mod tests {
             return Err(crate::Error::Invalid("test page lost Contents".to_owned()));
         };
         let mut decoded = Vec::new();
-        crate::content::decoded_content_value(&document, contents, &mut decoded)?;
+        crate::content::decoded_content_value(
+            &document,
+            crate::source::CurrentValue::Owned(contents),
+            &mut decoded,
+        )?;
         assert!(!decoded.contains(&b'%'));
         assert_eq!(operator_count(&decoded, b"l"), 4000);
         Ok(())
@@ -2746,7 +2751,8 @@ mod tests {
         let Some(object) = document.current_owned_object(forms[0])? else {
             return Err(crate::Error::Invalid("test Form disappeared".to_owned()));
         };
-        let decoded = document.decoded_owned_stream_data(&object)?;
+        let decoded =
+            document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))?;
         assert_eq!(operator_count(&decoded, b"l"), 1);
 
         let output = document.write_compact()?;

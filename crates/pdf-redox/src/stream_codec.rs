@@ -1,6 +1,12 @@
 //! Stream filter decoding and encoding for the copy-on-write document layer.
 
-use crate::{EditDocument, Error, OwnedDictionary, OwnedObject, Result};
+use crate::{
+    EditDocument, Error, OwnedDictionary, OwnedObject, Result,
+    source::{CurrentValue, NumericValue},
+};
+use std::borrow::Cow;
+
+const EXTERNAL_STREAM_KEYS: [&[u8]; 3] = [b"F", b"FFilter", b"FDecodeParms"];
 
 /// Whether the stream dictionary declares payload from an external file.
 ///
@@ -8,14 +14,14 @@ use crate::{EditDocument, Error, OwnedDictionary, OwnedObject, Result};
 /// `/FDecodeParms` describe its independent filter chain. The inline bytes
 /// cannot be treated as the authoritative decoded stream in this case.
 pub fn has_external_file_stream_entries(dictionary: &OwnedDictionary) -> bool {
-    [b"F".as_slice(), b"FFilter", b"FDecodeParms"]
+    EXTERNAL_STREAM_KEYS
         .iter()
         .any(|key| dictionary.contains_key(*key))
 }
 
 fn write_resolved_value(
     document: &EditDocument,
-    value: &OwnedObject,
+    value: CurrentValue<'_>,
     output: &mut Vec<u8>,
     depth: usize,
 ) -> Result<()> {
@@ -24,91 +30,126 @@ fn write_resolved_value(
             "stream filter dictionary nesting exceeds supported depth".to_owned(),
         ));
     }
-    let resolved;
-    let value = if matches!(value, OwnedObject::Reference(_)) {
-        let Some(value) = document.resolve_owned_value(value)? else {
-            output.extend_from_slice(b"null");
-            return Ok(());
-        };
-        resolved = value;
-        &resolved
-    } else {
-        value
+    let Some(value) = document.resolve_current_value(value)? else {
+        output.extend_from_slice(b"null");
+        return Ok(());
     };
 
-    match value {
-        OwnedObject::Null => output.extend_from_slice(b"null"),
-        OwnedObject::Boolean(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" });
+    if value.is_stream() {
+        return Err(Error::Invalid(
+            "stream cannot be embedded in stream filter parameters".to_owned(),
+        ));
+    }
+    if value.is_null() {
+        output.extend_from_slice(b"null");
+    } else if let Some(value) = value.boolean() {
+        output.extend_from_slice(if value { b"true" } else { b"false" });
+    } else if let Some(number) = value.number() {
+        match number {
+            NumericValue::Integer(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            NumericValue::Real(value) => crate::writer::write_pdf_real(output, value)?,
         }
-        OwnedObject::Integer(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        OwnedObject::Real(value) => crate::writer::write_pdf_real(output, *value)?,
-        OwnedObject::Name(value) => crate::writer::write_pdf_name(output, value),
-        OwnedObject::String(value) => crate::writer::write_pdf_string(output, value),
-        OwnedObject::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b' ');
-                }
-                write_resolved_value(document, value, output, depth + 1)?;
-            }
-            output.push(b']');
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            output.extend_from_slice(b"<<");
-            for (name, value) in dictionary {
+    } else if let Some(name) = value.name() {
+        crate::writer::write_pdf_name(output, name);
+    } else if let Some(string) = value.string() {
+        crate::writer::write_pdf_string(output, string);
+    } else if let Some(values) = value.array_items() {
+        output.push(b'[');
+        for (index, value) in values.enumerate() {
+            if index != 0 {
                 output.push(b' ');
-                crate::writer::write_pdf_name(output, name);
-                output.push(b' ');
-                write_resolved_value(document, value, output, depth + 1)?;
             }
-            output.extend_from_slice(b" >>");
+            write_resolved_value(document, value, output, depth + 1)?;
         }
-        OwnedObject::Reference(_) => unreachable!("references are resolved above"),
-        OwnedObject::Stream { .. } => {
-            return Err(Error::Invalid(
-                "stream cannot be embedded in stream filter parameters".to_owned(),
-            ));
+        output.push(b']');
+    } else if let Some(entries) = value.dictionary_entries() {
+        output.extend_from_slice(b"<<");
+        for (name, value) in entries {
+            output.push(b' ');
+            crate::writer::write_pdf_name(output, name.as_ref());
+            output.push(b' ');
+            write_resolved_value(document, value, output, depth + 1)?;
         }
+        output.extend_from_slice(b" >>");
+    } else {
+        return Err(Error::Invalid(
+            "unresolved stream filter parameter".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn standalone_filter_dictionary(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
-) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output.extend_from_slice(b"<<");
-    for key in [b"Filter".as_slice(), b"DecodeParms".as_slice()] {
-        let Some(value) = dictionary.get(key) else {
-            continue;
-        };
-        output.push(b' ');
-        crate::writer::write_pdf_name(&mut output, key);
-        output.push(b' ');
-        write_resolved_value(document, value, &mut output, 0)?;
-    }
-    output.extend_from_slice(b" >>");
-    Ok(output)
+/// The only COS entries needed to decode an inline payload. Read them once
+/// and retain the original source/overlay views while serializing the
+/// detached filter dictionary.
+pub struct InlineFilterConfiguration<'a> {
+    filter: Option<CurrentValue<'a>>,
+    parameters: Option<CurrentValue<'a>>,
 }
 
-/// Prepare the inline filter chain once for both ordinary and image streams.
-/// External-file entries take precedence even when no inline `/Filter` exists.
-fn inline_filter_dictionary(
-    document: &EditDocument,
-    dictionary: &OwnedDictionary,
-) -> Result<Option<Vec<u8>>> {
-    if has_external_file_stream_entries(dictionary) {
-        return Err(Error::Invalid(
-            "external-file stream data cannot be decoded as inline payload".to_owned(),
-        ));
+impl<'a> InlineFilterConfiguration<'a> {
+    fn from_lookup(lookup: impl Fn(&[u8]) -> Option<CurrentValue<'a>>) -> Result<Self> {
+        if EXTERNAL_STREAM_KEYS
+            .into_iter()
+            .any(|key| lookup(key).is_some())
+        {
+            return Err(Error::Invalid(
+                "external-file stream data cannot be decoded as inline payload".to_owned(),
+            ));
+        }
+        Ok(Self {
+            filter: lookup(b"Filter"),
+            parameters: lookup(b"DecodeParms"),
+        })
     }
-    dictionary
-        .contains_key(b"Filter".as_slice())
-        .then(|| standalone_filter_dictionary(document, dictionary))
-        .transpose()
+
+    pub fn from_stream(stream: &CurrentValue<'a>) -> Result<Self> {
+        if !stream.is_stream() {
+            return Err(Error::Invalid("object is not a stream".to_owned()));
+        }
+        Self::from_lookup(|key| stream.dictionary_entry(key))
+    }
+
+    fn from_dictionary(dictionary: &'a OwnedDictionary) -> Result<Self> {
+        Self::from_lookup(|key| dictionary.get(key).map(CurrentValue::Owned))
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.filter
+            .iter()
+            .chain(&self.parameters)
+            .all(|value| !value.contains_indirect_reference())
+    }
+
+    fn serialize(self, document: &EditDocument) -> Result<Option<Vec<u8>>> {
+        let Some(filter) = self.filter else {
+            return Ok(None);
+        };
+        let mut output = Vec::new();
+        output.extend_from_slice(b"<<");
+        for (key, value) in [
+            (b"Filter".as_slice(), Some(filter)),
+            (b"DecodeParms", self.parameters),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            output.push(b' ');
+            crate::writer::write_pdf_name(&mut output, key);
+            output.push(b' ');
+            write_resolved_value(document, value, &mut output, 0)?;
+        }
+        output.extend_from_slice(b" >>");
+        Ok(Some(output))
+    }
+
+    pub fn decode(self, document: &EditDocument, encoded: Cow<'_, [u8]>) -> Result<Vec<u8>> {
+        let Some(filter_dictionary) = self.serialize(document)? else {
+            return Ok(encoded.into_owned());
+        };
+        hayro_syntax::object::stream::decode_standalone_stream(&filter_dictionary, encoded.as_ref())
+            .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
+    }
 }
 
 /// Decode bytes using the stream's current `/Filter` and `/DecodeParms`.
@@ -117,11 +158,7 @@ pub fn decode_stream(
     dictionary: &OwnedDictionary,
     encoded: &[u8],
 ) -> Result<Vec<u8>> {
-    let Some(filter_dictionary) = inline_filter_dictionary(document, dictionary)? else {
-        return Ok(encoded.to_vec());
-    };
-    hayro_syntax::object::stream::decode_standalone_stream(&filter_dictionary, encoded)
-        .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
+    InlineFilterConfiguration::from_dictionary(dictionary)?.decode(document, Cow::Borrowed(encoded))
 }
 
 /// Decode image-stream bytes with the image metadata required by DCT/JPX/etc.
@@ -134,7 +171,9 @@ pub fn decode_image_stream(
     bits_per_component: u8,
     components: u8,
 ) -> Result<Vec<u8>> {
-    let Some(filter_dictionary) = inline_filter_dictionary(document, dictionary)? else {
+    let Some(filter_dictionary) =
+        InlineFilterConfiguration::from_dictionary(dictionary)?.serialize(document)?
+    else {
         return Ok(encoded.to_vec());
     };
     let params = hayro_syntax::object::stream::ImageDecodeParams {
