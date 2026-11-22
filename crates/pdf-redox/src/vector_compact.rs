@@ -2451,9 +2451,9 @@ const fn same_rect(left: Rect, right: Rect) -> bool {
 
 struct SharedPageData {
     page: ObjectHandle,
-    decoded: std::sync::Arc<Vec<u8>>,
     blocks: Vec<SharedQBlock>,
     bounds: Rect,
+    occupied_names: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2467,7 +2467,7 @@ struct SharedRunCandidate {
 /// Explicit depth-first work stack. A shared prefix can split at every
 /// nontrivia gap, so recursion depth is not bounded by the page count.
 fn enqueue_shared_groups(
-    page_data: &[SharedPageData],
+    page_data: &[&SharedPageData],
     pages: &[usize],
     cursor: usize,
     pending: &mut Vec<(Vec<usize>, usize)>,
@@ -2488,7 +2488,7 @@ fn enqueue_shared_groups(
     );
 }
 
-fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunCandidate> {
+fn collect_shared_run_candidates(page_data: &[&SharedPageData]) -> Vec<SharedRunCandidate> {
     let mut out = Vec::new();
     let all_pages = (0..page_data.len()).collect::<Vec<_>>();
     let mut pending = Vec::new();
@@ -2528,6 +2528,7 @@ fn collect_shared_run_candidates(page_data: &[SharedPageData]) -> Vec<SharedRunC
 
 fn visit_shared_run(
     page: &SharedPageData,
+    decoded: &[u8],
     candidate: &SharedRunCandidate,
     mut visit: impl FnMut(&[u8]) -> Option<()>,
 ) -> Option<BTreeSet<SharedResourceRef>> {
@@ -2537,7 +2538,7 @@ fn visit_shared_run(
         .get(candidate.start_block..candidate.end_block)?
     {
         visit_canonical_shared_span(
-            &page.decoded,
+            decoded,
             block.start,
             block.end,
             &block.resource_uses,
@@ -2551,10 +2552,11 @@ fn visit_shared_run(
 
 fn shared_run_body(
     page: &SharedPageData,
+    decoded: &[u8],
     candidate: &SharedRunCandidate,
 ) -> Option<(Vec<u8>, BTreeSet<SharedResourceRef>)> {
     let mut body = Vec::new();
-    let resources = visit_shared_run(page, candidate, |bytes| {
+    let resources = visit_shared_run(page, decoded, candidate, |bytes| {
         body.extend_from_slice(bytes);
         Some(())
     })?;
@@ -2563,12 +2565,13 @@ fn shared_run_body(
 
 fn shared_run_matches(
     page: &SharedPageData,
+    decoded: &[u8],
     candidate: &SharedRunCandidate,
     body: &[u8],
     resources: &BTreeSet<SharedResourceRef>,
 ) -> bool {
     let mut remaining = body;
-    let actual = visit_shared_run(page, candidate, |bytes| {
+    let actual = visit_shared_run(page, decoded, candidate, |bytes| {
         remaining = remaining.strip_prefix(bytes)?;
         Some(())
     });
@@ -2614,6 +2617,102 @@ struct SelectedSharedRun {
     compressed_body_bytes: usize,
 }
 
+/// Decoded payloads belong to a single admission transaction, never to
+/// the retained inventory. Load cached pages only after a candidate needs
+/// byte-exact verification.
+#[derive(Default)]
+struct SharedRunScan<'a> {
+    pages: Vec<&'a SharedPageData>,
+    payloads: BTreeMap<ObjectHandle, std::sync::Arc<Vec<u8>>>,
+}
+
+impl SharedRunScan<'_> {
+    fn load_candidate_payloads(
+        &mut self,
+        document: &EditDocument,
+        candidate: &SharedRunCandidate,
+    ) -> Result<()> {
+        for &index in &candidate.page_indices {
+            let page = self.pages[index].page;
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.payloads.entry(page) {
+                let bytes = page_content_if_present(document, page)?.ok_or_else(|| {
+                    crate::Error::Invalid("shared-run page disappeared after inventory".into())
+                })?;
+                entry.insert(bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Preserve positive and negative exact scan evidence across the structural
+/// fixed point. Every retained entry belongs to an unchanged page and its
+/// unchanged effective resource bindings.
+#[derive(Default)]
+struct SharedRunInventory {
+    entries: BTreeMap<ObjectHandle, Option<SharedPageData>>,
+}
+
+impl SharedRunInventory {
+    fn invalidate(&mut self, pages: &BTreeSet<ObjectHandle>) {
+        self.entries.retain(|page, _| !pages.contains(page));
+    }
+
+    fn scan(
+        &mut self,
+        document: &EditDocument,
+        pages: &[ObjectHandle],
+    ) -> Result<SharedRunScan<'_>> {
+        let mut pending = Vec::new();
+        let mut cached_count = 0usize;
+        for &page in pages {
+            if let Some(known) = self.entries.get(&page) {
+                cached_count += usize::from(known.is_some());
+                continue;
+            }
+            let Some(decoded) = page_content_if_present(document, page)? else {
+                self.entries.insert(page, None);
+                continue;
+            };
+            if shared_q_page_can_reach_minimum(decoded.len()) {
+                pending.push((page, decoded));
+            } else {
+                self.entries.insert(page, None);
+            }
+        }
+        if cached_count.saturating_add(pending.len()) < 2 {
+            // Do not resolve resource targets or parse a lone potential page.
+            return Ok(SharedRunScan::default());
+        }
+        let mut payloads = BTreeMap::new();
+        for (page, decoded) in pending {
+            let Some(bounds) = shared_page_visible_box(document, page)? else {
+                self.entries.insert(page, None);
+                continue;
+            };
+            let targets = shared_resource_targets(document, page)?;
+            let blocks = factorable_shared_q_blocks(&decoded, &targets);
+            let value = (!blocks.is_empty()).then(|| {
+                payloads.insert(page, decoded);
+                SharedPageData {
+                    page,
+                    blocks,
+                    bounds,
+                    occupied_names: targets.xobjects.into_keys().collect(),
+                }
+            });
+            self.entries.insert(page, value);
+        }
+        Ok(SharedRunScan {
+            pages: pages
+                .iter()
+                .filter_map(|page| self.entries.get(page)?.as_ref())
+                .collect(),
+            payloads,
+        })
+    }
+}
+
 /// Exact cross-page q-run factoring for Size, independent of rectangle/fill
 /// compaction. A fill-only raster preflight cannot prove these Forms absent.
 /// The underlying scanner checks page-box/resource identity and only admits
@@ -2631,6 +2730,7 @@ pub fn factor_size_shared_forms(
         flate_level,
         pages,
         &mut VectorFlateLengthMemo::default(),
+        &mut SharedRunInventory::default(),
     )
 }
 
@@ -2643,66 +2743,49 @@ fn factor_shared_q_prefix_runs(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     flate_lengths: &mut VectorFlateLengthMemo,
+    inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
-    let mut eligible_pages = Vec::new();
-    for &page in pages {
-        let Some(decoded) = page_content_if_present(document, page)? else {
-            continue;
-        };
-        // Every selected shared run is a span inside one page content stream.
-        // A page shorter than the run floor cannot possibly contribute.
-        if shared_q_page_can_reach_minimum(decoded.len()) {
-            eligible_pages.push((page, decoded));
-        }
-    }
-    // A shared run must occur on at least two pages. Prove the whole stage
-    // impossible before resolving resources or parsing/hashing any q blocks.
-    if eligible_pages.len() < 2 {
+    let mut scan = inventory.scan(document, pages)?;
+    if scan.pages.len() < 2 {
         return Ok(VectorCompactionStats::default());
     }
+    let mut occupied_names = scan
+        .pages
+        .iter()
+        .flat_map(|page| page.occupied_names.iter().cloned())
+        .collect::<BTreeSet<_>>();
 
-    let mut page_data = Vec::new();
-    let mut occupied_names = BTreeSet::new();
-    for (page, decoded) in eligible_pages {
-        let Some(bounds) = shared_page_visible_box(document, page)? else {
-            continue;
-        };
-        let targets = shared_resource_targets(document, page)?;
-        let blocks = factorable_shared_q_blocks(&decoded, &targets);
-        if blocks.is_empty() {
-            continue;
-        }
-        occupied_names.extend(targets.xobjects.into_keys());
-        page_data.push(SharedPageData {
-            page,
-            decoded,
-            blocks,
-            bounds,
-        });
-    }
-    if page_data.len() < 2 {
-        return Ok(VectorCompactionStats::default());
-    }
-
-    let candidates = collect_shared_run_candidates(&page_data);
+    let candidates = collect_shared_run_candidates(&scan.pages);
     let mut selected = Vec::new();
     let mut form_index = 0usize;
     for candidate in candidates {
         let representative = candidate.page_indices[0];
-        let first = &page_data[representative].blocks[candidate.start_block];
-        let last = &page_data[representative].blocks[candidate.end_block - 1];
+        let first = &scan.pages[representative].blocks[candidate.start_block];
+        let last = &scan.pages[representative].blocks[candidate.end_block - 1];
         let decoded_span = last.end.saturating_sub(first.start);
         if decoded_span < MIN_SHARED_RUN_DECODED_BYTES {
             continue;
         }
-        let Some((body, resources)) = shared_run_body(&page_data[representative], &candidate)
-        else {
+        scan.load_candidate_payloads(document, &candidate)?;
+        let representative_page = scan.pages[representative];
+        let Some((body, resources)) = shared_run_body(
+            representative_page,
+            &scan.payloads[&representative_page.page],
+            &candidate,
+        ) else {
             continue;
         };
         // Fingerprints only identify candidates. Compare the canonical bytes
         // and exact resource identities before replacing any page content.
         if !candidate.page_indices.iter().skip(1).all(|&page_index| {
-            shared_run_matches(&page_data[page_index], &candidate, &body, &resources)
+            let page = scan.pages[page_index];
+            shared_run_matches(
+                page,
+                &scan.payloads[&page.page],
+                &candidate,
+                &body,
+                &resources,
+            )
         }) {
             continue;
         }
@@ -2733,11 +2816,11 @@ fn factor_shared_q_prefix_runs(
         return Ok(VectorCompactionStats::default());
     }
 
-    let mut replacements_by_page = vec![Vec::<PageReplacement<'_>>::new(); page_data.len()];
+    let mut replacements_by_page = vec![Vec::<PageReplacement<'_>>::new(); scan.pages.len()];
     for run in &selected {
         for &page_index in &run.candidate.page_indices {
-            let first = &page_data[page_index].blocks[run.candidate.start_block];
-            let last = &page_data[page_index].blocks[run.candidate.end_block - 1];
+            let first = &scan.pages[page_index].blocks[run.candidate.start_block];
+            let last = &scan.pages[page_index].blocks[run.candidate.end_block - 1];
             replacements_by_page[page_index].push((
                 first.start,
                 last.end,
@@ -2760,16 +2843,18 @@ fn factor_shared_q_prefix_runs(
         .saturating_add(selected.len().saturating_mul(384))
         .saturating_add(resource_refs.saturating_mul(96))
         .saturating_add(page_refs.saturating_mul(32));
-    let pages = page_data
+    let pages = scan
+        .pages
         .iter()
         .zip(&replacements_by_page)
         .enumerate()
-        .filter_map(|(index, (page, replacements))| {
-            (!replacements.is_empty()).then_some((
+        .filter(|(_, (_, replacements))| !replacements.is_empty())
+        .map(|(index, (page, replacements))| {
+            (
                 index,
-                page.decoded.as_slice(),
+                scan.payloads[&page.page].as_slice(),
                 replacements.as_slice(),
-            ))
+            )
         });
     let Some(measured) = measure_form_rewrites(
         pages,
@@ -2793,9 +2878,9 @@ fn factor_shared_q_prefix_runs(
         )));
     }
     for (page_index, rewritten) in measured.pages {
-        replace_page_content(document, page_data[page_index].page, rewritten)?;
+        replace_page_content(document, scan.pages[page_index].page, rewritten)?;
     }
-    let page_data = &page_data;
+    let page_data = &scan.pages;
     install_page_resource_bindings(
         document,
         b"XObject",
@@ -2819,12 +2904,12 @@ fn factor_shared_q_prefix_runs(
             .saturating_add(block_count.saturating_mul(run.candidate.page_indices.len()));
         let mut occurrence_bytes = 0usize;
         for &page_index in &run.candidate.page_indices {
-            let first = &page_data[page_index].blocks[run.candidate.start_block];
-            let last = &page_data[page_index].blocks[run.candidate.end_block - 1];
+            let first = &scan.pages[page_index].blocks[run.candidate.start_block];
+            let last = &scan.pages[page_index].blocks[run.candidate.end_block - 1];
             occurrence_bytes =
                 occurrence_bytes.saturating_add(last.end.saturating_sub(first.start));
             generated_page_xobjects
-                .entry(page_data[page_index].page)
+                .entry(scan.pages[page_index].page)
                 .or_default()
                 .insert(run.name.clone());
         }
@@ -3273,6 +3358,7 @@ fn factor_processing_structural_forms(
     pages: &[ObjectHandle],
     pre_scanned: ProcessingFactorBlocks,
     flate_lengths: &mut VectorFlateLengthMemo,
+    shared_inventory: &mut SharedRunInventory,
 ) -> Result<(
     VectorCompactionStats,
     BTreeSet<ObjectHandle>,
@@ -3293,10 +3379,19 @@ fn factor_processing_structural_forms(
         pages,
         flate_lengths,
     )?;
-    let shared = factor_shared_q_prefix_runs(document, flate_level, pages, flate_lengths)?;
     let mut rewritten = path_rewritten;
     rewritten.extend(transformed.generated_page_xobjects.keys().copied());
-    rewritten.extend(shared.generated_page_xobjects.keys().copied());
+    shared_inventory.invalidate(&rewritten);
+    let shared = factor_shared_q_prefix_runs(
+        document,
+        flate_level,
+        pages,
+        flate_lengths,
+        shared_inventory,
+    )?;
+    let shared_rewritten = shared.generated_page_xobjects.keys().copied().collect();
+    shared_inventory.invalidate(&shared_rewritten);
+    rewritten.extend(shared_rewritten);
     // A rewritten stream invalidates its source offsets and block semantics.
     // All unchanged pages remain candidates for cross-page matches.
     for page in &rewritten {
@@ -3323,6 +3418,7 @@ fn close_processing_exact_factoring(
     pages: &[ObjectHandle],
     mut pre_scanned: ProcessingFactorBlocks,
     flate_lengths: &mut VectorFlateLengthMemo,
+    shared_inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     loop {
@@ -3332,6 +3428,7 @@ fn close_processing_exact_factoring(
             pages,
             pre_scanned,
             flate_lengths,
+            shared_inventory,
         )?;
         let changed = forms.path_forms_created != 0
             || forms.transformed_forms_created != 0
@@ -3361,6 +3458,7 @@ fn finish_processing_vector_compaction(
     flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
+    let mut shared_inventory = SharedRunInventory::default();
     for page in &vector_rewritten_pages {
         path_coordinate_plans.remove(page);
     }
@@ -3370,6 +3468,7 @@ fn finish_processing_vector_compaction(
         pages,
         pre_scanned_processing,
         &mut flate_state.lengths,
+        &mut shared_inventory,
     )?;
     for page in &factored_pages {
         path_coordinate_plans.remove(page);
@@ -3416,12 +3515,14 @@ fn finish_processing_vector_compaction(
         for page in &late_rewritten_pages {
             reusable_blocks.remove(page);
         }
+        shared_inventory.invalidate(&late_rewritten_pages);
         let closure = close_processing_exact_factoring(
             document,
             flate_level,
             pages,
             reusable_blocks,
             &mut flate_state.lengths,
+            &mut shared_inventory,
         )?;
         total.absorb(closure);
     }
@@ -3926,6 +4027,7 @@ mod tests {
         let mut cold = EditDocument::from_bytes(bytes)?;
         let pages = [3, 4, 5].map(|number| ObjectHandle::Existing(ObjectId::new(number, 0)));
 
+        let mut warm_shared = SharedRunInventory::default();
         let mut warm_lengths = VectorFlateLengthMemo::processing();
         let mut cold_lengths = VectorFlateLengthMemo::processing();
         let (warm_first, changed, reusable) = factor_processing_structural_forms(
@@ -3934,6 +4036,7 @@ mod tests {
             &pages,
             ProcessingFactorBlocks::new(),
             &mut warm_lengths,
+            &mut warm_shared,
         )?;
         let (cold_first, cold_changed, _) = factor_processing_structural_forms(
             &mut cold,
@@ -3941,6 +4044,7 @@ mod tests {
             &pages,
             ProcessingFactorBlocks::new(),
             &mut cold_lengths,
+            &mut SharedRunInventory::default(),
         )?;
         assert_eq!(warm_first, cold_first);
         assert_eq!(changed, cold_changed);
@@ -3957,6 +4061,7 @@ mod tests {
             &pages,
             reusable,
             &mut warm_lengths,
+            &mut warm_shared,
         )?;
         let (cold_second, cold_changed, _) = factor_processing_structural_forms(
             &mut cold,
@@ -3964,6 +4069,7 @@ mod tests {
             &pages,
             ProcessingFactorBlocks::new(),
             &mut cold_lengths,
+            &mut SharedRunInventory::default(),
         )?;
         assert_eq!(warm_second, cold_second);
         assert_eq!(warm_changed, cold_changed);
@@ -4451,14 +4557,70 @@ mod tests {
     }
 
     #[test]
+    fn shared_run_inventory_reuses_only_unchanged_pages() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>")?;
+        for (page, stream) in [(3, 6), (4, 7), (5, 8)] {
+            pdf.object(page, format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Occupied 9 0 R >> >> /Contents {stream} 0 R >>").as_bytes())?;
+        }
+        let body = b"q 0 0 m 1 1 l S Q ".repeat(4000);
+        pdf.stream(6, b"", &body)?;
+        pdf.stream(7, b"", &body)?;
+        pdf.stream(8, b"", b"q Q")?;
+        pdf.stream(9, b"/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b"q Q")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        let mut inventory = SharedRunInventory::default();
+        let first = inventory.scan(&document, &pages)?;
+        assert_eq!(first.pages.len(), 2);
+        assert_eq!(first.pages[0].page, pages[0]);
+        assert_eq!(first.pages[1].page, pages[1]);
+        assert_eq!(first.pages[0].occupied_names, [b"Occupied".to_vec()]);
+        assert_eq!(first.payloads.len(), 2);
+        let unchanged_payload = std::sync::Arc::clone(&first.payloads[&pages[1]]);
+        let unchanged_blocks = first.pages[1].blocks.as_ptr();
+        drop(first);
+        assert!(
+            inventory
+                .entries
+                .get(&pages[2])
+                .is_some_and(Option::is_none)
+        );
+        replace_page_content(&mut document, pages[0], b"q Q".to_vec())?;
+        replace_page_content(&mut document, pages[2], body)?;
+        inventory.invalidate(&BTreeSet::from([pages[0], pages[2]]));
+        let mut next = inventory.scan(&document, &pages)?;
+        assert_eq!(next.pages.len(), 2);
+        assert_eq!(next.pages[0].page, pages[1]);
+        assert_eq!(next.pages[1].page, pages[2]);
+        assert_eq!(next.payloads.len(), 1);
+        assert!(!next.payloads.contains_key(&pages[1]));
+        let candidate = SharedRunCandidate {
+            page_indices: vec![0, 1],
+            start_block: 0,
+            end_block: 1,
+            bounds: next.pages[0].bounds,
+        };
+        next.load_candidate_payloads(&document, &candidate)?;
+        assert!(std::sync::Arc::ptr_eq(
+            &unchanged_payload,
+            &next.payloads[&pages[1]]
+        ));
+        assert_eq!(unchanged_blocks, next.pages[0].blocks.as_ptr());
+        Ok(())
+    }
+
+    #[test]
     fn shared_run_collision_proof_checks_exact_bytes_and_resource_identity() -> Result<()> {
         let targets = SharedResourceTargets::default();
         let first = b"q 0 0 m 1 1 l S Q";
         let second = b"q 0 0 m 2 2 l S Q";
         let make_page = |number, input: &[u8]| SharedPageData {
             page: ObjectHandle::Existing(ObjectId::new(number, 0)),
-            decoded: input.to_vec().into(),
             blocks: factorable_shared_q_blocks(input, &targets),
+            occupied_names: Vec::new(),
             bounds: Rect {
                 x0: 0.0,
                 y0: 0.0,
@@ -4466,8 +4628,10 @@ mod tests {
                 y1: 10.0,
             },
         };
-        let first = make_page(1, first);
-        let mut second = make_page(2, second);
+        let first_bytes = first;
+        let second_bytes = second;
+        let first = make_page(1, first_bytes);
+        let mut second = make_page(2, second_bytes);
         second.blocks[0].digest = first.blocks[0].digest;
         let candidate = SharedRunCandidate {
             page_indices: vec![0, 1],
@@ -4475,10 +4639,22 @@ mod tests {
             end_block: 1,
             bounds: first.bounds,
         };
-        let (body, resources) = shared_run_body(&first, &candidate)
+        let (body, resources) = shared_run_body(&first, first_bytes, &candidate)
             .ok_or_else(|| crate::Error::Invalid("shared run fixture".into()))?;
-        assert!(shared_run_matches(&first, &candidate, &body, &resources));
-        assert!(!shared_run_matches(&second, &candidate, &body, &resources));
+        assert!(shared_run_matches(
+            &first,
+            first_bytes,
+            &candidate,
+            &body,
+            &resources
+        ));
+        assert!(!shared_run_matches(
+            &second,
+            second_bytes,
+            &candidate,
+            &body,
+            &resources
+        ));
         Ok(())
     }
 
@@ -4495,11 +4671,11 @@ mod tests {
         let pages = [1, 2].map(|number| SharedPageData {
             page: ObjectHandle::Existing(ObjectId::new(number, 0)),
             blocks: factorable_shared_q_blocks(&input, &targets),
-            decoded: input.clone().into(),
             bounds,
+            occupied_names: Vec::new(),
         });
         assert_eq!(pages[0].blocks.len(), 20_000);
-        let candidates = collect_shared_run_candidates(&pages);
+        let candidates = collect_shared_run_candidates(&pages.iter().collect::<Vec<_>>());
         assert_eq!(candidates.len(), 20_000);
         for (i, candidate) in candidates.iter().enumerate() {
             assert_eq!(candidate.page_indices, [0, 1]);
