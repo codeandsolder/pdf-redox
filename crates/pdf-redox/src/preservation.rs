@@ -1,4 +1,7 @@
-use crate::direct_object::{DirectPathStep, object_at_direct_path_mut, value_at_direct_path};
+use crate::direct_object::{
+    DirectDictionaryView, DirectObjectVisitor, DirectPathStep, DirectWalkControl,
+    object_at_direct_path_mut, value_at_direct_path, walk_direct_output_objects,
+};
 use crate::geometry::{Matrix, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
@@ -467,91 +470,72 @@ const fn keep_catalog_key(key: &[u8], policy: &PreservationConfig) -> bool {
     }
 }
 
-fn collect_direct_key_removals(
-    root: CowObjectHandle,
-    object: &OwnedObject,
-    path: &mut Vec<DirectPathStep>,
-    removable_key: &[u8],
-    removals: &mut BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
-) {
-    match object {
-        OwnedObject::Dictionary(dictionary) | OwnedObject::Stream { dictionary, .. } => {
-            if dictionary.contains_key(removable_key) {
-                removals
-                    .entry(PreservationDictionaryTarget {
-                        root,
-                        path: path.clone(),
-                    })
-                    .or_default()
-                    .insert(removable_key.to_vec());
+struct AuthoringRemovalVisitor {
+    key: &'static [u8],
+    removals: BTreeMap<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>,
+}
+
+impl DirectObjectVisitor for AuthoringRemovalVisitor {
+    fn visit_dictionary(
+        &mut self,
+        document: &EditDocument,
+        root: CowObjectHandle,
+        path: &[DirectPathStep],
+        dictionary: DirectDictionaryView<'_, '_>,
+    ) -> Result<DirectWalkControl> {
+        let remove_key = dictionary.raw_value(self.key).is_some();
+        let remove_modified = self.key == b"Metadata"
+            && path.is_empty()
+            && dictionary.raw_value(b"LastModified").is_some()
+            && document.stream_subtype_is(root, b"Form")?;
+        if remove_key || remove_modified {
+            let keys = self
+                .removals
+                .entry(PreservationDictionaryTarget {
+                    root,
+                    path: path.to_vec(),
+                })
+                .or_default();
+            if remove_key {
+                keys.insert(self.key.to_vec());
             }
-            for (key, value) in dictionary {
-                if key.as_slice() == removable_key || matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::DictKey(key.clone()));
-                collect_direct_key_removals(root, value, path, removable_key, removals);
-                path.pop();
-            }
-        }
-        OwnedObject::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                if matches!(value, OwnedObject::Reference(_)) {
-                    continue;
-                }
-                path.push(DirectPathStep::ArrayIndex(index));
-                collect_direct_key_removals(root, value, path, removable_key, removals);
-                path.pop();
+            if remove_modified {
+                keys.insert(b"LastModified".to_vec());
             }
         }
-        OwnedObject::Reference(_)
-        | OwnedObject::Null
-        | OwnedObject::Boolean(_)
-        | OwnedObject::Integer(_)
-        | OwnedObject::Real(_)
-        | OwnedObject::Name(_)
-        | OwnedObject::String(_) => {}
+        Ok(DirectWalkControl::Descend)
     }
+
+    fn visit_source_stream_length(&self) -> bool {
+        false
+    }
+
+    fn descend_dictionary_value(&self, key: &[u8]) -> bool {
+        key != self.key
+    }
+}
+
+fn drop_authoring_key(
+    document: &mut EditDocument,
+    key: &'static [u8],
+    stats: &mut PreservationStats,
+) -> Result<()> {
+    // Discover against the original reachable graph before editing. A removed
+    // direct subtree is skipped, but independently reachable indirect targets
+    // remain separate roots, preserving the existing removal counts.
+    let mut visitor = AuthoringRemovalVisitor {
+        key,
+        removals: BTreeMap::new(),
+    };
+    walk_direct_output_objects(document, &mut visitor)?;
+    apply_authoring_removals(document, visitor.removals, stats)
 }
 
 fn drop_authoring_metadata(
     document: &mut EditDocument,
     stats: &mut PreservationStats,
 ) -> Result<()> {
-    // Discover every removable authoring-metadata key in one reachability walk.
-    // Recurse only through direct dictionaries/arrays; referenced objects are
-    // visited separately as roots, so discovery cannot follow graph cycles.
-    let mut removals = BTreeMap::<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>::new();
-    for root in document.reachable_output_objects()? {
-        let Some(snapshot) = document.current_owned_object(root)? else {
-            continue;
-        };
-        collect_direct_key_removals(root, &snapshot, &mut Vec::new(), b"Metadata", &mut removals);
-
-        let Some(dictionary) = snapshot.as_dictionary() else {
-            continue;
-        };
-        let is_form = matches!(snapshot, OwnedObject::Stream { .. })
-            && match dictionary.get(b"Subtype".as_slice()) {
-                Some(value) => matches!(
-                    document.resolve_owned_value(value)?,
-                    Some(OwnedObject::Name(name)) if name == b"Form"
-                ),
-                None => false,
-            };
-        if is_form {
-            let target = PreservationDictionaryTarget {
-                root,
-                path: Vec::new(),
-            };
-            let key = b"LastModified".as_slice();
-            if dictionary.contains_key(key) {
-                removals.entry(target).or_default().insert(key.to_vec());
-            }
-        }
-    }
-
-    apply_authoring_removals(document, removals, stats)
+    drop_authoring_key(document, b"Metadata", stats)
 }
 
 fn apply_authoring_removals(
@@ -584,20 +568,7 @@ pub fn drop_private_authoring_data(
     document: &mut EditDocument,
     stats: &mut PreservationStats,
 ) -> Result<()> {
-    let mut removals = BTreeMap::<PreservationDictionaryTarget, BTreeSet<Vec<u8>>>::new();
-    for root in document.reachable_output_objects()? {
-        let Some(snapshot) = document.current_owned_object(root)? else {
-            continue;
-        };
-        collect_direct_key_removals(
-            root,
-            &snapshot,
-            &mut Vec::new(),
-            b"PieceInfo",
-            &mut removals,
-        );
-    }
-    apply_authoring_removals(document, removals, stats)
+    drop_authoring_key(document, b"PieceInfo", stats)
 }
 
 fn prune_dictionary_target(
@@ -1580,6 +1551,68 @@ mod tests {
         assert_eq!(
             inherited_page_value(&document, &cycle_target, b"Rotate")?,
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authoring_removals_walk_source_and_overlay_without_editing_unaffected_roots() -> Result<()> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Extra [4 0 R 5 0 R 6 0 R 7 0 R 9 0 R] >>",
+        )?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+        pdf.stream(4, b"/Subtype 8 0 R /LastModified (old) /Nested [<< /Metadata << /Metadata true >> /PieceInfo << /PieceInfo true >> >>] /Metadata 9 0 R", b"q Q")?;
+        pdf.object(
+            5,
+            b"<< /Subtype /Form /LastModified (keep) /Nested << /LastModified (keep) >> >>",
+        )?;
+        pdf.stream(
+            6,
+            b"/Subtype /Image /LastModified (keep) /Metadata null",
+            &[0],
+        )?;
+        pdf.object(7, b"<< /PieceInfo 9 0 R >>")?;
+        pdf.object(8, b"/Form")?;
+        pdf.object(9, b"<< /Metadata true /PieceInfo true >>")?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let handle = |number| CowObjectHandle::Existing(crate::ObjectId::new(number, 0));
+        // Force one source dictionary into the overlay and add a reachable new root.
+        let new = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([
+                (b"Metadata".to_vec(), OwnedObject::Null),
+                (b"PieceInfo".to_vec(), OwnedObject::Null),
+            ]),
+        )));
+        document
+            .edit_handle(handle(7))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing dictionary".to_owned()))?
+            .insert(b"Extra".to_vec(), OwnedObject::Reference(new));
+
+        let mut stats = PreservationStats::default();
+        drop_private_authoring_data(&mut document, &mut stats)?;
+        drop_authoring_metadata(&mut document, &mut stats)?;
+        assert_eq!(stats.dropped_authoring_keys.get("/PieceInfo"), Some(&4));
+        assert_eq!(stats.dropped_authoring_keys.get("/Metadata"), Some(&5));
+        assert_eq!(stats.dropped_authoring_keys.get("/LastModified"), Some(&1));
+        assert!(matches!(
+            document.current_value(handle(5))?,
+            Some(CurrentValue::Source(..))
+        ));
+        for number in [5, 6] {
+            assert!(
+                document
+                    .current_value(handle(number))?
+                    .is_some_and(|value| value.dictionary_entry(b"LastModified").is_some())
+            );
+        }
+        assert!(
+            document
+                .current_value(handle(4))?
+                .is_some_and(|value| value.dictionary_entry(b"LastModified").is_none())
         );
         Ok(())
     }
