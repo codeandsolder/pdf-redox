@@ -3308,7 +3308,11 @@ fn canonicalize_page_path_coordinates(
             continue;
         };
         let mut decoded = Vec::new();
-        decoded_content_value(document, contents, &mut decoded)?;
+        decoded_content_value(
+            document,
+            crate::source::CurrentValue::Owned(contents),
+            &mut decoded,
+        )?;
         let cached = (!rewritten_pages.contains(&page))
             .then(|| pre_scanned.remove(&page))
             .flatten();

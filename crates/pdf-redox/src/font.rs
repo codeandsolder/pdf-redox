@@ -793,7 +793,9 @@ fn cid_to_gid_mapping(
 
     let decoded = match value {
         OwnedObject::Reference(handle) => document.decoded_stream_data(*handle),
-        OwnedObject::Stream { .. } => document.decoded_owned_stream_data(value),
+        OwnedObject::Stream { .. } => {
+            document.decoded_stream_value(&crate::source::CurrentValue::Owned(value))
+        }
         _ => return Ok(None),
     };
     let Ok(decoded) = decoded else {
@@ -1640,7 +1642,9 @@ fn scan_type3_charproc_font_usage(
                 poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
                 break;
             };
-            let Ok(content) = document.decoded_content_stream_value(&stream) else {
+            let Ok(content) =
+                document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
+            else {
                 poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
                 break;
             };

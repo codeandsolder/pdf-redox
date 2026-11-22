@@ -1952,7 +1952,8 @@ fn decode_mask_stream(
     if !matches!(bpc, 1 | 2 | 4 | 8) {
         return Ok(None);
     }
-    let decoded = match document.decoded_owned_stream_data(&stream) {
+    let decoded = match document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
+    {
         Ok(decoded) => decoded,
         Err(error) => {
             if *DEBUG_RASTER {
@@ -2068,10 +2069,12 @@ fn indexed_palette(
     };
     let bytes = match lookup {
         OwnedObject::String(bytes) => bytes,
-        OwnedObject::Stream { .. } => match document.decoded_owned_stream_data(&lookup) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(None),
-        },
+        OwnedObject::Stream { .. } => {
+            match document.decoded_stream_value(&crate::source::CurrentValue::Owned(&lookup)) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None),
+            }
+        }
         _ => return Ok(None),
     };
     let needed = usize::from(hival)
@@ -2429,15 +2432,16 @@ fn image_info(
     if bpc != 8 && !indexed && !device_gray {
         return Ok(None);
     }
-    let raw_decoded = match document.decoded_owned_stream_data(&object) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            if *DEBUG_RASTER {
-                eprintln!("raster-layout: skipping undecodable image {handle:?}: {error}");
+    let raw_decoded =
+        match document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object)) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                if *DEBUG_RASTER {
+                    eprintln!("raster-layout: skipping undecodable image {handle:?}: {error}");
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-    };
+        };
     let mut decoded = if (indexed || device_gray) && bpc != 8 {
         let Some(samples) = unpack_packed_samples(&raw_decoded, width, height, bpc) else {
             return Ok(None);

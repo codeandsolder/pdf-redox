@@ -1,4 +1,4 @@
-use crate::stream_codec::decode_stream;
+use crate::stream_codec::InlineFilterConfiguration;
 use crate::{Error, Result, SourceLoadError};
 use hayro_syntax::{
     Pdf, PdfVersion,
@@ -643,6 +643,20 @@ impl<'a> CurrentValue<'a> {
         )
     }
 
+    pub fn contains_indirect_reference(&self) -> bool {
+        self.reference().is_some()
+            || current_descendants(self.children(false), false)
+                .any(|value| value.reference().is_some())
+    }
+
+    pub fn stream_bytes(&self, source: &'a SourcePdf) -> Result<Cow<'a, [u8]>> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::Stream(stream)), _) => Ok(stream.raw_data()),
+            Self::Owned(OwnedObject::Stream { data, .. }) => data.bytes(source),
+            _ => Err(Error::Invalid("object is not a stream".to_owned())),
+        }
+    }
+
     pub fn dictionary_entry(&self, key: &[u8]) -> Option<Self> {
         match self {
             Self::Source(MaybeRef::NotRef(Object::Dict(dictionary)), _) => dictionary
@@ -747,6 +761,14 @@ impl<'a> CurrentValue<'a> {
         match self {
             Self::Source(MaybeRef::NotRef(Object::Name(name)), _) => Some(name.as_ref()),
             Self::Owned(OwnedObject::Name(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn string(&self) -> Option<&[u8]> {
+        match self {
+            Self::Source(MaybeRef::NotRef(Object::String(value)), _) => Some(value.as_bytes()),
+            Self::Owned(OwnedObject::String(value)) => Some(value),
             _ => None,
         }
     }
@@ -934,28 +956,6 @@ fn current_descendants<'a>(
     })
 }
 
-fn contains_indirect_reference(value: &OwnedObject) -> bool {
-    let root = CurrentValue::Owned(value);
-    root.reference().is_some()
-        || current_descendants(root.children(false), false).any(|value| value.reference().is_some())
-}
-
-fn stream_filter_configuration_is_direct(stream: &OwnedObject) -> bool {
-    let OwnedObject::Stream { dictionary, .. } = stream else {
-        return false;
-    };
-    [
-        b"Filter".as_slice(),
-        b"DecodeParms".as_slice(),
-        b"F".as_slice(),
-        b"FFilter".as_slice(),
-        b"FDecodeParms".as_slice(),
-    ]
-    .into_iter()
-    .filter_map(|key| dictionary.get(key))
-    .all(|value| !contains_indirect_reference(value))
-}
-
 const MAX_DECODED_CONTENT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_CONTENT_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1045,7 +1045,7 @@ impl DecodedContentCache {
 pub enum ContentRead<'a> {
     Decoded(Vec<u8>),
     Cached(Arc<[u8]>),
-    Other(Cow<'a, OwnedObject>),
+    Other(CurrentValue<'a>),
 }
 
 struct ReachableOutputCache {
@@ -1283,45 +1283,26 @@ impl EditDocument {
         }
     }
 
-    /// Materialize the current value of an object handle from either the source
-    /// graph or the COW overlay without mutating the document.
-    /// Decode a current stream value through Hayro's standalone filter codecs.
-    ///
-    /// Only filter-related dictionary entries are materialized into the
-    /// detached helper object. Decoding does not need resources, metadata, or
-    /// other semantic stream keys, and avoiding them prevents unrelated COS
-    /// cycles/deep graphs from being copied merely to inflate a stream.
-    pub(crate) fn decoded_owned_stream_data(&self, stream: &OwnedObject) -> Result<Vec<u8>> {
-        let OwnedObject::Stream { dictionary, data } = stream else {
-            return Err(Error::Invalid("object is not a stream".to_owned()));
-        };
-        let bytes = data.bytes(self.source())?;
-        decode_stream(self, dictionary, bytes.as_ref())
-    }
-
-    /// Decode page/Form content while accepting codec warnings that preserve
-    /// usable output. Runtime codec errors and unsupported filter chains remain fatal.
-    pub(crate) fn decoded_content_stream_value(&self, stream: &OwnedObject) -> Result<Vec<u8>> {
-        let OwnedObject::Stream { dictionary, data } = stream else {
-            return Err(Error::Invalid("object is not a stream".to_owned()));
-        };
-        let bytes = data.bytes(self.source())?;
-        decode_stream(self, dictionary, bytes.as_ref())
+    /// Decode a source or overlay stream through the current filter graph.
+    /// Read only the filter configuration and encoded payload.
+    pub(crate) fn decoded_stream_value(&self, stream: &CurrentValue<'_>) -> Result<Vec<u8>> {
+        let configuration = InlineFilterConfiguration::from_stream(stream)?;
+        configuration.decode(self, stream.stream_bytes(self.source())?)
     }
 
     /// Decode a current indirect stream through the standalone filter-codec bridge.
     pub(crate) fn decoded_stream_data(&self, handle: ObjectHandle) -> Result<Vec<u8>> {
-        let Some(stream) = self.current_owned_object_cow(handle)? else {
+        let Some(stream) = self.current_value(handle)? else {
             return Err(Error::Invalid(
                 "stream reference resolves to null".to_owned(),
             ));
         };
-        self.decoded_owned_stream_data(&stream)
+        self.decoded_stream_value(&stream)
     }
 
     /// Resolve a page/Form content reference, decoding streams in one pass.
     ///
-    /// Cache lookup precedes source object materialization. A cache entry was
+    /// Cache lookup precedes source object inspection. A cache entry was
     /// inserted only for an immutable source stream with direct filter values;
     /// references into the mutable overlay are deliberately never cached.
     pub(crate) fn content_read(&self, handle: ObjectHandle) -> Result<Option<ContentRead<'_>>> {
@@ -1335,16 +1316,16 @@ impl EditDocument {
             return Ok(Some(ContentRead::Cached(decoded)));
         }
 
-        let Some(object) = self.current_owned_object_cow(handle)? else {
+        let Some(object) = self.current_value(handle)? else {
             return Ok(None);
         };
-        if !matches!(object.as_ref(), OwnedObject::Stream { .. }) {
+        if !object.is_stream() {
             return Ok(Some(ContentRead::Other(object)));
         }
 
-        let cache_id =
-            unchanged_source_id.filter(|_| stream_filter_configuration_is_direct(&object));
-        let decoded = self.decoded_content_stream_value(&object)?;
+        let configuration = InlineFilterConfiguration::from_stream(&object)?;
+        let cache_id = unchanged_source_id.filter(|_| configuration.is_direct());
+        let decoded = configuration.decode(self, object.stream_bytes(self.source())?)?;
         if let Some(id) = cache_id
             && decoded.len() <= MAX_DECODED_CONTENT_STREAM_BYTES
         {
@@ -2418,7 +2399,10 @@ mod tests {
             )]),
             data: StreamData::Owned(vec![0x78, 0x9c, 0x4b, 0x04]),
         };
-        assert_eq!(document.decoded_content_stream_value(&stream)?, b"a");
+        assert_eq!(
+            document.decoded_stream_value(&CurrentValue::Owned(&stream))?,
+            b"a"
+        );
         Ok(())
     }
 
@@ -2512,7 +2496,7 @@ mod tests {
         for _ in 0..20_000 {
             nested = OwnedObject::Array(vec![nested]);
         }
-        assert!(contains_indirect_reference(&nested));
+        assert!(CurrentValue::Owned(&nested).contains_indirect_reference());
         assert_eq!(nested.references(), vec![target]);
 
         // Iteratively dismantle the test fixture too: recursively dropping a
@@ -2528,7 +2512,7 @@ mod tests {
         for _ in 0..20_000 {
             no_reference = OwnedObject::Array(vec![no_reference]);
         }
-        assert!(!contains_indirect_reference(&no_reference));
+        assert!(!CurrentValue::Owned(&no_reference).contains_indirect_reference());
         assert_eq!(no_reference.references(), Vec::<ObjectHandle>::new());
         while let OwnedObject::Array(mut values) = no_reference {
             let Some(child) = values.pop() else {
@@ -2539,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_reference_walk_only_skips_stream_length_in_graph_collection() {
+    fn owned_reference_walk_only_skips_stream_length_in_graph_collection() -> Result<()> {
         let length = ObjectHandle::Existing(ObjectId::new(41, 0));
         let nested = ObjectHandle::Existing(ObjectId::new(42, 0));
 
@@ -2558,9 +2542,11 @@ mod tests {
 
         // Filter eligibility inspects all descendant entries, including
         // /Length, whereas graph traversal excludes only stream /Length.
-        assert!(contains_indirect_reference(&stream));
+        assert!(CurrentValue::Owned(&stream).contains_indirect_reference());
         assert_eq!(stream.references(), vec![nested]);
-        assert!(!stream_filter_configuration_is_direct(&stream));
+        assert!(
+            !InlineFilterConfiguration::from_stream(&CurrentValue::Owned(&stream))?.is_direct()
+        );
 
         let mut direct_dict = OwnedDictionary::new();
         direct_dict.insert(
@@ -2571,9 +2557,10 @@ mod tests {
             dictionary: direct_dict,
             data: StreamData::Owned(Vec::new()),
         };
-        assert!(stream_filter_configuration_is_direct(&direct));
-        assert!(!contains_indirect_reference(&direct));
+        assert!(InlineFilterConfiguration::from_stream(&CurrentValue::Owned(&direct))?.is_direct());
+        assert!(!CurrentValue::Owned(&direct).contains_indirect_reference());
         assert_eq!(direct.references(), Vec::<ObjectHandle>::new());
+        Ok(())
     }
 
     #[test]

@@ -1483,7 +1483,7 @@ impl ObjectAnalysisAccumulator {
             || (self.deep && (is_form || filter == "/FlateDecode"))
             || is_content_density_form
         {
-            match document.decoded_owned_stream_data(object) {
+            match document.decoded_stream_value(&crate::source::CurrentValue::Owned(object)) {
                 Ok(decoded) => Some(decoded),
                 Err(error) => {
                     if is_content_density_form && self.form_content_analysis_error.is_none() {
@@ -1630,7 +1630,9 @@ impl ObjectAnalysisAccumulator {
                 continue;
             }
             let raw = raw_stream_bytes(document, &object)?;
-            let decoded = document.decoded_owned_stream_data(&object).ok();
+            let decoded = document
+                .decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
+                .ok();
             record_font_program_payload(
                 raw.as_ref(),
                 decoded.as_deref(),
@@ -1661,7 +1663,9 @@ impl ObjectAnalysisAccumulator {
             let Some(object) = document.current_owned_object(handle)? else {
                 continue;
             };
-            if let Ok(decoded) = document.decoded_owned_stream_data(&object) {
+            if let Ok(decoded) =
+                document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
+            {
                 record_font_file2_opportunity(
                     &decoded,
                     &mut self.font_sparse_skeletons,

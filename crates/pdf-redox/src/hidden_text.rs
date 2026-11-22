@@ -1604,7 +1604,8 @@ fn font_info(document: &EditDocument, font: &OwnedDictionary) -> Result<FontInfo
     if let Some(to_unicode) = font.get(b"ToUnicode".as_slice())
         && let Some(stream) = document.resolve_owned_value(to_unicode)?
         && matches!(stream, OwnedObject::Stream { .. })
-        && let Ok(data) = document.decoded_owned_stream_data(&stream)
+        && let Ok(data) =
+            document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
     {
         info.unicode = parse_to_unicode(&data);
         if let Some(max) = info.unicode.keys().map(Vec::len).max() {

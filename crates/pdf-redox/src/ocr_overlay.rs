@@ -427,7 +427,11 @@ pub fn apply_ocr_overlay(
         };
         let mut decoded = Vec::new();
         if let Some(contents) = dict.get(b"Contents".as_slice()) {
-            decoded_content_value(&doc, contents, &mut decoded)?;
+            decoded_content_value(
+                &doc,
+                crate::source::CurrentValue::Owned(contents),
+                &mut decoded,
+            )?;
         }
         // Insert before original painting so overlays inherit neither the
         // source's potentially unbalanced CTM nor its text rendering mode.
