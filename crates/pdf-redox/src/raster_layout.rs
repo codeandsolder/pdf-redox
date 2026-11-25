@@ -4566,7 +4566,8 @@ enum NativeFragmentAxis {
 }
 
 fn native_fragment_axis_roles(
-    info: &SampleImage,
+    width: u32,
+    height: u32,
     config: &RasterLayoutConfig,
 ) -> [(Option<NativeFragmentAxis>, bool, bool); 2] {
     let short_max = u32::from(config.pixel_cluster_max_source_dimension);
@@ -4576,10 +4577,10 @@ fn native_fragment_axis_roles(
     // larger multi-row/multi-column raster at the same physical pixel pitch may
     // anchor and bridge the component: these are often the intact regions on
     // either side of a scanline that a broken producer exploded into tiny runs.
-    let horizontal_fragment_shape = info.height <= short_max;
-    let vertical_fragment_shape = info.width <= short_max;
-    let horizontal_anchor = info.width >= anchor_min;
-    let vertical_anchor = info.height >= anchor_min;
+    let horizontal_fragment_shape = height <= short_max;
+    let vertical_fragment_shape = width <= short_max;
+    let horizontal_anchor = width >= anchor_min;
+    let vertical_anchor = height >= anchor_min;
     let horizontal =
         (horizontal_fragment_shape || horizontal_anchor).then_some(NativeFragmentAxis::Horizontal);
     let vertical =
@@ -4587,12 +4588,12 @@ fn native_fragment_axis_roles(
     [
         (
             horizontal,
-            horizontal_fragment_shape && info.width <= fragment_max,
+            horizontal_fragment_shape && width <= fragment_max,
             horizontal_anchor,
         ),
         (
             vertical,
-            vertical_fragment_shape && info.height <= fragment_max,
+            vertical_fragment_shape && height <= fragment_max,
             vertical_anchor,
         ),
     ]
@@ -4650,7 +4651,9 @@ fn find_native_fragment_plans(
         let Some(pitch) = native_pixel_pitch(draw, info) else {
             continue;
         };
-        for (axis, is_fragment, is_anchor) in native_fragment_axis_roles(info, config) {
+        for (axis, is_fragment, is_anchor) in
+            native_fragment_axis_roles(info.width, info.height, config)
+        {
             let Some(axis) = axis else {
                 continue;
             };
@@ -5925,6 +5928,136 @@ struct MergePlanContext<'a> {
     user_unit: f64,
 }
 
+/// Metadata-only necessary conditions for the pixel-consuming planners.
+#[derive(Clone, Copy)]
+struct MaterializationShape {
+    width: u32,
+    height: u32,
+    masked: bool,
+}
+
+fn materialization_shape(
+    document: &EditDocument,
+    handle: ObjectHandle,
+) -> Option<MaterializationShape> {
+    let object = document.current_owned_object_cow(handle).ok()??;
+    let dictionary = object.as_dictionary()?;
+    let (width, height) = dimensions(document, dictionary).ok()??;
+    let masked = resolved_non_null(document, dictionary.get(b"SMask".as_slice())).ok()?
+        || resolved_non_null(document, dictionary.get(b"Mask".as_slice())).ok()?;
+    Some(MaterializationShape {
+        width,
+        height,
+        masked,
+    })
+}
+
+fn may_link_stripe(
+    a: &RasterDraw,
+    b: &RasterDraw,
+    left: MaterializationShape,
+    right: Option<MaterializationShape>,
+) -> bool {
+    if a.epoch != b.epoch
+        || a.paint_generation != b.paint_generation
+        || a.gs_name != b.gs_name
+        || a.rendering_intent != b.rendering_intent
+    {
+        return false;
+    }
+    if left.width <= 5 && left.height <= 5 {
+        return false;
+    }
+    let vertical = u64::from(left.height) * 2 <= u64::from(left.width);
+    let horizontal = u64::from(left.width) * 2 <= u64::from(left.height);
+    right.map_or(vertical || horizontal, |right| {
+        if right.width <= 5 && right.height <= 5 {
+            return false;
+        }
+        (vertical
+            && left.width == right.width
+            && u64::from(right.height) * 2 <= u64::from(right.width))
+            || (horizontal
+                && left.height == right.height
+                && u64::from(right.width) * 2 <= u64::from(right.height))
+    })
+}
+
+fn materialization_candidates(
+    document: &EditDocument,
+    target: ContentTarget,
+    draws: &[RasterDraw],
+    used: &HashSet<usize>,
+    config: &RasterLayoutConfig,
+) -> HashSet<ObjectHandle> {
+    let mut shapes = HashMap::new();
+    for (index, draw) in draws.iter().enumerate() {
+        if !used.contains(&index) {
+            shapes
+                .entry(draw.target)
+                .or_insert_with(|| materialization_shape(document, draw.target));
+        }
+    }
+    let native = config.reconstruct_pixel_clusters && matches!(target, ContentTarget::Page(_));
+    let mut fragments = [0usize; 2];
+    if native {
+        for (index, draw) in draws.iter().enumerate() {
+            if used.contains(&index) {
+                continue;
+            }
+            let Some(shape) = shapes[&draw.target] else {
+                // An unresolved shape cannot rule out any planner.
+                fragments[0] += 1;
+                fragments[1] += 1;
+                continue;
+            };
+            for (axis, (_, fragment, _)) in
+                native_fragment_axis_roles(shape.width, shape.height, config)
+                    .into_iter()
+                    .enumerate()
+            {
+                fragments[axis] += usize::from(fragment);
+            }
+        }
+    }
+    let short_max = u32::from(config.pixel_cluster_max_source_dimension);
+    let mut candidates = HashSet::new();
+    for (index, draw) in draws.iter().enumerate() {
+        if used.contains(&index) || candidates.contains(&draw.target) {
+            continue;
+        }
+        let Some(shape) = shapes[&draw.target] else {
+            candidates.insert(draw.target);
+            continue;
+        };
+        // Preserve all possible alpha/stencil candidates and all tiny tile
+        // accounting. A large ordinary image must participate in a stripe
+        // or an anchored native-fragment component to require its pixels.
+        let tiny = shape.width <= short_max && shape.height <= short_max;
+        let native_candidate = native
+            && native_fragment_axis_roles(shape.width, shape.height, config)
+                .into_iter()
+                .enumerate()
+                .any(|(axis, (role, _, _))| {
+                    role.is_some() && fragments[axis] >= config.pixel_cluster_min_paints.max(1)
+                });
+        let stripe_candidate = config.merge_stripes
+            && [index.checked_sub(1), index.checked_add(1)]
+                .into_iter()
+                .flatten()
+                .any(|neighbor| {
+                    draws.get(neighbor).is_some_and(|other| {
+                        !used.contains(&neighbor)
+                            && may_link_stripe(draw, other, shape, shapes[&other.target])
+                    })
+                });
+        if shape.masked || tiny || native_candidate || stripe_candidate {
+            candidates.insert(draw.target);
+        }
+    }
+    candidates
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "candidate discovery coordinates several mutually exclusive reconstruction strategies over shared scanner state"
@@ -5965,8 +6098,16 @@ fn build_merge_plans_for_scanner(
 
     let image_materialize_started = Instant::now();
     let mut infos = HashMap::new();
+    let candidates = enough_for_merge.then(|| {
+        materialization_candidates(document, target, &scanner.draws, initial_used, config)
+    });
     for (index, draw) in scanner.draws.iter().enumerate() {
-        if initial_used.contains(&index) || infos.contains_key(&draw.target) {
+        if initial_used.contains(&index)
+            || infos.contains_key(&draw.target)
+            || candidates
+                .as_ref()
+                .is_some_and(|candidates| !candidates.contains(&draw.target))
+        {
             continue;
         }
         if !enough_for_merge && config.crop_transparent {
