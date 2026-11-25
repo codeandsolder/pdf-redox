@@ -1,7 +1,11 @@
-use crate::{EditDocument, OwnedDictionary, OwnedObject, Result, StreamData};
+use crate::{
+    EditDocument, ObjectHandle, OwnedDictionary, OwnedObject, Result, StreamData,
+    stream_codec::FlateBatchEncoder,
+};
 use libjpeg_turbo_rs::{
     MarkerCopyMode, TransformOp, TransformOptions, transform_jpeg_with_options,
 };
+use std::borrow::Cow;
 
 const MIN_JPEG_BYTES: usize = 1024;
 
@@ -146,7 +150,7 @@ fn restore_source_app_com_markers(source: &[u8], transformed: &[u8]) -> Option<V
     None
 }
 
-pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
+fn transform_entropy(data: &[u8]) -> Option<Vec<u8>> {
     let optimized = transform_jpeg_with_options(
         data,
         &TransformOptions {
@@ -159,8 +163,10 @@ pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
         },
     )
     .ok()?;
-    let optimized = restore_source_app_com_markers(data, &optimized)?;
+    restore_source_app_com_markers(data, &optimized)
+}
 
+fn verify_pixels(data: &[u8], optimized: Vec<u8>) -> Option<Vec<u8>> {
     // libjpeg-turbo-rs's coefficient reader accepts some entropy streams that
     // Hayro's DCT compatibility path rejects. Require the before/after JPEGs
     // to decode through the Hayro DCT pipeline and to produce the
@@ -170,52 +176,124 @@ pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     (before == after).then_some(optimized)
 }
 
+pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    verify_pixels(data, transform_entropy(data)?)
+}
+
+fn meets_savings(original: usize, optimized: usize, min_bytes: usize, min_percent: u8) -> bool {
+    let saving = original.saturating_sub(optimized);
+    saving != 0
+        && saving >= min_bytes
+        && saving.saturating_mul(100) >= original.saturating_mul(usize::from(min_percent))
+}
+
+struct JpegJob<'a> {
+    handle: ObjectHandle,
+    raw: Cow<'a, [u8]>,
+    result: Option<Vec<u8>>,
+}
+
+impl JpegJob<'_> {
+    fn run(&mut self, min_bytes: usize, min_percent: u8) {
+        let Some(optimized) = transform_entropy(&self.raw) else {
+            return;
+        };
+        // No pixel decoding is needed for a candidate that cannot be
+        // accepted. Preserve the exact previous pixel validation for winners.
+        if meets_savings(self.raw.len(), optimized.len(), min_bytes, min_percent) {
+            self.result = verify_pixels(&self.raw, optimized);
+        }
+    }
+}
+
+fn collect_jpeg_job(document: &EditDocument, handle: ObjectHandle) -> Result<Option<JpegJob<'_>>> {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
+        return Ok(None);
+    };
+    let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
+        return Ok(None);
+    };
+    if !is_safe_lone_dct(document, dictionary)? {
+        return Ok(None);
+    }
+    drop(object);
+    let Some(stream) = document.current_value(handle)? else {
+        return Ok(None);
+    };
+    let raw = stream.stream_bytes(document.source())?;
+    if raw.len() < MIN_JPEG_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(JpegJob {
+        handle,
+        raw,
+        result: None,
+    }))
+}
+
+fn run_jpeg_jobs(
+    document: &EditDocument,
+    handles: &mut impl Iterator<Item = ObjectHandle>,
+    min_bytes: usize,
+    min_percent: u8,
+    workers: &FlateBatchEncoder,
+    stats: &mut JpegEntropyStats,
+) -> Result<Vec<(ObjectHandle, usize, Vec<u8>)>> {
+    const MAX_OWNED_BYTES: usize = 32 * 1024 * 1024;
+    let mut jobs = Vec::new();
+    let mut retained = 0usize;
+    for handle in handles {
+        let Some(job) = collect_jpeg_job(document, handle)? else {
+            continue;
+        };
+        if let Cow::Owned(bytes) = &job.raw {
+            retained = retained.saturating_add(bytes.capacity());
+        }
+        jobs.push(job);
+        if retained >= MAX_OWNED_BYTES {
+            break;
+        }
+    }
+    stats.streams_considered += jobs.len();
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.raw.len()));
+    workers.for_each(&mut jobs, |job| job.run(min_bytes, min_percent));
+    let mut results = jobs
+        .into_iter()
+        .filter_map(|job| Some((job.handle, job.raw.len(), job.result?)))
+        .collect::<Vec<_>>();
+    results.sort_by_key(|result| result.0);
+    Ok(results)
+}
+
 pub fn optimize_jpeg_entropy(
     document: &mut EditDocument,
     min_savings_bytes: usize,
     min_savings_percent: u8,
+    workers: &FlateBatchEncoder,
 ) -> Result<JpegEntropyStats> {
     let mut stats = JpegEntropyStats::default();
-    for handle in document.reachable_streams_with_subtype(b"Image")? {
-        let Some(object) = document.current_owned_object_cow(handle)? else {
-            continue;
-        };
-        let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
-            continue;
-        };
-        if !is_safe_lone_dct(document, dictionary)? {
-            continue;
-        }
-
-        let raw = data.bytes(document.source())?;
-        if raw.len() < MIN_JPEG_BYTES {
-            continue;
-        }
-        stats.streams_considered += 1;
-
-        let Some(optimized) = optimized_jpeg_bytes(raw.as_ref()) else {
-            continue;
-        };
-        let saving = raw.len().saturating_sub(optimized.len());
-        if saving == 0
-            || saving < min_savings_bytes
-            || saving.saturating_mul(100)
-                < raw.len().saturating_mul(usize::from(min_savings_percent))
-        {
-            continue;
-        }
-
-        let original_len = raw.len();
-        let optimized_len = optimized.len();
-        // Drop the borrowed image before replacing its encoded payload.
-        drop(raw);
-        drop(object);
-        let object = document.edit_handle(handle)?;
-        if let OwnedObject::Stream { data, .. } = object {
-            *data = StreamData::Owned(optimized.into());
-            stats.streams_optimized += 1;
-            stats.original_encoded_bytes += original_len;
-            stats.optimized_encoded_bytes += optimized_len;
+    let mut handles = document
+        .reachable_streams_with_subtype(b"Image")?
+        .into_iter()
+        .peekable();
+    while handles.peek().is_some() {
+        let results = run_jpeg_jobs(
+            document,
+            &mut handles,
+            min_savings_bytes,
+            min_savings_percent,
+            workers,
+            &mut stats,
+        )?;
+        for (handle, original_len, optimized) in results {
+            let optimized_len = optimized.len();
+            let object = document.edit_handle(handle)?;
+            if let OwnedObject::Stream { data, .. } = object {
+                *data = StreamData::Owned(optimized.into());
+                stats.streams_optimized += 1;
+                stats.original_encoded_bytes += original_len;
+                stats.optimized_encoded_bytes += optimized_len;
+            }
         }
     }
     Ok(stats)

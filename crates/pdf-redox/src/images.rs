@@ -1697,9 +1697,18 @@ mod tests {
                 non_xobject_reference_targets(&overlay)?
             );
             if entropy_only {
-                let source_stats = crate::jpeg_optimize::optimize_jpeg_entropy(&mut source, 1, 0)?;
-                let overlay_stats =
-                    crate::jpeg_optimize::optimize_jpeg_entropy(&mut overlay, 1, 0)?;
+                let source_stats = crate::jpeg_optimize::optimize_jpeg_entropy(
+                    &mut source,
+                    1,
+                    0,
+                    &crate::stream_codec::FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?,
+                )?;
+                let overlay_stats = crate::jpeg_optimize::optimize_jpeg_entropy(
+                    &mut overlay,
+                    1,
+                    0,
+                    &crate::stream_codec::FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?,
+                )?;
                 assert_eq!(source_stats, overlay_stats);
                 assert_eq!(source_stats.streams_considered, 1);
             } else {

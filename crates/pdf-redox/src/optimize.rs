@@ -1300,7 +1300,7 @@ fn optimize_pdf_with_document(
     // canonicalization. This preserves quantized DCT coefficients while allowing
     // images that differed only in Huffman coding to converge.
     let jpeg_entropy = timed(&mut timings, "jpeg-entropy", || {
-        optimize_jpeg_entropy(&mut document, 128, 1)
+        optimize_jpeg_entropy(&mut document, 128, 1, session.flate_encoder()?)
     })?;
 
     // Exact image canonicalization follows inline-image externalization and JPEG
