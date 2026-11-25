@@ -421,7 +421,7 @@ pub fn hoist_repeated_clip_prefixes(
         else {
             continue;
         };
-        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
+        let before_flate = reuse.encoded_len(&decoded, flate_level)?;
         let Some(budget) = clip_rewrite_budget(before_flate, goal) else {
             continue;
         };

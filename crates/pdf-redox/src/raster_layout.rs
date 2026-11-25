@@ -5154,18 +5154,22 @@ impl ApplyPlansResult {
     }
 }
 
-fn encoded_content_payload_len(
+fn prepared_content_payload(
     content: &[u8],
     flate_level: crate::FlateLevel,
     normalize_before_flate: bool,
-) -> Result<usize> {
+) -> Result<([u8; 32], Vec<u8>)> {
+    use sha2::{Digest as _, Sha256};
     let normalized = if normalize_before_flate {
         normalize_content_stream(content, |_, _| {})
     } else {
         None
     };
     let bytes = normalized.as_deref().unwrap_or(content);
-    Ok(crate::stream_codec::encode_flate(bytes, flate_level)?.len())
+    Ok((
+        Sha256::digest(bytes).into(),
+        crate::stream_codec::encode_flate(bytes, flate_level)?,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5186,12 +5190,19 @@ fn inline_reconstruction_budget(
     added_image_payload_bytes: usize,
     flate_level: crate::FlateLevel,
     normalize_before_flate: bool,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<InlineReconstructionBudget> {
-    let fallback_payload =
-        encoded_content_payload_len(fallback_content, flate_level, normalize_before_flate)?;
-    let candidate_payload =
-        encoded_content_payload_len(candidate_content, flate_level, normalize_before_flate)?
-            .saturating_add(added_image_payload_bytes);
+    let (fallback_digest, fallback) =
+        prepared_content_payload(fallback_content, flate_level, normalize_before_flate)?;
+    let (candidate_digest, candidate) =
+        prepared_content_payload(candidate_content, flate_level, normalize_before_flate)?;
+    let fallback_payload = fallback.len();
+    let candidate_payload = candidate.len().saturating_add(added_image_payload_bytes);
+    if candidate_payload < fallback_payload {
+        reuse.insert_content_with_digest(flate_level, candidate_digest, candidate);
+    } else {
+        reuse.insert_content_with_digest(flate_level, fallback_digest, fallback);
+    }
     Ok(InlineReconstructionBudget {
         fallback_payload,
         candidate_payload,
@@ -5691,9 +5702,10 @@ impl RasterTargetTransaction<'_> {
         &self,
         document: &mut EditDocument,
         input: RasterTargetTransactionInput,
+        reuse: &mut crate::flate::FlateReuseCache,
     ) -> Result<RasterTargetTransactionResult> {
         let checkpoint = document.new_object_checkpoint();
-        match self.try_execute(document, input, checkpoint) {
+        match self.try_execute(document, input, checkpoint, reuse) {
             Ok(result) => Ok(result),
             Err(error) => {
                 document.rollback_new_objects(checkpoint)?;
@@ -5706,6 +5718,7 @@ impl RasterTargetTransaction<'_> {
         &self,
         original_content: &[u8],
         applied: &ApplyPlansResult,
+        reuse: &mut crate::flate::FlateReuseCache,
     ) -> Result<Option<InlineReconstructionBudget>> {
         if applied.rewritten_content.is_none()
             || applied.has_non_fragment_plan
@@ -5739,6 +5752,7 @@ impl RasterTargetTransaction<'_> {
             applied.added_image_payload_bytes,
             self.flate_level,
             self.normalize_content_for_budget && matches!(self.target, ContentTarget::Page(_)),
+            reuse,
         )?;
         Ok((!budget.fits()).then_some(budget))
     }
@@ -5748,6 +5762,7 @@ impl RasterTargetTransaction<'_> {
         document: &mut EditDocument,
         input: RasterTargetTransactionInput,
         checkpoint: crate::source::NewObjectCheckpoint,
+        reuse: &mut crate::flate::FlateReuseCache,
     ) -> Result<RasterTargetTransactionResult> {
         let RasterTargetTransactionInput {
             resources,
@@ -5774,7 +5789,10 @@ impl RasterTargetTransaction<'_> {
         let apply_plans_us = elapsed_micros_u64(started);
         let plan_changed = applied.rewritten_content.is_some();
 
-        if self.rejected_inline_budget(&content, &applied)?.is_some() {
+        if self
+            .rejected_inline_budget(&content, &applied, reuse)?
+            .is_some()
+        {
             let rollback_resources = resources_for_inline_rollback.ok_or_else(|| {
                 Error::Invalid("missing pre-apply resources for staged inline rollback".to_owned())
             })?;
@@ -6519,6 +6537,7 @@ fn reconcile_fragmented_inline_inventory(
 // inline cleanup. Page snapshots and source-image caches live for the entire
 // pass, but each target still commits (or rolls back) independently.
 struct RasterNormalizationPass<'cfg, 'vector> {
+    reuse: &'vector mut crate::flate::FlateReuseCache,
     config: &'cfg RasterLayoutConfig,
     flate_level: crate::FlateLevel,
     normalize_content_for_budget: bool,
@@ -6550,6 +6569,7 @@ impl<'cfg, 'vector> RasterNormalizationPass<'cfg, 'vector> {
         flate_level: crate::FlateLevel,
         normalize_content_for_budget: bool,
         vector_cache: Option<&'vector mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
+        reuse: &'vector mut crate::flate::FlateReuseCache,
     ) -> Result<Self> {
         let hidden_context = if config.prune_hidden_paints {
             Some(hidden_text_shared_context(document)?)
@@ -6563,6 +6583,7 @@ impl<'cfg, 'vector> RasterNormalizationPass<'cfg, 'vector> {
             .map(|(index, page)| (page, index + 1))
             .collect();
         Ok(Self {
+            reuse,
             config,
             flate_level,
             normalize_content_for_budget,
@@ -6729,6 +6750,7 @@ impl<'cfg, 'vector> RasterNormalizationPass<'cfg, 'vector> {
                 plans,
                 prior_prune_changed,
             },
+            self.reuse,
         )?;
         self.stats.apply_plans_us = self
             .stats
@@ -6790,6 +6812,7 @@ pub fn normalize_raster_layout(
     flate_level: crate::FlateLevel,
     normalize_content_for_budget: bool,
     vector_cache: Option<&mut BTreeMap<ObjectHandle, ProcessingVectorAnalysis>>,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<RasterLayoutStats> {
     // Tiny Image XObjects used as individual raster pixels/fragments are a
     // structural pathology, not a quality policy. Reconstruct those in every
@@ -6825,6 +6848,7 @@ pub fn normalize_raster_layout(
         flate_level,
         normalize_content_for_budget,
         vector_cache,
+        reuse,
     )?
     .run(document, pages)
 }
@@ -8022,6 +8046,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             Some(&mut vector_cache),
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert_eq!(stats.page_count, 2);
         assert!(stats.inline_inventory_complete);
@@ -8188,6 +8213,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             Some(&mut vector_cache),
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert!(stats.inline_inventory_complete);
@@ -8242,6 +8268,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             None,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert_eq!(stats.transparent_paints_pruned, 1);
@@ -8279,6 +8306,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             None,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert!(stats.inline_inventory_complete);
@@ -8318,6 +8346,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             None,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert!(stats.inline_inventory_complete);
@@ -8357,6 +8386,7 @@ mod tests {
             FlateLevel::PROCESSING,
             true,
             None,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert!(stats.inline_inventory_complete);
@@ -8438,6 +8468,7 @@ mod tests {
                 plans: vec![plan],
                 prior_prune_changed: false,
             },
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert!(outcome.target_changed);
         assert!(outcome.plan_changed);
@@ -8543,6 +8574,7 @@ mod tests {
                 plans: vec![plan],
                 prior_prune_changed,
             },
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert!(matches!(
             outcome.commit,
@@ -8580,6 +8612,7 @@ mod tests {
                 8 * 1024,
                 crate::FlateLevel::PROCESSING,
                 false,
+                &mut crate::flate::FlateReuseCache::default(),
             )?
             .fits()
         );
@@ -8599,6 +8632,7 @@ mod tests {
                 64,
                 crate::FlateLevel::PROCESSING,
                 false,
+                &mut crate::flate::FlateReuseCache::default(),
             )?
             .fits()
         );

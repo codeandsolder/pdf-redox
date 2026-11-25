@@ -63,9 +63,12 @@ struct FlateReuseEntry {
     encoded: Box<[u8]>,
 }
 
+type EncodingKey = (i32, [u8; 32]);
+
 #[derive(Debug, Default)]
 pub struct FlateReuseCache {
-    entries: BTreeMap<ObjectHandle, FlateReuseEntry>,
+    entries: BTreeMap<EncodingKey, FlateReuseEntry>,
+    handles: BTreeMap<ObjectHandle, EncodingKey>,
     retained_bytes: usize,
 }
 
@@ -87,20 +90,36 @@ impl FlateReuseCache {
         decoded_sha256: [u8; 32],
         encoded: Vec<u8>,
     ) {
-        if encoded.len() > MAX_REUSED_FLATE_BYTES.saturating_sub(self.retained_bytes)
-            || self.entries.contains_key(&handle)
-        {
-            return;
+        if self.insert_content_with_digest(level, decoded_sha256, encoded) {
+            self.handles.insert(handle, (level.value(), decoded_sha256));
         }
-        self.retained_bytes = self.retained_bytes.saturating_add(encoded.len());
+    }
+
+    /// Content identity survives page replacement, normalization and exact
+    /// deduplication. A staged encoding need not know its final object handle.
+    pub(crate) fn insert_content_with_digest(
+        &mut self,
+        level: crate::FlateLevel,
+        decoded_sha256: [u8; 32],
+        encoded: Vec<u8>,
+    ) -> bool {
+        let key = (level.value(), decoded_sha256);
+        if self.entries.contains_key(&key) {
+            return true;
+        }
+        if encoded.len() > MAX_REUSED_FLATE_BYTES.saturating_sub(self.retained_bytes) {
+            return false;
+        }
+        self.retained_bytes += encoded.len();
         self.entries.insert(
-            handle,
+            key,
             FlateReuseEntry {
                 level,
                 decoded_sha256,
                 encoded: encoded.into_boxed_slice(),
             },
         );
+        true
     }
 
     /// Install raw content while retaining the encoding already computed by
@@ -119,32 +138,33 @@ impl FlateReuseCache {
         Ok(())
     }
 
-    /// Reuse the exact scalar encoding length from a preceding page rewrite.
-    /// A handle alone is not evidence that the bytes are unchanged.
-    pub(crate) fn page_len(
-        &self,
-        document: &crate::EditDocument,
-        page: ObjectHandle,
-        decoded: &[u8],
-        level: crate::FlateLevel,
-    ) -> Result<usize> {
-        if let Some(handle) = document
-            .current_value(page)?
-            .and_then(|value| value.dictionary_entry(b"Contents"))
-            .and_then(|value| value.reference())
-            && let Some(entry) = self.entries.get(&handle)
-            && entry.level == level
-            && entry.decoded_sha256 == <[u8; 32]>::from(Sha256::digest(decoded))
-        {
-            return Ok(entry.encoded.len());
+    /// Reuse exact scalar encoding lengths, including candidates that were
+    /// assigned a different object handle by a subsequent graph rewrite.
+    pub(crate) fn encoded_len(&self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
+        if !self.entries.is_empty() {
+            let key = (level.value(), Sha256::digest(decoded).into());
+            if let Some(entry) = self.entries.get(&key) {
+                return Ok(entry.encoded.len());
+            }
         }
         crate::stream_codec::flate_encoded_len(decoded, level)
     }
 
-    fn take_entry(&mut self, handle: ObjectHandle) -> Option<FlateReuseEntry> {
-        let entry = self.entries.remove(&handle)?;
-        self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
+    fn has_handle(&self, handle: ObjectHandle) -> bool {
+        self.handles
+            .get(&handle)
+            .is_some_and(|key| self.entries.contains_key(key))
+    }
+
+    fn take_key(&mut self, key: EncodingKey) -> Option<FlateReuseEntry> {
+        let entry = self.entries.remove(&key)?;
+        self.retained_bytes -= entry.encoded.len();
         Some(entry)
+    }
+
+    fn take_entry(&mut self, handle: ObjectHandle) -> Option<FlateReuseEntry> {
+        let key = self.handles.remove(&handle)?;
+        self.take_key(key)
     }
 
     fn take_matching(
@@ -153,7 +173,12 @@ impl FlateReuseCache {
         level: crate::FlateLevel,
         decoded: &[u8],
     ) -> Option<Vec<u8>> {
-        self.take_entry(handle)?.matching(level, decoded)
+        self.handles.remove(&handle);
+        if self.entries.is_empty() {
+            return None;
+        }
+        let key = (level.value(), Sha256::digest(decoded).into());
+        self.take_key(key).map(|entry| entry.encoded.into_vec())
     }
 }
 
@@ -554,7 +579,7 @@ fn collect_filtered_job<'a>(
     }
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
     let transcode = batcher.transcode_enabled()
-        && !reuse_cache.entries.contains_key(&handle)
+        && !reuse_cache.has_handle(handle)
         && identity_flate_predictor(document, dictionary)?;
     #[cfg(not(all(feature = "cuda", not(target_family = "wasm"))))]
     let _ = batcher;
@@ -1763,7 +1788,7 @@ mod tests {
         cache.insert_with_digest(handle, crate::FlateLevel::PROCESSING, digest, vec![9, 10]);
         assert_eq!(
             cache.take_matching(handle, crate::FlateLevel::PROCESSING, decoded),
-            Some(vec![9, 10])
+            Some(vec![5, 6])
         );
     }
 

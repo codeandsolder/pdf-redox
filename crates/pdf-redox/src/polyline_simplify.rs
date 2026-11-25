@@ -433,7 +433,7 @@ pub fn simplify_page_polylines(
         else {
             continue;
         };
-        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
+        let before_flate = reuse.encoded_len(&decoded, flate_level)?;
         let Some(budget) = before_flate.checked_sub(MIN_FLATE_SAVINGS_BYTES) else {
             continue;
         };

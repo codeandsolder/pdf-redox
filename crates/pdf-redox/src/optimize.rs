@@ -834,6 +834,7 @@ fn prepare_raster_preflight(
     cfg: &Config,
     flate_level: crate::FlateLevel,
     timings: &mut BTreeMap<String, f64>,
+    reuse: &mut FlateReuseCache,
 ) -> Result<RasterPreflight> {
     let repeated_page_objects_may_rewrite = cfg.remove_repeated_page_objects
         && cfg.optimization_goal == crate::OptimizationGoal::Processing
@@ -850,6 +851,7 @@ fn prepare_raster_preflight(
             flate_level,
             cfg.optimization_goal == crate::OptimizationGoal::Processing,
             vector_cache,
+            reuse,
         )
     })?;
     for (name, micros) in [
@@ -908,9 +910,9 @@ fn run_vector_optimization_phase(
     evidence: &mut RasterPhaseEvidence,
     timings: &mut BTreeMap<String, f64>,
     catalog: Option<&mut GlyphCatalog>,
+    mut flate_reuse_cache: FlateReuseCache,
 ) -> Result<VectorPhaseResult> {
     let flate_level = cfg.optimization_goal.flate_level();
-    let mut flate_reuse_cache = FlateReuseCache::default();
     let PageRewriteResult {
         stats: repeated_clips,
         rewritten_pages: repeated_clip_rewritten_pages,
@@ -1268,10 +1270,18 @@ fn optimize_pdf_with_document(
     let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
         rasterize_pathological_microstrokes(&mut document, &stable_pages, cfg.optimization_goal)
     })?;
+    let mut raster_reuse = FlateReuseCache::default();
     let RasterPreflight {
         layout: raster_layout,
         evidence: mut raster_evidence,
-    } = prepare_raster_preflight(&mut document, &stable_pages, cfg, flate_level, &mut timings)?;
+    } = prepare_raster_preflight(
+        &mut document,
+        &stable_pages,
+        cfg,
+        flate_level,
+        &mut timings,
+        &mut raster_reuse,
+    )?;
     let PageRewriteResult {
         stats: physically_hidden_text,
         rewritten_pages: physically_hidden_text_rewritten_pages,
@@ -1488,6 +1498,7 @@ fn optimize_pdf_with_document(
         &mut raster_evidence,
         &mut timings,
         catalog,
+        raster_reuse,
     )?;
 
     let FinalizationResult {

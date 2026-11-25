@@ -976,7 +976,7 @@ pub(super) fn factor(
         else {
             return Ok(stats);
         };
-        before += reuse.page_len(doc, source.page, &source.decoded, flate_level)?;
+        before += reuse.encoded_len(&source.decoded, flate_level)?;
         let encoded = crate::stream_codec::encode_flate(&content, flate_level)?;
         after += encoded.len();
         rewritten.push(Some((content, encoded)));

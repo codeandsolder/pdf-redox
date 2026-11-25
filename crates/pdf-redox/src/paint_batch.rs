@@ -956,7 +956,7 @@ fn apply_local_page_rewrites(
         if operations == 0 || after.as_slice() == before.as_ref() {
             continue;
         }
-        let before_flate = reuse.page_len(document, page, &before, flate_level)?;
+        let before_flate = reuse.encoded_len(&before, flate_level)?;
         let Some(encoded) =
             crate::stream_codec::encode_flate_capped(&after, before_flate, flate_level)?
         else {
@@ -2460,7 +2460,7 @@ fn factor_polyline_outlined_glyphs(
         else {
             continue;
         };
-        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
+        let before_flate = reuse.encoded_len(&decoded, flate_level)?;
         let page_encoding = crate::stream_codec::encode_flate(&rewritten, flate_level)?;
         let (font_cost, glyph_encodings) = prepare_glyph_encodings(&plans, flate_level)?;
         let after_flate = page_encoding.len().saturating_add(font_cost);
