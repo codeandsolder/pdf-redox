@@ -145,6 +145,9 @@ struct Args {
     /// Retry GPU cap rejections on the CPU to retain compression opportunities.
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_retry_rejected: bool,
+    /// Reference mode: upload already-decoded bytes instead of transcoding source zlib on CUDA.
+    #[arg(long, requires = "flate_gpu_budget")]
+    flate_gpu_decoded_input: bool,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -228,6 +231,7 @@ fn configure_flate(cfg: &mut Config, args: &Args) {
             min_cap_per_mille: args.flate_gpu_min_cap_per_mille.unwrap_or(0),
             match_window_bytes: args.flate_gpu_window_bytes,
             retry_rejected: args.flate_gpu_retry_rejected,
+            transcode_source: !args.flate_gpu_decoded_input,
         });
 }
 

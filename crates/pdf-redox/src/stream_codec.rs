@@ -246,6 +246,37 @@ impl GpuFlateExecutor {
     }
 }
 
+#[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+pub(crate) enum FlateTranscode {
+    NotRouted,
+    Rejected,
+    RetryCpu,
+    Accepted(Vec<u8>),
+}
+
+#[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+impl GpuFlateExecutor {
+    fn searcher(
+        &self,
+        stats: Option<&Mutex<crate::FlateBatchStats>>,
+    ) -> Result<&zlib_rs::GpuMatchSearcher> {
+        self.searcher
+            .get_or_init(|| {
+                let start = std::time::Instant::now();
+                let result = zlib_rs::GpuMatchSearcher::new(self.config.adapter.as_deref());
+                if let Some(stats) = stats {
+                    stats
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .gpu_initialization_ms = start.elapsed().as_secs_f64() * 1000.0;
+                }
+                result
+            })
+            .as_ref()
+            .map_err(|error| Error::Compression(format!("GPU Flate initialization: {error}")))
+    }
+}
+
 impl FlateBatchEncoder {
     pub fn from_config(config: &crate::Config) -> Result<Self> {
         let Some(gpu) = &config.flate_gpu else {
@@ -334,6 +365,138 @@ impl FlateBatchEncoder {
         });
     }
 
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    pub(crate) fn transcode_source(
+        &self,
+        source: &[u8],
+        limit: usize,
+        level: crate::FlateLevel,
+    ) -> Result<FlateTranscode> {
+        let Some(gpu) = &self.gpu else {
+            return Ok(FlateTranscode::NotRouted);
+        };
+        if !gpu.config.transcode_source
+            || !gpu
+                .config
+                .adapter
+                .as_deref()
+                .is_some_and(|a| a.starts_with("cuda:"))
+        {
+            return Ok(FlateTranscode::NotRouted);
+        }
+        let Ok(minimum_decoded_len) = u32::try_from(gpu.config.min_stream_bytes) else {
+            return Ok(FlateTranscode::NotRouted);
+        };
+        let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
+            u32::MAX
+        } else {
+            u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
+                .unwrap_or(u32::MAX)
+        };
+        if minimum_decoded_len > decoded_limit {
+            return Ok(FlateTranscode::NotRouted);
+        }
+        let searcher = gpu.searcher(self.stats.as_ref())?;
+        let config = flate_config(level);
+        if !searcher.supports_zlib_transcode(config) {
+            return Ok(FlateTranscode::NotRouted);
+        }
+        let Some(result) = searcher
+            .recompress_zlib(
+                source,
+                zlib_rs::GpuTranscodeOptions {
+                    output_limit: limit,
+                    decoded_limit,
+                    minimum_decoded_len,
+                    config,
+                    search_budget: gpu.config.search_budget.get(),
+                    window: gpu.config.match_window_bytes.unwrap_or_else(|| {
+                        std::num::NonZeroUsize::new(16 * 1024 * 1024)
+                            .unwrap_or(std::num::NonZeroUsize::MIN)
+                    }),
+                },
+            )
+            .map_err(|error| Error::Compression(format!("GPU Flate transcode: {error}")))?
+        else {
+            return Ok(FlateTranscode::NotRouted);
+        };
+        if result.decoded_bytes_processed != 0 {
+            if let Some(stats) = &self.stats {
+                let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+                let record = |work: &mut crate::report::FlateBatchWork| {
+                    work.batches = work.batches.saturating_add(1);
+                    work.streams = work.streams.saturating_add(1);
+                    work.decoded_bytes = work
+                        .decoded_bytes
+                        .saturating_add(result.decoded_bytes_processed);
+                };
+                record(&mut stats.gpu_assisted);
+                record(&mut stats.gpu_transcoded);
+                stats.gpu_transcode_source_bytes = stats
+                    .gpu_transcode_source_bytes
+                    .saturating_add(result.source_bytes_uploaded);
+                stats.gpu_transcode_descriptor_bytes = stats
+                    .gpu_transcode_descriptor_bytes
+                    .saturating_add(result.descriptor_bytes_uploaded);
+            }
+        }
+        // A complete accepted source was structurally indexed and its Adler
+        // verified. A rejected prefix can have an unknown decoded length;
+        // respect a nonzero ratio gate by falling back if it cannot be proven.
+        match result.code {
+            zlib_rs::ReturnCode::Ok
+                if result.decoded_len.is_some_and(|n| gpu.eligible(n, limit)) =>
+            {
+                Ok(FlateTranscode::Accepted(result.output))
+            }
+            zlib_rs::ReturnCode::BufError
+                if result.output.len() == limit
+                    && (gpu.config.min_cap_per_mille == 0
+                        || result.decoded_len.is_some_and(|n| gpu.eligible(n, limit))) =>
+            {
+                Ok(if gpu.config.retry_rejected {
+                    FlateTranscode::RetryCpu
+                } else {
+                    FlateTranscode::Rejected
+                })
+            }
+            zlib_rs::ReturnCode::Ok
+            | zlib_rs::ReturnCode::BufError
+            | zlib_rs::ReturnCode::DataError => Ok(FlateTranscode::NotRouted),
+            code => Err(compression_code_error(code)),
+        }
+    }
+
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    pub(crate) fn retry_transcoded(
+        &self,
+        decoded: &[u8],
+        limit: usize,
+        level: crate::FlateLevel,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut output = Vec::new();
+        let result = self.compress_cpu(
+            &mut [zlib_rs::BatchJob::with_vec(
+                decoded,
+                &mut output,
+                limit.min(zlib_rs::compress_bound(decoded.len())),
+            )
+            .map_err(|error| {
+                Error::Compression(format!("failed to reserve Flate retry: {error}"))
+            })?],
+            flate_config(level),
+        )[0];
+        let accepted = flate_length_with_limit(result.written, result.code)?.map(|_| output);
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+            stats.gpu_rejected_cpu_retries = stats.gpu_rejected_cpu_retries.saturating_add(1);
+            if accepted.is_some() {
+                stats.gpu_rejected_cpu_accepted = stats.gpu_rejected_cpu_accepted.saturating_add(1);
+            }
+        }
+        Ok(accepted)
+    }
+
     fn compress_cpu(
         &self,
         jobs: &mut [zlib_rs::BatchJob<'_>],
@@ -362,23 +525,7 @@ impl FlateBatchEncoder {
                 .zip(maximum_lengths)
                 .any(|(job, &limit)| gpu.eligible(job.input.len(), limit))
         {
-            let searcher = gpu
-                .searcher
-                .get_or_init(|| {
-                    let start = std::time::Instant::now();
-                    let result = zlib_rs::GpuMatchSearcher::new(gpu.config.adapter.as_deref());
-                    if let Some(stats) = &self.stats {
-                        stats
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .gpu_initialization_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    }
-                    result
-                })
-                .as_ref()
-                .map_err(|error| {
-                    Error::Compression(format!("GPU Flate initialization: {error}"))
-                })?;
+            let searcher = gpu.searcher(self.stats.as_ref())?;
             let search_budget = gpu.config.search_budget.get();
             let count = jobs.len();
             let (cpu_jobs, gpu_jobs): (Vec<_>, Vec<_>) = jobs
@@ -811,6 +958,7 @@ mod tests {
                 min_cap_per_mille: 50,
                 match_window_bytes: None,
                 retry_rejected: false,
+                transcode_source: false,
             }),
             ..crate::Config::default()
         };
@@ -891,6 +1039,7 @@ mod tests {
                 min_cap_per_mille: 0,
                 match_window_bytes: None,
                 retry_rejected: false,
+                transcode_source: false,
             }),
             ..crate::Config::default()
         };
@@ -978,6 +1127,7 @@ mod tests {
                 min_cap_per_mille: 0,
                 match_window_bytes: None,
                 retry_rejected: false,
+                transcode_source: false,
             }),
             ..crate::Config::default()
         };

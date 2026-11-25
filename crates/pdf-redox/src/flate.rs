@@ -377,6 +377,65 @@ struct FilteredFlateCandidate {
     encoded: Option<AdaptiveFlateEncoding>,
 }
 
+#[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+fn identity_flate_predictor(
+    document: &crate::EditDocument,
+    dictionary: &crate::OwnedDictionary,
+) -> Result<bool> {
+    let Some(params) = dictionary.get(b"DecodeParms".as_slice()) else {
+        return Ok(true);
+    };
+    let params = match document.resolve_owned_value(params)? {
+        Some(crate::OwnedObject::Array(values)) if values.len() == 1 => {
+            document.resolve_owned_value(&values[0])?
+        }
+        value => value,
+    };
+    match params {
+        Some(crate::OwnedObject::Null) => Ok(true),
+        Some(crate::OwnedObject::Dictionary(params)) => {
+            let Some(predictor) = params.get(b"Predictor".as_slice()) else {
+                return Ok(true);
+            };
+            Ok(matches!(
+                document.resolve_owned_value(predictor)?,
+                Some(crate::OwnedObject::Integer(1))
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn commit_filtered_encoding(
+    document: &mut crate::EditDocument,
+    handle: ObjectHandle,
+    raw_len: usize,
+    encoded: AdaptiveFlateEncoding,
+    stats: &mut FlateOptimizationStats,
+) -> Result<()> {
+    if encoded.high_effort_tested {
+        stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
+    }
+    let saving = raw_len.saturating_sub(encoded.bytes.len());
+    if saving < minimum_flate_savings(raw_len) {
+        return Ok(());
+    }
+    if encoded.high_effort_selected {
+        stats.high_effort_streams_selected = stats.high_effort_streams_selected.saturating_add(1);
+        stats.high_effort_extra_savings_bytes = stats
+            .high_effort_extra_savings_bytes
+            .saturating_add(encoded.high_effort_extra_savings_bytes);
+    }
+    let object = document.edit_handle(handle)?;
+    if let crate::OwnedObject::Stream { dictionary, data } = object {
+        set_plain_flate(dictionary);
+        *data = crate::StreamData::Owned(encoded.bytes.into());
+        stats.streams_selected = stats.streams_selected.saturating_add(1);
+        stats.estimated_savings_bytes = stats.estimated_savings_bytes.saturating_add(saving);
+    }
+    Ok(())
+}
+
 fn flush_filtered_batch(
     document: &mut crate::EditDocument,
     candidates: &mut Vec<FilteredFlateCandidate>,
@@ -414,29 +473,14 @@ fn flush_filtered_batch(
     }
 
     for candidate in candidates.drain(..) {
-        let Some(encoded) = candidate.encoded else {
-            continue;
-        };
-        if encoded.high_effort_tested {
-            stats.high_effort_streams_tested = stats.high_effort_streams_tested.saturating_add(1);
-        }
-        let saving = candidate.raw_len.saturating_sub(encoded.bytes.len());
-        if saving < minimum_flate_savings(candidate.raw_len) {
-            continue;
-        }
-        if encoded.high_effort_selected {
-            stats.high_effort_streams_selected =
-                stats.high_effort_streams_selected.saturating_add(1);
-            stats.high_effort_extra_savings_bytes = stats
-                .high_effort_extra_savings_bytes
-                .saturating_add(encoded.high_effort_extra_savings_bytes);
-        }
-        let object = document.edit_handle(candidate.handle)?;
-        if let crate::OwnedObject::Stream { dictionary, data } = object {
-            set_plain_flate(dictionary);
-            *data = crate::StreamData::Owned(encoded.bytes.into());
-            stats.streams_selected = stats.streams_selected.saturating_add(1);
-            stats.estimated_savings_bytes = stats.estimated_savings_bytes.saturating_add(saving);
+        if let Some(encoded) = candidate.encoded {
+            commit_filtered_encoding(
+                document,
+                candidate.handle,
+                candidate.raw_len,
+                encoded,
+                stats,
+            )?;
         }
     }
     Ok(())
@@ -462,13 +506,43 @@ fn optimize_flate_streams_bounded(
         if !is_safe_lone_flate(document, dictionary)? {
             continue;
         }
-        let raw_len = data.bytes(document.source())?.len();
-        drop(object);
+        let raw = data.bytes(document.source())?;
+        let raw_len = raw.len();
         if raw_len < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
-            // An RFC 1950 stream always needs at least six framing bytes.
-            // There is no possible encoding that clears the savings floor.
             continue;
         }
+        #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+        if !reuse_cache.entries.contains_key(&handle)
+            && identity_flate_predictor(document, dictionary)?
+        {
+            use crate::stream_codec::FlateTranscode;
+            let limit = raw_len.saturating_sub(minimum_flate_savings(raw_len));
+            let outcome = batcher.transcode_source(&raw, limit, level)?;
+            if !matches!(outcome, FlateTranscode::NotRouted) {
+                drop(raw);
+                drop(object);
+                let encoded = match outcome {
+                    FlateTranscode::Accepted(bytes) => Some(bytes),
+                    FlateTranscode::RetryCpu => match document.decoded_stream_data(handle) {
+                        Ok(decoded) => batcher.retry_transcoded(&decoded, limit, level)?,
+                        Err(_) => None,
+                    },
+                    FlateTranscode::Rejected | FlateTranscode::NotRouted => None,
+                };
+                if let Some(bytes) = encoded {
+                    commit_filtered_encoding(
+                        document,
+                        handle,
+                        raw_len,
+                        AdaptiveFlateEncoding::baseline(bytes),
+                        &mut stats,
+                    )?;
+                }
+                continue;
+            }
+        }
+        drop(raw);
+        drop(object);
         let Ok(decoded) = document.decoded_stream_data(handle) else {
             continue;
         };

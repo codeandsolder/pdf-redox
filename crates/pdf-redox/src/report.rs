@@ -519,8 +519,14 @@ pub struct FlateBatchWork {
 pub struct FlateBatchStats {
     /// Ordinary CPU-only batch work.
     pub cpu: FlateBatchWork,
-    /// Work routed to the GPU-assisted matcher (which may locally resolve cheap matches).
+    /// All GPU Flate work, including compressed-input transcoding.
     pub gpu_assisted: FlateBatchWork,
+    /// Subset using original compressed input; decoded bytes count actual processed cores.
+    pub gpu_transcoded: FlateBatchWork,
+    /// Compact source and Huffman-header bytes uploaded for transcoding.
+    pub gpu_transcode_source_bytes: usize,
+    /// Structural entropy-segment descriptor bytes uploaded.
+    pub gpu_transcode_descriptor_bytes: usize,
     /// CPU retries of GPU output-cap rejections, also included in CPU work.
     pub gpu_rejected_cpu_retries: usize,
     /// Rejected GPU attempts that the CPU subsequently admitted.

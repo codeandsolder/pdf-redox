@@ -26,6 +26,8 @@ struct Args {
     #[arg(long)]
     retry_rejected: bool,
     #[arg(long)]
+    decoded_gpu_input: bool,
+    #[arg(long)]
     adapter: Option<String>,
     #[arg(long, default_value = "2")]
     rounds: NonZeroUsize,
@@ -94,6 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             min_cap_per_mille: args.min_cap_per_mille,
             match_window_bytes: args.window_bytes,
             retry_rejected: args.retry_rejected,
+            transcode_source: !args.decoded_gpu_input,
         }),
         ..cpu_config.clone()
     };

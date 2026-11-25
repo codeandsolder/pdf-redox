@@ -404,6 +404,8 @@ pub struct FlateGpuConfig {
     pub match_window_bytes: Option<NonZeroUsize>,
     /// Retry GPU-assisted attempts rejected by the output cap using the CPU matcher.
     pub retry_rejected: bool,
+    /// For native CUDA, upload an identity-predictor source zlib member instead of decoded bytes.
+    pub transcode_source: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
