@@ -1,7 +1,5 @@
 use crate::content::{page_content_if_present, page_resources};
-use crate::stream_codec::{
-    decode_stream, encode_flate, is_unfiltered_or_lone_flate, set_plain_flate,
-};
+use crate::stream_codec::{encode_flate, is_unfiltered_or_lone_flate, set_plain_flate};
 use crate::{
     EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary, OwnedObject, Result,
     StreamData,
@@ -454,7 +452,8 @@ fn editable_font_program(
         return Ok(None);
     }
     let raw = data.bytes(document.source())?;
-    Ok(decode_stream(document, dictionary, raw.as_ref())
+    Ok(document
+        .decoded_stream_data(program)
         .ok()
         .map(|decoded| (decoded, raw.len())))
 }
@@ -2015,7 +2014,7 @@ fn decoded_u16_mapping(
         if !is_unfiltered_or_lone_flate(document, dictionary)? {
             return Ok(None);
         }
-        let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
+        let Ok(decoded) = document.decoded_stream_data(handle) else {
             return Ok(None);
         };
         std::borrow::Cow::Owned(decoded)
@@ -2173,8 +2172,7 @@ fn dense_compact_cidfont_type2_programs_with_usage(
             if !is_unfiltered_or_lone_flate(document, program_dictionary)? {
                 continue;
             }
-            let Ok(decoded) = decode_stream(document, program_dictionary, program_raw.as_ref())
-            else {
+            let Ok(decoded) = document.decoded_stream_data(program) else {
                 continue;
             };
             std::borrow::Cow::Owned(decoded)
@@ -2407,6 +2405,7 @@ struct CidCmapStripCandidate {
     raw_len: usize,
     cmap_len: usize,
     had_length1: bool,
+    decoded: std::sync::Arc<Vec<u8>>,
 }
 
 fn cid_cmap_hint_has_material_opportunity(
@@ -2429,14 +2428,13 @@ fn cid_cmap_hint_has_material_opportunity(
         let Some(object) = document.current_owned_object_cow(program)? else {
             continue;
         };
-        let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
+        let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
             continue;
         };
         if !is_unfiltered_or_lone_flate(document, dictionary)? {
             continue;
         }
-        let raw = data.bytes(document.source())?;
-        let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
+        let Ok(decoded) = document.decoded_content_stream_data(program) else {
             continue;
         };
         let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
@@ -2483,7 +2481,7 @@ fn cid_cmap_strip_candidate(
         return Ok(None);
     }
     let raw = data.bytes(document.source())?;
-    let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
+    let Ok(decoded) = document.decoded_content_stream_data(program) else {
         return Ok(None);
     };
     let Some(cmap_len) = crate::font_subset::cidfont_type2_cmap_size(&decoded) else {
@@ -2498,6 +2496,7 @@ fn cid_cmap_strip_candidate(
         raw_len: raw.len(),
         cmap_len,
         had_length1: dictionary.contains_key(b"Length1".as_slice()),
+        decoded,
     }))
 }
 
@@ -2546,23 +2545,8 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 
     let mut stats = FontOptimizationStats::default();
     for info in candidates {
-        let Some(program_object) = document.current_owned_object_cow(info.program)? else {
-            continue;
-        };
-        let OwnedObject::Stream { data, .. } = program_object.as_ref() else {
-            continue;
-        };
-        let raw = data.bytes(document.source())?;
-        if raw.len() != info.raw_len {
-            return Err(Error::Invalid(
-                "CIDFontType2 program changed between cmap measurement and rewrite".to_owned(),
-            ));
-        }
-        let Ok(decoded) = decode_stream(document, &info.dictionary, raw.as_ref()) else {
-            continue;
-        };
         let Some((candidate, removed_decoded_bytes)) =
-            crate::font_subset::strip_cidfont_type2_cmap(&decoded)
+            crate::font_subset::strip_cidfont_type2_cmap(&info.decoded)
         else {
             continue;
         };
@@ -2584,8 +2568,6 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
         stats.cid_cmap_decoded_bytes_removed += removed_decoded_bytes;
         stats.original_encoded_bytes += info.raw_len;
         stats.optimized_encoded_bytes += encoded.len();
-        drop(raw);
-        drop(program_object);
         replace_current_stream_data(document, info.program, encoded, plain_flate)?;
         if info.had_length1 {
             set_font_program_length1(document, info.program, candidate.len())?;

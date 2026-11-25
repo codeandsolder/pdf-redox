@@ -475,6 +475,7 @@ struct FilteredJob<'a> {
     handle: ObjectHandle,
     input: DetachedStream<'a>,
     cache: Option<FlateReuseEntry>,
+    decoded: Option<std::sync::Arc<Vec<u8>>>,
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
     transcode: bool,
     result: Result<Option<AdaptiveFlateEncoding>>,
@@ -512,8 +513,13 @@ impl FilteredJob<'_> {
                 FlateTranscode::NotRouted => {}
             }
         }
-        let Ok(decoded) = self.input.decode() else {
-            return Ok(None);
+        let decoded = if let Some(decoded) = &self.decoded {
+            std::borrow::Cow::Borrowed(decoded.as_slice())
+        } else {
+            let Ok(decoded) = self.input.decode() else {
+                return Ok(None);
+            };
+            std::borrow::Cow::Owned(decoded)
         };
         if let Some(encoded) = self
             .cache
@@ -561,12 +567,14 @@ fn collect_filtered_job<'a>(
     else {
         return Ok(None);
     };
+    let decoded = document.cached_decoded_stream(handle);
     Ok(Some(FilteredJob {
         handle,
         input,
         cache: reuse_cache.take_entry(handle),
         #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-        transcode,
+        transcode: transcode && decoded.is_none(),
+        decoded,
         result: Ok(None),
     }))
 }
