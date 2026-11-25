@@ -898,6 +898,13 @@ struct VectorPhaseResult {
     flate_reuse_cache: FlateReuseCache,
 }
 
+struct VectorPhaseContext<'a> {
+    cfg: &'a Config,
+    layout: &'a RasterLayoutStats,
+    evidence: &'a mut RasterPhaseEvidence,
+    catalog: Option<&'a mut GlyphCatalog>,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Keep the ordered vector passes and their shared evidence together"
@@ -905,13 +912,16 @@ struct VectorPhaseResult {
 fn run_vector_optimization_phase(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],
-    cfg: &Config,
-    layout: &RasterLayoutStats,
-    evidence: &mut RasterPhaseEvidence,
+    context: VectorPhaseContext<'_>,
     timings: &mut BTreeMap<String, f64>,
-    catalog: Option<&mut GlyphCatalog>,
     mut flate_reuse_cache: FlateReuseCache,
 ) -> Result<VectorPhaseResult> {
+    let VectorPhaseContext {
+        cfg,
+        layout,
+        evidence,
+        catalog,
+    } = context;
     let flate_level = cfg.optimization_goal.flate_level();
     let PageRewriteResult {
         stats: repeated_clips,
@@ -1493,11 +1503,13 @@ fn optimize_pdf_with_document(
     } = run_vector_optimization_phase(
         &mut document,
         &stable_pages,
-        cfg,
-        &raster_layout,
-        &mut raster_evidence,
+        VectorPhaseContext {
+            cfg,
+            layout: &raster_layout,
+            evidence: &mut raster_evidence,
+            catalog,
+        },
         &mut timings,
-        catalog,
         raster_reuse,
     )?;
 

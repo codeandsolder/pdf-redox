@@ -774,11 +774,36 @@ impl FlateBatchEncoder {
         maximum_lengths: &[usize],
         level: crate::FlateLevel,
     ) -> Result<Vec<Option<usize>>> {
-        Ok(self
-            .encode_many_with_limits(inputs, maximum_lengths, level)?
-            .into_iter()
-            .map(|output| output.map(|bytes| bytes.len()))
-            .collect())
+        #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+        if self.gpu.is_some() {
+            return Ok(self
+                .encode_many_with_limits(inputs, maximum_lengths, level)?
+                .into_iter()
+                .map(|output| output.map(|bytes| bytes.len()))
+                .collect());
+        }
+        if inputs.len() != maximum_lengths.len() {
+            return Err(Error::Invalid(
+                "Flate input and output-limit counts differ".to_owned(),
+            ));
+        }
+        let mut jobs = inputs
+            .iter()
+            .zip(maximum_lengths)
+            .map(|(&input, &limit)| (input, limit, Ok(None)))
+            .collect::<Vec<_>>();
+        self.for_each(&mut jobs, |(input, limit, result)| {
+            *result = flate_capped_encoded_len(input, *limit, level)
+        });
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+            stats.cpu.batches = stats.cpu.batches.saturating_add(1);
+            stats.cpu.streams = stats.cpu.streams.saturating_add(inputs.len());
+            stats.cpu.decoded_bytes = inputs.iter().fold(stats.cpu.decoded_bytes, |n, input| {
+                n.saturating_add(input.len())
+            });
+        }
+        jobs.into_iter().map(|(_, _, result)| result).collect()
     }
 }
 
@@ -799,7 +824,41 @@ pub fn flate_capped_encoded_len(
     maximum_length: usize,
     level: crate::FlateLevel,
 ) -> Result<Option<usize>> {
-    Ok(encode_flate_capped(decoded, maximum_length, level)?.map(|bytes| bytes.len()))
+    // Only the length is needed. Drive the same ordinary zlib encoder to
+    // Finish using a bounded scratch output instead of allocating a bound
+    // proportional to input size. Probe one extra byte to distinguish exact
+    // cap equality from a still-pending trailer.
+    let mut encoder = zlib_rs::Deflate::new_with_config(flate_config(level));
+    let mut scratch = [std::mem::MaybeUninit::<u8>::uninit(); 16 * 1024];
+    loop {
+        let consumed = usize::try_from(encoder.total_in())
+            .map_err(|_| Error::Compression("Flate input counter overflow".into()))?;
+        let written = usize::try_from(encoder.total_out())
+            .map_err(|_| Error::Compression("Flate output counter overflow".into()))?;
+        let capacity = scratch
+            .len()
+            .min(maximum_length.saturating_sub(written).saturating_add(1));
+        let status = encoder
+            .compress_uninit(
+                &decoded[consumed..],
+                &mut scratch[..capacity],
+                zlib_rs::DeflateFlush::Finish,
+            )
+            .map_err(|error| Error::Compression(format!("Flate length measurement: {error:?}")))?;
+        let total = usize::try_from(encoder.total_out())
+            .map_err(|_| Error::Compression("Flate output counter overflow".into()))?;
+        if total > maximum_length {
+            return Ok(None);
+        }
+        if status == zlib_rs::Status::StreamEnd {
+            return Ok(Some(total));
+        }
+        if total == written && encoder.total_in() == consumed as u64 {
+            return Err(Error::Compression(
+                "Flate length measurement made no progress".into(),
+            ));
+        }
+    }
 }
 
 /// The ordinary zlib encoding, only if it fits the exact byte budget.
@@ -819,7 +878,8 @@ pub fn encode_flate_capped(
 
 /// Return the encoded byte length of ordinary zlib/Flate data.
 pub fn flate_encoded_len(decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
-    Ok(encode_flate(decoded, level)?.len())
+    flate_capped_encoded_len(decoded, usize::MAX, level)?
+        .ok_or_else(|| Error::Compression("Flate output exceeded usize".into()))
 }
 
 /// Return true when the stream is unfiltered or has exactly one Flate filter.
@@ -1033,6 +1093,40 @@ mod tests {
                     .map(|(&input, &cap)| flate_capped_encoded_len(input, cap, level))
                     .collect::<Result<Vec<_>>>()?;
                 assert_eq!(scalar, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn length_sink_matches_one_shot_across_scratch_boundaries() -> Result<()> {
+        let mut state = 0x8765_4321_u32;
+        let data = (0..512 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+            for size in [0, 1, 16_383, 16_384, 16_385, 65_536, data.len()] {
+                let input = &data[..size];
+                let expected = encode_flate(input, level)?.len();
+                for cap in [
+                    0,
+                    1,
+                    16_384,
+                    expected - 1,
+                    expected,
+                    expected + 1,
+                    usize::MAX,
+                ] {
+                    assert_eq!(
+                        flate_capped_encoded_len(input, cap, level)?,
+                        (expected <= cap).then_some(expected)
+                    );
+                }
             }
         }
         Ok(())

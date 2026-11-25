@@ -1146,7 +1146,7 @@ pub struct ReachabilityCacheStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreparedEncoding {
+pub enum PreparedEncoding {
     Flate(crate::FlateLevel),
     Jpeg,
 }
@@ -1469,7 +1469,6 @@ impl EditDocument {
 
     /// Decode a stable snapshot. Direct source and overlay filter configurations
     /// can be cached by handle; indirect parameters must be resolved afresh.
-    /// Decode a stream and return a shared immutable snapshot.
     ///
     /// # Errors
     /// Returns an error if the stream filters or payload cannot be decoded.

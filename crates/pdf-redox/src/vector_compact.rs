@@ -6,8 +6,7 @@ use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
         decoded_content_value, effective_page_resources, install_page_resource_bindings,
-        page_box_numbers_matching, page_user_unit, replace_page_content,
-        replace_page_content_with_handle,
+        page_box_numbers_matching, page_user_unit, replace_page_content_with_handle,
     },
     content_stream::{measure_form_rewrites, operand_name, operand_number},
     flate::FlateReuseCache,
@@ -3742,7 +3741,7 @@ pub fn compact_vector_paths_with_flate_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ObjectId;
+    use crate::{ObjectId, content::replace_page_content};
 
     #[test]
     fn preferred_body_index_matches_exhaustive_containment() {
@@ -4166,6 +4165,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Compare complete cold and warm closure transactions on one fixture"
+    )]
     fn exact_closure_reuses_only_unchanged_page_blocks() -> Result<()> {
         use crate::{FlateLevel, test_support::ClassicPdfBuilder};
 
