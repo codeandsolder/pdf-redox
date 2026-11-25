@@ -1536,6 +1536,20 @@ impl EditDocument {
         )))
     }
 
+    /// Resolve the terminal stream handle, then share its decoded snapshot.
+    /// Direct embedded values have no stable handle and are decoded normally.
+    pub(crate) fn decoded_reference_snapshot(&self, value: &OwnedObject) -> Result<Arc<Vec<u8>>> {
+        let Some((current, terminal)) =
+            self.resolve_current_value_with_handle(CurrentValue::Owned(value))?
+        else {
+            return Err(Error::Invalid("missing or cyclic stream reference".into()));
+        };
+        if !current.is_stream() {
+            return Err(Error::Invalid("object is not a stream".into()));
+        }
+        self.decode_snapshot(&current, terminal)
+    }
+
     /// Read decoded content as a stable snapshot, including after later edits.
     pub(crate) fn decoded_content_stream_data(&self, handle: ObjectHandle) -> Result<Arc<Vec<u8>>> {
         match self.content_read(handle)? {
@@ -1579,9 +1593,18 @@ impl EditDocument {
     /// Resolve only the reference chain, not the selected object's children.
     pub(crate) fn resolve_current_value<'a>(
         &'a self,
-        mut value: CurrentValue<'a>,
+        value: CurrentValue<'a>,
     ) -> Result<Option<CurrentValue<'a>>> {
+        self.resolve_current_value_with_handle(value)
+            .map(|result| result.map(|(value, _)| value))
+    }
+
+    fn resolve_current_value_with_handle<'a>(
+        &'a self,
+        mut value: CurrentValue<'a>,
+    ) -> Result<Option<(CurrentValue<'a>, Option<ObjectHandle>)>> {
         let mut seen = BTreeSet::new();
+        let mut terminal = None;
         while let Some(handle) = value.reference() {
             if !seen.insert(handle) {
                 return Ok(None);
@@ -1589,9 +1612,10 @@ impl EditDocument {
             let Some(next) = self.current_value(handle)? else {
                 return Ok(None);
             };
+            terminal = Some(handle);
             value = next;
         }
-        Ok(Some(value))
+        Ok(Some((value, terminal)))
     }
 
     /// Borrow an already-owned overlay object, materializing only untouched

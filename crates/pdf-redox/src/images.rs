@@ -8,7 +8,8 @@ use crate::{
     stream_codec::{decode_image_stream, decode_stream, encode_flate, is_unfiltered_or_lone_flate},
 };
 use fast_image_resize::{
-    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
+    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    images::{Image as ResizeImage, ImageRef},
 };
 use libjpeg_turbo_rs::{
     Encoder, PixelFormat, Subsampling,
@@ -18,7 +19,10 @@ use libjpeg_turbo_rs::{
     read_coefficients,
 };
 use num_traits::ToPrimitive;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 const LOCAL_PALETTE_LAYER_OVERHEAD_BYTES: usize = 512;
 const LOCAL_PALETTE_FORM_OVERHEAD_BYTES: usize = 256;
@@ -766,15 +770,15 @@ fn redundant_opaque_smask(document: &EditDocument, dictionary: &OwnedDictionary)
     let Some(smask) = dictionary.get(b"SMask".as_slice()) else {
         return Ok(true);
     };
-    let Some(smask) = document.resolve_owned_value(smask)? else {
+    let Some(resolved) = document.resolve_owned_value_cow(smask)? else {
         return Ok(false);
     };
     let OwnedObject::Stream {
         dictionary: mask_dictionary,
-        data,
-    } = smask
+        ..
+    } = resolved.as_ref()
     else {
-        return Ok(match smask {
+        return Ok(match resolved.as_ref() {
             OwnedObject::Null => true,
             OwnedObject::Name(name) => name.as_slice() == b"None",
             _ => false,
@@ -787,28 +791,19 @@ fn redundant_opaque_smask(document: &EditDocument, dictionary: &OwnedDictionary)
             != Some(b"Image")
         || resolved_name(document, mask_dictionary.get(b"ColorSpace".as_slice()))?.as_deref()
             != Some(b"DeviceGray")
-        || !bpc_is_8(document, &mask_dictionary)?
+        || !bpc_is_8(document, mask_dictionary)?
         || !mask_dictionary.contains_key(b"Filter".as_slice())
-        || !is_unfiltered_or_lone_flate(document, &mask_dictionary)?
+        || !is_unfiltered_or_lone_flate(document, mask_dictionary)?
     {
         return Ok(false);
     }
-    let Some(width) = dimension(document, &mask_dictionary, b"Width")? else {
+    let Some(width) = dimension(document, mask_dictionary, b"Width")? else {
         return Ok(false);
     };
-    let Some(height) = dimension(document, &mask_dictionary, b"Height")? else {
+    let Some(height) = dimension(document, mask_dictionary, b"Height")? else {
         return Ok(false);
     };
-    let encoded = data.bytes(document.source())?;
-    let Ok(decoded) = decode_image_stream(
-        document,
-        &mask_dictionary,
-        encoded.as_ref(),
-        width,
-        height,
-        8,
-        1,
-    ) else {
+    let Ok(decoded) = document.decoded_reference_snapshot(smask) else {
         return Ok(false);
     };
     let Some(expected) = usize::try_from(width)
@@ -1106,26 +1101,36 @@ fn paper_indexed_layered_transform(
 
 fn decoded_pixels(
     document: &EditDocument,
+    handle: ObjectHandle,
     image: &OwnedObject,
     width: u32,
     height: u32,
     components: usize,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Arc<Vec<u8>>>> {
     let OwnedObject::Stream { dictionary, data } = image else {
         return Ok(None);
     };
-    let encoded = data.bytes(document.source())?;
-    let components_u8 = u8::try_from(components)
-        .map_err(|_| Error::Invalid("image component count exceeds u8".to_owned()))?;
-    let Ok(decoded) = decode_image_stream(
-        document,
-        dictionary,
-        encoded.as_ref(),
-        width,
-        height,
-        8,
-        components_u8,
-    ) else {
+    // Flate (including predictor decoding) does not depend on image
+    // metadata. Reuse the exact same snapshot used by raster processing.
+    // Image-specific filters still require explicit dimensions/components.
+    let decoded = if is_unfiltered_or_lone_flate(document, dictionary)? {
+        document.decoded_content_stream_data(handle)
+    } else {
+        let encoded = data.bytes(document.source())?;
+        let components_u8 = u8::try_from(components)
+            .map_err(|_| Error::Invalid("image component count exceeds u8".into()))?;
+        decode_image_stream(
+            document,
+            dictionary,
+            encoded.as_ref(),
+            width,
+            height,
+            8,
+            components_u8,
+        )
+        .map(Arc::new)
+    };
+    let Ok(decoded) = decoded else {
         return Ok(None);
     };
     let expected = usize::try_from(width)
@@ -1192,6 +1197,7 @@ const fn meets_image_optimization_size(
 
 fn transcode_image(
     document: &EditDocument,
+    handle: ObjectHandle,
     image: &OwnedObject,
     options: ImageOptimizationOptions,
     flate_level: crate::FlateLevel,
@@ -1241,7 +1247,7 @@ fn transcode_image(
             return Ok(None);
         }
     }
-    let Some(decoded) = decoded_pixels(document, image, width, height, components)? else {
+    let Some(decoded) = decoded_pixels(document, handle, image, width, height, components)? else {
         return Ok(None);
     };
     let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
@@ -1334,6 +1340,7 @@ fn resize_source_safe(
 
 fn resize_image(
     document: &EditDocument,
+    handle: ObjectHandle,
     image: &OwnedObject,
     options: ImageOptimizationOptions,
     target: ImageResizeTarget,
@@ -1359,10 +1366,10 @@ fn resize_image(
     if target_width == width && target_height == height {
         return Ok(None);
     }
-    let Some(decoded) = decoded_pixels(document, image, width, height, components)? else {
+    let Some(decoded) = decoded_pixels(document, handle, image, width, height, components)? else {
         return Ok(None);
     };
-    let source = ResizeImage::from_vec_u8(width, height, decoded, pixel_type)
+    let source = ImageRef::new(width, height, &decoded, pixel_type)
         .map_err(|error| Error::Invalid(format!("invalid decoded image buffer: {error}")))?;
     let mut destination = ResizeImage::new(target_width, target_height, pixel_type);
     Resizer::new()
@@ -1435,8 +1442,8 @@ fn transform_one(
             return Ok(false);
         }
         match target {
-            Some(target) => resize_image(document, &image, options, target, flate_level)?,
-            None => transcode_image(document, &image, options, flate_level)?,
+            Some(target) => resize_image(document, handle, &image, options, target, flate_level)?,
+            None => transcode_image(document, handle, &image, options, flate_level)?,
         }
     };
     let Some(transform) = transform else {
@@ -1854,6 +1861,24 @@ mod tests {
         pdf.finish(1)
     }
 
+    #[test]
+    fn flate_image_samples_share_generic_stream_snapshot() -> Result<()> {
+        let document = EditDocument::from_bytes(iccbased_flate_pdf(*b"RGB ", false)?)?;
+        let handle = document
+            .reachable_streams_with_subtype(b"Image")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("missing test image".into()))?;
+        let object = document
+            .current_owned_object_cow(handle)?
+            .ok_or_else(|| Error::Invalid("missing test image object".into()))?;
+        let snapshot = document.decoded_content_stream_data(handle)?;
+        let pixels = decoded_pixels(&document, handle, &object, 800, 700, 3)?
+            .ok_or_else(|| Error::Invalid("missing test pixels".into()))?;
+        assert!(Arc::ptr_eq(&snapshot, &pixels));
+        Ok(())
+    }
+
     fn iccbased_flate_transform(
         data_space: [u8; 4],
         indirect: bool,
@@ -1873,6 +1898,7 @@ mod tests {
         };
         transcode_image(
             &document,
+            handle,
             &image,
             ImageOptimizationOptions {
                 min_width: 0,
@@ -1905,6 +1931,7 @@ mod tests {
         };
         transcode_image(
             &document,
+            handle,
             &image,
             ImageOptimizationOptions {
                 min_width: 0,

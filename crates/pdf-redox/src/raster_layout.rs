@@ -1710,7 +1710,7 @@ fn color_components(document: &EditDocument, value: &OwnedObject) -> Result<Opti
 
 #[derive(Debug, Clone)]
 struct AlphaPlane {
-    data: Arc<[u8]>,
+    data: Arc<Vec<u8>>,
     width: u32,
     height: u32,
 }
@@ -1725,7 +1725,7 @@ struct SampleImage {
     preserve_encoded_color: bool,
     encoded_color_bytes: usize,
     encoded_mask_bytes: usize,
-    data: Arc<[u8]>,
+    data: Arc<Vec<u8>>,
     alpha: Option<AlphaPlane>,
     mask_width: u32,
     mask_height: u32,
@@ -1914,10 +1914,10 @@ fn decode_mask_stream(
     value: &OwnedObject,
     stencil_semantics: bool,
 ) -> Result<Option<AlphaPlane>> {
-    let Some(stream) = document.resolve_owned_value(value)? else {
+    let Some(stream) = document.resolve_owned_value_cow(value)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, .. } = &stream else {
+    let OwnedObject::Stream { dictionary, .. } = stream.as_ref() else {
         return Ok(None);
     };
     let Some((width, height)) = dimensions(document, dictionary)? else {
@@ -1938,16 +1938,33 @@ fn decode_mask_stream(
     if !matches!(bpc, 1 | 2 | 4 | 8) {
         return Ok(None);
     }
-    let Ok(decoded) = document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
-    else {
+    let Ok(decoded) = document.decoded_reference_snapshot(value) else {
         return Ok(None);
     };
-    let Some(mut alpha) = unpack_mask_samples(&decoded, width, height, bpc) else {
-        return Ok(None);
+    let mut alpha = if bpc == 8 {
+        let Some(expected) = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+        else {
+            return Ok(None);
+        };
+        if decoded.len() < expected {
+            return Ok(None);
+        }
+        if decoded.len() == expected {
+            decoded
+        } else {
+            Arc::new(decoded[..expected].to_vec())
+        }
+    } else {
+        let Some(unpacked) = unpack_mask_samples(&decoded, width, height, bpc) else {
+            return Ok(None);
+        };
+        Arc::new(unpacked)
     };
     let (decode_min, decode_max) = decode_pair(document, dictionary)?.unwrap_or((0.0, 1.0));
     if decode_min != 0.0 || decode_max != 1.0 || stencil_semantics {
-        for sample in &mut alpha {
+        for sample in Arc::make_mut(&mut alpha) {
             let mut value =
                 (f64::from(*sample) / 255.0).mul_add(decode_max - decode_min, decode_min);
             value = value.clamp(0.0, 1.0);
@@ -1958,7 +1975,7 @@ fn decode_mask_stream(
         }
     }
     Ok(Some(AlphaPlane {
-        data: alpha.into(),
+        data: alpha,
         width,
         height,
     }))
@@ -2295,10 +2312,10 @@ fn image_info(
     handle: ObjectHandle,
     bake_masks: bool,
 ) -> Result<Option<SampleImage>> {
-    let Some(object) = document.current_owned_object(handle)? else {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(None);
     };
-    let OwnedObject::Stream { dictionary, data } = &object else {
+    let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
         return Ok(None);
     };
     let encoded_color_bytes = data.bytes(document.source())?.len();
@@ -2346,16 +2363,14 @@ fn image_info(
     if (has_soft_mask || has_explicit_mask) && !bake_masks {
         return Ok(None);
     }
-    let Ok(raw_decoded) =
-        document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
-    else {
+    let Ok(raw_decoded) = document.decoded_content_stream_data(handle) else {
         return Ok(None);
     };
     let mut decoded = if (indexed || device_gray) && bpc != 8 {
         let Some(samples) = unpack_packed_samples(&raw_decoded, width, height, bpc) else {
             return Ok(None);
         };
-        samples
+        Arc::new(samples)
     } else {
         raw_decoded
     };
@@ -2371,7 +2386,9 @@ fn image_info(
     }
     // Some producers append harmless bytes after the declared image sample grid.
     // Renderers ignore those bytes because Width/Height/BPC define the raster payload.
-    decoded.truncate(expected);
+    if decoded.len() > expected {
+        Arc::make_mut(&mut decoded).truncate(expected);
+    }
     if resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
         .is_some_and(|value| value != 0.0)
     {
@@ -2431,14 +2448,14 @@ fn image_info(
         else {
             return Ok(None);
         };
-        decoded = expanded;
+        decoded = Arc::new(expanded);
         components = expanded_components;
     } else if device_gray && bpc != 8 {
         let Some(expanded) = expand_low_bit_device_gray(document, dictionary, &decoded, bpc)?
         else {
             return Ok(None);
         };
-        decoded = expanded;
+        decoded = Arc::new(expanded);
     }
 
     let interpolate = resolved_bool(document, dictionary.get(b"Interpolate".as_slice()))?
@@ -2505,7 +2522,7 @@ fn image_info(
         preserve_encoded_color,
         encoded_color_bytes,
         encoded_mask_bytes,
-        data: decoded.into(),
+        data: decoded,
         alpha,
         mask_width,
         mask_height,
