@@ -731,18 +731,11 @@ fn record_font_file2_opportunity(
     sparse_skeletons: &mut HashMap<[u8; 32], usize>,
     material_cmap_bytes: &mut usize,
 ) {
-    let unwrapped = crate::font_subset::unwrap_single_face_collection(decoded);
-    let standalone = unwrapped.as_deref().unwrap_or(decoded);
-    let stripped = crate::font_subset::has_pdf_rendering_unused_tables(standalone)
-        .then(|| crate::font_subset::strip_pdf_unused_tables(standalone))
-        .flatten();
-    let rendering = stripped
-        .as_ref()
-        .map_or(standalone, |(bytes, _)| bytes.as_slice());
-    if let Some(skeleton) = crate::font::sparse_cid_union_skeleton_hash(rendering) {
+    let (skeleton, cmap) = crate::font::font_file2_opportunity(decoded);
+    if let Some(skeleton) = skeleton {
         *sparse_skeletons.entry(skeleton).or_default() += 1;
     }
-    if let Some(cmap_bytes) = crate::font_subset::cidfont_type2_cmap_size(rendering)
+    if let Some(cmap_bytes) = cmap
         && cmap_bytes >= crate::font::MIN_CID_CMAP_DECODED_BYTES_PER_PROGRAM
     {
         *material_cmap_bytes = material_cmap_bytes.saturating_add(cmap_bytes);

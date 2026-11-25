@@ -513,10 +513,25 @@ impl MicroStrokeScanner {
     }
 }
 
+const fn is_pdf_whitespace(byte: u8) -> bool {
+    matches!(byte, 0 | 9 | 10 | 12 | 13 | 32)
+}
+
 fn pdf_whitespace(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .all(|byte| matches!(*byte, 0 | 9 | 10 | 12 | 13 | 32))
+    bytes.iter().copied().all(is_pdf_whitespace)
+}
+
+/// A qualifying run of N blocks necessarily contains N-1 raw Q-to-q
+/// boundaries separated only by PDF whitespace. Counting these boundaries
+/// is a cheap upper bound; strings and inline image data can only inflate it.
+fn may_contain_microstroke_run(content: &[u8]) -> bool {
+    content
+        .split(|&byte| byte == b'Q')
+        .skip(1)
+        .filter(|tail| tail.iter().copied().find(|&byte| !is_pdf_whitespace(byte)) == Some(b'q'))
+        .take(MIN_MICROSTROKE_RUN - 1)
+        .count()
+        == MIN_MICROSTROKE_RUN - 1
 }
 
 type Point = (f64, f64);
@@ -1006,6 +1021,9 @@ pub fn rasterize_pathological_microstrokes(
         let Some(decoded) = page_content_if_present(document, page)? else {
             continue;
         };
+        if !may_contain_microstroke_run(&decoded) {
+            continue;
+        }
         let resources = effective_page_resources(document, page)?;
         let Some(user_unit) = page_user_unit(document, page)? else {
             continue;
@@ -1180,6 +1198,33 @@ mod tests {
             let content = crate::content::page_content(&document, pages[0])?;
             assert!(content.windows(2).any(|window| window == b"Do"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn microstroke_prefilter_requires_only_necessary_raw_boundaries() -> Result<()> {
+        let block = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q";
+        let mut content = Vec::new();
+        for index in 0..MIN_MICROSTROKE_RUN {
+            if index != 0 {
+                content.push([0, 9, 10, 12, 13, 32][index % 6]);
+            }
+            content.extend_from_slice(block);
+            assert_eq!(
+                may_contain_microstroke_run(&content),
+                index + 1 >= MIN_MICROSTROKE_RUN
+            );
+        }
+        let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
+        let mut builder = MicroStrokeRunBuilder::default();
+        scanner.scan(&content, |block| builder.push(&content, block))?;
+        assert_eq!(builder.finish()[0].lines.len(), MIN_MICROSTROKE_RUN);
+        assert!(!may_contain_microstroke_run(
+            &b"Q % comment\nq ".repeat(MIN_MICROSTROKE_RUN)
+        ));
+        assert!(may_contain_microstroke_run(
+            &b"Qq ".repeat(MIN_MICROSTROKE_RUN - 1)
+        ));
         Ok(())
     }
 

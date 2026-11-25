@@ -127,42 +127,48 @@ pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     use write_fonts::read::{FontRef, TableProvider};
 
     let font = FontRef::new(bytes).ok()?;
-    if font.table_directory().sfnt_version() != 0x0001_0000 {
+    let version = font.table_directory().sfnt_version();
+    let tables = font
+        .table_directory()
+        .table_records()
+        .iter()
+        .map(|record| {
+            let tag = record.tag();
+            Some((tag, font.data_for_tag(tag)?.as_bytes()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    skeleton_hash(version, tables)
+}
+
+const CID_TRUETYPE_REQUIRED_TABLES: [[u8; 4]; 6] =
+    [*b"glyf", *b"loca", *b"head", *b"maxp", *b"hhea", *b"hmtx"];
+
+fn skeleton_hash(
+    version: u32,
+    mut tables: Vec<(write_fonts::types::Tag, &[u8])>,
+) -> Option<[u8; 32]> {
+    if version != 0x0001_0000 {
         return None;
     }
-    let mut tables = Vec::new();
     let mut required = [false; 6];
-    for record in font.table_directory().table_records() {
-        let tag = record.tag();
-        let data = font.data_for_tag(tag)?.as_bytes();
-        match &tag.to_be_bytes() {
-            b"glyf" => {
-                required[0] = true;
-                continue;
-            }
-            b"loca" => {
-                required[1] = true;
-                continue;
-            }
-            b"head" => {
-                required[2] = true;
-                if data.len() < 54 {
-                    return None;
-                }
-            }
-            b"maxp" => required[3] = true,
-            b"hhea" => required[4] = true,
-            b"hmtx" => required[5] = true,
-            _ => {}
+    for (tag, data) in &tables {
+        if let Some(index) = CID_TRUETYPE_REQUIRED_TABLES
+            .iter()
+            .position(|required| *required == tag.to_be_bytes())
+        {
+            required[index] = true;
         }
-        tables.push((tag, data));
+        if tag.to_be_bytes() == *b"head" && data.len() < 54 {
+            return None;
+        }
     }
     if required.iter().any(|present| !present) {
         return None;
     }
+    tables.retain(|(tag, _)| !matches!(&tag.to_be_bytes(), b"glyf" | b"loca"));
     tables.sort_unstable_by_key(|(tag, _)| tag.to_be_bytes());
     let mut hasher = Sha256::new();
-    hasher.update(font.table_directory().sfnt_version().to_be_bytes());
+    hasher.update(version.to_be_bytes());
     hasher.update((tables.len() as u64).to_le_bytes());
     for (tag, data) in tables {
         hasher.update(tag.to_be_bytes());
@@ -176,6 +182,28 @@ pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
         }
     }
     Some(hasher.finalize().into())
+}
+
+/// Preflight only needs the projected rendering tables, not rebuilt font bytes.
+pub fn font_file2_opportunity(bytes: &[u8]) -> (Option<[u8; 32]>, Option<usize>) {
+    let Some((version, tables)) = crate::font_subset::rendering_table_view(bytes) else {
+        // A malformed unrelated table prevents a rebuild, but need not
+        // prevent discovering a valid cmap on the original standalone font.
+        return (None, crate::font_subset::cidfont_type2_cmap_size(bytes));
+    };
+    let cmap = if version == 0x0001_0000
+        && CID_TRUETYPE_REQUIRED_TABLES
+            .iter()
+            .all(|required| tables.iter().any(|(tag, _)| tag.to_be_bytes() == *required))
+    {
+        tables
+            .iter()
+            .find(|(tag, _)| tag.to_be_bytes() == *b"cmap")
+            .map(|(_, data)| data.len())
+    } else {
+        None
+    };
+    (skeleton_hash(version, tables), cmap)
 }
 
 fn sfnt_glyph_offsets(bytes: &[u8]) -> Option<Vec<usize>> {
@@ -3665,6 +3693,61 @@ mod tests {
             (*b"fpgm", b"fpgm"),
             (*b"prep", b"prep"),
         ]))
+    }
+
+    #[test]
+    fn borrowed_font_opportunity_matches_materialized_rendering() -> Result<()> {
+        fn compare(bytes: &[u8]) {
+            let unwrapped = single_font_ttc_to_sfnt(bytes);
+            let standalone = unwrapped.as_deref().unwrap_or(bytes);
+            let stripped = sfnt_for_pdf_rendering(standalone);
+            let rendering = stripped
+                .as_ref()
+                .map_or(standalone, |(bytes, _)| bytes.as_slice());
+            assert_eq!(
+                font_file2_opportunity(bytes),
+                (
+                    sparse_cid_union_skeleton_hash(rendering),
+                    crate::font_subset::cidfont_type2_cmap_size(rendering),
+                )
+            );
+        }
+        let head = [0_u8; 54];
+        let cmap = [0_u8; 4096];
+        for extra in [b"".as_slice(), b"unused table"] {
+            let font = sfnt(&[
+                (*b"head", &head),
+                (*b"maxp", b"maxp"),
+                (*b"hhea", b"hhea"),
+                (*b"hmtx", b"hmtx"),
+                (*b"loca", b"loca"),
+                (*b"glyf", b"glyf"),
+                (*b"cmap", &cmap),
+                (*b"GSUB", extra),
+            ]);
+            compare(&font);
+            assert!(font_file2_opportunity(&font).0.is_some());
+            assert_eq!(font_file2_opportunity(&font).1, Some(cmap.len()));
+            let mut collection = b"ttcf\0\x01\0\0\0\0\0\x01\0\0\0\x10".to_vec();
+            let mut face = font.clone();
+            let count = usize::from(u16::from_be_bytes([face[4], face[5]]));
+            for index in 0..count {
+                let offset = 12 + index * 16 + 8;
+                let bytes: [u8; 4] = face[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| Error::Invalid("test offset".to_owned()))?;
+                face[offset..offset + 4]
+                    .copy_from_slice(&(u32::from_be_bytes(bytes) + 16).to_be_bytes());
+            }
+            collection.extend_from_slice(&face);
+            assert!(single_font_ttc_to_sfnt(&collection).is_some());
+            compare(&collection);
+            let mut malformed = font;
+            malformed.truncate(malformed.len() / 2);
+            compare(&malformed);
+        }
+        compare(b"not a font");
+        Ok(())
     }
 
     fn simple_test_glyph(marker: u8) -> Vec<u8> {

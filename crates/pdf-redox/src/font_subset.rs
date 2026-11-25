@@ -87,6 +87,49 @@ pub fn strip_pdf_unused_tables(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     (result.1 > 0).then_some(result)
 }
 
+/// Borrow the tables that the rendering-only font would contain, without
+/// serializing a temporary SFNT. Rebuilding normalizes the version and
+/// collapses duplicate tags; preserve both details in the projected view.
+pub fn rendering_table_view(bytes: &[u8]) -> Option<(u32, Vec<(Tag, &[u8])>)> {
+    let (font, collection) = match FileRef::new(bytes).ok()? {
+        FileRef::Font(font) => (font, false),
+        FileRef::Collection(collection) if collection.len() == 1 => (collection.get(0).ok()?, true),
+        FileRef::Collection(_) => return None,
+    };
+    let mut tables = Vec::new();
+    let mut removed = false;
+    let mut retained = false;
+    for record in font.table_directory().table_records() {
+        let tag = record.tag();
+        let data = font.data_for_tag(tag)?.as_bytes();
+        if PDF_RENDERING_UNUSED_TABLES.contains(&tag) {
+            removed |= !data.is_empty();
+        } else {
+            retained = true;
+        }
+        tables.push((tag, data));
+    }
+    if removed && retained {
+        tables.retain(|(tag, _)| !PDF_RENDERING_UNUSED_TABLES.contains(tag));
+    }
+    let version = if collection || (removed && retained) {
+        // Same SFNT version selection as FontBuilder.
+        tables.sort_unstable_by_key(|(tag, _)| tag.to_be_bytes());
+        tables.dedup_by_key(|(tag, _)| *tag);
+        if tables
+            .iter()
+            .any(|(tag, _)| matches!(&tag.to_be_bytes(), b"CFF " | b"CFF2"))
+        {
+            u32::from_be_bytes(*b"OTTO")
+        } else {
+            0x0001_0000
+        }
+    } else {
+        font.table_directory().sfnt_version()
+    };
+    Some((version, tables))
+}
+
 /// Remove the internal character-to-glyph map from a TrueType program that is
 /// embedded exclusively through PDF `CIDFontType2` dictionaries. PDF supplies
 /// CID→GID selection separately for embedded Type 2 `CIDFonts`, so retaining the
