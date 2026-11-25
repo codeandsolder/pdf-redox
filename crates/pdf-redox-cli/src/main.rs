@@ -206,6 +206,19 @@ struct Args {
     json: bool,
 }
 
+fn configure_flate(cfg: &mut Config, args: &Args) {
+    if let Some(flate_workers) = args.flate_workers {
+        cfg.flate_workers = flate_workers;
+    }
+    cfg.flate_gpu = args
+        .flate_gpu_budget
+        .map(|search_budget| pdf_redox::FlateGpuConfig {
+            adapter: args.flate_gpu_adapter.clone(),
+            search_budget,
+            min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
+        });
+}
+
 fn config_from_args(args: &Args) -> Config {
     let mut cfg = match args.profile {
         ProfileArg::Optimize => Config::optimize_only(),
@@ -276,16 +289,7 @@ fn config_from_args(args: &Args) -> Config {
     if let Some(max_image_ppi) = args.max_image_ppi {
         cfg.max_image_ppi = Some(max_image_ppi);
     }
-    if let Some(flate_workers) = args.flate_workers {
-        cfg.flate_workers = flate_workers;
-    }
-    cfg.flate_gpu = args
-        .flate_gpu_budget
-        .map(|search_budget| pdf_redox::FlateGpuConfig {
-            adapter: args.flate_gpu_adapter.clone(),
-            search_budget,
-            min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
-        });
+    configure_flate(&mut cfg, args);
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
         && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled |= args.normalize_raster_layout;
