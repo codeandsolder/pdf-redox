@@ -526,7 +526,9 @@ pub fn analyze_microstroke_rasterization(
 }
 
 /// Reusable optimizer with a fixed policy and lazily initialized compression
-/// resources. Document-local analyses and rewrite caches are never retained.
+/// resources.
+///
+/// Document-local analyses and rewrite caches are never retained.
 /// Reuse the session across PDFs to amortize worker and GPU initialization.
 pub struct OptimizationSession {
     config: Config,

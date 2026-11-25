@@ -1,5 +1,6 @@
 #![doc = include_str!("../../../README.md")]
 #![deny(missing_docs)]
+#![recursion_limit = "256"]
 
 mod analyze;
 mod bilevel;
