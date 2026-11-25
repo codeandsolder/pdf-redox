@@ -3153,6 +3153,7 @@ struct PreparedAlpha {
 
 #[derive(Debug)]
 struct PreparedImage {
+    flate_level: crate::FlateLevel,
     dictionary: OwnedDictionary,
     data: Vec<u8>,
     alpha: Option<PreparedAlpha>,
@@ -3191,6 +3192,7 @@ fn prepare_constant_color_mask_stencil(
         BilevelCodec::Flate => encoding.bilevel_flate_images = 1,
     }
     Ok(Some(PreparedImage {
+        flate_level,
         dictionary: stencil_payload.dictionary,
         data: stencil_payload.data,
         alpha: None,
@@ -3259,6 +3261,7 @@ fn try_prepare_binary_alpha_stencil(
             encoding.encoded_bytes_saved =
                 u64::try_from(normal_cost - stencil_cost).unwrap_or(u64::MAX);
             return Ok(Some(PreparedImage {
+                flate_level,
                 dictionary,
                 data: stencil_payload.data,
                 alpha: None,
@@ -3518,6 +3521,7 @@ fn prepare_image(
     )?;
 
     Ok(PreparedImage {
+        flate_level,
         dictionary,
         data: encoded,
         alpha: prepared_alpha,
@@ -3557,6 +3561,10 @@ fn install_prepared_image(
             dictionary: alpha_dictionary,
             data: StreamData::Owned(alpha.data.into()),
         }));
+        document.record_prepared_encoding(
+            alpha_stream,
+            crate::source::PreparedEncoding::Flate(prepared.flate_level),
+        );
         prepared
             .dictionary
             .insert(b"SMask".to_vec(), OwnedObject::Reference(alpha_stream));
@@ -3565,6 +3573,7 @@ fn install_prepared_image(
         dictionary: prepared.dictionary,
         data: StreamData::Owned(prepared.data.into()),
     }));
+    document.record_generated_image_encoding(handle, prepared.flate_level);
     (handle, prepared.encoding)
 }
 

@@ -527,6 +527,7 @@ fn install_indexed_image_layer(
     color_space: OwnedObject,
     encoded: Vec<u8>,
     transparent_zero: bool,
+    level: crate::FlateLevel,
 ) -> ObjectHandle {
     let mut dictionary = OwnedDictionary::from([
         (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
@@ -546,10 +547,12 @@ fn install_indexed_image_layer(
             OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
         );
     }
-    ObjectHandle::New(document.add_object(OwnedObject::Stream {
+    let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
         dictionary,
         data: StreamData::Owned(encoded.into()),
-    }))
+    }));
+    document.record_prepared_encoding(handle, crate::source::PreparedEncoding::Flate(level));
+    handle
 }
 
 fn install_local_layered_indexed_transform(
@@ -559,6 +562,7 @@ fn install_local_layered_indexed_transform(
     height: u32,
     layers: Vec<LayeredIndexedLayerTransform>,
     base_color_space: &OwnedObject,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     let mut resources = OwnedDictionary::new();
     let mut content = Vec::new();
@@ -566,8 +570,15 @@ fn install_local_layered_indexed_transform(
         let name = format!("PdfRedoxLocalPalette{index}").into_bytes();
         let color_space =
             indexed_color_space_with_transparent_zero(base_color_space.clone(), &layer.palette)?;
-        let child =
-            install_indexed_image_layer(document, width, height, color_space, layer.encoded, true);
+        let child = install_indexed_image_layer(
+            document,
+            width,
+            height,
+            color_space,
+            layer.encoded,
+            true,
+            level,
+        );
         resources.insert(name.clone(), OwnedObject::Reference(child));
         content.push(b'/');
         content.extend_from_slice(&name);
@@ -583,6 +594,7 @@ fn install_residual_indexed_transform(
     width: u32,
     height: u32,
     transform: ResidualIndexedTransform,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     let base_name = b"PdfRedoxResidualBase".to_vec();
     let residual_name = b"PdfRedoxResidualCorrection".to_vec();
@@ -599,6 +611,7 @@ fn install_residual_indexed_transform(
         base_color_space,
         transform.base_encoded,
         false,
+        level,
     );
     let residual = install_indexed_image_layer(
         document,
@@ -607,6 +620,7 @@ fn install_residual_indexed_transform(
         residual_color_space,
         transform.residual_encoded,
         true,
+        level,
     );
     let resources = OwnedDictionary::from([
         (base_name.clone(), OwnedObject::Reference(base)),
@@ -627,6 +641,7 @@ fn install_layered_indexed_transform(
     width: u32,
     height: u32,
     transform: LayeredIndexedTransform,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     match transform {
         LayeredIndexedTransform::Local {
@@ -639,9 +654,10 @@ fn install_layered_indexed_transform(
             height,
             layers,
             &base_color_space,
+            level,
         ),
         LayeredIndexedTransform::Residual(transform) => {
-            install_residual_indexed_transform(document, handle, width, height, transform)
+            install_residual_indexed_transform(document, handle, width, height, transform, level)
         }
     }
 }
@@ -650,6 +666,7 @@ fn install_transform(
     document: &mut EditDocument,
     handle: ObjectHandle,
     transform: ImageTransform,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     if let Some(layered) = transform.layered_indexed {
         return install_layered_indexed_transform(
@@ -658,6 +675,7 @@ fn install_transform(
             transform.width,
             transform.height,
             layered,
+            level,
         );
     }
     let object = document.edit_handle(handle)?;
@@ -679,6 +697,7 @@ fn install_transform(
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
     *data = StreamData::Owned(transform.encoded.into());
+    document.record_generated_image_encoding(handle, level);
     Ok(())
 }
 
@@ -1476,7 +1495,7 @@ fn transform_one(
     stats.optimized_pixels = stats
         .optimized_pixels
         .saturating_add(transform.optimized_pixels);
-    install_transform(document, handle, transform)?;
+    install_transform(document, handle, transform, flate_level)?;
     Ok(true)
 }
 
@@ -2001,6 +2020,7 @@ mod tests {
                 ],
                 base_color_space: OwnedObject::Name(b"DeviceRGB".to_vec()),
             },
+            crate::FlateLevel::SIZE,
         )?;
         let Some(object) = document.current_owned_object(image)? else {
             return Err(Error::Invalid("installed Form is missing".to_owned()));
@@ -2094,6 +2114,7 @@ mod tests {
                 residual_palette: vec![10, 80, 200],
                 base_color_space: OwnedObject::Name(b"DeviceRGB".to_vec()),
             }),
+            crate::FlateLevel::SIZE,
         )?;
         let Some(OwnedObject::Stream { dictionary, data }) =
             document.current_owned_object(image)?
@@ -2245,6 +2266,7 @@ mod tests {
                 paper_indexed: true,
                 encoding: ImageResizeEncoding::Flate,
             },
+            crate::FlateLevel::SIZE,
         )?;
         let Some(after) = document.current_owned_object(color)? else {
             return Err(Error::Invalid(

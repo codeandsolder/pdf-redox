@@ -187,6 +187,9 @@ impl JpegJob<'_> {
 }
 
 fn collect_jpeg_job(document: &EditDocument, handle: ObjectHandle) -> Result<Option<JpegJob<'_>>> {
+    if document.has_prepared_encoding(handle, crate::source::PreparedEncoding::Jpeg) {
+        return Ok(None);
+    }
     let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(None);
     };
@@ -270,6 +273,7 @@ pub fn optimize_jpeg_entropy(
             let object = document.edit_handle(handle)?;
             if let OwnedObject::Stream { data, .. } = object {
                 *data = StreamData::Owned(optimized.into());
+                document.record_prepared_encoding(handle, crate::source::PreparedEncoding::Jpeg);
                 stats.streams_optimized += 1;
                 stats.original_encoded_bytes += original_len;
                 stats.optimized_encoded_bytes += optimized_len;

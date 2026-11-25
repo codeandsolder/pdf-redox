@@ -9,7 +9,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 /// Immutable evidence about a stream subtype, without resolving references.
@@ -1147,11 +1147,18 @@ pub struct ReachabilityCacheStats {
 
 /// A lazily parsed source document plus the objects changed by optimization
 /// passes. This is the target architecture for the Hayro migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedEncoding {
+    Flate(crate::FlateLevel),
+    Jpeg,
+}
+
 pub struct EditDocument {
     source: SourcePdf,
     trailer: OwnedDictionary,
     overlay: ObjectOverlay,
     decoded_content_stream_cache: RefCell<DecodedContentCache>,
+    prepared_encodings: HashMap<ObjectHandle, (PreparedEncoding, Weak<Vec<u8>>)>,
     mutation_generation: Cell<u64>,
     reachable_output_cache: RefCell<Option<ReachableOutputCache>>,
     pending_reference_baselines: RefCell<HashMap<ObjectHandle, Vec<ObjectHandle>>>,
@@ -1172,6 +1179,7 @@ impl EditDocument {
             trailer,
             overlay: ObjectOverlay::default(),
             decoded_content_stream_cache: RefCell::new(DecodedContentCache::default()),
+            prepared_encodings: HashMap::new(),
             mutation_generation: Cell::new(0),
             reachable_output_cache: RefCell::new(None),
             pending_reference_baselines: RefCell::new(HashMap::new()),
@@ -1287,6 +1295,7 @@ impl EditDocument {
         // Opaque callers can edit or delete any source stream. Discard all
         // cached entries so unreachable decoded bytes cannot exhaust the budget.
         *self.decoded_content_stream_cache.get_mut() = DecodedContentCache::default();
+        self.prepared_encodings.clear();
         &mut self.overlay
     }
 
@@ -1295,6 +1304,70 @@ impl EditDocument {
     /// Adds a new object to the document overlay and returns its temporary identifier.
     pub fn add_object(&mut self, object: OwnedObject) -> NewObjectId {
         self.overlay.add(object)
+    }
+
+    // Only explicitly produced encodings qualify. The weak pointer tracks the
+    // precise payload without retaining dead buffers or hashing it again.
+    // Metadata-only edits do not invalidate the encoding; changing the
+    // payload, filter, or parameters does.
+    fn prepared_payload(
+        &self,
+        handle: ObjectHandle,
+        encoding: PreparedEncoding,
+    ) -> Option<&Arc<Vec<u8>>> {
+        let Ok(Some(CurrentValue::Owned(OwnedObject::Stream {
+            dictionary,
+            data: StreamData::Owned(bytes),
+        }))) = self.current_value(handle)
+        else {
+            return None;
+        };
+        let expected = match encoding {
+            PreparedEncoding::Flate(_) => b"FlateDecode".as_slice(),
+            PreparedEncoding::Jpeg => b"DCTDecode".as_slice(),
+        };
+        if !matches!(dictionary.get(b"Filter".as_slice()), Some(OwnedObject::Name(name)) if name == expected)
+            || dictionary.contains_key(b"DecodeParms".as_slice())
+            || crate::stream_codec::has_external_file_stream_entries(dictionary)
+        {
+            return None;
+        }
+        Some(bytes)
+    }
+
+    pub(crate) fn record_prepared_encoding(
+        &mut self,
+        handle: ObjectHandle,
+        encoding: PreparedEncoding,
+    ) {
+        if let Some(payload) = self.prepared_payload(handle, encoding).map(Arc::downgrade) {
+            self.prepared_encodings.insert(handle, (encoding, payload));
+        }
+    }
+
+    pub(crate) fn has_prepared_encoding(
+        &self,
+        handle: ObjectHandle,
+        encoding: PreparedEncoding,
+    ) -> bool {
+        self.prepared_encodings
+            .get(&handle)
+            .is_some_and(|(recorded, payload)| {
+                *recorded == encoding
+                    && self
+                        .prepared_payload(handle, encoding)
+                        .is_some_and(|bytes| Weak::ptr_eq(payload, &Arc::downgrade(bytes)))
+            })
+    }
+
+    pub(crate) fn record_generated_image_encoding(
+        &mut self,
+        handle: ObjectHandle,
+        level: crate::FlateLevel,
+    ) {
+        for encoding in [PreparedEncoding::Flate(level), PreparedEncoding::Jpeg] {
+            self.record_prepared_encoding(handle, encoding);
+        }
     }
 
     /// Snapshot the tail of the unnumbered-object arena before speculative allocation.
@@ -1330,6 +1403,9 @@ impl EditDocument {
         for handle in discarded {
             cache.evict(handle);
         }
+        self.prepared_encodings.retain(
+            |handle, _| !matches!(handle, ObjectHandle::New(id) if id.index() >= checkpoint.0),
+        );
         self.overlay.added.truncate(checkpoint.0);
         Ok(())
     }

@@ -538,7 +538,11 @@ fn collect_filtered_job<'a>(
     handle: ObjectHandle,
     reuse_cache: &mut FlateReuseCache,
     batcher: &FlateBatchEncoder,
+    level: crate::FlateLevel,
 ) -> Result<Option<FilteredJob<'a>>> {
+    if document.has_prepared_encoding(handle, crate::source::PreparedEncoding::Flate(level)) {
+        return Ok(None);
+    }
     let Some(object) = document.current_owned_object_cow(handle)? else {
         return Ok(None);
     };
@@ -599,7 +603,7 @@ fn run_filtered_jobs(
     let mut jobs = Vec::new();
     let mut retained = 0_usize;
     for handle in handles {
-        let Some(job) = collect_filtered_job(document, handle, reuse_cache, batcher)? else {
+        let Some(job) = collect_filtered_job(document, handle, reuse_cache, batcher, level)? else {
             continue;
         };
         retained = retained.saturating_add(job.input.retained_bytes());

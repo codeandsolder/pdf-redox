@@ -632,7 +632,7 @@ fn union_sparse_cid_font_programs(
 
         let encoded_len = encoded.len();
         drop(object);
-        replace_current_stream_data(document, canonical.program, encoded, true)?;
+        replace_current_stream_data(document, canonical.program, encoded, true, flate_level)?;
         // Keep Length1 truthful for the newly synthesized program. Existing
         // single-program table stripping intentionally preserves candidate-32
         // behavior; this only applies to the union stream.
@@ -1910,6 +1910,7 @@ fn replace_current_stream_data(
     handle: CowObjectHandle,
     encoded: Vec<u8>,
     plain_flate: bool,
+    level: crate::FlateLevel,
 ) -> Result<()> {
     let object = document.edit_handle(handle)?;
     match object {
@@ -1918,6 +1919,12 @@ fn replace_current_stream_data(
                 set_plain_flate(dictionary);
             }
             *data = StreamData::Owned(encoded.into());
+            if plain_flate {
+                document.record_prepared_encoding(
+                    handle,
+                    crate::source::PreparedEncoding::Flate(level),
+                );
+            }
             Ok(())
         }
         _ => Err(Error::Invalid(
@@ -2234,10 +2241,16 @@ fn dense_compact_cidfont_type2_programs_with_usage(
         drop(program_decoded);
         drop(program_raw);
         drop(program_object);
-        replace_current_stream_data(document, program, encoded_program, program_plain_flate)?;
+        replace_current_stream_data(
+            document,
+            program,
+            encoded_program,
+            program_plain_flate,
+            flate_level,
+        )?;
         set_font_program_length1(document, program, dense.bytes.len())?;
         for (map, encoded, _, plain_flate) in encoded_maps {
-            replace_current_stream_data(document, map, encoded, plain_flate)?;
+            replace_current_stream_data(document, map, encoded, plain_flate, flate_level)?;
         }
 
         stats.programs_optimized = stats.programs_optimized.saturating_add(1);
@@ -2357,7 +2370,7 @@ pub fn strip_font_editing_tables(
         stats.original_encoded_bytes += raw_len;
         stats.optimized_encoded_bytes += encoded.len();
         stats.decoded_table_bytes_removed += removed_decoded_bytes;
-        replace_current_stream_data(document, program, encoded, true)?;
+        replace_current_stream_data(document, program, encoded, true, flate_level)?;
     }
 
     Ok(stats)
@@ -2568,7 +2581,7 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
         stats.cid_cmap_decoded_bytes_removed += removed_decoded_bytes;
         stats.original_encoded_bytes += info.raw_len;
         stats.optimized_encoded_bytes += encoded.len();
-        replace_current_stream_data(document, info.program, encoded, plain_flate)?;
+        replace_current_stream_data(document, info.program, encoded, plain_flate, flate_level)?;
         if info.had_length1 {
             set_font_program_length1(document, info.program, candidate.len())?;
         }
@@ -2786,7 +2799,7 @@ pub fn subset_font_outlines_after_dedup(
         stats.optimized_encoded_bytes += best.encoded.len();
         stats.decoded_table_bytes_removed += best.table_bytes_removed;
         stats.glyph_subset_decoded_bytes_removed += best.glyph_bytes_removed;
-        replace_current_stream_data(document, program, best.encoded, true)?;
+        replace_current_stream_data(document, program, best.encoded, true, flate_level)?;
     }
 
     Ok(stats)
@@ -4502,7 +4515,13 @@ mod tests {
             };
             let encoded = crate::stream_codec::encode_flate(&sparse, crate::FlateLevel::SIZE)
                 .map_err(|error| Error::Invalid(format!("fixture flate encode failed: {error}")))?;
-            replace_current_stream_data(&mut document, program, encoded, true)?;
+            replace_current_stream_data(
+                &mut document,
+                program,
+                encoded,
+                true,
+                crate::FlateLevel::SIZE,
+            )?;
             set_font_program_length1(&mut document, program, sparse.len())?;
         }
 

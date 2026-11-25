@@ -1257,6 +1257,10 @@ fn compact_collinear_form_paths(
         };
         crate::stream_codec::set_plain_flate(dictionary);
         *data = StreamData::Owned(candidate.encoded.into());
+        document.record_prepared_encoding(
+            candidate.handle,
+            crate::source::PreparedEncoding::Flate(flate_level),
+        );
         stats.forms_rewritten = stats.forms_rewritten.saturating_add(1);
         stats.vertices_removed = stats
             .vertices_removed

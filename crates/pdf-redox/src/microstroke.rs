@@ -1125,6 +1125,10 @@ pub fn rasterize_pathological_microstrokes(
                 dictionary: candidate.dictionary,
                 data: StreamData::Owned(candidate.data.into()),
             }));
+            document.record_prepared_encoding(
+                handle,
+                crate::source::PreparedEncoding::Flate(flate_level),
+            );
             installed.push((candidate.name, handle));
         }
         replace_page_content(document, page, rewritten)?;
