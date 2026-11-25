@@ -390,7 +390,7 @@ fn default_flate_workers() -> NonZeroUsize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlateGpuConfig {
-    /// Optional case-insensitive Vulkan adapter name substring.
+    /// Optional Vulkan adapter substring or explicit CUDA device selector (cuda:N).
     pub adapter: Option<String>,
     /// Maximum number of hash-chain candidates visited at each input position.
     pub search_budget: NonZeroU32,

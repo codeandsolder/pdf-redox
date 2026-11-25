@@ -27,6 +27,7 @@ doc = false
 
 [features]
 gpu = ["pdf-redox/gpu"]
+cuda = ["gpu", "pdf-redox/cuda"]
 
 [dependencies]
 pdf-redox = { path = "../pdf-redox" }

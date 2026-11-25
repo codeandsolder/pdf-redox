@@ -525,7 +525,7 @@ pub struct FlateBatchStats {
     pub gpu_rejected_cpu_retries: usize,
     /// Rejected GPU attempts that the CPU subsequently admitted.
     pub gpu_rejected_cpu_accepted: usize,
-    /// Actual Vulkan context initialization time charged to this document, if any.
+    /// Actual GPU context initialization time charged to this document, if any.
     pub gpu_initialization_ms: f64,
 }
 

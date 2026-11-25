@@ -53,6 +53,12 @@ cargo build --release -p pdf-redox-cli --bin pdf-redox --features gpu
 pdf-redox input.pdf --output output.pdf --optimize-for size --flate-gpu-budget 512
 ```
 
+On NVIDIA CUDA systems (including WSL2 with the NVIDIA driver and CUDA NVRTC runtime installed), build with the `cuda` feature instead and select the device explicitly:
+```sh
+cargo build --release -p pdf-redox-cli --bin pdf-redox --features cuda
+pdf-redox input.pdf --output output.pdf --optimize-for size --flate-gpu-adapter cuda:0 --flate-gpu-budget 128 --flate-gpu-window-bytes 4194304
+```
+
 GPU matching is explicitly opt-in. The final Flate recompression and unfiltered-stream compression passes share one lazily initialized GPU context. CPU-only and GPU-assisted batches overlap on the same worker pool, without increasing its configured CPU thread count. Library callers processing multiple PDFs can reuse an `OptimizationSession` with a fixed `Config` to retain both the worker pool and GPU context across documents; the one-shot CLI creates a single session. Streams smaller than 1 MiB remain on the CPU by default; adjust that threshold with `--flate-gpu-min-stream-bytes`, or choose an adapter with `--flate-gpu-adapter NVIDIA`. The search budget controls the maximum number of predecessor candidates visited per byte, not the compression level. To evaluate bounded, demand-driven GPU matching for capped recompression, use `--flate-gpu-window-bytes 4194304`; this preserves the whole-input GPU encoding while avoiding search of tails the encoder never reaches. To experiment with CPU routing for extremely tight compression caps, set `--flate-gpu-min-cap-per-mille 30` (3% of decoded input size). Use `--flate-gpu-retry-rejected` to retry only GPU output-cap failures with the CPU matcher, trading additional work for more compression opportunities. GPU and CPU encodings can differ while decoding to identical bytes, and the usual output-size acceptance limits remain in force. Size optimization (level 9) on large streams is the intended starting point; lower levels and small streams may be faster on the CPU. Other compression probes still use the CPU. Native builds without the feature and the WASM UI retain their existing CPU paths.
 
 ## Documentation scope

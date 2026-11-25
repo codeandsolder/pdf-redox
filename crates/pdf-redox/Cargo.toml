@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 gpu = ["zlib-rs/gpu"]
+cuda = ["gpu", "zlib-rs/cuda"]
 
 [dependencies]
 hayro-syntax.workspace = true

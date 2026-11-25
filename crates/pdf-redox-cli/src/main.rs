@@ -127,10 +127,10 @@ struct Args {
     /// Maximum persistent workers used for independent whole-stream Flate compression.
     #[arg(long)]
     flate_workers: Option<NonZeroUsize>,
-    /// Enable experimental Vulkan-assisted Flate compression with this search budget.
+    /// Enable experimental GPU-assisted Flate compression with this search budget.
     #[arg(long)]
     flate_gpu_budget: Option<NonZeroU32>,
-    /// Select a Vulkan adapter by name substring.
+    /// Select a Vulkan adapter by name substring or CUDA device as cuda:N.
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_adapter: Option<String>,
     /// Keep smaller streams on the CPU (default: 1048576 decoded bytes).
