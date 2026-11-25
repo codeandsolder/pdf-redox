@@ -6844,6 +6844,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn materialization_preflight_retains_only_possible_reconstructions() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [] /Count 0 >>")?;
+        // The payloads deliberately need not be decodable: this is a
+        // metadata-only necessary-condition pass, not a pixel validator.
+        pdf.stream(
+            3,
+            b"/Subtype /Image /Width 9000 /Height 12000 /SMask 4 0 R",
+            b"x",
+        )?;
+        pdf.stream(4, b"/Subtype /Image /Width 9000 /Height 12000", b"x")?;
+        pdf.stream(
+            5,
+            b"/Subtype /Image /Width 9000 /Height 12000 /SMask 6 0 R",
+            b"x",
+        )?;
+        pdf.stream(6, b"/Subtype /Image /Width 1 /Height 1", b"x")?;
+        pdf.stream(7, b"/Subtype /Image /Width 100 /Height 10", b"x")?;
+        pdf.stream(8, b"/Subtype /Image /Width 100 /Height 12", b"x")?;
+        pdf.stream(9, b"/Subtype /Image /Width 3 /Height 2", b"x")?;
+        let document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let draws = [3, 5, 7, 8, 9].map(|id| test_draw(id, 0.0));
+        let target = ContentTarget::Page(draws[0].target);
+        let config = RasterLayoutConfig {
+            crop_transparent: false,
+            merge_stripes: true,
+            ..Default::default()
+        };
+        let candidates =
+            materialization_candidates(&document, target, &draws, &HashSet::new(), &config);
+        assert_eq!(
+            candidates,
+            HashSet::from([
+                draws[1].target,
+                draws[2].target,
+                draws[3].target,
+                draws[4].target
+            ])
+        );
+        let config = RasterLayoutConfig {
+            merge_stripes: false,
+            ..config
+        };
+        let candidates =
+            materialization_candidates(&document, target, &draws, &HashSet::new(), &config);
+        assert_eq!(
+            candidates,
+            HashSet::from([draws[1].target, draws[4].target])
+        );
+        Ok(())
+    }
+
     fn inline_staging_test_config(fragmented_paint_threshold: usize) -> RasterLayoutConfig {
         RasterLayoutConfig {
             enabled: true,

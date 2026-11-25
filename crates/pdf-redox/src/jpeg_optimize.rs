@@ -305,6 +305,24 @@ mod tests {
     use libjpeg_turbo_rs::{PixelFormat, Subsampling, compress, read_coefficients};
 
     #[test]
+    fn savings_gate_matches_previous_admission() {
+        for original in [0usize, 1, 1024, 10_000, usize::MAX] {
+            for encoded in [0, 1, 1024, 10_000, usize::MAX] {
+                for percent in [0, 1, 25, 100] {
+                    let saving = original.saturating_sub(encoded);
+                    assert_eq!(
+                        meets_savings(original, encoded, 128, percent),
+                        !(saving == 0
+                            || saving < 128
+                            || saving.saturating_mul(100)
+                                < original.saturating_mul(usize::from(percent)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn jpeg_rewrite_excludes_all_external_file_stream_entries() -> crate::Result<()> {
         use crate::test_support::ClassicPdfBuilder;
 
