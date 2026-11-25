@@ -431,15 +431,24 @@ impl FlateBatchEncoder {
         let Ok(minimum_decoded_len) = u32::try_from(gpu.config.min_stream_bytes) else {
             return Ok(outcomes);
         };
+        // Match the standalone PDF decoder's decoded-stream resource limit.
+        // A bounded device workspace must not silently extend the document
+        // decoder's accepted logical stream size.
+        let decode_bound = hayro_syntax::Limits::DEFAULT
+            .max_decoded_stream_size
+            .bound()
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(u32::MAX);
         let config = flate_config(level);
         let mut indices = Vec::new();
         let mut jobs = Vec::new();
         for (index, &(source, limit)) in sources.iter().enumerate() {
             let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
-                u32::MAX
+                decode_bound
             } else {
                 u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
                     .unwrap_or(u32::MAX)
+                    .min(decode_bound)
             };
             if minimum_decoded_len > decoded_limit {
                 continue;
