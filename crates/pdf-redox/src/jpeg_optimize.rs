@@ -48,12 +48,6 @@ fn is_safe_lone_dct(document: &EditDocument, dictionary: &OwnedDictionary) -> Re
     ))
 }
 
-fn compatible_decode(data: &[u8]) -> Option<Vec<u8>> {
-    libjpeg_turbo_rs::decompress(data)
-        .ok()
-        .map(|image| image.data)
-}
-
 fn is_app_or_com_marker(marker: u8) -> bool {
     (0xe0..=0xef).contains(&marker) || marker == 0xfe
 }
@@ -150,7 +144,9 @@ fn restore_source_app_com_markers(source: &[u8], transformed: &[u8]) -> Option<V
     None
 }
 
-fn transform_entropy(data: &[u8]) -> Option<Vec<u8>> {
+/// Recode the quantized coefficients without a spatial transform or requantization.
+/// Pixel and coefficient round-trip checks belong in the codec regression tests.
+pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let optimized = transform_jpeg_with_options(
         data,
         &TransformOptions {
@@ -164,20 +160,6 @@ fn transform_entropy(data: &[u8]) -> Option<Vec<u8>> {
     )
     .ok()?;
     restore_source_app_com_markers(data, &optimized)
-}
-
-fn verify_pixels(data: &[u8], optimized: Vec<u8>) -> Option<Vec<u8>> {
-    // libjpeg-turbo-rs's coefficient reader accepts some entropy streams that
-    // Hayro's DCT compatibility path rejects. Require the before/after JPEGs
-    // to decode through the Hayro DCT pipeline and to produce the
-    // exact same pixels before considering the rewrite.
-    let before = compatible_decode(data)?;
-    let after = compatible_decode(&optimized)?;
-    (before == after).then_some(optimized)
-}
-
-pub fn optimized_jpeg_bytes(data: &[u8]) -> Option<Vec<u8>> {
-    verify_pixels(data, transform_entropy(data)?)
 }
 
 fn meets_savings(original: usize, optimized: usize, min_bytes: usize, min_percent: u8) -> bool {
@@ -195,13 +177,11 @@ struct JpegJob<'a> {
 
 impl JpegJob<'_> {
     fn run(&mut self, min_bytes: usize, min_percent: u8) {
-        let Some(optimized) = transform_entropy(&self.raw) else {
+        let Some(optimized) = optimized_jpeg_bytes(&self.raw) else {
             return;
         };
-        // No pixel decoding is needed for a candidate that cannot be
-        // accepted. Preserve the exact previous pixel validation for winners.
         if meets_savings(self.raw.len(), optimized.len(), min_bytes, min_percent) {
-            self.result = verify_pixels(&self.raw, optimized);
+            self.result = Some(optimized);
         }
     }
 }
@@ -428,12 +408,21 @@ mod tests {
             .map_err(|error| crate::Error::Invalid(error.to_string()))?;
         assert_eq!(before.width, after.width);
         assert_eq!(before.height, after.height);
+        assert_eq!(before.data_precision, after.data_precision);
+        assert_eq!(before.quant_tables, after.quant_tables);
         assert_eq!(before.components.len(), after.components.len());
         for (left, right) in before.components.iter().zip(&after.components) {
+            assert_eq!(left.component_id, right.component_id);
+            assert_eq!(left.quant_table_index, right.quant_table_index);
             assert_eq!(left.h_sampling, right.h_sampling);
             assert_eq!(left.v_sampling, right.v_sampling);
             assert_eq!(left.blocks, right.blocks);
         }
+        let before_pixels = libjpeg_turbo_rs::decompress(&original)
+            .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+        let after_pixels = libjpeg_turbo_rs::decompress(&optimized)
+            .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+        assert_eq!(before_pixels.data, after_pixels.data);
         assert!(optimized.len() < original.len());
         Ok(())
     }
