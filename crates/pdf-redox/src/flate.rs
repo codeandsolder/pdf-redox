@@ -486,6 +486,125 @@ fn flush_filtered_batch(
     Ok(())
 }
 
+/// Stage only handles and encoded lengths, never another copy of an
+/// already-compressed PDF stream. Resolve source bytes for a batch under
+/// immutable document access, then commit results after releasing borrows.
+struct FilteredSourceCandidate {
+    handle: ObjectHandle,
+    raw_len: usize,
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    transcode: bool,
+}
+
+#[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+fn transcode_filtered_sources(
+    document: &mut crate::EditDocument,
+    sources: &mut Vec<FilteredSourceCandidate>,
+    level: crate::FlateLevel,
+    batcher: &FlateBatchEncoder,
+    stats: &mut FlateOptimizationStats,
+) -> Result<()> {
+    use crate::stream_codec::FlateTranscode;
+
+    let indices = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.transcode.then_some(i))
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        return Ok(());
+    }
+    let results = {
+        let objects = indices
+            .iter()
+            .map(|&i| document.current_owned_object_cow(sources[i].handle))
+            .collect::<Result<Vec<_>>>()?;
+        let bytes = objects
+            .iter()
+            .map(|object| {
+                let Some(crate::OwnedObject::Stream { data, .. }) = object.as_deref() else {
+                    return Err(crate::Error::Invalid(
+                        "staged Flate stream disappeared".to_owned(),
+                    ));
+                };
+                data.bytes(document.source())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let jobs = indices
+            .iter()
+            .zip(&bytes)
+            .map(|(&i, raw)| {
+                let len = sources[i].raw_len;
+                (raw.as_ref(), len.saturating_sub(minimum_flate_savings(len)))
+            })
+            .collect::<Vec<_>>();
+        batcher.transcode_sources(&jobs, level)?
+    };
+    for (index, outcome) in indices.into_iter().zip(results) {
+        let source = &mut sources[index];
+        // Keep only streams whose source could not be transcoded for the
+        // conventional bounded decode/recompress pass below.
+        source.transcode = !matches!(outcome, FlateTranscode::NotRouted);
+        let limit = source
+            .raw_len
+            .saturating_sub(minimum_flate_savings(source.raw_len));
+        let encoded = match outcome {
+            FlateTranscode::Accepted(bytes) => Some(bytes),
+            FlateTranscode::RetryCpu => match document.decoded_stream_data(source.handle) {
+                Ok(decoded) => batcher.retry_transcoded(&decoded, limit, level)?,
+                Err(_) => None,
+            },
+            FlateTranscode::Rejected | FlateTranscode::NotRouted => None,
+        };
+        if let Some(bytes) = encoded {
+            commit_filtered_encoding(
+                document,
+                source.handle,
+                source.raw_len,
+                AdaptiveFlateEncoding::baseline(bytes),
+                stats,
+            )?;
+        }
+    }
+    sources.retain(|source| !source.transcode);
+    Ok(())
+}
+
+fn flush_filtered_sources(
+    document: &mut crate::EditDocument,
+    sources: &mut Vec<FilteredSourceCandidate>,
+    level: crate::FlateLevel,
+    reuse_cache: &mut FlateReuseCache,
+    batcher: &FlateBatchEncoder,
+    limits: FlateBatchLimits,
+    stats: &mut FlateOptimizationStats,
+) -> Result<()> {
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    transcode_filtered_sources(document, sources, level, batcher, stats)?;
+    let mut candidates = Vec::new();
+    let mut staged_bytes = 0_usize;
+    for source in sources.drain(..) {
+        let Ok(decoded) = document.decoded_stream_data(source.handle) else {
+            continue;
+        };
+        let encoded = reuse_cache
+            .take_matching(source.handle, level, &decoded)
+            .map(AdaptiveFlateEncoding::baseline);
+        staged_bytes = staged_bytes.saturating_add(decoded.len());
+        candidates.push(FilteredFlateCandidate {
+            handle: source.handle,
+            raw_len: source.raw_len,
+            decoded,
+            encoded,
+        });
+        if limits.full(candidates.len(), staged_bytes) {
+            flush_filtered_batch(document, &mut candidates, level, batcher, stats)?;
+            staged_bytes = 0;
+        }
+    }
+    flush_filtered_batch(document, &mut candidates, level, batcher, stats)
+}
+
 fn optimize_flate_streams_bounded(
     document: &mut crate::EditDocument,
     level: crate::FlateLevel,
@@ -493,7 +612,7 @@ fn optimize_flate_streams_bounded(
     batcher: &FlateBatchEncoder,
     limits: FlateBatchLimits,
 ) -> Result<FlateOptimizationStats> {
-    let mut candidates = Vec::new();
+    let mut sources = Vec::new();
     let mut staged_bytes = 0_usize;
     let mut stats = FlateOptimizationStats::default();
     for handle in document.reachable_streams()? {
@@ -506,62 +625,42 @@ fn optimize_flate_streams_bounded(
         if !is_safe_lone_flate(document, dictionary)? {
             continue;
         }
-        let raw = data.bytes(document.source())?;
-        let raw_len = raw.len();
+        let raw_len = data.bytes(document.source())?.len();
         if raw_len < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
             continue;
         }
-        #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-        if !reuse_cache.entries.contains_key(&handle)
-            && identity_flate_predictor(document, dictionary)?
-        {
-            use crate::stream_codec::FlateTranscode;
-            let limit = raw_len.saturating_sub(minimum_flate_savings(raw_len));
-            let outcome = batcher.transcode_source(&raw, limit, level)?;
-            if !matches!(outcome, FlateTranscode::NotRouted) {
-                drop(raw);
-                drop(object);
-                let encoded = match outcome {
-                    FlateTranscode::Accepted(bytes) => Some(bytes),
-                    FlateTranscode::RetryCpu => match document.decoded_stream_data(handle) {
-                        Ok(decoded) => batcher.retry_transcoded(&decoded, limit, level)?,
-                        Err(_) => None,
-                    },
-                    FlateTranscode::Rejected | FlateTranscode::NotRouted => None,
-                };
-                if let Some(bytes) = encoded {
-                    commit_filtered_encoding(
-                        document,
-                        handle,
-                        raw_len,
-                        AdaptiveFlateEncoding::baseline(bytes),
-                        &mut stats,
-                    )?;
-                }
-                continue;
-            }
-        }
-        drop(raw);
-        drop(object);
-        let Ok(decoded) = document.decoded_stream_data(handle) else {
-            continue;
-        };
-        let encoded = reuse_cache
-            .take_matching(handle, level, &decoded)
-            .map(AdaptiveFlateEncoding::baseline);
-        staged_bytes = staged_bytes.saturating_add(decoded.len());
-        candidates.push(FilteredFlateCandidate {
+        sources.push(FilteredSourceCandidate {
             handle,
             raw_len,
-            decoded,
-            encoded,
+            #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+            transcode: batcher.transcode_enabled()
+                && !reuse_cache.entries.contains_key(&handle)
+                && identity_flate_predictor(document, dictionary)?,
         });
-        if limits.full(candidates.len(), staged_bytes) {
-            flush_filtered_batch(document, &mut candidates, level, batcher, &mut stats)?;
+        drop(object);
+        staged_bytes = staged_bytes.saturating_add(raw_len);
+        if limits.full(sources.len(), staged_bytes) {
+            flush_filtered_sources(
+                document,
+                &mut sources,
+                level,
+                reuse_cache,
+                batcher,
+                limits,
+                &mut stats,
+            )?;
             staged_bytes = 0;
         }
     }
-    flush_filtered_batch(document, &mut candidates, level, batcher, &mut stats)?;
+    flush_filtered_sources(
+        document,
+        &mut sources,
+        level,
+        reuse_cache,
+        batcher,
+        limits,
+        &mut stats,
+    )?;
     Ok(stats)
 }
 

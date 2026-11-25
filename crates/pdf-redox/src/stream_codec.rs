@@ -256,6 +256,38 @@ pub(crate) enum FlateTranscode {
 
 #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
 impl GpuFlateExecutor {
+    #[cfg(feature = "cuda")]
+    fn classify_transcode(
+        &self,
+        result: zlib_rs::GpuTranscodeResult,
+        limit: usize,
+    ) -> Result<FlateTranscode> {
+        // A rejected prefix can have an unknown decoded length. Respect a
+        // nonzero ratio gate by falling back if eligibility cannot be proven.
+        match result.code {
+            zlib_rs::ReturnCode::Ok
+                if result.decoded_len.is_some_and(|n| self.eligible(n, limit)) =>
+            {
+                Ok(FlateTranscode::Accepted(result.output))
+            }
+            zlib_rs::ReturnCode::BufError
+                if result.output.len() == limit
+                    && (self.config.min_cap_per_mille == 0
+                        || result.decoded_len.is_some_and(|n| self.eligible(n, limit))) =>
+            {
+                Ok(if self.config.retry_rejected {
+                    FlateTranscode::RetryCpu
+                } else {
+                    FlateTranscode::Rejected
+                })
+            }
+            zlib_rs::ReturnCode::Ok
+            | zlib_rs::ReturnCode::BufError
+            | zlib_rs::ReturnCode::DataError => Ok(FlateTranscode::NotRouted),
+            code => Err(compression_code_error(code)),
+        }
+    }
+
     fn searcher(
         &self,
         stats: Option<&Mutex<crate::FlateBatchStats>>,
@@ -366,43 +398,54 @@ impl FlateBatchEncoder {
     }
 
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-    pub(crate) fn transcode_source(
+    pub(crate) fn transcode_enabled(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|gpu| {
+            gpu.config.transcode_source
+                && gpu
+                    .config
+                    .adapter
+                    .as_deref()
+                    .is_some_and(|a| a.starts_with("cuda:"))
+        })
+    }
+
+    /// Submit compact source streams together. The existing CPU worker pool
+    /// handles entropy indexing and leases independent resident CUDA lanes.
+    /// Preserve the input order, including streams routed back to CPU decode.
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    pub(crate) fn transcode_sources(
         &self,
-        source: &[u8],
-        limit: usize,
+        sources: &[(&[u8], usize)],
         level: crate::FlateLevel,
-    ) -> Result<FlateTranscode> {
+    ) -> Result<Vec<FlateTranscode>> {
+        let mut outcomes = sources
+            .iter()
+            .map(|_| FlateTranscode::NotRouted)
+            .collect::<Vec<_>>();
         let Some(gpu) = &self.gpu else {
-            return Ok(FlateTranscode::NotRouted);
+            return Ok(outcomes);
         };
-        if !gpu.config.transcode_source
-            || !gpu
-                .config
-                .adapter
-                .as_deref()
-                .is_some_and(|a| a.starts_with("cuda:"))
-        {
-            return Ok(FlateTranscode::NotRouted);
+        if !self.transcode_enabled() {
+            return Ok(outcomes);
         }
         let Ok(minimum_decoded_len) = u32::try_from(gpu.config.min_stream_bytes) else {
-            return Ok(FlateTranscode::NotRouted);
+            return Ok(outcomes);
         };
-        let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
-            u32::MAX
-        } else {
-            u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
-                .unwrap_or(u32::MAX)
-        };
-        if minimum_decoded_len > decoded_limit {
-            return Ok(FlateTranscode::NotRouted);
-        }
-        let searcher = gpu.searcher(self.stats.as_ref())?;
         let config = flate_config(level);
-        if !searcher.supports_zlib_transcode(config) {
-            return Ok(FlateTranscode::NotRouted);
-        }
-        let Some(result) = searcher
-            .recompress_zlib(
+        let mut indices = Vec::new();
+        let mut jobs = Vec::new();
+        for (index, &(source, limit)) in sources.iter().enumerate() {
+            let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
+                u32::MAX
+            } else {
+                u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
+                    .unwrap_or(u32::MAX)
+            };
+            if minimum_decoded_len > decoded_limit {
+                continue;
+            }
+            indices.push(index);
+            jobs.push((
                 source,
                 zlib_rs::GpuTranscodeOptions {
                     output_limit: limit,
@@ -415,56 +458,56 @@ impl FlateBatchEncoder {
                             .unwrap_or(std::num::NonZeroUsize::MIN)
                     }),
                 },
-            )
-            .map_err(|error| Error::Compression(format!("GPU Flate transcode: {error}")))?
-        else {
-            return Ok(FlateTranscode::NotRouted);
-        };
-        if result.decoded_bytes_processed != 0 {
-            if let Some(stats) = &self.stats {
-                let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
-                let record = |work: &mut crate::report::FlateBatchWork| {
-                    work.batches = work.batches.saturating_add(1);
+            ));
+        }
+        if jobs.is_empty() {
+            return Ok(outcomes);
+        }
+        let searcher = gpu.searcher(self.stats.as_ref())?;
+        if !searcher.supports_zlib_transcode(config) {
+            return Ok(outcomes);
+        }
+        let results = if let Some(pool) = self.compressor.as_deref() {
+            pool.recompress_zlib_batch(&mut jobs, searcher)
+        } else {
+            jobs.iter()
+                .map(|&(source, options)| searcher.recompress_zlib(source, options))
+                .collect()
+        }
+        .map_err(|error| Error::Compression(format!("GPU Flate transcode: {error}")))?;
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut work = crate::report::FlateBatchWork::default();
+            for result in results.iter().flatten() {
+                if result.decoded_bytes_processed != 0 {
                     work.streams = work.streams.saturating_add(1);
                     work.decoded_bytes = work
                         .decoded_bytes
                         .saturating_add(result.decoded_bytes_processed);
+                    stats.gpu_transcode_source_bytes = stats
+                        .gpu_transcode_source_bytes
+                        .saturating_add(result.source_bytes_uploaded);
+                    stats.gpu_transcode_descriptor_bytes = stats
+                        .gpu_transcode_descriptor_bytes
+                        .saturating_add(result.descriptor_bytes_uploaded);
+                }
+            }
+            if work.streams != 0 {
+                let record = |target: &mut crate::report::FlateBatchWork| {
+                    target.batches = target.batches.saturating_add(1);
+                    target.streams = target.streams.saturating_add(work.streams);
+                    target.decoded_bytes = target.decoded_bytes.saturating_add(work.decoded_bytes);
                 };
                 record(&mut stats.gpu_assisted);
                 record(&mut stats.gpu_transcoded);
-                stats.gpu_transcode_source_bytes = stats
-                    .gpu_transcode_source_bytes
-                    .saturating_add(result.source_bytes_uploaded);
-                stats.gpu_transcode_descriptor_bytes = stats
-                    .gpu_transcode_descriptor_bytes
-                    .saturating_add(result.descriptor_bytes_uploaded);
             }
         }
-        // A complete accepted source was structurally indexed and its Adler
-        // verified. A rejected prefix can have an unknown decoded length;
-        // respect a nonzero ratio gate by falling back if it cannot be proven.
-        match result.code {
-            zlib_rs::ReturnCode::Ok
-                if result.decoded_len.is_some_and(|n| gpu.eligible(n, limit)) =>
-            {
-                Ok(FlateTranscode::Accepted(result.output))
+        for (index, result) in indices.into_iter().zip(results) {
+            if let Some(result) = result {
+                outcomes[index] = gpu.classify_transcode(result, sources[index].1)?;
             }
-            zlib_rs::ReturnCode::BufError
-                if result.output.len() == limit
-                    && (gpu.config.min_cap_per_mille == 0
-                        || result.decoded_len.is_some_and(|n| gpu.eligible(n, limit))) =>
-            {
-                Ok(if gpu.config.retry_rejected {
-                    FlateTranscode::RetryCpu
-                } else {
-                    FlateTranscode::Rejected
-                })
-            }
-            zlib_rs::ReturnCode::Ok
-            | zlib_rs::ReturnCode::BufError
-            | zlib_rs::ReturnCode::DataError => Ok(FlateTranscode::NotRouted),
-            code => Err(compression_code_error(code)),
         }
+        Ok(outcomes)
     }
 
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
