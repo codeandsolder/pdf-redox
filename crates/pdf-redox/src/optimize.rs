@@ -78,7 +78,7 @@ fn timed<T>(timings: &mut BTreeMap<String, f64>, name: &str, f: impl FnOnce() ->
 /// The standalone outline-opportunity probe is a pure encoded-font size
 /// search. Processing avoids paying for that search, but still runs the normal
 /// subset proof when another font stage already materialized the usage graph.
-#[must_use]
+#[must_use = "the decision controls whether font outline subsetting is searched"]
 const fn search_font_outline_subset(cfg: &Config) -> bool {
     !matches!(cfg.optimization_goal, crate::OptimizationGoal::Processing)
 }
