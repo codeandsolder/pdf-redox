@@ -387,35 +387,38 @@ impl FlateBatchEncoder {
                 .partition(|(index, job)| !gpu.eligible(job.input.len(), maximum_lengths[*index]));
             let (cpu_indices, mut cpu_jobs): (Vec<_>, Vec<_>) = cpu_jobs.into_iter().unzip();
             let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
-            let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
             self.record_jobs(&gpu_jobs, true);
-            let mut gpu_results = match (self.compressor.as_deref(), gpu.config.match_window_bytes)
-            {
-                (Some(pool), Some(window)) => pool.compress_gpu_windowed(
+            let (cpu_results, mut gpu_results) = if let Some(pool) = self.compressor.as_deref() {
+                self.record_jobs(&cpu_jobs, false);
+                pool.compress_mixed_gpu(
+                    &mut cpu_jobs,
                     &mut gpu_jobs,
                     config,
                     searcher,
                     search_budget,
-                    window,
-                ),
-                (None, Some(window)) => zlib_rs::compress_slices_batch_gpu_windowed(
-                    &mut gpu_jobs,
-                    config,
-                    searcher,
-                    search_budget,
-                    window,
-                ),
-                (Some(pool), None) => {
-                    pool.compress_gpu(&mut gpu_jobs, config, searcher, search_budget)
+                    gpu.config.match_window_bytes,
+                )
+                .map_err(|error| Error::Compression(format!("GPU Flate search: {error}")))?
+            } else {
+                let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
+                let gpu_results = match gpu.config.match_window_bytes {
+                    Some(window) => zlib_rs::compress_slices_batch_gpu_windowed(
+                        &mut gpu_jobs,
+                        config,
+                        searcher,
+                        search_budget,
+                        window,
+                    ),
+                    None => zlib_rs::compress_slices_batch_gpu(
+                        &mut gpu_jobs,
+                        config,
+                        searcher,
+                        search_budget,
+                    ),
                 }
-                (None, None) => zlib_rs::compress_slices_batch_gpu(
-                    &mut gpu_jobs,
-                    config,
-                    searcher,
-                    search_budget,
-                ),
-            }
-            .map_err(|error| Error::Compression(format!("GPU Flate search: {error}")))?;
+                .map_err(|error| Error::Compression(format!("GPU Flate search: {error}")))?;
+                (cpu_results, gpu_results)
+            };
             if gpu.config.retry_rejected {
                 self.retry_rejected_gpu_jobs(gpu_jobs, &mut gpu_results, config);
             }
