@@ -197,7 +197,8 @@ pub fn apply_replacements<B: AsRef<[u8]>>(
 }
 
 pub struct MeasuredFormRewrites {
-    pub pages: Vec<(usize, Vec<u8>)>,
+    pub pages: Vec<(usize, Vec<u8>, Vec<u8>)>,
+    pub bodies: Vec<Vec<u8>>,
     pub savings: usize,
 }
 
@@ -209,6 +210,7 @@ pub fn measure_form_rewrites<'a, B: AsRef<[u8]> + 'a>(
     bodies: impl Iterator<Item = &'a [u8]>,
     fixed_overhead: usize,
     minimum_savings: usize,
+    level: crate::FlateLevel,
     mut measure: impl FnMut(&[u8], usize) -> Result<Option<usize>>,
 ) -> Result<Option<MeasuredFormRewrites>> {
     let before = pages.clone().try_fold(0_usize, |total, (_, input, _)| {
@@ -228,20 +230,25 @@ pub fn measure_form_rewrites<'a, B: AsRef<[u8]> + 'a>(
         let Some(rewritten) = apply_replacements(input, replacements) else {
             return Ok(None);
         };
-        let Some(length) = measure(&rewritten, remaining)? else {
+        let Some(encoded) = crate::stream_codec::encode_flate_capped(&rewritten, remaining, level)?
+        else {
             return Ok(None);
         };
-        remaining -= length;
-        rewritten_pages.push((index, rewritten));
+        remaining -= encoded.len();
+        rewritten_pages.push((index, rewritten, encoded));
     }
+    let mut encoded_bodies = Vec::new();
     for body in bodies {
-        let Some(length) = measure(body, remaining)? else {
+        let Some(encoded) = crate::stream_codec::encode_flate_capped(body, remaining, level)?
+        else {
             return Ok(None);
         };
-        remaining -= length;
+        remaining -= encoded.len();
+        encoded_bodies.push(encoded);
     }
     Ok(Some(MeasuredFormRewrites {
         pages: rewritten_pages,
+        bodies: encoded_bodies,
         savings: remaining + minimum_savings,
     }))
 }

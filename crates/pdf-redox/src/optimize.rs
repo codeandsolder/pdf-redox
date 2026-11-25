@@ -962,7 +962,7 @@ fn run_vector_optimization_phase(
     // this factor as part of its ordered structural-Form closure.
     if cfg.optimization_goal == crate::OptimizationGoal::Size {
         let forms = timed(timings, "size-shared-form-factor", || {
-            factor_size_shared_forms(document, flate_level, pages)
+            factor_size_shared_forms(document, flate_level, pages, &mut flate_reuse_cache)
         })?;
         vector_compaction.absorb(forms);
     }
@@ -1010,7 +1010,13 @@ fn run_vector_optimization_phase(
 
     let stroke_forms = timed(timings, "stroke-form-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_repeated_stroke_forms(document, pages, flate_level, &mut stroke_scan_evidence)
+            factor_repeated_stroke_forms(
+                document,
+                pages,
+                flate_level,
+                &mut stroke_scan_evidence,
+                &mut flate_reuse_cache,
+            )
         } else {
             Ok(StrokeFormFactorStats::default())
         }

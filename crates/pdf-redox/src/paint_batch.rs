@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use num_traits::ToPrimitive;
+use sha2::Digest as _;
 use smallvec::SmallVec;
 use std::{
     borrow::Cow,
@@ -2049,6 +2050,7 @@ pub fn factor_repeated_stroke_forms(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
     evidence: &mut StrokeFormScanEvidence,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<StrokeFormFactorStats> {
     let mut page_data = Vec::<ObjectHandle>::new();
     let mut groups = BTreeMap::<Vec<u8>, Vec<StrokeFormPageOccurrence>>::new();
@@ -2184,6 +2186,7 @@ pub fn factor_repeated_stroke_forms(
         plans.iter().map(|plan| plan.body.as_slice()),
         overhead,
         MIN_STROKE_FORM_ESTIMATED_SAVINGS,
+        flate_level,
         |bytes, cap| crate::stream_codec::flate_capped_encoded_len(bytes, cap, flate_level),
     )?
     else {
@@ -2192,14 +2195,16 @@ pub fn factor_repeated_stroke_forms(
     let pages_rewritten = measured.pages.len();
 
     let mut bindings = Vec::new();
-    for plan in &mut plans {
+    for (plan, encoded) in plans.iter_mut().zip(measured.bodies) {
         let Some(dictionary) = stroke_form_dictionary(plan.bounds, plan.bbox_margin_grid) else {
             return Ok(StrokeFormFactorStats::default());
         };
+        let digest = sha2::Sha256::digest(&plan.body).into();
         let form = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary,
             data: StreamData::Owned(std::mem::take(&mut plan.body).into()),
         }));
+        reuse.insert_with_digest(form, flate_level, digest, encoded);
         bindings.extend(
             plan.occurrences
                 .iter()
@@ -2210,8 +2215,14 @@ pub fn factor_repeated_stroke_forms(
         );
     }
     install_page_resource_bindings(document, b"XObject", bindings)?;
-    for (page_index, rewritten) in measured.pages {
-        replace_page_content(document, page_data[page_index], rewritten)?;
+    for (page_index, rewritten, encoded) in measured.pages {
+        reuse.install_page(
+            document,
+            page_data[page_index],
+            rewritten,
+            encoded,
+            flate_level,
+        )?;
     }
 
     Ok(StrokeFormFactorStats {
@@ -2900,6 +2911,7 @@ mod tests {
             &mut document,
             &pages,
             &mut StrokeFormScanEvidence::default(),
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert_eq!(stats.pages_rewritten, 1);
         assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
@@ -3239,6 +3251,7 @@ mod tests {
             &pages,
             crate::FlateLevel::PROCESSING,
             &mut evidence,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert!(evidence.pages.is_empty());
         assert_eq!(stats, cold_stats);

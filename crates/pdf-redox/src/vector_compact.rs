@@ -1794,7 +1794,7 @@ fn apply_path_form_plan(
     page_data: &[PagePathData],
     selected: &[SelectedPathForm<'_>],
     level: crate::FlateLevel,
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<Option<PathFormCommit>> {
     if selected.is_empty() {
         return Ok(None);
@@ -1833,26 +1833,32 @@ fn apply_path_form_plan(
         selected.iter().map(|form| form.body),
         fixed_overhead,
         1,
-        |bytes, cap| flate_lengths.capped_len(bytes, level, cap),
+        level,
+        |bytes, cap| flate_state.lengths.capped_len(bytes, level, cap),
     )?
     else {
         return Ok(None);
     };
     let form_handles = selected
         .iter()
-        .map(|form| {
-            ObjectHandle::New(document.add_object(OwnedObject::Stream {
+        .zip(measured.bodies)
+        .map(|(form, encoded)| {
+            let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
                 dictionary: path_form_dictionary(form.bounds),
                 data: StreamData::Owned(form.body.to_vec().into()),
-            }))
+            }));
+            flate_state.reuse.insert(handle, level, form.body, encoded);
+            handle
         })
         .collect::<Vec<_>>();
     let pages_rewritten = measured.pages.len();
     let mut rewritten_page_handles = BTreeSet::new();
-    for (index, rewritten) in measured.pages {
+    for (index, rewritten, encoded) in measured.pages {
         let page = &page_data[index];
         if rewritten.as_slice() != page.decoded.as_slice() {
-            replace_page_content(document, page.page, rewritten)?;
+            flate_state
+                .reuse
+                .install_page(document, page.page, rewritten, encoded, level)?;
             rewritten_page_handles.insert(page.page);
         }
     }
@@ -2021,7 +2027,7 @@ fn factor_repeated_path_forms(
     flate_level: crate::FlateLevel,
     mut reusable_blocks: ProcessingFactorBlocks,
     pages: &[ObjectHandle],
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<PathFactoringOutcome> {
     let present = factor_page_inventory(document, pages, &mut reusable_blocks)?;
     let mut groups = FormGroups::new();
@@ -2064,7 +2070,7 @@ fn factor_repeated_path_forms(
     candidates.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(bytes.len()));
     let selected = select_path_forms(candidates.into_iter(), &mut occupied_names, 0);
     let Some(commit) =
-        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_lengths)?
+        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_state)?
     else {
         return Ok(PathFactoringOutcome {
             stats: VectorCompactionStats::default(),
@@ -2106,7 +2112,7 @@ fn factor_repeated_transformed_blocks(
     flate_level: crate::FlateLevel,
     reusable_blocks: &mut ProcessingFactorBlocks,
     pages: &[ObjectHandle],
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<VectorCompactionStats> {
     let present = factor_page_inventory(document, pages, reusable_blocks)?;
     let mut groups = FormGroups::new();
@@ -2156,7 +2162,7 @@ fn factor_repeated_transformed_blocks(
         10_000,
     );
     let Some(commit) =
-        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_lengths)?
+        apply_path_form_plan(document, &page_data, &selected, flate_level, flate_state)?
     else {
         return Ok(VectorCompactionStats::default());
     };
@@ -2675,7 +2681,7 @@ struct SelectedSharedRun {
     replacement: Vec<u8>,
     body: Vec<u8>,
     resources: BTreeSet<SharedResourceRef>,
-    compressed_body_bytes: usize,
+    encoded_body: Vec<u8>,
 }
 
 /// Decoded payloads belong to a single admission transaction, never to
@@ -2782,6 +2788,7 @@ pub fn factor_size_shared_forms(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
+    reuse: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     if pages.len() < 2 {
         return Ok(VectorCompactionStats::default());
@@ -2790,7 +2797,7 @@ pub fn factor_size_shared_forms(
         document,
         flate_level,
         pages,
-        &mut VectorFlateLengthMemo::default(),
+        &mut VectorCompactionFlateState::new(reuse, OptimizationGoal::Size),
         &mut SharedRunInventory::default(),
     )
 }
@@ -2803,7 +2810,7 @@ fn factor_shared_q_prefix_runs(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
     inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
     let mut scan = inventory.scan(document, pages)?;
@@ -2850,7 +2857,8 @@ fn factor_shared_q_prefix_runs(
         }) {
             continue;
         }
-        let compressed_body_bytes = flate_lengths.encoded_len(&body, flate_level)?;
+        let encoded_body = crate::stream_codec::encode_flate(&body, flate_level)?;
+        let compressed_body_bytes = encoded_body.len();
         let conservative_overhead = 384usize
             .saturating_add(resources.len().saturating_mul(96))
             .saturating_add(candidate.page_indices.len().saturating_mul(32));
@@ -2870,7 +2878,7 @@ fn factor_shared_q_prefix_runs(
             replacement,
             body,
             resources,
-            compressed_body_bytes,
+            encoded_body,
         });
     }
     if selected.is_empty() {
@@ -2899,7 +2907,7 @@ fn factor_shared_q_prefix_runs(
         .sum::<usize>();
     let fixed_overhead = selected
         .iter()
-        .map(|run| run.compressed_body_bytes)
+        .map(|run| run.encoded_body.len())
         .sum::<usize>()
         .saturating_add(selected.len().saturating_mul(384))
         .saturating_add(resource_refs.saturating_mul(96))
@@ -2922,7 +2930,8 @@ fn factor_shared_q_prefix_runs(
         std::iter::empty(),
         fixed_overhead,
         1,
-        |bytes, cap| flate_lengths.capped_len(bytes, flate_level, cap),
+        flate_level,
+        |bytes, cap| flate_state.lengths.capped_len(bytes, flate_level, cap),
     )?
     else {
         return Ok(VectorCompactionStats::default());
@@ -2930,16 +2939,27 @@ fn factor_shared_q_prefix_runs(
     let pages_rewritten = measured.pages.len();
 
     let mut form_handles = Vec::with_capacity(selected.len());
-    for run in &selected {
-        form_handles.push(ObjectHandle::New(document.add_object(
-            OwnedObject::Stream {
-                dictionary: shared_form_dictionary(run.candidate.bounds, &run.resources),
-                data: StreamData::Owned(run.body.clone().into()),
-            },
-        )));
+    for run in &mut selected {
+        let handle = ObjectHandle::New(document.add_object(OwnedObject::Stream {
+            dictionary: shared_form_dictionary(run.candidate.bounds, &run.resources),
+            data: StreamData::Owned(run.body.clone().into()),
+        }));
+        flate_state.reuse.insert(
+            handle,
+            flate_level,
+            &run.body,
+            std::mem::take(&mut run.encoded_body),
+        );
+        form_handles.push(handle);
     }
-    for (page_index, rewritten) in measured.pages {
-        replace_page_content(document, scan.pages[page_index].page, rewritten)?;
+    for (page_index, rewritten, encoded) in measured.pages {
+        flate_state.reuse.install_page(
+            document,
+            scan.pages[page_index].page,
+            rewritten,
+            encoded,
+            flate_level,
+        )?;
     }
     let page_data = &scan.pages;
     install_page_resource_bindings(
@@ -3380,7 +3400,7 @@ fn compact_processing_fill_tail(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &BTreeSet<ObjectHandle>,
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     for &page in pages {
@@ -3393,9 +3413,16 @@ fn compact_processing_fill_tail(
         if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded.as_slice() {
             continue;
         }
-        let before_flate = flate_lengths.encoded_len(&decoded, flate_level)?;
-        let after_flate = flate_lengths.encoded_len(&compacted, flate_level)?;
-        replace_page_content(document, page, compacted.into_owned())?;
+        let before_flate = flate_state.lengths.encoded_len(&decoded, flate_level)?;
+        let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
+        let after_flate = encoded.len();
+        flate_state.reuse.install_page(
+            document,
+            page,
+            compacted.into_owned(),
+            encoded,
+            flate_level,
+        )?;
         total.pages_compacted = total.pages_compacted.saturating_add(1);
         total.fill_groups_batched = total
             .fill_groups_batched
@@ -3423,7 +3450,7 @@ fn factor_processing_structural_forms(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     pre_scanned: ProcessingFactorBlocks,
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
     shared_inventory: &mut SharedRunInventory,
 ) -> Result<(
     VectorCompactionStats,
@@ -3434,7 +3461,7 @@ fn factor_processing_structural_forms(
         stats: path_stats,
         mut reusable_blocks,
         rewritten_pages: path_rewritten,
-    } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages, flate_lengths)?;
+    } = factor_repeated_path_forms(document, flate_level, pre_scanned, pages, flate_state)?;
     for page in &path_rewritten {
         reusable_blocks.remove(page);
     }
@@ -3443,18 +3470,13 @@ fn factor_processing_structural_forms(
         flate_level,
         &mut reusable_blocks,
         pages,
-        flate_lengths,
+        flate_state,
     )?;
     let mut rewritten = path_rewritten;
     rewritten.extend(transformed.generated_page_xobjects.keys().copied());
     shared_inventory.invalidate(&rewritten);
-    let shared = factor_shared_q_prefix_runs(
-        document,
-        flate_level,
-        pages,
-        flate_lengths,
-        shared_inventory,
-    )?;
+    let shared =
+        factor_shared_q_prefix_runs(document, flate_level, pages, flate_state, shared_inventory)?;
     let shared_rewritten = shared.generated_page_xobjects.keys().copied().collect();
     shared_inventory.invalidate(&shared_rewritten);
     rewritten.extend(shared_rewritten);
@@ -3483,7 +3505,7 @@ fn close_processing_exact_factoring(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     mut pre_scanned: ProcessingFactorBlocks,
-    flate_lengths: &mut VectorFlateLengthMemo,
+    flate_state: &mut VectorCompactionFlateState<'_>,
     shared_inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
@@ -3493,7 +3515,7 @@ fn close_processing_exact_factoring(
             flate_level,
             pages,
             pre_scanned,
-            flate_lengths,
+            flate_state,
             shared_inventory,
         )?;
         let changed = forms.path_forms_created != 0
@@ -3504,7 +3526,7 @@ fn close_processing_exact_factoring(
         }
         // A page rewritten by any Form pass must be scanned using its new
         // content and resources; do not recycle pre-mutation raster/path proofs.
-        let fills = compact_processing_fill_tail(document, flate_level, &rewritten, flate_lengths)?;
+        let fills = compact_processing_fill_tail(document, flate_level, &rewritten, flate_state)?;
         // Fill cleanup rewrites only pages already present in rewritten;
         // every retained metadata entry is still tied to identical bytes.
         pre_scanned = reusable_blocks;
@@ -3533,7 +3555,7 @@ fn finish_processing_vector_compaction(
         flate_level,
         pages,
         pre_scanned_processing,
-        &mut flate_state.lengths,
+        flate_state,
         &mut shared_inventory,
     )?;
     for page in &factored_pages {
@@ -3567,12 +3589,8 @@ fn finish_processing_vector_compaction(
     // Processing-only coordinate/factoring rewrites can make exact rectangle
     // adjacency visible only after the initial fill scan. Close that local
     // dependency here instead of requiring another whole optimizer pass.
-    let fill_tail = compact_processing_fill_tail(
-        document,
-        flate_level,
-        &late_rewritten_pages,
-        &mut flate_state.lengths,
-    )?;
+    let fill_tail =
+        compact_processing_fill_tail(document, flate_level, &late_rewritten_pages, flate_state)?;
     total.absorb(fill_tail);
     // The earlier lossless factor passes had already run before bounded-error
     // coordinate rewriting and the fill tail. Close only the exact stages
@@ -3587,7 +3605,7 @@ fn finish_processing_vector_compaction(
             flate_level,
             pages,
             reusable_blocks,
-            &mut flate_state.lengths,
+            flate_state,
             &mut shared_inventory,
         )?;
         total.absorb(closure);
@@ -3869,17 +3887,30 @@ mod tests {
                 std::iter::once(body.as_slice()),
                 before - after - 1,
                 1,
+                level,
                 |bytes, cap| memo.capped_len(bytes, level, cap),
             )?
             .ok_or_else(|| crate::Error::Invalid("one-byte exact saving rejected".into()))?;
             assert_eq!(accepted.savings, 1);
-            assert_eq!(accepted.pages, [(0, b"q Q".to_vec())]);
+            assert_eq!(
+                accepted.pages,
+                [(
+                    0,
+                    b"q Q".to_vec(),
+                    crate::stream_codec::encode_flate(b"q Q", level)?
+                )]
+            );
+            assert_eq!(
+                accepted.bodies,
+                [crate::stream_codec::encode_flate(body, level)?]
+            );
             assert!(
                 measure_form_rewrites(
                     pages.into_iter(),
                     std::iter::once(body.as_slice()),
                     before - after,
                     1,
+                    level,
                     |bytes, cap| memo.capped_len(bytes, level, cap),
                 )?
                 .is_none()
@@ -3892,17 +3923,30 @@ mod tests {
                 std::iter::once(body.as_slice()),
                 before - after - minimum,
                 minimum,
+                level,
                 |bytes, cap| memo.capped_len(bytes, level, cap),
             )?
             .ok_or_else(|| crate::Error::Invalid("minimum exact saving rejected".into()))?;
             assert_eq!(accepted.savings, minimum);
-            assert_eq!(accepted.pages, [(0, b"q Q".to_vec())]);
+            assert_eq!(
+                accepted.pages,
+                [(
+                    0,
+                    b"q Q".to_vec(),
+                    crate::stream_codec::encode_flate(b"q Q", level)?
+                )]
+            );
+            assert_eq!(
+                accepted.bodies,
+                [crate::stream_codec::encode_flate(body, level)?]
+            );
             assert!(
                 measure_form_rewrites(
                     owned_pages.into_iter(),
                     std::iter::once(body.as_slice()),
                     before - after - minimum + 1,
                     minimum,
+                    level,
                     |bytes, cap| memo.capped_len(bytes, level, cap),
                 )?
                 .is_none()
@@ -3914,6 +3958,7 @@ mod tests {
                     std::iter::once(body.as_slice()),
                     0,
                     1,
+                    level,
                     |bytes, cap| memo.capped_len(bytes, level, cap),
                 )?
                 .is_none()
@@ -4176,8 +4221,12 @@ mod tests {
         let pages = [3, 4, 5].map(|number| ObjectHandle::Existing(ObjectId::new(number, 0)));
 
         let mut warm_shared = SharedRunInventory::default();
-        let mut warm_lengths = VectorFlateLengthMemo::processing();
-        let mut cold_lengths = VectorFlateLengthMemo::processing();
+        let mut warm_reuse = FlateReuseCache::default();
+        let mut cold_reuse = FlateReuseCache::default();
+        let mut warm_lengths =
+            VectorCompactionFlateState::new(&mut warm_reuse, OptimizationGoal::Processing);
+        let mut cold_lengths =
+            VectorCompactionFlateState::new(&mut cold_reuse, OptimizationGoal::Processing);
         let (warm_first, changed, reusable) = factor_processing_structural_forms(
             &mut warm,
             FlateLevel::PROCESSING,
