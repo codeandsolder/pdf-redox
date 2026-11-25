@@ -20,6 +20,8 @@ struct Args {
     #[arg(long, default_value_t = 1024 * 1024)]
     min_stream_bytes: usize,
     #[arg(long)]
+    window_bytes: Option<NonZeroUsize>,
+    #[arg(long)]
     adapter: Option<String>,
     #[arg(long, default_value = "2")]
     rounds: NonZeroUsize,
@@ -85,6 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             adapter: args.adapter,
             search_budget: args.budget,
             min_stream_bytes: args.min_stream_bytes,
+            match_window_bytes: args.window_bytes,
         }),
         ..cpu_config.clone()
     };

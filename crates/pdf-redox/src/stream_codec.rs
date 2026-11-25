@@ -376,9 +376,25 @@ impl FlateBatchEncoder {
             let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
             let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
             self.record_jobs(&gpu_jobs, true);
-            let gpu_results = match &self.compressor {
-                Some(pool) => pool.compress_gpu(&mut gpu_jobs, config, searcher, search_budget),
-                None => zlib_rs::compress_slices_batch_gpu(
+            let gpu_results = match (self.compressor.as_deref(), gpu.config.match_window_bytes) {
+                (Some(pool), Some(window)) => pool.compress_gpu_windowed(
+                    &mut gpu_jobs,
+                    config,
+                    searcher,
+                    search_budget,
+                    window,
+                ),
+                (None, Some(window)) => zlib_rs::compress_slices_batch_gpu_windowed(
+                    &mut gpu_jobs,
+                    config,
+                    searcher,
+                    search_budget,
+                    window,
+                ),
+                (Some(pool), None) => {
+                    pool.compress_gpu(&mut gpu_jobs, config, searcher, search_budget)
+                }
+                (None, None) => zlib_rs::compress_slices_batch_gpu(
                     &mut gpu_jobs,
                     config,
                     searcher,
@@ -740,6 +756,7 @@ mod tests {
                 search_budget: std::num::NonZeroU32::new(32)
                     .ok_or_else(|| Error::Invalid("zero budget".into()))?,
                 min_stream_bytes: 1024,
+                match_window_bytes: None,
             }),
             ..crate::Config::default()
         };
@@ -752,59 +769,66 @@ mod tests {
             b"tail",
         ];
         let full_caps = inputs.map(|input| zlib_rs::compress_bound(input.len()));
-        for workers in [1, 4] {
-            config.flate_workers = std::num::NonZeroUsize::new(workers)
-                .ok_or_else(|| Error::Invalid("zero workers".into()))?;
-            let executor = FlateBatchEncoder::from_config(&config)?;
-            let batcher = executor.for_document();
-            for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
-                let encoded = batcher
-                    .encode_many_capped(&inputs, &full_caps, level)?
-                    .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| Error::Compression("full bound rejected".into()))?;
-                for (input, bytes) in inputs.iter().zip(&encoded) {
-                    let mut decoded = vec![0; input.len()];
-                    let (decoded, code) = zlib_rs::decompress_slice(
-                        &mut decoded,
-                        bytes,
-                        zlib_rs::InflateConfig::default(),
+        for window in [None, std::num::NonZeroUsize::new(65_537)] {
+            config
+                .flate_gpu
+                .as_mut()
+                .ok_or_else(|| Error::Invalid("missing GPU configuration".into()))?
+                .match_window_bytes = window;
+            for workers in [1, 4] {
+                config.flate_workers = std::num::NonZeroUsize::new(workers)
+                    .ok_or_else(|| Error::Invalid("zero workers".into()))?;
+                let executor = FlateBatchEncoder::from_config(&config)?;
+                let batcher = executor.for_document();
+                for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+                    let encoded = batcher
+                        .encode_many_capped(&inputs, &full_caps, level)?
+                        .into_iter()
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Error::Compression("full bound rejected".into()))?;
+                    for (input, bytes) in inputs.iter().zip(&encoded) {
+                        let mut decoded = vec![0; input.len()];
+                        let (decoded, code) = zlib_rs::decompress_slice(
+                            &mut decoded,
+                            bytes,
+                            zlib_rs::InflateConfig::default(),
+                        );
+                        assert_eq!(code, zlib_rs::ReturnCode::Ok);
+                        assert_eq!(decoded, *input);
+                    }
+                    let mut caps = [0; 4];
+                    for (cap, bytes) in caps.iter_mut().zip(&encoded) {
+                        *cap = bytes.len();
+                    }
+                    caps[1] -= 1;
+                    caps[3] -= 1;
+                    assert_eq!(
+                        batcher.encode_many_capped(&inputs, &caps, level)?,
+                        vec![
+                            Some(encoded[0].clone()),
+                            None,
+                            Some(encoded[2].clone()),
+                            None
+                        ]
                     );
-                    assert_eq!(code, zlib_rs::ReturnCode::Ok);
-                    assert_eq!(decoded, *input);
+                    assert_eq!(encoded[0], encode_flate(inputs[0], level)?);
+                    assert_eq!(encoded[3], encode_flate(inputs[3], level)?);
                 }
-                let mut caps = [0; 4];
-                for (cap, bytes) in caps.iter_mut().zip(&encoded) {
-                    *cap = bytes.len();
-                }
-                caps[1] -= 1;
-                caps[3] -= 1;
+                let stats = batcher.stats();
+                assert_eq!(stats.cpu.streams, 8);
+                assert_eq!(stats.gpu_assisted.streams, 8);
                 assert_eq!(
-                    batcher.encode_many_capped(&inputs, &caps, level)?,
-                    vec![
-                        Some(encoded[0].clone()),
-                        None,
-                        Some(encoded[2].clone()),
-                        None
-                    ]
+                    stats.gpu_assisted.decoded_bytes,
+                    4 * (large.len() + other.len())
                 );
-                assert_eq!(encoded[0], encode_flate(inputs[0], level)?);
-                assert_eq!(encoded[3], encode_flate(inputs[3], level)?);
+                assert!(stats.gpu_initialization_ms > 0.0);
+                let next = executor.for_document();
+                assert_eq!(next.stats(), crate::FlateBatchStats::default());
+                let _ = next.encode_many_capped(&inputs, &full_caps, crate::FlateLevel::SIZE)?;
+                assert_eq!(next.stats().gpu_assisted.streams, 2);
+                assert!(next.stats().gpu_initialization_ms <= 0.0);
+                assert_eq!(batcher.stats(), stats);
             }
-            let stats = batcher.stats();
-            assert_eq!(stats.cpu.streams, 8);
-            assert_eq!(stats.gpu_assisted.streams, 8);
-            assert_eq!(
-                stats.gpu_assisted.decoded_bytes,
-                4 * (large.len() + other.len())
-            );
-            assert!(stats.gpu_initialization_ms > 0.0);
-            let next = executor.for_document();
-            assert_eq!(next.stats(), crate::FlateBatchStats::default());
-            let _ = next.encode_many_capped(&inputs, &full_caps, crate::FlateLevel::SIZE)?;
-            assert_eq!(next.stats().gpu_assisted.streams, 2);
-            assert!(next.stats().gpu_initialization_ms <= 0.0);
-            assert_eq!(batcher.stats(), stats);
         }
         Ok(())
     }
@@ -817,6 +841,7 @@ mod tests {
                 adapter: None,
                 search_budget: std::num::NonZeroU32::MIN,
                 min_stream_bytes: 0,
+                match_window_bytes: None,
             }),
             ..crate::Config::default()
         };

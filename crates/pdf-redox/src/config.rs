@@ -396,6 +396,9 @@ pub struct FlateGpuConfig {
     pub search_budget: NonZeroU32,
     /// Streams smaller than this remain on the CPU to avoid GPU transfer overhead.
     pub min_stream_bytes: usize,
+    /// Optional bounded GPU match window; stops searching once a capped output is exhausted.
+    /// None searches the whole input before encoding.
+    pub match_window_bytes: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

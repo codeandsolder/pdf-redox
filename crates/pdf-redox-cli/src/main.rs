@@ -136,6 +136,9 @@ struct Args {
     /// Keep smaller streams on the CPU (default: 1048576 decoded bytes).
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_min_stream_bytes: Option<usize>,
+    /// Resolve GPU matches on demand in windows of this many decoded bytes.
+    #[arg(long, requires = "flate_gpu_budget")]
+    flate_gpu_window_bytes: Option<NonZeroUsize>,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -216,6 +219,7 @@ fn configure_flate(cfg: &mut Config, args: &Args) {
             adapter: args.flate_gpu_adapter.clone(),
             search_budget,
             min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
+            match_window_bytes: args.flate_gpu_window_bytes,
         });
 }
 
