@@ -2338,6 +2338,14 @@ fn image_info(
     if bpc != 8 && !indexed && !device_gray {
         return Ok(None);
     }
+    // The mask policy is independent of the color payload. In particular,
+    // structural mode must not inflate an enormous masked color image only
+    // to discover that it requires the separate stencil eligibility path.
+    let has_soft_mask = resolved_non_null(document, dictionary.get(b"SMask".as_slice()))?;
+    let has_explicit_mask = resolved_non_null(document, dictionary.get(b"Mask".as_slice()))?;
+    if (has_soft_mask || has_explicit_mask) && !bake_masks {
+        return Ok(None);
+    }
     let Ok(raw_decoded) =
         document.decoded_stream_value(&crate::source::CurrentValue::Owned(&object))
     else {
@@ -2371,8 +2379,6 @@ fn image_info(
     }
 
     let preserve_encoded_color = preserves_compact_color_encoding(document, dictionary)?;
-    let has_soft_mask = resolved_non_null(document, dictionary.get(b"SMask".as_slice()))?;
-    let has_explicit_mask = resolved_non_null(document, dictionary.get(b"Mask".as_slice()))?;
     let encoded_mask_bytes = if has_soft_mask {
         match dictionary.get(b"SMask".as_slice()) {
             Some(smask) => encoded_stream_payload_len(document, smask)?.unwrap_or(0),
@@ -2386,9 +2392,6 @@ fn image_info(
     } else {
         0
     };
-    if (has_soft_mask || has_explicit_mask) && !bake_masks {
-        return Ok(None);
-    }
 
     let mut alpha = None;
     let mut mask_width = width;
@@ -5934,6 +5937,7 @@ struct MaterializationShape {
     width: u32,
     height: u32,
     masked: bool,
+    stencil_possible: bool,
 }
 
 fn materialization_shape(
@@ -5943,12 +5947,22 @@ fn materialization_shape(
     let object = document.current_owned_object_cow(handle).ok()??;
     let dictionary = object.as_dictionary()?;
     let (width, height) = dimensions(document, dictionary).ok()??;
-    let masked = resolved_non_null(document, dictionary.get(b"SMask".as_slice())).ok()?
-        || resolved_non_null(document, dictionary.get(b"Mask".as_slice())).ok()?;
+    let soft_mask = dictionary.get(b"SMask".as_slice());
+    let has_soft_mask = resolved_non_null(document, soft_mask).ok()?;
+    let masked =
+        has_soft_mask || resolved_non_null(document, dictionary.get(b"Mask".as_slice())).ok()?;
+    // Standalone constant-color-to-stencil conversion requires a different
+    // mask grid. An unknown grid cannot exclude the plan.
+    let stencil_possible = has_soft_mask
+        && soft_mask
+            .and_then(|mask| document.resolve_owned_value(mask).ok().flatten())
+            .and_then(|mask| dimensions(document, mask.as_dictionary()?).ok().flatten())
+            .is_none_or(|grid| grid != (width, height));
     Some(MaterializationShape {
         width,
         height,
         masked,
+        stencil_possible,
     })
 }
 
@@ -6051,7 +6065,12 @@ fn materialization_candidates(
                             && may_link_stripe(draw, other, shape, shapes[&other.target])
                     })
                 });
-        if shape.masked || tiny || native_candidate || stripe_candidate {
+        if (shape.masked && config.crop_transparent)
+            || shape.stencil_possible
+            || tiny
+            || native_candidate
+            || stripe_candidate
+        {
             candidates.insert(draw.target);
         }
     }
