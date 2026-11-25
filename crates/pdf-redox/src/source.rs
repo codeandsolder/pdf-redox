@@ -285,7 +285,7 @@ impl SourcePdf {
     /// Return trailer entries that belong to document semantics rather than
     /// the input xref/encryption machinery.
     ///
-    /// The vendored Hayro accessor exposes the final already-parsed trailer
+    /// The Hayro accessor exposes the final already-parsed trailer
     /// dictionary, so document construction no longer reparses the PDF through
     /// a second parser merely to preserve `/Info`, `/ID`, or custom roots.
     pub(crate) fn preserved_trailer(&self) -> OwnedDictionary {
