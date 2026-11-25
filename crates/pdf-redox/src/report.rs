@@ -1159,9 +1159,6 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of microstroke Flate images.
     pub microstroke_flate_images: usize,
-    #[serde(default)]
-    /// Estimated encoded bytes saved by microstroke.
-    pub microstroke_estimated_flate_bytes_saved: usize,
     /// Number of print images placed.
     pub print_images_placed: usize,
     /// Number of print image uses.

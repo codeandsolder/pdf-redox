@@ -24,7 +24,7 @@ const MAX_RASTER_DIMENSION: usize = 16_384;
 const MAX_RASTER_PIXELS: usize = 100_000_000;
 // Preserve individual marks, not the source renderer's subpixel antialiasing.
 // Consider a compact 200-DPI grid only when every source mark remains covered;
-// the former 300-DPI grid remains an encoded-cost candidate.
+// the former 300-DPI grid remains an alternative raster representation.
 const MAX_PAGE_RASTER_PITCH_PT: f64 = 72.0 / 200.0;
 const MIN_STROKE_RASTER_PIXELS: f64 = 1.5;
 
@@ -47,8 +47,6 @@ pub struct MicrostrokeRasterStats {
     pub ccitt_images: usize,
     /// Number of generated images encoded with Flate.
     pub flate_images: usize,
-    /// Estimated encoded bytes saved relative to the equivalent Flate representation.
-    pub estimated_flate_bytes_saved: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -991,12 +989,11 @@ struct Candidate {
     data: Vec<u8>,
     codec: BilevelCodec,
     strokes: usize,
-    estimated_encoded_gain: usize,
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "candidate discovery, encoded-cost gating, and document rewrites form one ordered optimization pass"
+    reason = "candidate discovery, raster representation selection, and document rewrites form one ordered optimization pass"
 )]
 pub fn rasterize_pathological_microstrokes(
     document: &mut EditDocument,
@@ -1040,43 +1037,31 @@ pub fn rasterize_pathological_microstrokes(
             };
             let name = next_image_name(&mut name_index, &mut occupied);
             let mut chosen: Option<(BilevelImagePayload, Vec<u8>, usize)> = None;
-            let mut local_before = None;
             for sample_pitch in microstroke_sample_pitches(run.state, pitch, user_unit) {
-                // Oversized natural masks must not preclude a valid compact grid.
                 let Some(raster) = rasterize_run_on_grid(&run, geometry, sample_pitch) else {
                     continue;
                 };
-                let original_cost = if let Some(cost) = local_before {
-                    cost
-                } else {
-                    let cost = crate::stream_codec::flate_encoded_len(
-                        &decoded[run.start..run.end],
-                        flate_level,
-                    )?;
-                    local_before = Some(cost);
-                    cost
-                };
                 let replacement = replacement_bytes(&name, &run, &raster);
+                // Encoding cost selects the best raster representation, never
+                // whether a recognized raster should remain a vector field.
                 let overhead = replacement.len().saturating_add(192);
-                let limit = chosen.as_ref().map_or(original_cost, |(_, _, cost)| *cost);
-                let Some(max_payload) = limit
-                    .checked_sub(overhead)
-                    .and_then(|budget| budget.checked_sub(1))
-                else {
-                    continue;
-                };
-                let Some(payload) = raster
-                    .mask
-                    .encode_image_mask_capped(flate_level, max_payload)?
-                else {
-                    continue;
+                let payload = if let Some((_, _, cost)) = &chosen {
+                    let Some(cap) = cost.checked_sub(overhead).and_then(|n| n.checked_sub(1))
+                    else {
+                        continue;
+                    };
+                    let Some(payload) = raster.mask.encode_image_mask_capped(flate_level, cap)?
+                    else {
+                        continue;
+                    };
+                    payload
+                } else {
+                    raster.mask.encode_image_mask(flate_level)?
                 };
                 let cost = payload.data.len().saturating_add(overhead);
                 chosen = Some((payload, replacement, cost));
             }
-            let (Some((chosen_payload, chosen_replacement, chosen_cost)), Some(local_before)) =
-                (chosen, local_before)
-            else {
+            let Some((chosen_payload, chosen_replacement, _)) = chosen else {
                 continue;
             };
             candidates.push(Candidate {
@@ -1088,59 +1073,24 @@ pub fn rasterize_pathological_microstrokes(
                 data: chosen_payload.data,
                 codec: chosen_payload.codec,
                 strokes: run.lines.len(),
-                estimated_encoded_gain: local_before.saturating_sub(chosen_cost),
             });
         }
         if candidates.is_empty() {
             continue;
         }
 
-        let before = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let Some((rewritten, after)) = (loop {
-            if candidates.is_empty() {
-                break None;
-            }
-            let replacements = candidates
-                .iter()
-                .map(|candidate| {
-                    (
-                        candidate.start,
-                        candidate.end,
-                        candidate.replacement.as_slice(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let Some(rewritten) =
-                crate::content_stream::apply_replacements(&decoded, &replacements)
-            else {
-                break None;
-            };
-            let image_cost = candidates
-                .iter()
-                .map(|candidate| candidate.data.len().saturating_add(192))
-                .sum::<usize>();
-            if let Some(budget) = before
-                .checked_sub(image_cost)
-                .and_then(|remaining| remaining.checked_sub(1))
-                && let Some(length) =
-                    crate::stream_codec::flate_capped_encoded_len(&rewritten, budget, flate_level)?
-            {
-                break Some((rewritten, length + image_cost));
-            }
-            // Whole-page Flate has contextual effects not reflected in each
-            // isolated run estimate. If the full rewrite grows the PDF, drop
-            // the least effective candidate and retry until it really shrinks.
-            let Some((worst, _)) = candidates
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, candidate)| candidate.estimated_encoded_gain)
-            else {
-                break None;
-            };
-            candidates.remove(worst);
-        }) else {
-            continue;
-        };
+        let replacements = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.start,
+                    candidate.end,
+                    candidate.replacement.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rewritten = crate::content_stream::apply_replacements(&decoded, &replacements)
+            .ok_or_else(|| crate::Error::Invalid("overlapping microstroke replacements".into()))?;
 
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.runs_rasterized = stats.runs_rasterized.saturating_add(candidates.len());
@@ -1168,9 +1118,6 @@ pub fn rasterize_pathological_microstrokes(
                 .filter(|candidate| candidate.codec == BilevelCodec::Flate)
                 .count(),
         );
-        stats.estimated_flate_bytes_saved = stats
-            .estimated_flate_bytes_saved
-            .saturating_add(before.saturating_sub(after));
 
         let mut installed = Vec::with_capacity(candidates.len());
         for candidate in candidates {

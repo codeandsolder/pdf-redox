@@ -148,13 +148,6 @@ struct Args {
     /// Reference mode: upload already-decoded bytes instead of transcoding source zlib on CUDA.
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_decoded_input: bool,
-    /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
-    /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
-    #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
-    rasterize_excessive_small_vectors: bool,
-    /// Preserve pathological tiny-vector fields even when the Print profile would rasterize them.
-    #[arg(long, conflicts_with = "rasterize_excessive_small_vectors")]
-    keep_excessive_small_vectors: bool,
     /// Reconstruct pathological fragmented raster layouts (pixel sprites and split stripes).
     /// Enabled automatically with `--optimize-for processing`.
     #[arg(long)]
@@ -206,7 +199,7 @@ struct Args {
     /// Number of per-file worst cases retained in each corpus ranking.
     #[arg(long, default_value_t = 20)]
     corpus_top: usize,
-    /// Run only the production pathological-microstroke detector/cost gate.
+    /// Run only the production pathological-microstroke detector/reconstruction.
     #[arg(long, hide = true)]
     analyze_microstrokes: bool,
     #[arg(long, conflicts_with = "analyze_fast")]
@@ -306,8 +299,6 @@ fn config_from_args(args: &Args) -> Config {
         cfg.max_image_ppi = Some(max_image_ppi);
     }
     configure_flate(&mut cfg, args);
-    cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
-        && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled |= args.normalize_raster_layout;
     cfg.raster_layout.bake_masks |= args.bake_image_masks;
     cfg.raster_layout.exact_raster_rendering = args.exact_raster_rendering;
@@ -495,7 +486,6 @@ mod tests {
                 "--preserve-authoring-data",
                 "--keep-output-intents",
                 "--keep-icc-color-management",
-                "--keep-excessive-small-vectors",
             ])?;
             let config = config_from_args(&keep);
             assert!(config.preservation.private_authoring_data);
@@ -504,7 +494,6 @@ mod tests {
             assert!(config.preservation.unknown_objects);
             assert!(config.preservation.output_intents);
             assert!(!config.elide_icc_profiles_to_alternate);
-            assert!(!config.rasterize_excessive_small_vectors);
             assert_eq!(config.image_policy, base.image_policy);
         }
         Ok(())
@@ -518,35 +507,6 @@ mod tests {
             config_from_args(&args).optimization_goal,
             OptimizationGoal::Processing
         );
-        Ok(())
-    }
-
-    #[test]
-    fn processing_rasterizes_pathological_microstrokes_by_default() -> Result<(), clap::Error> {
-        let normal = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
-        assert!(!config_from_args(&normal).rasterize_excessive_small_vectors);
-        let perceptual =
-            Args::try_parse_from(["pdf-redox", "input.pdf", "--profile", "perceptual"])?;
-        assert!(config_from_args(&perceptual).rasterize_excessive_small_vectors);
-        let keep_perceptual = Args::try_parse_from([
-            "pdf-redox",
-            "input.pdf",
-            "--profile",
-            "perceptual",
-            "--keep-excessive-small-vectors",
-        ])?;
-        assert!(!config_from_args(&keep_perceptual).rasterize_excessive_small_vectors);
-        let processing =
-            Args::try_parse_from(["pdf-redox", "input.pdf", "--optimize-for", "processing"])?;
-        assert!(config_from_args(&processing).rasterize_excessive_small_vectors);
-        let keep = Args::try_parse_from([
-            "pdf-redox",
-            "input.pdf",
-            "--optimize-for",
-            "processing",
-            "--keep-excessive-small-vectors",
-        ])?;
-        assert!(!config_from_args(&keep).rasterize_excessive_small_vectors);
         Ok(())
     }
 

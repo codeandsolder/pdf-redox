@@ -451,11 +451,6 @@ pub struct Config {
     /// The match strategy can produce different lossless encodings than the CPU path.
     #[serde(default)]
     pub flate_gpu: Option<FlateGpuConfig>,
-    /// Rasterize only pathological fields of hundreds of tiny opaque vector strokes.
-    /// This is intentionally lossy at the vector/semantic level, so it is off for the
-    /// normal optimize/processing policies and enabled by default only for Print.
-    #[serde(default)]
-    pub rasterize_excessive_small_vectors: bool,
     /// Replace eligible large `/ICCBased` color spaces with their declared Device alternate.
     /// This intentionally drops embedded color-management transforms and is therefore lossy.
     #[serde(default)]
@@ -464,7 +459,7 @@ pub struct Config {
 
 impl Config {
     #[must_use]
-    /// Returns the lossless structural-optimization baseline configuration.
+    /// Returns the structural-optimization baseline configuration. Recognized pathological raster-like vector fields are reconstructed in every profile.
     pub fn optimize_only() -> Self {
         Self {
             preservation: PreservationConfig::functional(),
@@ -478,7 +473,6 @@ impl Config {
             optimization_goal: OptimizationGoal::Size,
             flate_workers: default_flate_workers(),
             flate_gpu: None,
-            rasterize_excessive_small_vectors: false,
             elide_icc_profiles_to_alternate: false,
         }
     }
@@ -487,15 +481,13 @@ impl Config {
     ///
     /// Prefer simpler display lists, preserve known functional document
     /// semantics, normalize fragmented rasters and bake their masks. This
-    /// intentionally permits microstroke rasterization and eligible ICC
-    /// alternate substitution. Apply explicit preservation or color-policy
+    /// intentionally permits eligible ICC alternate substitution. Apply explicit preservation or color-policy
     /// overrides after selecting the objective.
     #[must_use]
     pub const fn for_processing(mut self) -> Self {
         self.optimization_goal = OptimizationGoal::Processing;
         self.preservation = PreservationConfig::known_functional();
         self.preservation.output_intents = false;
-        self.rasterize_excessive_small_vectors = true;
         self.raster_layout.enabled = true;
         self.raster_layout.bake_masks = true;
         self.elide_icc_profiles_to_alternate = true;
@@ -511,7 +503,6 @@ impl Config {
                 min_savings_percent: 20,
                 preserve_resolution: true,
             },
-            rasterize_excessive_small_vectors: true,
             ..Self::optimize_only()
         }
     }
@@ -526,7 +517,6 @@ impl Config {
                 target_ppi: 600,
                 min_savings_percent: 20,
             },
-            rasterize_excessive_small_vectors: true,
             ..Self::optimize_only()
         }
     }
@@ -582,12 +572,5 @@ mod tests {
             assert!(!config.preservation.private_authoring_data);
             assert!(!config.preservation.font_editing_support);
         }
-    }
-
-    #[test]
-    fn image_optimized_profiles_enable_microstroke_rasterization() {
-        assert!(!Config::optimize_only().rasterize_excessive_small_vectors);
-        assert!(Config::perceptual().rasterize_excessive_small_vectors);
-        assert!(Config::print().rasterize_excessive_small_vectors);
     }
 }

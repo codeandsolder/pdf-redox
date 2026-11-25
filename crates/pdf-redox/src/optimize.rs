@@ -514,7 +514,7 @@ fn validate_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Run the production pathological-microstroke detector and encoded-cost gate
+/// Run the production pathological-microstroke detector and raster reconstruction
 /// without serializing an output PDF. The temporary document may be rewritten
 /// internally, but the caller receives only the would-be rasterization stats.
 ///
@@ -733,7 +733,6 @@ struct OptimizationRunStats {
     stroke_forms: StrokeFormFactorStats,
     polyline_simplification: PolylineSimplificationStats,
     resource_prune: crate::prune::ResourcePruneStats,
-    microstroke_raster: MicrostrokeRasterStats,
     flate: crate::flate::FlateOptimizationStats,
     flate_batch: crate::FlateBatchStats,
     page_content_dedup: crate::dedup::TargetedDedupStats,
@@ -1022,8 +1021,8 @@ fn run_vector_optimization_phase(
     })
 }
 
-/// Late mutations must stay in this order: prune resources, apply microstroke
-/// changes, establish Flate policy, canonicalize page content/graph, compress
+/// Late mutations must stay in this order: prune resources, establish Flate
+/// policy, canonicalize page content/graph, compress
 /// remaining raw streams, remove safe CID `CMaps`, and serialize.
 #[derive(Clone, Copy)]
 struct FinalizationContext<'a> {
@@ -1070,13 +1069,6 @@ fn finalize_document(
     let flate_level = cfg.optimization_goal.flate_level();
     let resource_prune = timed(timings, "resource-prune", || {
         raster_evidence.prune_resources(document, pages, generated_page_xobjects)
-    })?;
-    let microstroke_raster = timed(timings, "microstroke-raster", || {
-        if cfg.rasterize_excessive_small_vectors {
-            rasterize_pathological_microstrokes(document, pages, cfg.optimization_goal)
-        } else {
-            Ok(MicrostrokeRasterStats::default())
-        }
     })?;
     let flate_encoder = timed(timings, "flate-executor-init", || {
         session.flate_encoder().map(FlateBatchEncoder::for_document)
@@ -1136,7 +1128,6 @@ fn finalize_document(
 
     Ok(FinalizationResult {
         resource_prune,
-        microstroke_raster,
         flate,
         flate_batch: flate_encoder.stats(),
         page_content_dedup,
@@ -1245,6 +1236,12 @@ fn optimize_pdf_with_document(
         },
         &mut timings,
     )?;
+    // Reconstruct recognized raster-like vector fields before any generic
+    // vector factoring can obscure the original stroke geometry. This is a
+    // structural normalization, independent of profile or encoded size.
+    let microstroke_raster = timed(&mut timings, "microstroke-raster", || {
+        rasterize_pathological_microstrokes(&mut document, &stable_pages, cfg.optimization_goal)
+    })?;
     let RasterPreflight {
         layout: raster_layout,
         evidence: mut raster_evidence,
@@ -1451,7 +1448,6 @@ fn optimize_pdf_with_document(
 
     let FinalizationResult {
         resource_prune,
-        microstroke_raster,
         flate,
         flate_batch,
         page_content_dedup,
