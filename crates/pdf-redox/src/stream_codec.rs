@@ -428,7 +428,17 @@ impl FlateBatchEncoder {
         if !self.transcode_enabled() {
             return Ok(outcomes);
         }
-        let Ok(minimum_decoded_len) = u32::try_from(gpu.config.min_stream_bytes) else {
+        let window = gpu.config.match_window_bytes.unwrap_or_else(|| {
+            std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap_or(std::num::NonZeroUsize::MIN)
+        });
+        // Direct input pays for a structural scan and device inflate. For
+        // single-window streams neither can overlap a preceding window's
+        // compression; retain decoded-input GPU compression for that case.
+        let Ok(minimum_decoded_len) = u32::try_from(
+            gpu.config
+                .min_stream_bytes
+                .max(window.get().saturating_add(1)),
+        ) else {
             return Ok(outcomes);
         };
         // Match the standalone PDF decoder's decoded-stream resource limit.
@@ -462,10 +472,7 @@ impl FlateBatchEncoder {
                     minimum_decoded_len,
                     config,
                     search_budget: gpu.config.search_budget.get(),
-                    window: gpu.config.match_window_bytes.unwrap_or_else(|| {
-                        std::num::NonZeroUsize::new(16 * 1024 * 1024)
-                            .unwrap_or(std::num::NonZeroUsize::MIN)
-                    }),
+                    window,
                 },
             ));
         }
