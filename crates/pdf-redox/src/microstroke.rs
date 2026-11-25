@@ -1144,6 +1144,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_profile_reconstructs_even_when_encoded_size_grows() -> Result<()> {
+        use crate::test_support::ClassicPdfBuilder;
+        let content = format!(
+            ".24 w 1 J {}",
+            "q 1 0 0 1 10 20 cm 0 0 m .12 0 l S Q ".repeat(600)
+        );
+        let encoded =
+            crate::stream_codec::encode_flate(content.as_bytes(), crate::FlateLevel::SIZE)?;
+        // The old per-run 192-byte overhead gate alone excluded this input.
+        assert!(encoded.len() < 192);
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"/Filter /FlateDecode", &encoded)?;
+        let input = pdf.finish(1)?;
+        for config in [
+            crate::Config::optimize_only(),
+            crate::Config::perceptual(),
+            crate::Config::print(),
+            crate::Config::optimize_only().for_processing(),
+        ] {
+            let (output, report) = crate::optimize_pdf(&input, &config)?;
+            assert_eq!(report.microstroke_runs_rasterized, 1);
+            assert_eq!(report.microstroke_strokes_rasterized, 600);
+            let document = EditDocument::from_bytes(output)?;
+            let images = document.reachable_streams_with_subtype(b"Image")?;
+            assert_eq!(images.len(), 1);
+            let pages = document.page_handles()?;
+            let content = crate::content::page_content(&document, pages[0])?;
+            assert!(content.windows(2).any(|window| window == b"Do"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn groups_only_adjacent_identical_microstroke_state() -> Result<()> {
         let input = b"q 1 0 0 1 10 20 cm 0 0 m .1 0 l S Q q 1 0 0 1 10.1 20 cm 0 0 m .1 0 l S Q";
         let mut scanner = MicroStrokeScanner::new(BTreeMap::new());
