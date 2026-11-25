@@ -134,7 +134,7 @@ pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     let mut required = [false; 6];
     for record in font.table_directory().table_records() {
         let tag = record.tag();
-        let mut data = font.data_for_tag(tag)?.as_bytes().to_vec();
+        let data = font.data_for_tag(tag)?.as_bytes();
         match &tag.to_be_bytes() {
             b"glyf" => {
                 required[0] = true;
@@ -149,7 +149,6 @@ pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
                 if data.len() < 54 {
                     return None;
                 }
-                data[8..12].fill(0);
             }
             b"maxp" => required[3] = true,
             b"hhea" => required[4] = true,
@@ -168,7 +167,13 @@ pub fn sparse_cid_union_skeleton_hash(bytes: &[u8]) -> Option<[u8; 32]> {
     for (tag, data) in tables {
         hasher.update(tag.to_be_bytes());
         hasher.update((data.len() as u64).to_le_bytes());
-        hasher.update(data);
+        if tag.to_be_bytes() == *b"head" {
+            hasher.update(&data[..8]);
+            hasher.update([0_u8; 4]);
+            hasher.update(&data[12..]);
+        } else {
+            hasher.update(data);
+        }
     }
     Some(hasher.finalize().into())
 }
@@ -294,9 +299,10 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
         _ => return None,
     };
 
-    let mut union_glyphs = vec![None::<Vec<u8>>; glyph_count];
-    for (font, _) in fonts {
-        if sparse_cid_union_skeleton_hash(font)? != base_hash {
+    let mut union_glyphs = vec![None::<&[u8]>; glyph_count];
+    let mut source_outlines = Vec::with_capacity(fonts.len());
+    for (index, (font, used_gids)) in fonts.iter().enumerate() {
+        if index != 0 && sparse_cid_union_skeleton_hash(font)? != base_hash {
             return None;
         }
         let offsets = sfnt_glyph_offsets(font)?;
@@ -311,11 +317,12 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
                 continue;
             }
             match &union_glyphs[gid] {
-                Some(existing) if existing.as_slice() != glyph => return None,
+                Some(existing) if *existing != glyph => return None,
                 Some(_) => {}
-                None => union_glyphs[gid] = Some(glyph.to_vec()),
+                None => union_glyphs[gid] = Some(glyph),
             }
         }
+        source_outlines.push((glyf, offsets, used_gids));
     }
 
     // Stronger than merely proving non-conflicting sparse programs: every GID
@@ -324,10 +331,7 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
     // the same outline before and after unioning. GID 0 is included because a
     // renderer may use .notdef for an invalid/missing character without that
     // GID appearing literally in the content stream.
-    for (font, used_gids) in fonts {
-        let offsets = sfnt_glyph_offsets(font)?;
-        let source_font = FontRef::new(font).ok()?;
-        let glyf = source_font.glyf().ok()?.offset_data().as_bytes();
+    for (glyf, offsets, used_gids) in source_outlines {
         let mut pending = VecDeque::new();
         pending.push_back(0usize);
         pending.extend(used_gids.iter().map(|gid| usize::from(*gid)));
@@ -340,7 +344,7 @@ fn sfnt_union_sparse_glyphs(fonts: &[(&[u8], &BTreeSet<u16>)]) -> Option<Vec<u8>
                 continue;
             }
             let source_glyph = glyf.get(offsets[gid]..offsets[gid + 1])?;
-            let union_glyph = union_glyphs[gid].as_deref().unwrap_or_default();
+            let union_glyph = union_glyphs[gid].unwrap_or_default();
             if source_glyph != union_glyph {
                 return None;
             }
@@ -428,6 +432,7 @@ struct SparseCidUnionCandidate {
     program: CowObjectHandle,
     descriptors: Vec<CowObjectHandle>,
     base_name: Vec<u8>,
+    skeleton: [u8; 32],
     font: Vec<u8>,
     raw_len: usize,
 }
@@ -519,13 +524,14 @@ fn union_sparse_cid_font_programs(
         let font = sfnt_for_pdf_rendering(&decoded)
             .map(|(trimmed, _)| trimmed)
             .unwrap_or(decoded);
-        let Some(_) = sparse_cid_union_skeleton_hash(&font) else {
+        let Some(skeleton) = sparse_cid_union_skeleton_hash(&font) else {
             continue;
         };
         candidates.push(SparseCidUnionCandidate {
             program,
             descriptors: descriptors.clone(),
             base_name,
+            skeleton,
             font,
             raw_len,
         });
@@ -533,11 +539,8 @@ fn union_sparse_cid_font_programs(
 
     let mut groups = BTreeMap::<(Vec<u8>, [u8; 32]), Vec<usize>>::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let Some(skeleton) = sparse_cid_union_skeleton_hash(&candidate.font) else {
-            continue;
-        };
         groups
-            .entry((candidate.base_name.clone(), skeleton))
+            .entry((candidate.base_name.clone(), candidate.skeleton))
             .or_default()
             .push(index);
     }

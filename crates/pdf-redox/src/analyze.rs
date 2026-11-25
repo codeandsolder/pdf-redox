@@ -8,6 +8,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub fn input_sha256(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1118,7 +1119,7 @@ fn analyze_pdf_impl(input: &[u8], mode: AnalysisMode) -> Result<PdfAnalysis> {
 // Exact deep-analysis recompression estimates can run independently. Keep decoded
 // buffers bounded, and use the same whole-stream encoder as PDF optimization.
 struct FlateEstimate {
-    decoded: Vec<u8>,
+    decoded: Arc<Vec<u8>>,
     raw_len: usize,
     non_image: bool,
 }
@@ -1143,7 +1144,13 @@ impl DeepFlateEstimator {
     const MAX_STAGED_LARGE_BYTES: usize = 128 * 1024 * 1024;
     const MAX_BATCH_STREAMS: usize = 64;
 
-    fn queue(&mut self, decoded: Vec<u8>, raw_len: usize, non_image: bool, out: &mut PdfAnalysis) {
+    fn queue(
+        &mut self,
+        decoded: Arc<Vec<u8>>,
+        raw_len: usize,
+        non_image: bool,
+        out: &mut PdfAnalysis,
+    ) {
         let incoming_large = decoded.len() >= Self::MAX_BATCH_BYTES;
         let pending_large = self
             .pending
@@ -1459,7 +1466,7 @@ impl ObjectAnalysisAccumulator {
             || (self.deep && (is_form || filter == "/FlateDecode"))
             || is_content_density_form
         {
-            match document.decoded_stream_value(object) {
+            match document.decoded_content_stream_data(handle) {
                 Ok(decoded) => Some(decoded),
                 Err(error) => {
                     if is_content_density_form && self.form_content_analysis_error.is_none() {
@@ -1474,7 +1481,7 @@ impl ObjectAnalysisAccumulator {
         if is_font {
             record_font_program_payload(
                 raw.as_ref(),
-                decoded.as_deref(),
+                decoded.as_deref().map(Vec::as_slice),
                 self.deep,
                 out,
                 &mut self.font_raw_payloads,
@@ -1515,7 +1522,9 @@ impl ObjectAnalysisAccumulator {
             if self.deep {
                 record_payload(
                     &mut self.form_payloads,
-                    decoded.as_deref().unwrap_or_else(|| raw.as_ref()),
+                    decoded
+                        .as_deref()
+                        .map_or_else(|| raw.as_ref(), Vec::as_slice),
                 );
             }
             if is_content_density_form
@@ -1606,10 +1615,10 @@ impl ObjectAnalysisAccumulator {
                 continue;
             }
             let raw = object.stream_bytes(document.source())?;
-            let decoded = document.decoded_stream_value(&object).ok();
+            let decoded = document.decoded_content_stream_data(handle).ok();
             record_font_program_payload(
                 raw.as_ref(),
-                decoded.as_deref(),
+                decoded.as_deref().map(Vec::as_slice),
                 false,
                 out,
                 &mut self.font_raw_payloads,
@@ -1634,10 +1643,7 @@ impl ObjectAnalysisAccumulator {
             .difference(&self.processed_font_file2_refs)
             .copied()
         {
-            let Some(object) = document.current_value(handle)? else {
-                continue;
-            };
-            if let Ok(decoded) = document.decoded_stream_value(&object) {
+            if let Ok(decoded) = document.decoded_content_stream_data(handle) {
                 record_font_file2_opportunity(
                     &decoded,
                     &mut self.font_sparse_skeletons,
@@ -2049,16 +2055,31 @@ mod tests {
     fn deep_flate_estimator_overlaps_two_moderately_large_jobs_but_flushes_giant() {
         let mut estimator = DeepFlateEstimator::default();
         let mut report = PdfAnalysis::default();
-        estimator.queue(vec![0_u8; 35 * 1024 * 1024], 1_000_000, true, &mut report);
+        estimator.queue(
+            vec![0_u8; 35 * 1024 * 1024].into(),
+            1_000_000,
+            true,
+            &mut report,
+        );
         assert_eq!(estimator.pending.len(), 1);
-        estimator.queue(vec![1_u8; 36 * 1024 * 1024], 1_000_000, false, &mut report);
+        estimator.queue(
+            vec![1_u8; 36 * 1024 * 1024].into(),
+            1_000_000,
+            false,
+            &mut report,
+        );
         assert!(estimator.pending.is_empty());
         assert_eq!(report.flate_recompress_candidate_count, 2);
         assert_eq!(report.non_image_flate_recompress_candidate_count, 1);
 
         // A giant must not survive to the next stream's decode, where its
         // retained buffer could make a formerly successful PDF run out of RAM.
-        estimator.queue(vec![2_u8; 129 * 1024 * 1024], 2_000_000, true, &mut report);
+        estimator.queue(
+            vec![2_u8; 129 * 1024 * 1024].into(),
+            2_000_000,
+            true,
+            &mut report,
+        );
         assert!(estimator.pending.is_empty());
         assert_eq!(estimator.pending_bytes, 0);
         assert_eq!(report.flate_recompress_candidate_count, 3);
@@ -2104,7 +2125,7 @@ mod tests {
                     expected.non_image_flate_recompress_potential_saving_bytes += saving;
                 }
             }
-            estimator.queue(decoded, raw_len, non_image, &mut actual);
+            estimator.queue(decoded.into(), raw_len, non_image, &mut actual);
         }
         estimator.flush(&mut actual);
 
