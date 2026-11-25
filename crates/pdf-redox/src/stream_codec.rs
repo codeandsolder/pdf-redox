@@ -504,6 +504,9 @@ impl FlateBatchEncoder {
                         stats.gpu_device_indexed_streams =
                             stats.gpu_device_indexed_streams.saturating_add(1);
                     }
+                    stats.gpu_device_tokens = stats
+                        .gpu_device_tokens
+                        .saturating_add(result.device_tokens as usize);
                     stats.gpu_transcode_source_bytes = stats
                         .gpu_transcode_source_bytes
                         .saturating_add(result.source_bytes_uploaded);

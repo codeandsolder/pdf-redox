@@ -18,7 +18,7 @@ version = "0.1.0"
 hayro-syntax = { git = "https://github.com/LaurenzV/hayro", rev = "e7ada1354dff4041cdeed3d8ba56fe01b6186132", default-features = false, features = ["std", "images"] }
 # Use our zlib-rs line directly so independent PDF streams can use its exact batch API.
 # Processing remains level 7; Size remains level 9.
-zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "6e73628d48ffacb59e2272225c5bdb70812ae8c7", default-features = false, features = ["std"] }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "25218daba505d84eda43b765a1970001c69def2a", default-features = false, features = ["std"] }
 libjpeg-turbo-rs = "=0.9.0"
 fast_image_resize = "6.1"
 fax = "=0.3.0"
