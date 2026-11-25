@@ -58,8 +58,8 @@ pub use compression_corpus::{
 };
 pub(crate) use config::FlateLevel;
 pub use config::{
-    AnnotationPolicy, Config, HiddenTextPolicy, ImagePolicy, OptimizationGoal, PreservationConfig,
-    PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
+    AnnotationPolicy, Config, FlateGpuConfig, HiddenTextPolicy, ImagePolicy, OptimizationGoal,
+    PreservationConfig, PrivacyConfig, PrivacyLevel, RasterLayoutConfig,
 };
 pub use error::{Error, Result, SourceLoadError};
 pub use glyph_catalog::{

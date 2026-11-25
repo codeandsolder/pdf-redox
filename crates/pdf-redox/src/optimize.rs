@@ -1010,7 +1010,7 @@ fn finalize_document(
         }
     })?;
     let flate_encoder = timed(timings, "flate-executor-init", || {
-        FlateBatchEncoder::new(cfg.flate_workers)
+        FlateBatchEncoder::from_config(cfg)
     })?;
     let flate = timed(timings, "flate-policy", || {
         optimize_flate_streams_with_cache(

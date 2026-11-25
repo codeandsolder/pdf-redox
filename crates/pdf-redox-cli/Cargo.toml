@@ -25,6 +25,9 @@ name = "pdf-redox-glyph-labels"
 path = "src/glyph_labels.rs"
 doc = false
 
+[features]
+gpu = ["pdf-redox/gpu"]
+
 [dependencies]
 pdf-redox = { path = "../pdf-redox" }
 clap.workspace = true

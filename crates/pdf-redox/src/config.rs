@@ -2,7 +2,7 @@ use crate::report::{HiddenTextAction, HiddenTextCategory, HiddenTextFinding};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +386,18 @@ fn default_flate_workers() -> NonZeroUsize {
     }
 }
 
+/// Explicit GPU-assisted Flate search policy for native optimization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlateGpuConfig {
+    /// Optional case-insensitive Vulkan adapter name substring.
+    pub adapter: Option<String>,
+    /// Maximum number of hash-chain candidates visited at each input position.
+    pub search_budget: NonZeroU32,
+    /// Streams smaller than this remain on the CPU to avoid GPU transfer overhead.
+    pub min_stream_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
@@ -425,6 +437,10 @@ pub struct Config {
     /// WASM always uses one worker; native defaults to the available parallelism capped at four.
     #[serde(default = "default_flate_workers")]
     pub flate_workers: NonZeroUsize,
+    /// Opt in to GPU-assisted whole-stream compression; requires the native gpu feature.
+    /// The match strategy can produce different lossless encodings than the CPU path.
+    #[serde(default)]
+    pub flate_gpu: Option<FlateGpuConfig>,
     /// Rasterize only pathological fields of hundreds of tiny opaque vector strokes.
     /// This is intentionally lossy at the vector/semantic level, so it is off for the
     /// normal optimize/processing policies and enabled by default only for Print.
@@ -451,6 +467,7 @@ impl Config {
             remove_repeated_page_objects: false,
             optimization_goal: OptimizationGoal::Size,
             flate_workers: default_flate_workers(),
+            flate_gpu: None,
             rasterize_excessive_small_vectors: false,
             elide_icc_profiles_to_alternate: false,
         }

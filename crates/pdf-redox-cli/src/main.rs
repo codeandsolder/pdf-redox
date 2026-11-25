@@ -7,7 +7,7 @@ use pdf_redox::{
 };
 use std::{
     io::{self, Write},
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
 };
 
@@ -127,6 +127,15 @@ struct Args {
     /// Maximum persistent workers used for independent whole-stream Flate compression.
     #[arg(long)]
     flate_workers: Option<NonZeroUsize>,
+    /// Enable experimental Vulkan-assisted Flate compression with this search budget.
+    #[arg(long)]
+    flate_gpu_budget: Option<NonZeroU32>,
+    /// Select a Vulkan adapter by name substring.
+    #[arg(long, requires = "flate_gpu_budget")]
+    flate_gpu_adapter: Option<String>,
+    /// Keep smaller streams on the CPU (default: 1048576 decoded bytes).
+    #[arg(long, requires = "flate_gpu_budget")]
+    flate_gpu_min_stream_bytes: Option<usize>,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -270,6 +279,13 @@ fn config_from_args(args: &Args) -> Config {
     if let Some(flate_workers) = args.flate_workers {
         cfg.flate_workers = flate_workers;
     }
+    cfg.flate_gpu = args
+        .flate_gpu_budget
+        .map(|search_budget| pdf_redox::FlateGpuConfig {
+            adapter: args.flate_gpu_adapter.clone(),
+            search_budget,
+            min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
+        });
     cfg.rasterize_excessive_small_vectors = !args.keep_excessive_small_vectors
         && (cfg.rasterize_excessive_small_vectors || args.rasterize_excessive_small_vectors);
     cfg.raster_layout.enabled |= args.normalize_raster_layout;
@@ -519,6 +535,34 @@ mod tests {
         let args = Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-workers", "2"])?;
         assert_eq!(config_from_args(&args).flate_workers.get(), 2);
         assert!(Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-workers", "0"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn flate_gpu_is_explicitly_configurable() -> Result<(), clap::Error> {
+        let args = Args::try_parse_from(["pdf-redox", "input.pdf"])?;
+        assert!(config_from_args(&args).flate_gpu.is_none());
+        let args = Args::try_parse_from([
+            "pdf-redox",
+            "input.pdf",
+            "--flate-gpu-budget",
+            "32",
+            "--flate-gpu-adapter",
+            "NVIDIA",
+            "--flate-gpu-min-stream-bytes",
+            "4096",
+        ])?;
+        let gpu = config_from_args(&args).flate_gpu;
+        assert!(gpu.is_some_and(|gpu| gpu.search_budget.get() == 32
+            && gpu.adapter.as_deref() == Some("NVIDIA")
+            && gpu.min_stream_bytes == 4096));
+        assert!(
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-gpu-budget", "0"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-gpu-adapter", "NVIDIA"])
+                .is_err()
+        );
         Ok(())
     }
 

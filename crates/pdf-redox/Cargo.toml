@@ -10,6 +10,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+gpu = ["zlib-rs/gpu"]
+
 [dependencies]
 hayro-syntax.workspace = true
 zlib-rs.workspace = true

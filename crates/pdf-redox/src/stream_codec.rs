@@ -220,9 +220,40 @@ pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>>
 pub struct FlateBatchEncoder {
     #[cfg(not(target_family = "wasm"))]
     compressor: Option<zlib_rs::BatchCodec>,
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+    gpu: Option<GpuFlateExecutor>,
+}
+
+#[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+struct GpuFlateExecutor {
+    searcher:
+        std::sync::OnceLock<std::result::Result<zlib_rs::GpuMatchSearcher, zlib_rs::GpuMatchError>>,
+    config: crate::FlateGpuConfig,
 }
 
 impl FlateBatchEncoder {
+    pub fn from_config(config: &crate::Config) -> Result<Self> {
+        let Some(gpu) = &config.flate_gpu else {
+            return Self::new(config.flate_workers);
+        };
+        #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+        {
+            let mut encoder = Self::new(config.flate_workers)?;
+            encoder.gpu = Some(GpuFlateExecutor {
+                searcher: std::sync::OnceLock::new(),
+                config: gpu.clone(),
+            });
+            Ok(encoder)
+        }
+        #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
+        {
+            let _ = gpu;
+            Err(Error::Compression(
+                "GPU Flate requires a native build with the gpu feature".to_owned(),
+            ))
+        }
+    }
+
     pub fn new(workers: std::num::NonZeroUsize) -> Result<Self> {
         #[cfg(target_family = "wasm")]
         {
@@ -238,8 +269,80 @@ impl FlateBatchEncoder {
             } else {
                 None
             };
-            Ok(Self { compressor })
+            Ok(Self {
+                compressor,
+                #[cfg(feature = "gpu")]
+                gpu: None,
+            })
         }
+    }
+
+    fn compress_cpu(
+        &self,
+        jobs: &mut [zlib_rs::BatchJob<'_>],
+        config: zlib_rs::DeflateConfig,
+    ) -> Vec<zlib_rs::BatchCompressResult> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(compressor) = &self.compressor {
+            return compressor.compress(jobs, config);
+        }
+        zlib_rs::compress_slices_batch(jobs, config)
+    }
+
+    fn compress_jobs(
+        &self,
+        mut jobs: Vec<zlib_rs::BatchJob<'_>>,
+        config: zlib_rs::DeflateConfig,
+    ) -> Result<Vec<zlib_rs::BatchCompressResult>> {
+        #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+        if let Some(gpu) = &self.gpu
+            && jobs
+                .iter()
+                .any(|job| job.input.len() >= gpu.config.min_stream_bytes)
+        {
+            let searcher = gpu
+                .searcher
+                .get_or_init(|| zlib_rs::GpuMatchSearcher::new(gpu.config.adapter.as_deref()))
+                .as_ref()
+                .map_err(|error| {
+                    Error::Compression(format!("GPU Flate initialization: {error}"))
+                })?;
+            let search_budget = gpu.config.search_budget.get();
+            let count = jobs.len();
+            let (cpu_jobs, gpu_jobs): (Vec<_>, Vec<_>) = jobs
+                .into_iter()
+                .enumerate()
+                .partition(|(_, job)| job.input.len() < gpu.config.min_stream_bytes);
+            let (cpu_indices, mut cpu_jobs): (Vec<_>, Vec<_>) = cpu_jobs.into_iter().unzip();
+            let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
+            let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
+            let gpu_results = match &self.compressor {
+                Some(pool) => pool.compress_gpu(&mut gpu_jobs, config, searcher, search_budget),
+                None => zlib_rs::compress_slices_batch_gpu(
+                    &mut gpu_jobs,
+                    config,
+                    searcher,
+                    search_budget,
+                ),
+            }
+            .map_err(|error| Error::Compression(format!("GPU Flate search: {error}")))?;
+            let mut results = vec![
+                zlib_rs::BatchCompressResult {
+                    written: 0,
+                    code: zlib_rs::ReturnCode::StreamError
+                };
+                count
+            ];
+            for (index, result) in cpu_indices
+                .into_iter()
+                .zip(cpu_results)
+                .chain(gpu_indices.into_iter().zip(gpu_results))
+            {
+                results[index] = result;
+            }
+            return Ok(results);
+        }
+        Ok(self.compress_cpu(&mut jobs, config))
     }
 
     // Encode directly into bounded outputs. A failed cap is a normal rejection
@@ -257,7 +360,7 @@ impl FlateBatchEncoder {
             ));
         }
         let mut outputs = vec![Vec::new(); inputs.len()];
-        let mut jobs = inputs
+        let jobs = inputs
             .iter()
             .zip(maximum_lengths)
             .zip(&mut outputs)
@@ -272,15 +375,7 @@ impl FlateBatchEncoder {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let config = flate_config(level);
-        #[cfg(not(target_family = "wasm"))]
-        let results = match &self.compressor {
-            Some(compressor) => compressor.compress(&mut jobs, config),
-            None => zlib_rs::compress_slices_batch(&mut jobs, config),
-        };
-        #[cfg(target_family = "wasm")]
-        let results = zlib_rs::compress_slices_batch(&mut jobs, config);
-        drop(jobs);
+        let results = self.compress_jobs(jobs, flate_config(level))?;
         outputs
             .into_iter()
             .zip(results)
@@ -573,6 +668,84 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+    #[test]
+    #[ignore = "requires a Vulkan adapter"]
+    fn gpu_batch_preserves_order_caps_and_decoded_bytes() -> Result<()> {
+        let mut config = crate::Config {
+            flate_gpu: Some(crate::FlateGpuConfig {
+                adapter: None,
+                search_budget: std::num::NonZeroU32::new(32)
+                    .ok_or_else(|| Error::Invalid("zero budget".into()))?,
+                min_stream_bytes: 1024,
+            }),
+            ..crate::Config::default()
+        };
+        let large = b"BT /F1 12 Tf (GPU compression) Tj ET\n".repeat(4096);
+        let other = (0_u8..=255).cycle().take(100_000).collect::<Vec<_>>();
+        let inputs = [
+            b"small".as_slice(),
+            large.as_slice(),
+            other.as_slice(),
+            b"tail",
+        ];
+        let full_caps = inputs.map(|input| zlib_rs::compress_bound(input.len()));
+        for workers in [1, 4] {
+            config.flate_workers = std::num::NonZeroUsize::new(workers)
+                .ok_or_else(|| Error::Invalid("zero workers".into()))?;
+            let batcher = FlateBatchEncoder::from_config(&config)?;
+            for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+                let encoded = batcher
+                    .encode_many_capped(&inputs, &full_caps, level)?
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| Error::Compression("full bound rejected".into()))?;
+                for (input, bytes) in inputs.iter().zip(&encoded) {
+                    let mut decoded = vec![0; input.len()];
+                    let (decoded, code) = zlib_rs::decompress_slice(
+                        &mut decoded,
+                        bytes,
+                        zlib_rs::InflateConfig::default(),
+                    );
+                    assert_eq!(code, zlib_rs::ReturnCode::Ok);
+                    assert_eq!(decoded, *input);
+                }
+                let mut caps = [0; 4];
+                for (cap, bytes) in caps.iter_mut().zip(&encoded) {
+                    *cap = bytes.len();
+                }
+                caps[1] -= 1;
+                caps[3] -= 1;
+                assert_eq!(
+                    batcher.encode_many_capped(&inputs, &caps, level)?,
+                    vec![
+                        Some(encoded[0].clone()),
+                        None,
+                        Some(encoded[2].clone()),
+                        None
+                    ]
+                );
+                assert_eq!(encoded[0], encode_flate(inputs[0], level)?);
+                assert_eq!(encoded[3], encode_flate(inputs[3], level)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
+    #[test]
+    fn unsupported_gpu_configuration_is_explicit() {
+        let config = crate::Config {
+            flate_gpu: Some(crate::FlateGpuConfig {
+                adapter: None,
+                search_budget: std::num::NonZeroU32::MIN,
+                min_stream_bytes: 0,
+            }),
+            ..crate::Config::default()
+        };
+        assert!(FlateBatchEncoder::from_config(&config).is_err());
     }
 
     #[test]
