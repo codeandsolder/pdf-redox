@@ -1449,8 +1449,11 @@ mod tests {
             if direct {
                 assert!(work.gpu_transcoded.streams > 1);
                 assert!(work.gpu_transcode_source_bytes > 0);
+                assert_eq!(work.gpu_device_indexed_streams, work.gpu_transcoded.streams);
+                assert_eq!(work.gpu_transcode_descriptor_bytes, 0);
             } else {
                 assert_eq!(work.gpu_transcoded.streams, 0);
+                assert_eq!(work.gpu_device_indexed_streams, 0);
             }
             let objects = handles
                 .into_iter()

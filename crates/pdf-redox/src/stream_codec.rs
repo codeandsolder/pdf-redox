@@ -500,6 +500,10 @@ impl FlateBatchEncoder {
                     work.decoded_bytes = work
                         .decoded_bytes
                         .saturating_add(result.decoded_bytes_processed);
+                    if result.device_indexed {
+                        stats.gpu_device_indexed_streams =
+                            stats.gpu_device_indexed_streams.saturating_add(1);
+                    }
                     stats.gpu_transcode_source_bytes = stats
                         .gpu_transcode_source_bytes
                         .saturating_add(result.source_bytes_uploaded);

@@ -523,6 +523,8 @@ pub struct FlateBatchStats {
     pub gpu_assisted: FlateBatchWork,
     /// Subset using original compressed input; decoded bytes count actual processed cores.
     pub gpu_transcoded: FlateBatchWork,
+    /// Transcoded streams whose entropy boundaries were discovered on CUDA.
+    pub gpu_device_indexed_streams: usize,
     /// Compact source and Huffman-header bytes uploaded for transcoding.
     pub gpu_transcode_source_bytes: usize,
     /// Structural entropy-segment descriptor bytes uploaded.
