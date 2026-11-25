@@ -247,7 +247,7 @@ impl GpuFlateExecutor {
 }
 
 #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-pub(crate) enum FlateTranscode {
+pub enum FlateTranscode {
     NotRouted,
     Rejected,
     RetryCpu,
