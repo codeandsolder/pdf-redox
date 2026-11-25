@@ -71,8 +71,8 @@ pub use ocr_overlay::{
     OcrDocument, OcrLine, OcrOverlayOptions, OcrOverlayReport, OcrPage, apply_ocr_overlay,
 };
 pub use optimize::{
-    analyze_microstroke_rasterization, optimize_pdf, optimize_pdf_with_analysis,
-    optimize_pdf_with_glyph_catalog,
+    OptimizationSession, analyze_microstroke_rasterization, optimize_pdf,
+    optimize_pdf_with_analysis, optimize_pdf_with_glyph_catalog,
 };
 pub use report::{
     DocumentRepresentation, HiddenTextAction, HiddenTextCategory, HiddenTextFinding,

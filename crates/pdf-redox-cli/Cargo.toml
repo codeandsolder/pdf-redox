@@ -38,3 +38,7 @@ serde.workspace = true
 name = "pdf-redox-compression-corpus"
 path = "src/compression_corpus.rs"
 doc = false
+
+[[example]]
+name = "flate_session_bench"
+required-features = ["gpu"]

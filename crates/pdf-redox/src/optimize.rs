@@ -63,6 +63,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -524,6 +525,92 @@ pub fn analyze_microstroke_rasterization(
     rasterize_pathological_microstrokes(&mut document, &pages, optimization_goal)
 }
 
+/// Reusable optimizer with a fixed policy and lazily initialized compression
+/// resources. Document-local analyses and rewrite caches are never retained.
+/// Reuse the session across PDFs to amortize worker and GPU initialization.
+pub struct OptimizationSession {
+    config: Config,
+    flate_encoder: OnceLock<Result<FlateBatchEncoder>>,
+}
+
+impl OptimizationSession {
+    /// Create a session with the supplied immutable optimization policy.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or unsupported configuration.
+    pub fn new(config: Config) -> Result<Self> {
+        validate_config(&config)?;
+        Ok(Self {
+            config,
+            flate_encoder: OnceLock::new(),
+        })
+    }
+
+    fn flate_encoder(&self) -> Result<&FlateBatchEncoder> {
+        self.flate_encoder
+            .get_or_init(|| FlateBatchEncoder::from_config(&self.config))
+            .as_ref()
+            .map_err(|error| crate::Error::Compression(error.to_string()))
+    }
+
+    /// Optimize one document using the session's policy and compression resources.
+    ///
+    /// # Errors
+    /// Returns an error when the PDF cannot be parsed, optimized or serialized.
+    pub fn optimize(&self, input: &[u8]) -> Result<(Vec<u8>, OptimizationReport)> {
+        self.run(input, None, None)
+    }
+
+    /// Optimize one document using a previously computed analysis of these exact bytes.
+    ///
+    /// # Errors
+    /// Returns an error for mismatched analysis or when optimization fails.
+    pub fn optimize_with_analysis(
+        &self,
+        input: &[u8],
+        analysis: &PdfAnalysis,
+    ) -> Result<(Vec<u8>, OptimizationReport)> {
+        self.run(input, Some(analysis), None)
+    }
+
+    /// Optimize one document and collect the Type3 geometry catalog produced by
+    /// the Processing goal. Collection does not change the optimized PDF.
+    ///
+    /// # Errors
+    /// Returns an error when optimization fails.
+    pub fn optimize_with_glyph_catalog(
+        &self,
+        input: &[u8],
+    ) -> Result<(Vec<u8>, OptimizationReport, GlyphCatalog)> {
+        let mut catalog = GlyphCatalog::default();
+        let (output, report) = self.run(input, None, Some(&mut catalog))?;
+        catalog.optimized_pdf_sha256 = crate::digest::sha256_hex(&output);
+        Ok((output, report, catalog))
+    }
+
+    fn run(
+        &self,
+        input: &[u8],
+        analysis: Option<&PdfAnalysis>,
+        catalog: Option<&mut GlyphCatalog>,
+    ) -> Result<(Vec<u8>, OptimizationReport)> {
+        if analysis.is_some_and(|analysis| !analysis.matches_input(input)) {
+            return Err(crate::Error::AnalysisInputMismatch);
+        }
+        let mut timings = BTreeMap::new();
+        let document = timed(&mut timings, "document-open", || {
+            EditDocument::from_bytes(input.to_vec())
+        })?;
+        let analysis = match analysis {
+            Some(analysis) => PreparedAnalysis::Cached(analysis.clone()),
+            None => PreparedAnalysis::Fresh(timed(&mut timings, "analysis", || {
+                analyze_document_for_optimization(input, &document)
+            })?),
+        };
+        optimize_pdf_with_document(document, self, analysis, timings, catalog)
+    }
+}
+
 /// Optimize a PDF according to the supplied configuration.
 ///
 /// # Errors
@@ -531,7 +618,7 @@ pub fn analyze_microstroke_rasterization(
 /// Returns an error when the configuration is invalid, the input PDF cannot be parsed,
 /// an optimization pass fails, or the rewritten document cannot be serialized.
 pub fn optimize_pdf(input: &[u8], cfg: &Config) -> Result<(Vec<u8>, OptimizationReport)> {
-    optimize_pdf_impl(input, cfg, None)
+    OptimizationSession::new(cfg.clone())?.optimize(input)
 }
 
 /// Optimize a PDF and return the document-wide catalog of Type3 outline
@@ -548,10 +635,7 @@ pub fn optimize_pdf_with_glyph_catalog(
     input: &[u8],
     cfg: &Config,
 ) -> Result<(Vec<u8>, OptimizationReport, GlyphCatalog)> {
-    let mut catalog = GlyphCatalog::default();
-    let (output, report) = optimize_pdf_impl(input, cfg, Some(&mut catalog))?;
-    catalog.optimized_pdf_sha256 = crate::digest::sha256_hex(&output);
-    Ok((output, report, catalog))
+    OptimizationSession::new(cfg.clone())?.optimize_with_glyph_catalog(input)
 }
 
 /// A freshly analyzed document carries source-local handles; a cached public
@@ -575,28 +659,6 @@ impl PreparedAnalysis {
     }
 }
 
-fn optimize_pdf_impl(
-    input: &[u8],
-    cfg: &Config,
-    catalog: Option<&mut GlyphCatalog>,
-) -> Result<(Vec<u8>, OptimizationReport)> {
-    validate_config(cfg)?;
-    let mut timings = BTreeMap::new();
-    let document = timed(&mut timings, "document-open", || {
-        EditDocument::from_bytes(input.to_vec())
-    })?;
-    let analysis = timed(&mut timings, "analysis", || {
-        analyze_document_for_optimization(input, &document)
-    })?;
-    optimize_pdf_with_document(
-        document,
-        cfg,
-        PreparedAnalysis::Fresh(analysis),
-        timings,
-        catalog,
-    )
-}
-
 /// Optimize `input` using a previously computed analysis of these exact bytes.
 ///
 /// # Errors
@@ -608,21 +670,7 @@ pub fn optimize_pdf_with_analysis(
     cfg: &Config,
     analysis: &PdfAnalysis,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
-    validate_config(cfg)?;
-    if !analysis.matches_input(input) {
-        return Err(crate::Error::AnalysisInputMismatch);
-    }
-    let mut timings = BTreeMap::new();
-    let document = timed(&mut timings, "document-open", || {
-        EditDocument::from_bytes(input.to_vec())
-    })?;
-    optimize_pdf_with_document(
-        document,
-        cfg,
-        PreparedAnalysis::Cached(analysis.clone()),
-        timings,
-        None,
-    )
+    OptimizationSession::new(cfg.clone())?.optimize_with_analysis(input, analysis)
 }
 
 fn preservation_uses_fast_path(policy: &crate::PreservationConfig) -> bool {
@@ -966,7 +1014,7 @@ fn run_vector_optimization_phase(
 /// remaining raw streams, remove safe CID `CMaps`, and serialize.
 #[derive(Clone, Copy)]
 struct FinalizationContext<'a> {
-    cfg: &'a Config,
+    session: &'a OptimizationSession,
     before: &'a PdfAnalysis,
     pages: &'a [crate::ObjectHandle],
     raster_evidence: &'a RasterPhaseEvidence,
@@ -996,7 +1044,7 @@ fn finalize_document(
     timings: &mut BTreeMap<String, f64>,
 ) -> Result<FinalizationResult> {
     let FinalizationContext {
-        cfg,
+        session,
         before,
         pages,
         raster_evidence,
@@ -1004,6 +1052,7 @@ fn finalize_document(
         font_usage_hint,
         cid_cmap_source_inventory_still_valid,
     } = context;
+    let cfg = &session.config;
     let flate_level = cfg.optimization_goal.flate_level();
     let resource_prune = timed(timings, "resource-prune", || {
         raster_evidence.prune_resources(document, pages, generated_page_xobjects)
@@ -1015,15 +1064,13 @@ fn finalize_document(
             Ok(MicrostrokeRasterStats::default())
         }
     })?;
-    let flate_encoder = timed(timings, "flate-executor-init", || {
-        FlateBatchEncoder::from_config(cfg)
-    })?;
+    let flate_encoder = timed(timings, "flate-executor-init", || session.flate_encoder())?;
     let flate = timed(timings, "flate-policy", || {
         optimize_flate_streams_with_cache(
             document,
             flate_level,
             &mut flate_reuse_cache,
-            &flate_encoder,
+            flate_encoder,
         )
     })?;
     timed(timings, "content-normalize", || -> Result<()> {
@@ -1044,12 +1091,7 @@ fn finalize_document(
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(
-            document,
-            flate_level,
-            &mut flate_reuse_cache,
-            &flate_encoder,
-        )
+        compress_unfiltered_streams(document, flate_level, &mut flate_reuse_cache, flate_encoder)
     })?;
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
@@ -1089,11 +1131,12 @@ fn finalize_document(
 )]
 fn optimize_pdf_with_document(
     mut document: EditDocument,
-    cfg: &Config,
+    session: &OptimizationSession,
     analysis: PreparedAnalysis,
     mut timings: BTreeMap<String, f64>,
     catalog: Option<&mut GlyphCatalog>,
 ) -> Result<(Vec<u8>, OptimizationReport)> {
+    let cfg = &session.config;
     let (before, ext_gstate_handles) = analysis.into_parts();
     let ext_gstate_dictionary_handles = ext_gstate_handles.as_deref();
     let flate_level = cfg.optimization_goal.flate_level();
@@ -1397,7 +1440,7 @@ fn optimize_pdf_with_document(
         &mut document,
         flate_reuse_cache,
         FinalizationContext {
-            cfg,
+            session,
             before: &before,
             pages: &stable_pages,
             raster_evidence: &raster_evidence,
@@ -1553,6 +1596,25 @@ mod tests {
 
     use super::*;
     use crate::{Error, SourcePdf, test_support::ClassicPdfBuilder};
+
+    #[test]
+    fn session_reuses_executor_without_retaining_document_state() -> Result<()> {
+        let config = Config::optimize_only();
+        let session = OptimizationSession::new(config.clone())?;
+        let first = duplicate_extgstate_fixture()?;
+        let second = duplicate_to_unicode_fixture()?;
+        assert!(session.flate_encoder.get().is_none());
+        let (first_output, _) = session.optimize(&first)?;
+        let executor = session.flate_encoder()?;
+        let analysis = crate::analyze_pdf(&second)?;
+        assert!(session.optimize_with_analysis(&first, &analysis).is_err());
+        let (second_output, _) = session.optimize_with_analysis(&second, &analysis)?;
+        assert!(std::ptr::eq(executor, session.flate_encoder()?));
+        assert_eq!(first_output, optimize_pdf(&first, &config)?.0);
+        assert_eq!(second_output, optimize_pdf(&second, &config)?.0);
+        assert_eq!(first_output, session.optimize(&first)?.0);
+        Ok(())
+    }
 
     #[test]
     fn finalization_preserves_stage_timing_contract_in_both_goals() -> Result<()> {
