@@ -173,17 +173,17 @@ impl<'a> InlineFilterConfiguration<'a> {
 
 /// Resolved filter parameters and encoded bytes only: no non-Sync PDF
 /// parser, object overlay, or cache references cross the worker boundary.
-pub(crate) struct DetachedStream<'a> {
+pub struct DetachedStream<'a> {
     filter_dictionary: Option<Vec<u8>>,
     pub(crate) encoded: Cow<'a, [u8]>,
 }
 
 impl DetachedStream<'_> {
     pub(crate) fn decode(&self) -> Result<Vec<u8>> {
-        match &self.filter_dictionary {
-            Some(dictionary) => decode_detached(dictionary, &self.encoded),
-            None => Ok(self.encoded.to_vec()),
-        }
+        self.filter_dictionary.as_ref().map_or_else(
+            || Ok(self.encoded.to_vec()),
+            |dictionary| decode_detached(dictionary, &self.encoded),
+        )
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
