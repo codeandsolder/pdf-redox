@@ -1556,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=6052d6d1986fa1935a1dab7291797c5384d80f48#6052d6d1986fa1935a1dab7291797c5384d80f48"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=21e9207354c619695a6384c7229cdd77b4d5b49d#21e9207354c619695a6384c7229cdd77b4d5b49d"
 dependencies = [
  "bytemuck",
  "cudarc",

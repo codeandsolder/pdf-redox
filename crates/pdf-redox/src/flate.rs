@@ -1397,6 +1397,71 @@ mod tests {
         Ok((document, handles, decoded_payloads))
     }
 
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    #[test]
+    #[ignore = "requires CUDA hardware and NVRTC"]
+    fn cuda_transcode_preserves_filtered_streams_and_predictor_fallback() -> crate::Result<()> {
+        let mut config = crate::Config {
+            flate_workers: std::num::NonZeroUsize::new(4)
+                .ok_or_else(|| crate::Error::Invalid("workers".into()))?,
+            flate_gpu: Some(crate::FlateGpuConfig {
+                adapter: Some("cuda:0".to_owned()),
+                search_budget: std::num::NonZeroU32::new(128)
+                    .ok_or_else(|| crate::Error::Invalid("budget".into()))?,
+                min_stream_bytes: 1024,
+                min_cap_per_mille: 0,
+                match_window_bytes: std::num::NonZeroUsize::new(65_537),
+                retry_rejected: false,
+                transcode_source: false,
+            }),
+            ..crate::Config::default()
+        };
+        let mut results = Vec::new();
+        for direct in [false, true] {
+            let (mut document, handles, _) = many_streams_fixture(true)?;
+            // One active predictor must go through the regular PDF decoder.
+            let object = document.edit_handle(handles[17])?;
+            let crate::OwnedObject::Stream { dictionary, .. } = object else {
+                return Err(crate::Error::Invalid("fixture stream missing".into()));
+            };
+            let mut parameters = crate::OwnedDictionary::new();
+            parameters.insert(b"Predictor".to_vec(), crate::OwnedObject::Integer(2));
+            parameters.insert(b"Columns".to_vec(), crate::OwnedObject::Integer(11));
+            dictionary.insert(
+                b"DecodeParms".to_vec(),
+                crate::OwnedObject::Dictionary(parameters),
+            );
+            let expected = document.decoded_stream_data(handles[17])?;
+            config
+                .flate_gpu
+                .as_mut()
+                .ok_or_else(|| crate::Error::Invalid("missing CUDA config".into()))?
+                .transcode_source = direct;
+            let batcher = FlateBatchEncoder::from_config(&config)?.for_document();
+            let stats = optimize_flate_streams_with_cache(
+                &mut document,
+                crate::FlateLevel::SIZE,
+                &mut FlateReuseCache::default(),
+                &batcher,
+            )?;
+            assert_eq!(document.decoded_stream_data(handles[17])?, expected);
+            let work = batcher.stats();
+            if direct {
+                assert!(work.gpu_transcoded.streams > 1);
+                assert!(work.gpu_transcode_source_bytes > 0);
+            } else {
+                assert_eq!(work.gpu_transcoded.streams, 0);
+            }
+            let objects = handles
+                .into_iter()
+                .map(|handle| document.current_owned_object(handle))
+                .collect::<crate::Result<Vec<_>>>()?;
+            results.push((stats, objects));
+        }
+        assert_eq!(results[0], results[1]);
+        Ok(())
+    }
+
     #[test]
     fn bounded_batches_preserve_exact_streams_and_stats() -> crate::Result<()> {
         let limits = [
