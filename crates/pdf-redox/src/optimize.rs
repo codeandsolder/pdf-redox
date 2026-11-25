@@ -896,6 +896,10 @@ struct VectorPhaseResult {
     flate_reuse_cache: FlateReuseCache,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered vector passes and their shared evidence together"
+)]
 fn run_vector_optimization_phase(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],
@@ -1309,16 +1313,9 @@ fn optimize_pdf_with_document(
         inline_image_dedup.occurrences_externalized != 0,
     );
 
-    // Entropy-optimize surviving/reconstructed JPEGs before exact image
-    // canonicalization. This preserves quantized DCT coefficients while allowing
-    // images that differed only in Huffman coding to converge.
-    let jpeg_entropy = timed(&mut timings, "jpeg-entropy", || {
-        optimize_jpeg_entropy(&mut document, 128, 1, session.flate_encoder()?)
-    })?;
-
-    // Exact image canonicalization follows inline-image externalization and JPEG
-    // entropy normalization so both can converge with existing Image XObjects.
-    let image_dedup = timed(&mut timings, "image-dedup", || {
+    // Deduplicate exact images before expensive transforms. A second pass is
+    // needed only if the image codecs actually change an encoding.
+    let mut image_dedup = timed(&mut timings, "image-dedup", || {
         canonicalize_image_xobjects(&mut document)
     })?;
     let pattern_payload_factor = timed(&mut timings, "pattern-payload-factor", || {
@@ -1342,7 +1339,7 @@ fn optimize_pdf_with_document(
     // converge. Remove redundant opaque image-only paint invocations before
     // downstream page-level factoring obscures the original duplicate runs.
     let PageRewriteResult {
-        stats: dead_paint,
+        stats: mut dead_paint,
         rewritten_pages: dead_paint_rewritten_pages,
     } = timed(&mut timings, "dead-opaque-image-paints", || {
         eliminate_dead_image_paints(&mut document, &stable_pages)
@@ -1441,6 +1438,31 @@ fn optimize_pdf_with_document(
         "raster-transform".to_owned(),
         raster_transform_started.elapsed().as_secs_f64() * 1000.0,
     );
+
+    // Entropy-optimize only the JPEGs surviving image transformation.
+    // Newly generated JPEGs already use optimized Huffman tables.
+    let jpeg_entropy = timed(&mut timings, "jpeg-entropy", || {
+        optimize_jpeg_entropy(&mut document, 128, 1, session.flate_encoder()?)
+    })?;
+    if raster_transform.images_optimized != 0 || jpeg_entropy.streams_optimized != 0 {
+        let converged = timed(&mut timings, "image-dedup-converged", || {
+            canonicalize_image_xobjects(&mut document)
+        })?;
+        image_dedup.duplicate_streams_detected += converged.duplicate_streams_detected;
+        image_dedup.duplicate_raw_bytes += converged.duplicate_raw_bytes;
+        image_dedup.references_canonicalized += converged.references_canonicalized;
+        if converged.references_canonicalized != 0 {
+            let late = timed(&mut timings, "dead-opaque-image-paints-converged", || {
+                eliminate_dead_image_paints(&mut document, &stable_pages)
+            })?;
+            dead_paint.paints_removed += late.stats.paints_removed;
+            dead_paint.decoded_bytes_removed += late.stats.decoded_bytes_removed;
+            dead_paint.pages_rewritten = dead_paint_rewritten_pages
+                .union(&late.rewritten_pages)
+                .count();
+            raster_evidence.after_page_rewrite(&late.rewritten_pages, true);
+        }
+    }
 
     let VectorPhaseResult {
         repeated_clips,

@@ -410,10 +410,6 @@ pub struct FlateGpuConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "top-level configuration exposes independent user-selectable feature switches"
-)]
 /// Complete configuration for one optimization run.
 pub struct Config {
     #[serde(default)]

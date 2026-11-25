@@ -1145,14 +1145,13 @@ pub struct ReachabilityCacheStats {
     pub edge_stable_reuses: u64,
 }
 
-/// A lazily parsed source document plus the objects changed by optimization
-/// passes. This is the target architecture for the Hayro migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreparedEncoding {
     Flate(crate::FlateLevel),
     Jpeg,
 }
 
+/// A lazily parsed source document plus the objects changed by optimization passes.
 pub struct EditDocument {
     source: SourcePdf,
     trailer: OwnedDictionary,
@@ -1470,6 +1469,10 @@ impl EditDocument {
 
     /// Decode a stable snapshot. Direct source and overlay filter configurations
     /// can be cached by handle; indirect parameters must be resolved afresh.
+    /// Decode a stream and return a shared immutable snapshot.
+    ///
+    /// # Errors
+    /// Returns an error if the stream filters or payload cannot be decoded.
     pub fn content_snapshot(&self, stream: &CurrentValue<'_>) -> Result<Arc<Vec<u8>>> {
         let cache_handle = match stream {
             CurrentValue::Source(_, Some(id)) if self.overlay.change(*id).is_none() => {
