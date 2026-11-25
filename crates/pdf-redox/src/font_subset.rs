@@ -87,10 +87,15 @@ pub fn strip_pdf_unused_tables(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     (result.1 > 0).then_some(result)
 }
 
+pub struct RenderingTableView<'a> {
+    pub version: u32,
+    pub tables: Vec<(Tag, &'a [u8])>,
+}
+
 /// Borrow the tables that the rendering-only font would contain, without
 /// serializing a temporary SFNT. Rebuilding normalizes the version and
 /// collapses duplicate tags; preserve both details in the projected view.
-pub fn rendering_table_view(bytes: &[u8]) -> Option<(u32, Vec<(Tag, &[u8])>)> {
+pub fn rendering_table_view(bytes: &[u8]) -> Option<RenderingTableView<'_>> {
     let (font, collection) = match FileRef::new(bytes).ok()? {
         FileRef::Font(font) => (font, false),
         FileRef::Collection(collection) if collection.len() == 1 => (collection.get(0).ok()?, true),
@@ -127,7 +132,7 @@ pub fn rendering_table_view(bytes: &[u8]) -> Option<(u32, Vec<(Tag, &[u8])>)> {
     } else {
         font.table_directory().sfnt_version()
     };
-    Some((version, tables))
+    Some(RenderingTableView { version, tables })
 }
 
 /// Remove the internal character-to-glyph map from a TrueType program that is

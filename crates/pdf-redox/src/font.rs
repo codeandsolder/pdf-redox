@@ -186,7 +186,9 @@ fn skeleton_hash(
 
 /// Preflight only needs the projected rendering tables, not rebuilt font bytes.
 pub fn font_file2_opportunity(bytes: &[u8]) -> (Option<[u8; 32]>, Option<usize>) {
-    let Some((version, tables)) = crate::font_subset::rendering_table_view(bytes) else {
+    let Some(crate::font_subset::RenderingTableView { version, tables }) =
+        crate::font_subset::rendering_table_view(bytes)
+    else {
         // A malformed unrelated table prevents a rebuild, but need not
         // prevent discovering a valid cmap on the original standalone font.
         return (None, crate::font_subset::cidfont_type2_cmap_size(bytes));
