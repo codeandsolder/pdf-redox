@@ -1537,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=ee49f31014c79ee14d15b1124cecfdf3258f9d1b#ee49f31014c79ee14d15b1124cecfdf3258f9d1b"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=13eca05bc4a48f7cb7f63a429cbd0539daa8d055#13eca05bc4a48f7cb7f63a429cbd0539daa8d055"
 dependencies = [
  "bytemuck",
  "pollster",
