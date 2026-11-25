@@ -237,6 +237,15 @@ struct GpuFlateExecutor {
     config: crate::FlateGpuConfig,
 }
 
+#[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+impl GpuFlateExecutor {
+    fn eligible(&self, input_len: usize, output_limit: usize) -> bool {
+        input_len >= self.config.min_stream_bytes
+            && (output_limit as u128) * 1000
+                >= (input_len as u128) * u128::from(self.config.min_cap_per_mille)
+    }
+}
+
 impl FlateBatchEncoder {
     pub fn from_config(config: &crate::Config) -> Result<Self> {
         let Some(gpu) = &config.flate_gpu else {
@@ -342,12 +351,16 @@ impl FlateBatchEncoder {
         &self,
         mut jobs: Vec<zlib_rs::BatchJob<'_>>,
         config: zlib_rs::DeflateConfig,
+        maximum_lengths: &[usize],
     ) -> Result<Vec<zlib_rs::BatchCompressResult>> {
+        #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
+        let _ = maximum_lengths;
         #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
         if let Some(gpu) = &self.gpu
             && jobs
                 .iter()
-                .any(|job| job.input.len() >= gpu.config.min_stream_bytes)
+                .zip(maximum_lengths)
+                .any(|(job, &limit)| gpu.eligible(job.input.len(), limit))
         {
             let searcher = gpu
                 .searcher
@@ -371,7 +384,7 @@ impl FlateBatchEncoder {
             let (cpu_jobs, gpu_jobs): (Vec<_>, Vec<_>) = jobs
                 .into_iter()
                 .enumerate()
-                .partition(|(_, job)| job.input.len() < gpu.config.min_stream_bytes);
+                .partition(|(index, job)| !gpu.eligible(job.input.len(), maximum_lengths[*index]));
             let (cpu_indices, mut cpu_jobs): (Vec<_>, Vec<_>) = cpu_jobs.into_iter().unzip();
             let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
             let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
@@ -487,7 +500,7 @@ impl FlateBatchEncoder {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let results = self.compress_jobs(jobs, flate_config(level))?;
+        let results = self.compress_jobs(jobs, flate_config(level), maximum_lengths)?;
         outputs
             .into_iter()
             .zip(results)
@@ -784,6 +797,34 @@ mod tests {
 
     #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
     #[test]
+    fn tight_cap_routing_does_not_initialize_gpu() -> Result<()> {
+        let input = b"highly repetitive PDF data".repeat(1024);
+        let expected = encode_flate(&input, crate::FlateLevel::SIZE)?;
+        let config = crate::Config {
+            flate_gpu: Some(crate::FlateGpuConfig {
+                adapter: Some("intentionally nonexistent adapter".to_owned()),
+                search_budget: std::num::NonZeroU32::MIN,
+                min_stream_bytes: 0,
+                min_cap_per_mille: 50,
+                match_window_bytes: None,
+                retry_rejected: false,
+            }),
+            ..crate::Config::default()
+        };
+        let encoder = FlateBatchEncoder::from_config(&config)?.for_document();
+        let limits = [expected.len()];
+        assert_eq!(
+            encoder.encode_many_capped(&[&input], &limits, crate::FlateLevel::SIZE)?,
+            [Some(expected)]
+        );
+        assert_eq!(encoder.stats().cpu.streams, 1);
+        assert_eq!(encoder.stats().gpu_assisted.streams, 0);
+        assert!(encoder.stats().gpu_initialization_ms <= 0.0);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+    #[test]
     fn cpu_retry_replaces_only_gpu_cap_rejections() -> Result<()> {
         let encoder = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?.for_document();
         let input = b"repeatable GPU test input ".repeat(2048);
@@ -844,6 +885,7 @@ mod tests {
                 search_budget: std::num::NonZeroU32::new(32)
                     .ok_or_else(|| Error::Invalid("zero budget".into()))?,
                 min_stream_bytes: 1024,
+                min_cap_per_mille: 0,
                 match_window_bytes: None,
                 retry_rejected: false,
             }),
@@ -930,6 +972,7 @@ mod tests {
                 adapter: None,
                 search_budget: std::num::NonZeroU32::MIN,
                 min_stream_bytes: 0,
+                min_cap_per_mille: 0,
                 match_window_bytes: None,
                 retry_rejected: false,
             }),

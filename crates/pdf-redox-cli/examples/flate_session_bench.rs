@@ -19,6 +19,8 @@ struct Args {
     budget: NonZeroU32,
     #[arg(long, default_value_t = 1024 * 1024)]
     min_stream_bytes: usize,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=1000))]
+    min_cap_per_mille: u16,
     #[arg(long)]
     window_bytes: Option<NonZeroUsize>,
     #[arg(long)]
@@ -89,6 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             adapter: args.adapter,
             search_budget: args.budget,
             min_stream_bytes: args.min_stream_bytes,
+            min_cap_per_mille: args.min_cap_per_mille,
             match_window_bytes: args.window_bytes,
             retry_rejected: args.retry_rejected,
         }),

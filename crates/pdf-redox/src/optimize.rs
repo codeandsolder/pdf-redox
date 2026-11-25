@@ -487,6 +487,16 @@ fn micros_to_millis(micros: u64) -> f64 {
 }
 
 fn validate_config(cfg: &Config) -> Result<()> {
+    if cfg
+        .flate_gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.min_cap_per_mille > 1000)
+    {
+        return Err(crate::Error::Invalid(
+            "GPU Flate minimum cap ratio must be between 0 and 1000 per mille".to_owned(),
+        ));
+    }
+
     #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
     if cfg.flate_gpu.is_some() {
         return Err(crate::Error::Invalid(

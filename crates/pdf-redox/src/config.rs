@@ -396,6 +396,9 @@ pub struct FlateGpuConfig {
     pub search_budget: NonZeroU32,
     /// Streams smaller than this remain on the CPU to avoid GPU transfer overhead.
     pub min_stream_bytes: usize,
+    /// Minimum output-cap/input ratio in thousandths; tighter caps use the CPU.
+    /// Zero disables the ratio gate.
+    pub min_cap_per_mille: u16,
     /// Optional bounded GPU match window; stops searching once a capped output is exhausted.
     /// None searches the whole input before encoding.
     pub match_window_bytes: Option<NonZeroUsize>,

@@ -136,6 +136,9 @@ struct Args {
     /// Keep smaller streams on the CPU (default: 1048576 decoded bytes).
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_min_stream_bytes: Option<usize>,
+    /// Use the CPU for streams with a tighter output cap (0–1000 per mille).
+    #[arg(long, requires = "flate_gpu_budget", value_parser = clap::value_parser!(u16).range(0..=1000))]
+    flate_gpu_min_cap_per_mille: Option<u16>,
     /// Resolve GPU matches on demand in windows of this many decoded bytes.
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_window_bytes: Option<NonZeroUsize>,
@@ -222,6 +225,7 @@ fn configure_flate(cfg: &mut Config, args: &Args) {
             adapter: args.flate_gpu_adapter.clone(),
             search_budget,
             min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
+            min_cap_per_mille: args.flate_gpu_min_cap_per_mille.unwrap_or(0),
             match_window_bytes: args.flate_gpu_window_bytes,
             retry_rejected: args.flate_gpu_retry_rejected,
         });
