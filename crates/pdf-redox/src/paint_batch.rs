@@ -2911,7 +2911,6 @@ mod tests {
             &mut document,
             &pages,
             &mut StrokeFormScanEvidence::default(),
-            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert_eq!(stats.pages_rewritten, 1);
         assert!(stats.paints_eliminated >= MIN_PAINTS_ELIMINATED);
@@ -3238,6 +3237,7 @@ mod tests {
             &cold_pages,
             crate::FlateLevel::PROCESSING,
             &mut StrokeFormScanEvidence::default(),
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         let mut document = EditDocument::from_bytes(fixture)?;
