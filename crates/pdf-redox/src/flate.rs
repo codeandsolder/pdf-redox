@@ -3,7 +3,7 @@ use crate::stream_codec::{
 };
 use crate::{ObjectHandle, Result};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlateOptimizationStats {
@@ -18,6 +18,7 @@ const MIN_FLATE_SAVINGS_BYTES: usize = 1024;
 const MIN_FLATE_SAVINGS_PERCENT: usize = 5;
 const ADAPTIVE_FLATE_MIN_DECODED_BYTES: usize = 1024 * 1024;
 const ADAPTIVE_FLATE_MAX_BASELINE_RATIO_PERCENT: usize = 10;
+const MAX_FLATE_LENGTH_EVIDENCE: usize = 8_192;
 const MAX_REUSED_FLATE_BYTES: usize = 64 * 1024 * 1024;
 // The fresh PDF writer emits ` /Filter /FlateDecode` for an unfiltered
 // stream. An encoded payload must save more than those 21 dictionary bytes
@@ -65,11 +66,30 @@ struct FlateReuseEntry {
 
 type EncodingKey = (i32, [u8; 32]);
 
+/// Exact scalar output length or proof that output exceeds the given cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlateLengthEvidence {
+    Exact(usize),
+    Exceeds(usize),
+}
+
+enum CappedLength {
+    Fits(usize),
+    Exceeds,
+    Unknown,
+}
+
 #[derive(Debug, Default)]
 pub struct FlateReuseCache {
     entries: BTreeMap<EncodingKey, FlateReuseEntry>,
     handles: BTreeMap<ObjectHandle, EncodingKey>,
     retained_bytes: usize,
+    lengths: BTreeMap<EncodingKey, FlateLengthEvidence>,
+    length_order: VecDeque<EncodingKey>,
+    #[cfg(test)]
+    length_hits: usize,
+    #[cfg(test)]
+    length_misses: usize,
 }
 
 impl FlateReuseCache {
@@ -104,6 +124,7 @@ impl FlateReuseCache {
         encoded: Vec<u8>,
     ) -> bool {
         let key = (level.value(), decoded_sha256);
+        self.remember_length(key, FlateLengthEvidence::Exact(encoded.len()));
         if self.entries.contains_key(&key) {
             return true;
         }
@@ -138,18 +159,149 @@ impl FlateReuseCache {
         Ok(())
     }
 
-    /// Reuse exact scalar encoding lengths, including candidates that were
-    /// assigned a different object handle by a subsequent graph rewrite.
-    pub(crate) fn encoded_len(&self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
-        if !self.entries.is_empty() {
-            let key = (level.value(), Sha256::digest(decoded).into());
-            if let Some(entry) = self.entries.get(&key) {
-                return Ok(entry.encoded.len());
+    fn remember_length(&mut self, key: EncodingKey, evidence: FlateLengthEvidence) {
+        if let Some(current) = self.lengths.get_mut(&key) {
+            match (*current, evidence) {
+                (FlateLengthEvidence::Exact(_), _) => {}
+                (FlateLengthEvidence::Exceeds(old), FlateLengthEvidence::Exceeds(new)) => {
+                    *current = FlateLengthEvidence::Exceeds(old.max(new));
+                }
+                (FlateLengthEvidence::Exceeds(_), FlateLengthEvidence::Exact(_)) => {
+                    *current = evidence;
+                }
             }
+            return;
         }
-        crate::stream_codec::flate_encoded_len(decoded, level)
+        if self.lengths.len() == MAX_FLATE_LENGTH_EVIDENCE
+            && let Some(evicted) = self.length_order.pop_front()
+        {
+            self.lengths.remove(&evicted);
+        }
+        self.length_order.push_back(key);
+        self.lengths.insert(key, evidence);
     }
 
+    fn known_length(&self, key: EncodingKey, cap: usize) -> CappedLength {
+        let evidence = self
+            .entries
+            .get(&key)
+            .map(|entry| FlateLengthEvidence::Exact(entry.encoded.len()))
+            .or_else(|| self.lengths.get(&key).copied());
+        match evidence {
+            Some(FlateLengthEvidence::Exact(length)) if length <= cap => CappedLength::Fits(length),
+            Some(FlateLengthEvidence::Exact(_)) => CappedLength::Exceeds,
+            Some(FlateLengthEvidence::Exceeds(previous_cap)) if cap <= previous_cap => {
+                CappedLength::Exceeds
+            }
+            _ => CappedLength::Unknown,
+        }
+    }
+
+    /// Exact scalar length evidence is shared by every rewrite pass. A failed
+    /// capped measurement is also sufficient to reject any tighter cap.
+    pub(crate) fn capped_len(
+        &mut self,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+        cap: usize,
+    ) -> Result<Option<usize>> {
+        let key = (level.value(), Sha256::digest(decoded).into());
+        let known = self.known_length(key, cap);
+        if !matches!(known, CappedLength::Unknown) {
+            #[cfg(test)]
+            {
+                self.length_hits += 1;
+            }
+            return Ok(match known {
+                CappedLength::Fits(length) => Some(length),
+                _ => None,
+            });
+        }
+        #[cfg(test)]
+        {
+            self.length_misses += 1;
+        }
+        let length = crate::stream_codec::flate_capped_encoded_len(decoded, cap, level)?;
+        self.remember_length(
+            key,
+            length.map_or(
+                FlateLengthEvidence::Exceeds(cap),
+                FlateLengthEvidence::Exact,
+            ),
+        );
+        Ok(length)
+    }
+
+    pub(crate) fn encoded_len(
+        &mut self,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+    ) -> Result<usize> {
+        self.capped_len(decoded, level, usize::MAX)?
+            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".into()))
+    }
+
+    /// Keep the actual output when a rewrite might be committed. An exact
+    /// length alone cannot produce bytes, but it can reject an impossible cap.
+    pub(crate) fn encode_capped(
+        &mut self,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+        cap: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = (level.value(), Sha256::digest(decoded).into());
+        let cap = match self.known_length(key, cap) {
+            CappedLength::Fits(length) => length,
+            CappedLength::Exceeds => return Ok(None),
+            CappedLength::Unknown => cap,
+        };
+        if let Some(entry) = self.entries.get(&key) {
+            return Ok(Some(entry.encoded.to_vec()));
+        }
+        let encoded = crate::stream_codec::encode_flate_capped(decoded, cap, level)?;
+        self.remember_length(
+            key,
+            encoded
+                .as_ref()
+                .map_or(FlateLengthEvidence::Exceeds(cap), |bytes| {
+                    FlateLengthEvidence::Exact(bytes.len())
+                }),
+        );
+        Ok(encoded)
+    }
+
+    pub(crate) fn encode(&mut self, decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>> {
+        self.encode_capped(decoded, level, usize::MAX)?
+            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".into()))
+    }
+
+    /// When a source stream survives a rejected candidate, keep an encoding
+    /// produced by this measurement for final compression. Already-known
+    /// length evidence needs no further compression.
+    pub(crate) fn source_len(
+        &mut self,
+        handle: Option<ObjectHandle>,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+    ) -> Result<usize> {
+        let Some(handle) = handle else {
+            return self.encoded_len(decoded, level);
+        };
+        let digest = Sha256::digest(decoded).into();
+        let key = (level.value(), digest);
+        if let CappedLength::Fits(length) = self.known_length(key, usize::MAX) {
+            if self.entries.contains_key(&key) {
+                self.handles.insert(handle, key);
+            }
+            return Ok(length);
+        }
+        let encoded = crate::stream_codec::encode_flate(decoded, level)?;
+        let length = encoded.len();
+        self.insert_with_digest(handle, level, digest, encoded);
+        Ok(length)
+    }
+
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
     fn has_handle(&self, handle: ObjectHandle) -> bool {
         self.handles
             .get(&handle)
@@ -1747,6 +1899,109 @@ mod tests {
                 assert_eq!(after, before, "excluded stream mutated in case {case}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_flate_length_evidence_preserves_exact_lengths_and_bounds_entries() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let data = b"0 0 50 50 re f\n".repeat(64);
+        let mut memo = FlateReuseCache::default();
+        let expected = crate::stream_codec::flate_encoded_len(&data, level)?;
+        assert_eq!(memo.encoded_len(&data, level)?, expected);
+        assert_eq!(memo.encoded_len(&data, level)?, expected);
+        assert_eq!(memo.length_hits, 1);
+        assert_eq!(memo.length_misses, 1);
+        let other_level = crate::FlateLevel::SIZE;
+        assert_eq!(
+            memo.encoded_len(&data, other_level)?,
+            crate::stream_codec::flate_encoded_len(&data, other_level)?
+        );
+        assert_eq!(memo.length_misses, 2);
+        for i in 0..=MAX_FLATE_LENGTH_EVIDENCE {
+            let unique = i.to_le_bytes();
+            memo.remember_length(
+                (level.value(), Sha256::digest(unique).into()),
+                FlateLengthEvidence::Exact(unique.len()),
+            );
+        }
+        assert_eq!(memo.lengths.len(), MAX_FLATE_LENGTH_EVIDENCE);
+        assert_eq!(memo.length_order.len(), memo.lengths.len());
+        assert_eq!(
+            memo.encoded_len(&data, level)?,
+            crate::stream_codec::flate_encoded_len(&data, level)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_capped_length_reuses_proved_bounds_and_promotes_to_exact() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let data = b"0 0 30 30 re f\n".repeat(512);
+        let expected = crate::stream_codec::encode_flate(&data, level)?;
+        let mut memo = FlateReuseCache::default();
+
+        let limit = expected.len() - 2;
+        assert!(memo.capped_len(&data, level, limit)?.is_none());
+        assert_eq!(memo.lengths.len(), 1);
+        assert!(memo.capped_len(&data, level, limit)?.is_none());
+        assert!(memo.capped_len(&data, level, limit - 1)?.is_none());
+        assert_eq!(memo.length_hits, 2);
+        assert_eq!(memo.length_misses, 1);
+
+        assert!(memo.capped_len(&data, level, limit + 1)?.is_none());
+        assert!(memo.capped_len(&data, level, limit + 1)?.is_none());
+        assert_eq!(memo.length_hits, 3);
+        assert_eq!(memo.length_misses, 2);
+        let measured = memo
+            .capped_len(&data, level, expected.len())?
+            .ok_or_else(|| crate::Error::Invalid("exact-cap encoding rejected".into()))?;
+        assert_eq!(measured, expected.len());
+        assert_eq!(
+            memo.encode_capped(&data, level, expected.len())?,
+            Some(expected.clone())
+        );
+        assert_eq!(memo.length_misses, 3);
+        assert_eq!(memo.lengths.len(), 1);
+        assert_eq!(memo.length_order.len(), 1);
+
+        assert!(memo.capped_len(&data, level, expected.len() - 1)?.is_none());
+        let cached = memo
+            .capped_len(&data, level, usize::MAX)?
+            .ok_or_else(|| crate::Error::Invalid("cached exact length rejected".into()))?;
+        assert_eq!(cached, expected.len());
+        assert_eq!(memo.length_hits, 5);
+        let other_level = crate::FlateLevel::SIZE;
+        assert_eq!(
+            memo.encoded_len(&data, other_level)?,
+            crate::stream_codec::flate_encoded_len(&data, other_level)?
+        );
+        assert_eq!(memo.length_misses, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_flate_evidence_reuses_committed_bytes_and_source_handles() -> Result<()> {
+        let level = crate::FlateLevel::PROCESSING;
+        let data = b"0 0 30 30 re f\n".repeat(512);
+        let first = ObjectHandle::Existing(crate::ObjectId::new(1, 0));
+        let second = ObjectHandle::Existing(crate::ObjectId::new(2, 0));
+        let expected = crate::stream_codec::encode_flate(&data, level)?;
+        let mut cache = FlateReuseCache::default();
+        assert_eq!(cache.source_len(Some(first), &data, level)?, expected.len());
+        assert_eq!(cache.encoded_len(&data, level)?, expected.len());
+        assert_eq!(cache.encode_capped(&data, level, expected.len() - 1)?, None);
+        assert_eq!(cache.encode(&data, level)?, expected);
+        assert_eq!(
+            cache.source_len(Some(second), &data, level)?,
+            expected.len()
+        );
+        assert_eq!(
+            cache.take_matching(second, level, &data),
+            Some(expected.clone())
+        );
+        assert_eq!(cache.encoded_len(&data, level)?, expected.len());
+        assert_eq!(cache.length_misses, 0);
         Ok(())
     }
 

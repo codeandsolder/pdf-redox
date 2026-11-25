@@ -3221,13 +3221,19 @@ fn prepare_constant_color_mask_stencil(
     }))
 }
 
+#[derive(Default)]
+struct PreparedPlaneEncodings {
+    color: Option<Vec<u8>>,
+    alpha: Option<Vec<u8>>,
+}
+
 fn try_prepare_binary_alpha_stencil(
     info: &SampleImage,
     dimensions: (u32, u32),
     data: &[u8],
     alpha: Option<&[u8]>,
     context: ImageEncodingContext,
-    encoded_8bit: &mut Option<Vec<u8>>,
+    prepared: &mut PreparedPlaneEncodings,
 ) -> Result<Option<PreparedImage>> {
     let (width, height) = dimensions;
     let ImageEncodingContext {
@@ -3267,7 +3273,7 @@ fn try_prepare_binary_alpha_stencil(
         } else {
             let encoded = crate::stream_codec::encode_flate(data, flate_level)?;
             let cost = encoded.len().saturating_add(alpha_8bit_encoded.len());
-            *encoded_8bit = Some(encoded);
+            prepared.color = Some(encoded);
             cost
         };
         if stencil_cost < normal_cost {
@@ -3289,6 +3295,7 @@ fn try_prepare_binary_alpha_stencil(
                 encoding,
             }));
         }
+        prepared.alpha = Some(alpha_8bit_encoded);
     }
 
     Ok(None)
@@ -3296,13 +3303,17 @@ fn try_prepare_binary_alpha_stencil(
 
 fn encode_prepared_alpha(
     alpha: Option<Vec<u8>>,
+    encoded_8bit: Option<Vec<u8>>,
     dimensions: (u32, u32),
     flate_level: crate::FlateLevel,
     encoding: &mut ImageEncodingStats,
 ) -> Result<Option<PreparedAlpha>> {
     let (width, height) = dimensions;
     let prepared_alpha = if let Some(alpha) = alpha {
-        let alpha_8bit = crate::stream_codec::encode_flate(&alpha, flate_level)?;
+        let alpha_8bit = match encoded_8bit {
+            Some(encoded) => encoded,
+            None => crate::stream_codec::encode_flate(&alpha, flate_level)?,
+        };
         let (alpha_data, alpha_bpc, alpha_codec) =
             if let Some(raster) = BilevelRaster::from_binary_gray_samples(&alpha, width, height) {
                 let encoded = raster.encode(flate_level)?;
@@ -3489,7 +3500,7 @@ fn prepare_image(
         source_color_budget,
         ..
     } = context;
-    let mut encoded_8bit = None;
+    let mut prepared = PreparedPlaneEncodings::default();
     let mut encoding = ImageEncodingStats::default();
 
     if let Some(stencil) = try_prepare_binary_alpha_stencil(
@@ -3498,12 +3509,12 @@ fn prepare_image(
         data,
         alpha.as_deref(),
         context,
-        &mut encoded_8bit,
+        &mut prepared,
     )? {
         return Ok(stencil);
     }
 
-    let encoded_8bit = match encoded_8bit {
+    let encoded_8bit = match prepared.color {
         Some(encoded) => encoded,
         None => crate::stream_codec::encode_flate(data, flate_level)?,
     };
@@ -3519,7 +3530,13 @@ fn prepare_image(
     );
     dictionary.remove(b"DecodeParms".as_slice());
 
-    let prepared_alpha = encode_prepared_alpha(alpha, (width, height), flate_level, &mut encoding)?;
+    let prepared_alpha = encode_prepared_alpha(
+        alpha,
+        prepared.alpha,
+        (width, height),
+        flate_level,
+        &mut encoding,
+    )?;
 
     let encoded = encode_prepared_color(
         info,
@@ -5179,6 +5196,7 @@ fn prepared_content_payload(
     content: &[u8],
     flate_level: crate::FlateLevel,
     normalize_before_flate: bool,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<([u8; 32], Vec<u8>)> {
     use sha2::{Digest as _, Sha256};
     let normalized = if normalize_before_flate {
@@ -5189,7 +5207,7 @@ fn prepared_content_payload(
     let bytes = normalized.as_deref().unwrap_or(content);
     Ok((
         Sha256::digest(bytes).into(),
-        crate::stream_codec::encode_flate(bytes, flate_level)?,
+        reuse.encode(bytes, flate_level)?,
     ))
 }
 
@@ -5214,9 +5232,13 @@ fn inline_reconstruction_budget(
     reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<InlineReconstructionBudget> {
     let (fallback_digest, fallback) =
-        prepared_content_payload(fallback_content, flate_level, normalize_before_flate)?;
-    let (candidate_digest, candidate) =
-        prepared_content_payload(candidate_content, flate_level, normalize_before_flate)?;
+        prepared_content_payload(fallback_content, flate_level, normalize_before_flate, reuse)?;
+    let (candidate_digest, candidate) = prepared_content_payload(
+        candidate_content,
+        flate_level,
+        normalize_before_flate,
+        reuse,
+    )?;
     let fallback_payload = fallback.len();
     let candidate_payload = candidate.len().saturating_add(added_image_payload_bytes);
     if candidate_payload < fallback_payload {

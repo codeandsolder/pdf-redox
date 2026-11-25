@@ -977,7 +977,7 @@ pub(super) fn factor(
             return Ok(stats);
         };
         before += reuse.encoded_len(&source.decoded, flate_level)?;
-        let encoded = crate::stream_codec::encode_flate(&content, flate_level)?;
+        let encoded = reuse.encode(&content, flate_level)?;
         after += encoded.len();
         rewritten.push(Some((content, encoded)));
         affected_pages += 1;

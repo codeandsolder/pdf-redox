@@ -425,9 +425,7 @@ pub fn hoist_repeated_clip_prefixes(
         let Some(budget) = clip_rewrite_budget(before_flate, goal) else {
             continue;
         };
-        let Some(encoded) =
-            crate::stream_codec::encode_flate_capped(&rewritten, budget, flate_level)?
-        else {
+        let Some(encoded) = reuse.encode_capped(&rewritten, flate_level, budget)? else {
             continue;
         };
 

@@ -211,11 +211,10 @@ pub fn measure_form_rewrites<'a, B: AsRef<[u8]> + 'a>(
     fixed_overhead: usize,
     minimum_savings: usize,
     level: crate::FlateLevel,
-    mut measure: impl FnMut(&[u8], usize) -> Result<Option<usize>>,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<Option<MeasuredFormRewrites>> {
     let before = pages.clone().try_fold(0_usize, |total, (_, input, _)| {
-        let size = measure(input, usize::MAX)?
-            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".into()))?;
+        let size = reuse.encoded_len(input, level)?;
         Ok::<_, crate::Error>(total.saturating_add(size))
     })?;
     let minimum_savings = minimum_savings.max(1);
@@ -225,26 +224,24 @@ pub fn measure_form_rewrites<'a, B: AsRef<[u8]> + 'a>(
     else {
         return Ok(None);
     };
+    let mut encoded_bodies = Vec::new();
+    for body in bodies {
+        let Some(encoded) = reuse.encode_capped(body, level, remaining)? else {
+            return Ok(None);
+        };
+        remaining -= encoded.len();
+        encoded_bodies.push(encoded);
+    }
     let mut rewritten_pages = Vec::new();
     for (index, input, replacements) in pages {
         let Some(rewritten) = apply_replacements(input, replacements) else {
             return Ok(None);
         };
-        let Some(encoded) = crate::stream_codec::encode_flate_capped(&rewritten, remaining, level)?
-        else {
+        let Some(encoded) = reuse.encode_capped(&rewritten, level, remaining)? else {
             return Ok(None);
         };
         remaining -= encoded.len();
         rewritten_pages.push((index, rewritten, encoded));
-    }
-    let mut encoded_bodies = Vec::new();
-    for body in bodies {
-        let Some(encoded) = crate::stream_codec::encode_flate_capped(body, remaining, level)?
-        else {
-            return Ok(None);
-        };
-        remaining -= encoded.len();
-        encoded_bodies.push(encoded);
     }
     Ok(Some(MeasuredFormRewrites {
         pages: rewritten_pages,

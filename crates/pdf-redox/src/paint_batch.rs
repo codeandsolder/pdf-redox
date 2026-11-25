@@ -957,9 +957,7 @@ fn apply_local_page_rewrites(
             continue;
         }
         let before_flate = reuse.encoded_len(&before, flate_level)?;
-        let Some(encoded) =
-            crate::stream_codec::encode_flate_capped(&after, before_flate, flate_level)?
-        else {
+        let Some(encoded) = reuse.encode_capped(&after, flate_level, before_flate)? else {
             continue;
         };
         let removed_bytes = before.len().saturating_sub(after.len());
@@ -2187,7 +2185,7 @@ pub fn factor_repeated_stroke_forms(
         overhead,
         MIN_STROKE_FORM_ESTIMATED_SAVINGS,
         flate_level,
-        |bytes, cap| crate::stream_codec::flate_capped_encoded_len(bytes, cap, flate_level),
+        reuse,
     )?
     else {
         return Ok(StrokeFormFactorStats::default());
@@ -2461,7 +2459,7 @@ fn factor_polyline_outlined_glyphs(
             continue;
         };
         let before_flate = reuse.encoded_len(&decoded, flate_level)?;
-        let page_encoding = crate::stream_codec::encode_flate(&rewritten, flate_level)?;
+        let page_encoding = reuse.encode(&rewritten, flate_level)?;
         let (font_cost, glyph_encodings) = prepare_glyph_encodings(&plans, flate_level)?;
         let after_flate = page_encoding.len().saturating_add(font_cost);
         if before_flate <= after_flate

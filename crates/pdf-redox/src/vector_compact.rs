@@ -6,7 +6,7 @@ use crate::{
     EditDocument, ObjectHandle, OptimizationGoal, OwnedDictionary, OwnedObject, Result, StreamData,
     content::{
         decoded_content_value, effective_page_resources, install_page_resource_bindings,
-        page_box_numbers_matching, page_user_unit, replace_page_content_with_handle,
+        page_box_numbers_matching, page_user_unit,
     },
     content_stream::{measure_form_rewrites, operand_name, operand_number},
     flate::FlateReuseCache,
@@ -15,179 +15,7 @@ use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-
-// Only exact encoded lengths or proved lower bounds are retained: no
-// unbounded copies of source streams or compressed payloads. A fixed FIFO
-// bounds retention regardless of duplicate or adversarial input growth.
-// Key by the *full decoded bytes' SHA-256* and the exact Flate level, never
-// page identity: the same content can reappear on different pages and passes.
-const MAX_VECTOR_FLATE_LENGTHS: usize = 8_192;
-type VectorFlateKey = (i32, [u8; 32]);
-
-#[derive(Clone, Copy)]
-enum FlateLengthEvidence {
-    Exact(usize),
-    Exceeds(usize),
-}
-
-#[derive(Default)]
-struct VectorFlateLengthMemo {
-    enabled: bool,
-    lengths: HashMap<VectorFlateKey, FlateLengthEvidence>,
-    insertion_order: VecDeque<VectorFlateKey>,
-    #[cfg(test)]
-    hits: usize,
-    #[cfg(test)]
-    misses: usize,
-    #[cfg(test)]
-    evictions: usize,
-}
-
-impl VectorFlateLengthMemo {
-    fn processing() -> Self {
-        Self {
-            enabled: true,
-            ..Self::default()
-        }
-    }
-
-    fn encoded_len(&mut self, decoded: &[u8], level: crate::FlateLevel) -> Result<usize> {
-        self.capped_len(decoded, level, usize::MAX)?
-            .ok_or_else(|| crate::Error::Compression("Flate output exceeded its bound".to_owned()))
-    }
-
-    fn capped_len(
-        &mut self,
-        decoded: &[u8],
-        level: crate::FlateLevel,
-        limit: usize,
-    ) -> Result<Option<usize>> {
-        if !self.enabled {
-            return crate::stream_codec::flate_capped_encoded_len(decoded, limit, level);
-        }
-        Ok(self
-            .measure(decoded, level, limit)?
-            .map(|measurement| measurement.length))
-    }
-
-    fn measure(
-        &mut self,
-        decoded: &[u8],
-        level: crate::FlateLevel,
-        limit: usize,
-    ) -> Result<Option<FlateMeasurement>> {
-        let digest = Sha256::digest(decoded).into();
-        let key = (level.value(), digest);
-        if self.enabled {
-            match self.lengths.get(&key).copied() {
-                Some(FlateLengthEvidence::Exact(length)) => {
-                    #[cfg(test)]
-                    {
-                        self.hits = self.hits.saturating_add(1);
-                    }
-                    return Ok((length <= limit).then_some(FlateMeasurement {
-                        length,
-                        encoding: None,
-                        digest,
-                    }));
-                }
-                Some(FlateLengthEvidence::Exceeds(previous_limit)) if limit <= previous_limit => {
-                    #[cfg(test)]
-                    {
-                        self.hits = self.hits.saturating_add(1);
-                    }
-                    return Ok(None);
-                }
-                _ => {}
-            }
-            #[cfg(test)]
-            {
-                self.misses = self.misses.saturating_add(1);
-            }
-        }
-        let Some(encoded) = crate::stream_codec::encode_flate_capped(decoded, limit, level)? else {
-            if self.enabled {
-                self.insert_evidence(key, FlateLengthEvidence::Exceeds(limit));
-            }
-            return Ok(None);
-        };
-        let length = encoded.len();
-        self.remember_encoded_len(digest, level, length);
-        Ok(Some(FlateMeasurement {
-            length,
-            encoding: Some(encoded),
-            digest,
-        }))
-    }
-
-    fn remember_encoded_len(&mut self, digest: [u8; 32], level: crate::FlateLevel, length: usize) {
-        if self.enabled {
-            self.insert_evidence((level.value(), digest), FlateLengthEvidence::Exact(length));
-        }
-    }
-
-    fn insert_evidence(&mut self, key: VectorFlateKey, evidence: FlateLengthEvidence) {
-        if let Some(current) = self.lengths.get_mut(&key) {
-            match (*current, evidence) {
-                (FlateLengthEvidence::Exact(_), _) => {}
-                (FlateLengthEvidence::Exceeds(old), FlateLengthEvidence::Exceeds(new)) => {
-                    *current = FlateLengthEvidence::Exceeds(old.max(new));
-                }
-                (FlateLengthEvidence::Exceeds(_), FlateLengthEvidence::Exact(_)) => {
-                    *current = evidence;
-                }
-            }
-            return;
-        }
-        if self.lengths.len() == MAX_VECTOR_FLATE_LENGTHS
-            && let Some(evicted) = self.insertion_order.pop_front()
-        {
-            self.lengths.remove(&evicted);
-            #[cfg(test)]
-            {
-                self.evictions = self.evictions.saturating_add(1);
-            }
-        }
-        self.insertion_order.push_back(key);
-        self.lengths.insert(key, evidence);
-    }
-}
-
-/// An exact measured length and, on a cache miss, its reusable encoding.
-/// Failed capped measurements retain only a strict lower bound, not an exact length.
-struct FlateMeasurement {
-    length: usize,
-    encoding: Option<Vec<u8>>,
-    digest: [u8; 32],
-}
-
-impl FlateMeasurement {
-    fn retain(self, cache: &mut FlateReuseCache, handle: ObjectHandle, level: crate::FlateLevel) {
-        if let Some(encoded) = self.encoding {
-            cache.insert_with_digest(handle, level, self.digest, encoded);
-        }
-    }
-}
-
-// Related caches form one unit during page mutations: compressed bytes
-// benefit the final Flate phase, while encoded lengths benefit form factoring.
-struct VectorCompactionFlateState<'a> {
-    reuse: &'a mut FlateReuseCache,
-    lengths: VectorFlateLengthMemo,
-}
-
-impl<'a> VectorCompactionFlateState<'a> {
-    fn new(reuse: &'a mut FlateReuseCache, goal: OptimizationGoal) -> Self {
-        Self {
-            reuse,
-            lengths: match goal {
-                OptimizationGoal::Processing => VectorFlateLengthMemo::processing(),
-                OptimizationGoal::Size => VectorFlateLengthMemo::default(),
-            },
-        }
-    }
-}
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const RECT_SNAP_PAGE_GAP_PT: f64 = 0.001;
 // Keep independently painted thin rectangles separate. Some PDF renderers
@@ -1793,7 +1621,7 @@ fn apply_path_form_plan(
     page_data: &[PagePathData],
     selected: &[SelectedPathForm<'_>],
     level: crate::FlateLevel,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<Option<PathFormCommit>> {
     if selected.is_empty() {
         return Ok(None);
@@ -1833,7 +1661,7 @@ fn apply_path_form_plan(
         fixed_overhead,
         1,
         level,
-        |bytes, cap| flate_state.lengths.capped_len(bytes, level, cap),
+        flate_state,
     )?
     else {
         return Ok(None);
@@ -1846,7 +1674,7 @@ fn apply_path_form_plan(
                 dictionary: path_form_dictionary(form.bounds),
                 data: StreamData::Owned(form.body.to_vec().into()),
             }));
-            flate_state.reuse.insert(handle, level, form.body, encoded);
+            flate_state.insert(handle, level, form.body, encoded);
             handle
         })
         .collect::<Vec<_>>();
@@ -1855,9 +1683,7 @@ fn apply_path_form_plan(
     for (index, rewritten, encoded) in measured.pages {
         let page = &page_data[index];
         if rewritten.as_slice() != page.decoded.as_slice() {
-            flate_state
-                .reuse
-                .install_page(document, page.page, rewritten, encoded, level)?;
+            flate_state.install_page(document, page.page, rewritten, encoded, level)?;
             rewritten_page_handles.insert(page.page);
         }
     }
@@ -2026,7 +1852,7 @@ fn factor_repeated_path_forms(
     flate_level: crate::FlateLevel,
     mut reusable_blocks: ProcessingFactorBlocks,
     pages: &[ObjectHandle],
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<PathFactoringOutcome> {
     let present = factor_page_inventory(document, pages, &mut reusable_blocks)?;
     let mut groups = FormGroups::new();
@@ -2111,7 +1937,7 @@ fn factor_repeated_transformed_blocks(
     flate_level: crate::FlateLevel,
     reusable_blocks: &mut ProcessingFactorBlocks,
     pages: &[ObjectHandle],
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let present = factor_page_inventory(document, pages, reusable_blocks)?;
     let mut groups = FormGroups::new();
@@ -2796,7 +2622,7 @@ pub fn factor_size_shared_forms(
         document,
         flate_level,
         pages,
-        &mut VectorCompactionFlateState::new(reuse, OptimizationGoal::Size),
+        reuse,
         &mut SharedRunInventory::default(),
     )
 }
@@ -2809,7 +2635,7 @@ fn factor_shared_q_prefix_runs(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
     inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
     let mut scan = inventory.scan(document, pages)?;
@@ -2856,7 +2682,7 @@ fn factor_shared_q_prefix_runs(
         }) {
             continue;
         }
-        let encoded_body = crate::stream_codec::encode_flate(&body, flate_level)?;
+        let encoded_body = flate_state.encode(&body, flate_level)?;
         let compressed_body_bytes = encoded_body.len();
         let conservative_overhead = 384usize
             .saturating_add(resources.len().saturating_mul(96))
@@ -2930,7 +2756,7 @@ fn factor_shared_q_prefix_runs(
         fixed_overhead,
         1,
         flate_level,
-        |bytes, cap| flate_state.lengths.capped_len(bytes, flate_level, cap),
+        flate_state,
     )?
     else {
         return Ok(VectorCompactionStats::default());
@@ -2943,7 +2769,7 @@ fn factor_shared_q_prefix_runs(
             dictionary: shared_form_dictionary(run.candidate.bounds, &run.resources),
             data: StreamData::Owned(run.body.clone().into()),
         }));
-        flate_state.reuse.insert(
+        flate_state.insert(
             handle,
             flate_level,
             &run.body,
@@ -2952,7 +2778,7 @@ fn factor_shared_q_prefix_runs(
         form_handles.push(handle);
     }
     for (page_index, rewritten, encoded) in measured.pages {
-        flate_state.reuse.install_page(
+        flate_state.install_page(
             document,
             scan.pages[page_index].page,
             rewritten,
@@ -3315,7 +3141,7 @@ fn canonicalize_page_path_coordinates(
     pages: &[ObjectHandle],
     mut pre_scanned: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
     rewritten_pages: &BTreeSet<ObjectHandle>,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<PathCoordinateOutcome> {
     let mut stats = VectorCompactionStats::default();
     let mut coordinate_rewritten_pages = BTreeSet::new();
@@ -3347,32 +3173,18 @@ fn canonicalize_page_path_coordinates(
         let Some((canonicalized, coordinates)) = candidate else {
             continue;
         };
-        let Some(before) = flate_state
-            .lengths
-            .measure(&decoded, flate_level, usize::MAX)?
-        else {
-            return Err(crate::Error::Compression(
-                "Flate output exceeded its bound".to_owned(),
-            ));
-        };
+        let before = flate_state.source_len(contents_handle, &decoded, flate_level)?;
         let required = MIN_PATH_COORDINATE_FLATE_SAVINGS
-            .max(before.length / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
-        let after = match before.length.checked_sub(required) {
-            Some(limit) => flate_state
-                .lengths
-                .measure(&canonicalized, flate_level, limit)?,
-            None => None,
-        };
-        let Some(after) = after else {
-            if let Some(handle) = contents_handle {
-                before.retain(flate_state.reuse, handle, flate_level);
-            }
+            .max(before / PATH_COORDINATE_MIN_RELATIVE_SAVINGS_DIVISOR);
+        let Some(limit) = before.checked_sub(required) else {
             continue;
         };
-        let savings = before.length - after.length;
+        let Some(after) = flate_state.encode_capped(&canonicalized, flate_level, limit)? else {
+            continue;
+        };
+        let savings = before - after.len();
         let decoded_bytes_removed = decoded.len().saturating_sub(canonicalized.len());
-        let replacement = replace_page_content_with_handle(document, page, canonicalized)?;
-        after.retain(flate_state.reuse, replacement, flate_level);
+        flate_state.install_page(document, page, canonicalized, after, flate_level)?;
         coordinate_rewritten_pages.insert(page);
         stats.pages_compacted = stats.pages_compacted.saturating_add(1);
         stats.path_coordinate_pages_rewritten =
@@ -3399,7 +3211,7 @@ fn compact_processing_fill_tail(
     document: &mut EditDocument,
     flate_level: crate::FlateLevel,
     pages: &BTreeSet<ObjectHandle>,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     for &page in pages {
@@ -3412,16 +3224,10 @@ fn compact_processing_fill_tail(
         if matches!(compacted, Cow::Borrowed(_)) || compacted.as_ref() == decoded.as_slice() {
             continue;
         }
-        let before_flate = flate_state.lengths.encoded_len(&decoded, flate_level)?;
-        let encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
+        let before_flate = flate_state.encoded_len(&decoded, flate_level)?;
+        let encoded = flate_state.encode(&compacted, flate_level)?;
         let after_flate = encoded.len();
-        flate_state.reuse.install_page(
-            document,
-            page,
-            compacted.into_owned(),
-            encoded,
-            flate_level,
-        )?;
+        flate_state.install_page(document, page, compacted.into_owned(), encoded, flate_level)?;
         total.pages_compacted = total.pages_compacted.saturating_add(1);
         total.fill_groups_batched = total
             .fill_groups_batched
@@ -3449,7 +3255,7 @@ fn factor_processing_structural_forms(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     pre_scanned: ProcessingFactorBlocks,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
     shared_inventory: &mut SharedRunInventory,
 ) -> Result<(
     VectorCompactionStats,
@@ -3504,7 +3310,7 @@ fn close_processing_exact_factoring(
     flate_level: crate::FlateLevel,
     pages: &[ObjectHandle],
     mut pre_scanned: ProcessingFactorBlocks,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
     shared_inventory: &mut SharedRunInventory,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
@@ -3542,7 +3348,7 @@ fn finish_processing_vector_compaction(
     pre_scanned_processing: BTreeMap<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>,
     mut path_coordinate_plans: BTreeMap<ObjectHandle, Option<PathCoordinatePlan>>,
     mut vector_rewritten_pages: BTreeSet<ObjectHandle>,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
     let mut shared_inventory = SharedRunInventory::default();
@@ -3619,25 +3425,18 @@ fn write_compacted_vector_page(
     compacted: Vec<u8>,
     flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
-    flate_state: &mut VectorCompactionFlateState<'_>,
+    flate_state: &mut FlateReuseCache,
 ) -> Result<Option<usize>> {
-    let before_flate = flate_state.lengths.encoded_len(decoded, flate_level)?;
-    // Processing also needs the exact encoded length for its savings report.
-    // Retain those already-computed bytes for the final unfiltered-stream
-    // compression phase instead of recompressing unchanged page content.
-    let after_encoded = crate::stream_codec::encode_flate(&compacted, flate_level)?;
-    let after_flate = after_encoded.len();
-    if goal == OptimizationGoal::Size && after_flate >= before_flate {
+    let before_flate = flate_state.encoded_len(decoded, flate_level)?;
+    let cap = match goal {
+        OptimizationGoal::Size => before_flate.saturating_sub(1),
+        OptimizationGoal::Processing => usize::MAX,
+    };
+    let Some(after_encoded) = flate_state.encode_capped(&compacted, flate_level, cap)? else {
         return Ok(None);
-    }
-    let decoded_sha256 = Sha256::digest(&compacted).into();
-    flate_state
-        .lengths
-        .remember_encoded_len(decoded_sha256, flate_level, after_flate);
-    let replacement = replace_page_content_with_handle(document, page, compacted)?;
-    flate_state
-        .reuse
-        .insert_with_digest(replacement, flate_level, decoded_sha256, after_encoded);
+    };
+    let after_flate = after_encoded.len();
+    flate_state.install_page(document, page, compacted, after_encoded, flate_level)?;
     Ok(Some(before_flate.saturating_sub(after_flate)))
 }
 
@@ -3650,7 +3449,6 @@ pub fn compact_vector_paths_with_flate_cache(
     flate_reuse_cache: &mut FlateReuseCache,
 ) -> Result<VectorCompactionStats> {
     let mut total = VectorCompactionStats::default();
-    let mut flate_state = VectorCompactionFlateState::new(flate_reuse_cache, goal);
     let mut pre_scanned_processing =
         BTreeMap::<ObjectHandle, (Vec<PathBlock>, Vec<TransformedBlock>)>::new();
     let mut path_coordinate_plans = BTreeMap::<ObjectHandle, Option<PathCoordinatePlan>>::new();
@@ -3711,7 +3509,7 @@ pub fn compact_vector_paths_with_flate_cache(
             compacted.into_owned(),
             flate_level,
             goal,
-            &mut flate_state,
+            flate_reuse_cache,
         )?
         else {
             continue;
@@ -3732,7 +3530,7 @@ pub fn compact_vector_paths_with_flate_cache(
             pre_scanned_processing,
             path_coordinate_plans,
             vector_rewritten_pages,
-            &mut flate_state,
+            flate_reuse_cache,
         )?);
     }
     Ok(total)
@@ -3876,170 +3674,88 @@ mod tests {
         let after = crate::stream_codec::flate_encoded_len(b"q Q", level)?
             + crate::stream_codec::flate_encoded_len(body, level)?;
         let pages = [(0, input.as_slice(), edits.as_slice())];
-        for enabled in [false, true] {
-            let mut memo = VectorFlateLengthMemo {
-                enabled,
-                ..VectorFlateLengthMemo::default()
-            };
-            let accepted = measure_form_rewrites(
+        let mut memo = FlateReuseCache::default();
+        let accepted = measure_form_rewrites(
+            pages.into_iter(),
+            std::iter::once(body.as_slice()),
+            before - after - 1,
+            1,
+            level,
+            &mut memo,
+        )?
+        .ok_or_else(|| crate::Error::Invalid("one-byte exact saving rejected".into()))?;
+        assert_eq!(accepted.savings, 1);
+        assert_eq!(
+            accepted.pages,
+            [(
+                0,
+                b"q Q".to_vec(),
+                crate::stream_codec::encode_flate(b"q Q", level)?
+            )]
+        );
+        assert_eq!(
+            accepted.bodies,
+            [crate::stream_codec::encode_flate(body, level)?]
+        );
+        assert!(
+            measure_form_rewrites(
                 pages.into_iter(),
                 std::iter::once(body.as_slice()),
-                before - after - 1,
+                before - after,
                 1,
                 level,
-                |bytes, cap| memo.capped_len(bytes, level, cap),
+                &mut memo,
             )?
-            .ok_or_else(|| crate::Error::Invalid("one-byte exact saving rejected".into()))?;
-            assert_eq!(accepted.savings, 1);
-            assert_eq!(
-                accepted.pages,
-                [(
-                    0,
-                    b"q Q".to_vec(),
-                    crate::stream_codec::encode_flate(b"q Q", level)?
-                )]
-            );
-            assert_eq!(
-                accepted.bodies,
-                [crate::stream_codec::encode_flate(body, level)?]
-            );
-            assert!(
-                measure_form_rewrites(
-                    pages.into_iter(),
-                    std::iter::once(body.as_slice()),
-                    before - after,
-                    1,
-                    level,
-                    |bytes, cap| memo.capped_len(bytes, level, cap),
-                )?
-                .is_none()
-            );
-            let owned_edits = [(0, input.len(), b"q Q".to_vec())];
-            let owned_pages = [(0, input.as_slice(), owned_edits.as_slice())];
-            let minimum = 7;
-            let accepted = measure_form_rewrites(
+            .is_none()
+        );
+        let owned_edits = [(0, input.len(), b"q Q".to_vec())];
+        let owned_pages = [(0, input.as_slice(), owned_edits.as_slice())];
+        let minimum = 7;
+        let accepted = measure_form_rewrites(
+            owned_pages.into_iter(),
+            std::iter::once(body.as_slice()),
+            before - after - minimum,
+            minimum,
+            level,
+            &mut memo,
+        )?
+        .ok_or_else(|| crate::Error::Invalid("minimum exact saving rejected".into()))?;
+        assert_eq!(accepted.savings, minimum);
+        assert_eq!(
+            accepted.pages,
+            [(
+                0,
+                b"q Q".to_vec(),
+                crate::stream_codec::encode_flate(b"q Q", level)?
+            )]
+        );
+        assert_eq!(
+            accepted.bodies,
+            [crate::stream_codec::encode_flate(body, level)?]
+        );
+        assert!(
+            measure_form_rewrites(
                 owned_pages.into_iter(),
                 std::iter::once(body.as_slice()),
-                before - after - minimum,
+                before - after - minimum + 1,
                 minimum,
                 level,
-                |bytes, cap| memo.capped_len(bytes, level, cap),
+                &mut memo,
             )?
-            .ok_or_else(|| crate::Error::Invalid("minimum exact saving rejected".into()))?;
-            assert_eq!(accepted.savings, minimum);
-            assert_eq!(
-                accepted.pages,
-                [(
-                    0,
-                    b"q Q".to_vec(),
-                    crate::stream_codec::encode_flate(b"q Q", level)?
-                )]
-            );
-            assert_eq!(
-                accepted.bodies,
-                [crate::stream_codec::encode_flate(body, level)?]
-            );
-            assert!(
-                measure_form_rewrites(
-                    owned_pages.into_iter(),
-                    std::iter::once(body.as_slice()),
-                    before - after - minimum + 1,
-                    minimum,
-                    level,
-                    |bytes, cap| memo.capped_len(bytes, level, cap),
-                )?
-                .is_none()
-            );
-            let invalid = [(0, input.len() + 1, b"q Q".as_slice())];
-            assert!(
-                measure_form_rewrites(
-                    [(0, input.as_slice(), invalid.as_slice())].into_iter(),
-                    std::iter::once(body.as_slice()),
-                    0,
-                    1,
-                    level,
-                    |bytes, cap| memo.capped_len(bytes, level, cap),
-                )?
-                .is_none()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn vector_flate_length_memo_preserves_exact_lengths_and_bounds_entries() -> Result<()> {
-        let level = crate::FlateLevel::PROCESSING;
-        let data = b"0 0 50 50 re f\n".repeat(64);
-        let mut memo = VectorFlateLengthMemo {
-            enabled: true,
-            ..VectorFlateLengthMemo::default()
-        };
-        let expected = crate::stream_codec::flate_encoded_len(&data, level)?;
-        assert_eq!(memo.encoded_len(&data, level)?, expected);
-        assert_eq!(memo.encoded_len(&data, level)?, expected);
-        assert_eq!(memo.hits, 1);
-        assert_eq!(memo.misses, 1);
-        let other_level = crate::FlateLevel::SIZE;
-        assert_eq!(
-            memo.encoded_len(&data, other_level)?,
-            crate::stream_codec::flate_encoded_len(&data, other_level)?
+            .is_none()
         );
-        assert_eq!(memo.misses, 2);
-        for i in 0..=MAX_VECTOR_FLATE_LENGTHS {
-            let unique = i.to_le_bytes();
-            memo.remember_encoded_len(Sha256::digest(unique).into(), level, unique.len());
-        }
-        assert_eq!(memo.lengths.len(), MAX_VECTOR_FLATE_LENGTHS);
-        assert_eq!(memo.insertion_order.len(), memo.lengths.len());
-        assert!(memo.evictions > 0);
-        assert_eq!(
-            memo.encoded_len(&data, level)?,
-            crate::stream_codec::flate_encoded_len(&data, level)?
+        let invalid = [(0, input.len() + 1, b"q Q".as_slice())];
+        assert!(
+            measure_form_rewrites(
+                [(0, input.as_slice(), invalid.as_slice())].into_iter(),
+                std::iter::once(body.as_slice()),
+                0,
+                1,
+                level,
+                &mut memo,
+            )?
+            .is_none()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn capped_vector_measurement_reuses_proved_bounds_and_promotes_to_exact() -> Result<()> {
-        let level = crate::FlateLevel::PROCESSING;
-        let data = b"0 0 30 30 re f\n".repeat(512);
-        let expected = crate::stream_codec::encode_flate(&data, level)?;
-        let mut memo = VectorFlateLengthMemo::processing();
-
-        let limit = expected.len() - 2;
-        assert!(memo.measure(&data, level, limit)?.is_none());
-        assert_eq!(memo.lengths.len(), 1);
-        assert!(memo.measure(&data, level, limit)?.is_none());
-        assert!(memo.measure(&data, level, limit - 1)?.is_none());
-        assert_eq!(memo.hits, 2);
-        assert_eq!(memo.misses, 1);
-
-        assert!(memo.measure(&data, level, limit + 1)?.is_none());
-        assert!(memo.measure(&data, level, limit + 1)?.is_none());
-        assert_eq!(memo.hits, 3);
-        assert_eq!(memo.misses, 2);
-        let measured = memo
-            .measure(&data, level, expected.len())?
-            .ok_or_else(|| crate::Error::Invalid("exact-cap encoding rejected".into()))?;
-        assert_eq!(measured.length, expected.len());
-        assert_eq!(measured.encoding.as_deref(), Some(expected.as_slice()));
-        assert_eq!(memo.misses, 3);
-        assert_eq!(memo.lengths.len(), 1);
-        assert_eq!(memo.insertion_order.len(), 1);
-
-        assert!(memo.measure(&data, level, expected.len() - 1)?.is_none());
-        let cached = memo
-            .measure(&data, level, usize::MAX)?
-            .ok_or_else(|| crate::Error::Invalid("cached exact length rejected".into()))?;
-        assert_eq!(cached.length, expected.len());
-        assert!(cached.encoding.is_none());
-        assert_eq!(memo.hits, 5);
-        let other_level = crate::FlateLevel::SIZE;
-        assert_eq!(
-            memo.encoded_len(&data, other_level)?,
-            crate::stream_codec::flate_encoded_len(&data, other_level)?
-        );
-        assert_eq!(memo.misses, 4);
         Ok(())
     }
 
@@ -4077,8 +3793,6 @@ mod tests {
             let mut uncached = EditDocument::from_bytes(source.clone())?;
             let mut cache = FlateReuseCache::default();
             let mut empty = FlateReuseCache::default();
-            let mut cache_state = VectorCompactionFlateState::new(&mut cache, goal);
-            let mut empty_state = VectorCompactionFlateState::new(&mut empty, goal);
             let estimated = write_compacted_vector_page(
                 &mut cached,
                 page,
@@ -4086,7 +3800,7 @@ mod tests {
                 compacted.clone(),
                 level,
                 goal,
-                &mut cache_state,
+                &mut cache,
             )?;
             let reference_estimated = write_compacted_vector_page(
                 &mut uncached,
@@ -4095,7 +3809,7 @@ mod tests {
                 compacted.clone(),
                 level,
                 goal,
-                &mut empty_state,
+                &mut empty,
             )?;
             assert_eq!(estimated, reference_estimated);
             assert!(estimated.is_some());
@@ -4103,8 +3817,6 @@ mod tests {
                 .saturating_sub(crate::stream_codec::flate_encoded_len(&compacted, level)?);
             assert_eq!(estimated, Some(expected_savings));
             // The reference must use a fresh uncached encoding.
-            drop(cache_state);
-            drop(empty_state);
             empty = FlateReuseCache::default();
 
             let reused_stats = crate::flate::compress_unfiltered_streams(
@@ -4226,16 +3938,12 @@ mod tests {
         let mut warm_shared = SharedRunInventory::default();
         let mut warm_reuse = FlateReuseCache::default();
         let mut cold_reuse = FlateReuseCache::default();
-        let mut warm_lengths =
-            VectorCompactionFlateState::new(&mut warm_reuse, OptimizationGoal::Processing);
-        let mut cold_lengths =
-            VectorCompactionFlateState::new(&mut cold_reuse, OptimizationGoal::Processing);
         let (warm_first, changed, reusable) = factor_processing_structural_forms(
             &mut warm,
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
-            &mut warm_lengths,
+            &mut warm_reuse,
             &mut warm_shared,
         )?;
         let (cold_first, cold_changed, _) = factor_processing_structural_forms(
@@ -4243,7 +3951,7 @@ mod tests {
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
-            &mut cold_lengths,
+            &mut cold_reuse,
             &mut SharedRunInventory::default(),
         )?;
         assert_eq!(warm_first, cold_first);
@@ -4260,7 +3968,7 @@ mod tests {
             FlateLevel::PROCESSING,
             &pages,
             reusable,
-            &mut warm_lengths,
+            &mut warm_reuse,
             &mut warm_shared,
         )?;
         let (cold_second, cold_changed, _) = factor_processing_structural_forms(
@@ -4268,7 +3976,7 @@ mod tests {
             FlateLevel::PROCESSING,
             &pages,
             ProcessingFactorBlocks::new(),
-            &mut cold_lengths,
+            &mut cold_reuse,
             &mut SharedRunInventory::default(),
         )?;
         assert_eq!(warm_second, cold_second);

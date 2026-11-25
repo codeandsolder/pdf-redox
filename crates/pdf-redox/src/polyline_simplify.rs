@@ -437,9 +437,7 @@ pub fn simplify_page_polylines(
         let Some(budget) = before_flate.checked_sub(MIN_FLATE_SAVINGS_BYTES) else {
             continue;
         };
-        let Some(encoded) =
-            crate::stream_codec::encode_flate_capped(&simplified, budget, flate_level)?
-        else {
+        let Some(encoded) = reuse.encode_capped(&simplified, flate_level, budget)? else {
             continue;
         };
         let after_flate = encoded.len();
