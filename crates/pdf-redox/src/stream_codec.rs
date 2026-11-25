@@ -4,7 +4,12 @@ use crate::{
     EditDocument, Error, OwnedDictionary, OwnedObject, Result,
     source::{CurrentValue, NumericValue},
 };
-use std::borrow::Cow;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    sync::{Mutex, PoisonError},
+};
 
 const EXTERNAL_STREAM_KEYS: [&[u8]; 3] = [b"F", b"FFilter", b"FDecodeParms"];
 
@@ -219,9 +224,10 @@ pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>>
 /// Persistent whole-stream Flate executor used by document-level batch phases.
 pub struct FlateBatchEncoder {
     #[cfg(not(target_family = "wasm"))]
-    compressor: Option<zlib_rs::BatchCodec>,
+    compressor: Option<Arc<zlib_rs::BatchCodec>>,
     #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
-    gpu: Option<GpuFlateExecutor>,
+    gpu: Option<Arc<GpuFlateExecutor>>,
+    stats: Option<Mutex<crate::FlateBatchStats>>,
 }
 
 #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
@@ -239,10 +245,10 @@ impl FlateBatchEncoder {
         #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
         {
             let mut encoder = Self::new(config.flate_workers)?;
-            encoder.gpu = Some(GpuFlateExecutor {
+            encoder.gpu = Some(Arc::new(GpuFlateExecutor {
                 searcher: std::sync::OnceLock::new(),
                 config: gpu.clone(),
-            });
+            }));
             Ok(encoder)
         }
         #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
@@ -258,14 +264,16 @@ impl FlateBatchEncoder {
         #[cfg(target_family = "wasm")]
         {
             let _ = workers;
-            Ok(Self {})
+            Ok(Self { stats: None })
         }
         #[cfg(not(target_family = "wasm"))]
         {
             let compressor = if workers.get() > 1 {
-                Some(zlib_rs::BatchCodec::new(workers).map_err(|error| {
-                    Error::Compression(format!("failed to create Flate worker pool: {error}"))
-                })?)
+                Some(Arc::new(zlib_rs::BatchCodec::new(workers).map_err(
+                    |error| {
+                        Error::Compression(format!("failed to create Flate worker pool: {error}"))
+                    },
+                )?))
             } else {
                 None
             };
@@ -273,8 +281,48 @@ impl FlateBatchEncoder {
                 compressor,
                 #[cfg(feature = "gpu")]
                 gpu: None,
+                stats: None,
             })
         }
+    }
+
+    /// Share the immutable executor resources but start a fresh document's counters.
+    pub fn for_document(&self) -> Self {
+        Self {
+            #[cfg(not(target_family = "wasm"))]
+            compressor: self.compressor.clone(),
+            #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+            gpu: self.gpu.clone(),
+            stats: Some(Mutex::default()),
+        }
+    }
+
+    pub fn stats(&self) -> crate::FlateBatchStats {
+        self.stats
+            .as_ref()
+            .map_or_else(crate::FlateBatchStats::default, |stats| {
+                *stats.lock().unwrap_or_else(PoisonError::into_inner)
+            })
+    }
+
+    fn record_jobs(&self, jobs: &[zlib_rs::BatchJob<'_>], gpu: bool) {
+        let Some(stats) = &self.stats else {
+            return;
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+        let work = if gpu {
+            &mut stats.gpu_assisted
+        } else {
+            &mut stats.cpu
+        };
+        work.batches = work.batches.saturating_add(1);
+        work.streams = work.streams.saturating_add(jobs.len());
+        work.decoded_bytes = jobs.iter().fold(work.decoded_bytes, |bytes, job| {
+            bytes.saturating_add(job.input.len())
+        });
     }
 
     fn compress_cpu(
@@ -282,6 +330,7 @@ impl FlateBatchEncoder {
         jobs: &mut [zlib_rs::BatchJob<'_>],
         config: zlib_rs::DeflateConfig,
     ) -> Vec<zlib_rs::BatchCompressResult> {
+        self.record_jobs(jobs, false);
         #[cfg(not(target_family = "wasm"))]
         if let Some(compressor) = &self.compressor {
             return compressor.compress(jobs, config);
@@ -302,7 +351,17 @@ impl FlateBatchEncoder {
         {
             let searcher = gpu
                 .searcher
-                .get_or_init(|| zlib_rs::GpuMatchSearcher::new(gpu.config.adapter.as_deref()))
+                .get_or_init(|| {
+                    let start = std::time::Instant::now();
+                    let result = zlib_rs::GpuMatchSearcher::new(gpu.config.adapter.as_deref());
+                    if let Some(stats) = &self.stats {
+                        stats
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .gpu_initialization_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    result
+                })
                 .as_ref()
                 .map_err(|error| {
                     Error::Compression(format!("GPU Flate initialization: {error}"))
@@ -316,6 +375,7 @@ impl FlateBatchEncoder {
             let (cpu_indices, mut cpu_jobs): (Vec<_>, Vec<_>) = cpu_jobs.into_iter().unzip();
             let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
             let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
+            self.record_jobs(&gpu_jobs, true);
             let gpu_results = match &self.compressor {
                 Some(pool) => pool.compress_gpu(&mut gpu_jobs, config, searcher, search_budget),
                 None => zlib_rs::compress_slices_batch_gpu(
@@ -695,7 +755,8 @@ mod tests {
         for workers in [1, 4] {
             config.flate_workers = std::num::NonZeroUsize::new(workers)
                 .ok_or_else(|| Error::Invalid("zero workers".into()))?;
-            let batcher = FlateBatchEncoder::from_config(&config)?;
+            let executor = FlateBatchEncoder::from_config(&config)?;
+            let batcher = executor.for_document();
             for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
                 let encoded = batcher
                     .encode_many_capped(&inputs, &full_caps, level)?
@@ -730,6 +791,20 @@ mod tests {
                 assert_eq!(encoded[0], encode_flate(inputs[0], level)?);
                 assert_eq!(encoded[3], encode_flate(inputs[3], level)?);
             }
+            let stats = batcher.stats();
+            assert_eq!(stats.cpu.streams, 8);
+            assert_eq!(stats.gpu_assisted.streams, 8);
+            assert_eq!(
+                stats.gpu_assisted.decoded_bytes,
+                4 * (large.len() + other.len())
+            );
+            assert!(stats.gpu_initialization_ms > 0.0);
+            let next = executor.for_document();
+            assert_eq!(next.stats(), crate::FlateBatchStats::default());
+            let _ = next.encode_many_capped(&inputs, &full_caps, crate::FlateLevel::SIZE)?;
+            assert_eq!(next.stats().gpu_assisted.streams, 2);
+            assert!(next.stats().gpu_initialization_ms <= 0.0);
+            assert_eq!(batcher.stats(), stats);
         }
         Ok(())
     }

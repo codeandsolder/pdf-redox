@@ -503,6 +503,28 @@ impl PdfAnalysis {
     }
 }
 
+/// Work submitted to one finalization Flate batch backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlateBatchWork {
+    /// Nonempty batches submitted to this backend.
+    pub batches: usize,
+    /// Stream encoding attempts, including rejected capped outputs and retries.
+    pub streams: usize,
+    /// Total decoded input bytes across those attempts.
+    pub decoded_bytes: usize,
+}
+
+/// Per-document finalization compression work, independent of session reuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct FlateBatchStats {
+    /// Ordinary CPU-only batch work.
+    pub cpu: FlateBatchWork,
+    /// Work routed to the GPU-assisted matcher (which may locally resolve cheap matches).
+    pub gpu_assisted: FlateBatchWork,
+    /// Actual Vulkan context initialization time charged to this document, if any.
+    pub gpu_initialization_ms: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 /// Metrics and diagnostics produced by a complete optimization run.
 pub struct OptimizationReport {
@@ -517,6 +539,9 @@ pub struct OptimizationReport {
     /// Wall-clock milliseconds spent in major optimizer stages. Intended for profiling, not stable API ordering.
     #[serde(default)]
     pub stage_timings_ms: BTreeMap<String, f64>,
+    /// Finalization Flate workload by backend; excludes scalar transformation probes.
+    #[serde(default)]
+    pub flate_batch: FlateBatchStats,
     #[serde(default)]
     /// Number of reachability queries.
     pub reachability_queries: u64,

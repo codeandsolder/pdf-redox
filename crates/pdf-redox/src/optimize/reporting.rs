@@ -489,6 +489,7 @@ impl OptimizationRunStats {
             saved_bytes,
             saved_percent,
             stage_timings_ms: timings,
+            flate_batch: self.flate_batch,
             reachability_queries: reachability_cache.queries,
             reachability_rebuilds: reachability_cache.rebuilds,
             reachability_cache_hits: reachability_cache.cache_hits,

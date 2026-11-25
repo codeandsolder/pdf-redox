@@ -75,9 +75,9 @@ pub use optimize::{
     optimize_pdf_with_analysis, optimize_pdf_with_glyph_catalog,
 };
 pub use report::{
-    DocumentRepresentation, HiddenTextAction, HiddenTextCategory, HiddenTextFinding,
-    HiddenTextMechanism, OptimizationReport, PageRect, PageRepresentation, PdfAnalysis,
-    RiskFinding, RiskKind,
+    DocumentRepresentation, FlateBatchStats, FlateBatchWork, HiddenTextAction, HiddenTextCategory,
+    HiddenTextFinding, HiddenTextMechanism, OptimizationReport, PageRect, PageRepresentation,
+    PdfAnalysis, RiskFinding, RiskKind,
 };
 pub use source::{
     EditDocument, ExistingObjectChange, NewObjectId, ObjectHandle, ObjectId, ObjectOverlay,

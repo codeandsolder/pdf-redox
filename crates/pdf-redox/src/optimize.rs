@@ -723,6 +723,7 @@ struct OptimizationRunStats {
     resource_prune: crate::prune::ResourcePruneStats,
     microstroke_raster: MicrostrokeRasterStats,
     flate: crate::flate::FlateOptimizationStats,
+    flate_batch: crate::FlateBatchStats,
     page_content_dedup: crate::dedup::TargetedDedupStats,
     structure_compaction: crate::structure_compact::StructureCompactionStats,
     unfiltered_flate: crate::flate::FlateOptimizationStats,
@@ -1030,6 +1031,7 @@ struct FinalizationResult {
     resource_prune: crate::prune::ResourcePruneStats,
     microstroke_raster: MicrostrokeRasterStats,
     flate: crate::flate::FlateOptimizationStats,
+    flate_batch: crate::FlateBatchStats,
     page_content_dedup: crate::dedup::TargetedDedupStats,
     structure_compaction: crate::structure_compact::StructureCompactionStats,
     unfiltered_flate: crate::flate::FlateOptimizationStats,
@@ -1064,13 +1066,15 @@ fn finalize_document(
             Ok(MicrostrokeRasterStats::default())
         }
     })?;
-    let flate_encoder = timed(timings, "flate-executor-init", || session.flate_encoder())?;
+    let flate_encoder = timed(timings, "flate-executor-init", || {
+        session.flate_encoder().map(FlateBatchEncoder::for_document)
+    })?;
     let flate = timed(timings, "flate-policy", || {
         optimize_flate_streams_with_cache(
             document,
             flate_level,
             &mut flate_reuse_cache,
-            flate_encoder,
+            &flate_encoder,
         )
     })?;
     timed(timings, "content-normalize", || -> Result<()> {
@@ -1091,7 +1095,12 @@ fn finalize_document(
     // Match the historical writer's StreamDataMode::Compress policy explicitly
     // before handing the graph to the deliberately-simple fresh writer.
     let unfiltered_flate = timed(timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(document, flate_level, &mut flate_reuse_cache, flate_encoder)
+        compress_unfiltered_streams(
+            document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
     })?;
     // Cmap removal is deliberately the final graph transform. By this point
     // resource pruning has removed dead fonts and Flate policy has established
@@ -1117,6 +1126,7 @@ fn finalize_document(
         resource_prune,
         microstroke_raster,
         flate,
+        flate_batch: flate_encoder.stats(),
         page_content_dedup,
         structure_compaction,
         unfiltered_flate,
@@ -1431,6 +1441,7 @@ fn optimize_pdf_with_document(
         resource_prune,
         microstroke_raster,
         flate,
+        flate_batch,
         page_content_dedup,
         structure_compaction,
         unfiltered_flate,
@@ -1494,6 +1505,7 @@ fn optimize_pdf_with_document(
         resource_prune,
         microstroke_raster,
         flate,
+        flate_batch,
         page_content_dedup,
         structure_compaction,
         unfiltered_flate,

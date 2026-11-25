@@ -64,6 +64,7 @@ fn measure(
             "output_bytes": output_bytes,
             "pages": page_count,
             "flate_selected": report.flate_streams_selected_for_recompression,
+            "flate_batch": report.flate_batch,
             "stages_ms": report.stage_timings_ms,
         })
     );
