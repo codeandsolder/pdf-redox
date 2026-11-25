@@ -342,6 +342,14 @@ fn run_unfiltered_jobs(
     Ok(())
 }
 
+// ceil(raw_len * percent / 100), split to avoid overflowing usize
+// for large inputs. The same bound is used for admission and allocation.
+fn minimum_flate_savings(raw_len: usize) -> usize {
+    let proportional = (raw_len / 100) * MIN_FLATE_SAVINGS_PERCENT
+        + ((raw_len % 100) * MIN_FLATE_SAVINGS_PERCENT).div_ceil(100);
+    MIN_FLATE_SAVINGS_BYTES.max(proportional)
+}
+
 fn has_special_stream_type(
     document: &crate::EditDocument,
     dictionary: &crate::OwnedDictionary,
