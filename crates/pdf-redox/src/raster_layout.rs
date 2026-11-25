@@ -2387,7 +2387,11 @@ fn image_info(
     // Some producers append harmless bytes after the declared image sample grid.
     // Renderers ignore those bytes because Width/Height/BPC define the raster payload.
     if decoded.len() > expected {
-        Arc::make_mut(&mut decoded).truncate(expected);
+        if let Some(unique) = Arc::get_mut(&mut decoded) {
+            unique.truncate(expected);
+        } else {
+            decoded = Arc::new(decoded[..expected].to_vec());
+        }
     }
     if resolved_number(document, dictionary.get(b"SMaskInData".as_slice()))?
         .is_some_and(|value| value != 0.0)

@@ -831,19 +831,25 @@ pub fn flate_capped_encoded_len(
     let mut encoder = zlib_rs::Deflate::new_with_config(flate_config(level));
     let mut scratch = [std::mem::MaybeUninit::<u8>::uninit(); 16 * 1024];
     loop {
-        let consumed = usize::try_from(encoder.total_in())
+        let previous_in = encoder.total_in();
+        let consumed = usize::try_from(previous_in)
             .map_err(|_| Error::Compression("Flate input counter overflow".into()))?;
         let written = usize::try_from(encoder.total_out())
             .map_err(|_| Error::Compression("Flate output counter overflow".into()))?;
         let capacity = scratch
             .len()
             .min(maximum_length.saturating_sub(written).saturating_add(1));
+        let remaining = &decoded[consumed..];
+        // The streaming API exposes the ABI's u32 input cursor. As in
+        // compress_slice, do not finish until the final input chunk is visible.
+        let chunk_length = remaining.len().min(u32::MAX as usize);
+        let flush = if chunk_length == remaining.len() {
+            zlib_rs::DeflateFlush::Finish
+        } else {
+            zlib_rs::DeflateFlush::NoFlush
+        };
         let status = encoder
-            .compress_uninit(
-                &decoded[consumed..],
-                &mut scratch[..capacity],
-                zlib_rs::DeflateFlush::Finish,
-            )
+            .compress_uninit(&remaining[..chunk_length], &mut scratch[..capacity], flush)
             .map_err(|error| Error::Compression(format!("Flate length measurement: {error:?}")))?;
         let total = usize::try_from(encoder.total_out())
             .map_err(|_| Error::Compression("Flate output counter overflow".into()))?;
@@ -853,7 +859,7 @@ pub fn flate_capped_encoded_len(
         if status == zlib_rs::Status::StreamEnd {
             return Ok(Some(total));
         }
-        if total == written && encoder.total_in() == consumed as u64 {
+        if total == written && encoder.total_in() == previous_in {
             return Err(Error::Compression(
                 "Flate length measurement made no progress".into(),
             ));
