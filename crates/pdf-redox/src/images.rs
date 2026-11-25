@@ -11,7 +11,7 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image as ResizeImage,
 };
 use libjpeg_turbo_rs::{
-    PixelFormat, Subsampling, compress,
+    Encoder, PixelFormat, Subsampling,
     encode::tables::{
         STD_CHROMINANCE_QUANT_TABLE, STD_LUMINANCE_QUANT_TABLE, quality_scale_quant_table,
     },
@@ -204,15 +204,12 @@ pub fn encode_jpeg_raster(
     } else {
         Subsampling::S420
     };
-    compress(
-        data,
-        width_usize,
-        height_usize,
-        pixel_format,
-        jpeg_quality.clamp(1, 100),
-        subsampling,
-    )
-    .map_err(|error| Error::Invalid(format!("JPEG encode failed: {error}")))
+    Encoder::new(data, width_usize, height_usize, pixel_format)
+        .quality(jpeg_quality.clamp(1, 100))
+        .subsampling(subsampling)
+        .optimize_huffman(true)
+        .encode()
+        .map_err(|error| Error::Invalid(format!("JPEG encode failed: {error}")))
 }
 
 fn is_image_value(document: &EditDocument, object: &OwnedObject) -> Result<bool> {
@@ -694,24 +691,6 @@ fn passes_savings(options: ImageOptimizationOptions, original: u64, optimized: u
             >= u128::from(original) * u128::from(options.min_savings_percent)
 }
 
-fn finalize_jpeg_candidate(
-    encoded: Vec<u8>,
-    original: u64,
-    options: ImageOptimizationOptions,
-) -> Option<Vec<u8>> {
-    // Lossy eligibility is decided on the raw encoder output. Coefficient-preserving
-    // entropy optimization may shrink an already-admitted JPEG, but must never make
-    // a visually marginal candidate cross the material-savings threshold.
-    if !passes_savings(options, original, encoded.len()) {
-        return None;
-    }
-    Some(
-        crate::jpeg_optimize::optimized_jpeg_bytes(&encoded)
-            .filter(|optimized| optimized.len() < encoded.len())
-            .unwrap_or(encoded),
-    )
-}
-
 fn jpeg_transcode_candidate(
     decoded: &[u8],
     width: u32,
@@ -721,9 +700,9 @@ fn jpeg_transcode_candidate(
     options: ImageOptimizationOptions,
 ) -> Result<Option<ImageTransform>> {
     let encoded = encode_jpeg_raster(width, height, components, decoded, options.jpeg_quality)?;
-    let Some(encoded) = finalize_jpeg_candidate(encoded, original, options) else {
+    if !passes_savings(options, original, encoded.len()) {
         return Ok(None);
-    };
+    }
     let optimized_encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     let pixels = u64::from(width) * u64::from(height);
     Ok(Some(ImageTransform {
@@ -1621,7 +1600,7 @@ mod tests {
                 );
             }
         }
-        compress(
+        libjpeg_turbo_rs::compress(
             &pixels,
             width,
             height,
@@ -1942,38 +1921,34 @@ mod tests {
     }
 
     #[test]
-    fn entropy_optimization_cannot_admit_lossy_candidate() -> Result<()> {
-        let raw = rgb_jpeg(85)?;
-        let Some(entropy_optimized) = crate::jpeg_optimize::optimized_jpeg_bytes(&raw)
-            .filter(|optimized| optimized.len() < raw.len())
-        else {
-            return Err(Error::Invalid(
-                "test JPEG has no entropy-optimization opportunity".to_owned(),
-            ));
-        };
+    fn generated_jpeg_uses_final_entropy_optimized_size() -> Result<()> {
+        let data = paper_rgb(256, 256);
+        let encoded = encode_jpeg_raster(256, 256, 3, &data, 85)?;
+        let ordinary =
+            libjpeg_turbo_rs::compress(&data, 256, 256, PixelFormat::Rgb, 85, Subsampling::S420)
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+        let before = libjpeg_turbo_rs::read_coefficients(&ordinary)
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        let after = libjpeg_turbo_rs::read_coefficients(&encoded)
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+        assert_eq!(before.quant_tables, after.quant_tables);
+        for (left, right) in before.components.iter().zip(&after.components) {
+            assert_eq!(left.blocks, right.blocks);
+        }
+        assert!(encoded.len() < ordinary.len());
         let options = ImageOptimizationOptions {
-            min_savings_bytes: 1,
+            jpeg_quality: 85,
             min_savings_percent: 20,
+            min_savings_bytes: 1,
             ..ImageOptimizationOptions::default()
         };
-        let raw_len = u64::try_from(raw.len())
-            .map_err(|_| Error::Invalid("test JPEG length exceeds u64".to_owned()))?;
-        let entropy_len = u64::try_from(entropy_optimized.len())
-            .map_err(|_| Error::Invalid("optimized test JPEG length exceeds u64".to_owned()))?;
-        let Some(original) =
-            (raw_len.saturating_add(1)..=raw_len.saturating_mul(2)).find(|&size| {
-                !passes_savings(options, size, raw.len())
-                    && passes_savings(options, size, entropy_optimized.len())
-            })
-        else {
-            return Err(Error::Invalid(format!(
-                "unable to construct admission boundary for raw={raw_len}, entropy={entropy_len}"
-            )));
-        };
-
-        assert!(!passes_savings(options, original, raw.len()));
-        assert!(passes_savings(options, original, entropy_optimized.len()));
-        assert!(finalize_jpeg_candidate(raw, original, options).is_none());
+        let original = u64::try_from(encoded.len().div_ceil(4) * 5)
+            .map_err(|_| Error::Invalid("test size overflow".into()))?;
+        assert!(passes_savings(options, original, encoded.len()));
+        assert!(!passes_savings(options, original, ordinary.len()));
+        let candidate = jpeg_transcode_candidate(&data, 256, 256, 3, original, options)?
+            .ok_or_else(|| Error::Invalid("final encoded candidate should qualify".into()))?;
+        assert_eq!(candidate.encoded, encoded);
         Ok(())
     }
 

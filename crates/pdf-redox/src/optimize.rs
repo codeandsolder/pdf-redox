@@ -1040,7 +1040,6 @@ struct FinalizationContext<'a> {
 /// outlive the document generation it was created for.
 struct FinalizationResult {
     resource_prune: crate::prune::ResourcePruneStats,
-    microstroke_raster: MicrostrokeRasterStats,
     flate: crate::flate::FlateOptimizationStats,
     flate_batch: crate::FlateBatchStats,
     page_content_dedup: crate::dedup::TargetedDedupStats,

@@ -2601,16 +2601,38 @@ pub fn strip_cidfont_type2_cmaps_after_dedup(
 /// byte-identical programs into per-caller variants and lose a much larger
 /// deduplication win. At this point every canonical program naturally receives
 /// the union of glyph use from all font dictionaries that reference it.
-/// Cheap negative-only proof for outline subsetting.
-///
-/// This deliberately does not try to authorize a rewrite: it uses the existing
-/// live-GID scanner, tries both supported embedded-font backends, and applies
-/// the same final Flate size gate. If neither backend can produce a smaller
-/// stream for any live program, the authoritative ownership/subtype graph
-/// cannot make an outline rewrite possible and may be skipped entirely.
+/// Prepared outline candidates for the current document generation. The
+/// caller builds the authoritative ownership graph without changing the
+/// document, then consumes the selected backend's already encoded result.
 #[derive(Debug)]
 pub struct FontOutlineSubsetProbe {
-    identity_glyph_usage: IdentityGlyphUsage,
+    programs: BTreeMap<CowObjectHandle, PreparedOutlineProgram>,
+}
+
+#[derive(Debug)]
+struct PreparedOutlineSubset {
+    encoded: Vec<u8>,
+    glyph_bytes_removed: usize,
+    table_bytes_removed: usize,
+}
+
+#[derive(Debug)]
+struct PreparedOutlineProgram {
+    original_len: usize,
+    cff: Option<PreparedOutlineSubset>,
+    truetype: Option<PreparedOutlineSubset>,
+}
+
+impl PreparedOutlineProgram {
+    fn select(self, usage: FontProgramUsage) -> Option<PreparedOutlineSubset> {
+        if usage.cidfont_type0_only() {
+            self.cff
+        } else if usage.cidfont_type2_only() {
+            self.truetype
+        } else {
+            None
+        }
+    }
 }
 
 /// Build alternative rendering-preserving subsets from the same immutable
@@ -2650,6 +2672,43 @@ fn font_program_subset_candidates(
     variants
 }
 
+fn prepare_outline_subset(
+    candidate: &[u8],
+    gids: &BTreeSet<u16>,
+    cff: bool,
+    truetype: bool,
+    raw_len: usize,
+    flate_level: crate::FlateLevel,
+) -> Option<PreparedOutlineSubset> {
+    let mut best: Option<PreparedOutlineSubset> = None;
+    for (mut subset, glyph_bytes_removed) in
+        font_program_subset_candidates(candidate, gids, cff, truetype)
+    {
+        let table_bytes_removed = if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&subset)
+        {
+            subset = trimmed;
+            removed
+        } else {
+            0
+        };
+        let Ok(encoded) = encode_flate(&subset, flate_level) else {
+            continue;
+        };
+        if encoded.len() < raw_len
+            && best
+                .as_ref()
+                .is_none_or(|best| encoded.len() < best.encoded.len())
+        {
+            best = Some(PreparedOutlineSubset {
+                encoded,
+                glyph_bytes_removed,
+                table_bytes_removed,
+            });
+        }
+    }
+    best
+}
+
 pub fn probe_profitable_font_outline_subset(
     document: &EditDocument,
     pages: &[CowObjectHandle],
@@ -2658,44 +2717,30 @@ pub fn probe_profitable_font_outline_subset(
 ) -> Result<Option<FontOutlineSubsetProbe>> {
     let (identity_glyph_usage, _) =
         font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?;
-    let profitable = 'programs: {
-        for (program, gids) in &identity_glyph_usage {
-            if gids.is_empty() {
-                continue;
-            }
-            let Some(object) = document.current_owned_object_cow(*program)? else {
-                continue;
-            };
-            let OwnedObject::Stream { dictionary, data } = object.as_ref() else {
-                continue;
-            };
-            if !dictionary.contains_key(b"Filter".as_slice())
-                || !is_unfiltered_or_lone_flate(document, dictionary)?
-            {
-                continue;
-            }
-            let raw = data.bytes(document.source())?;
-            let Ok(decoded) = decode_stream(document, dictionary, raw.as_ref()) else {
-                continue;
-            };
-            let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-            for (mut subset, _) in font_program_subset_candidates(&candidate, gids, true, true) {
-                if let Some((trimmed, _)) = sfnt_for_pdf_rendering(&subset) {
-                    subset = trimmed;
-                }
-                let Ok(encoded) = encode_flate(&subset, flate_level) else {
-                    continue;
-                };
-                if encoded.len() < raw.len() {
-                    break 'programs true;
-                }
-            }
+    let mut programs = BTreeMap::new();
+    for (program, gids) in identity_glyph_usage {
+        if gids.is_empty() {
+            continue;
         }
-        false
-    };
-    Ok(profitable.then_some(FontOutlineSubsetProbe {
-        identity_glyph_usage,
-    }))
+        let Some((decoded, original_len)) = editable_font_program(document, program)? else {
+            continue;
+        };
+        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+        let cff = prepare_outline_subset(&candidate, &gids, true, false, original_len, flate_level);
+        let truetype =
+            prepare_outline_subset(&candidate, &gids, false, true, original_len, flate_level);
+        if cff.is_some() || truetype.is_some() {
+            programs.insert(
+                program,
+                PreparedOutlineProgram {
+                    original_len,
+                    cff,
+                    truetype,
+                },
+            );
+        }
+    }
+    Ok((!programs.is_empty()).then_some(FontOutlineSubsetProbe { programs }))
 }
 
 pub fn subset_font_outlines_after_dedup(
@@ -2711,69 +2756,55 @@ pub fn subset_font_outlines_after_dedup(
         return Ok(FontOptimizationStats::default());
     }
 
-    let identity_glyph_usage = if let Some(pre_scanned) = pre_scanned {
-        pre_scanned.identity_glyph_usage
-    } else {
-        font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?.0
+    let (mut prepared, glyph_usage) = match pre_scanned {
+        Some(probe) => (Some(probe.programs), None),
+        None => (
+            None,
+            Some(font_glyph_usage_with_hints(document, pages, glyph_usage_hints)?.0),
+        ),
     };
-    if identity_glyph_usage.is_empty() {
-        return Ok(FontOptimizationStats::default());
-    }
-
     let mut ordered_programs = program_usage.into_iter().collect::<Vec<_>>();
     ordered_programs.sort_unstable_by_key(|(program, _)| *program);
     let mut stats = FontOptimizationStats::default();
-
     for (program, usage) in ordered_programs {
-        let Some(gids) = identity_glyph_usage.get(&program) else {
-            continue;
-        };
-        if gids.is_empty() {
-            continue;
-        }
-
-        let Some((decoded, raw_len)) = editable_font_program(document, program)? else {
-            continue;
-        };
-        let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
-        let variants = font_program_subset_candidates(
-            &candidate,
-            gids,
-            usage.cidfont_type0_only(),
-            usage.cidfont_type2_only(),
-        );
-        let mut best = None::<(Vec<u8>, usize, usize)>;
-        for (mut subset, glyph_subset_removed_bytes) in variants {
-            let removed_decoded_bytes =
-                if let Some((trimmed, removed)) = sfnt_for_pdf_rendering(&subset) {
-                    subset = trimmed;
-                    removed
-                } else {
-                    0
-                };
-            let Ok(encoded) = encode_flate(&subset, flate_level) else {
+        let (raw_len, best) = if let Some(prepared) = &mut prepared {
+            let Some(candidate) = prepared.remove(&program) else {
                 continue;
             };
-            if encoded.len() >= raw_len
-                || best
-                    .as_ref()
-                    .is_some_and(|(bytes, _, _)| bytes.len() <= encoded.len())
-            {
+            (candidate.original_len, candidate.select(usage))
+        } else {
+            let Some(gids) = glyph_usage.as_ref().and_then(|usage| usage.get(&program)) else {
+                continue;
+            };
+            if gids.is_empty() || !(usage.cidfont_type0_only() || usage.cidfont_type2_only()) {
                 continue;
             }
-            best = Some((encoded, glyph_subset_removed_bytes, removed_decoded_bytes));
-        }
-        let Some((encoded, glyph_subset_removed_bytes, removed_decoded_bytes)) = best else {
+            let Some((decoded, raw_len)) = editable_font_program(document, program)? else {
+                continue;
+            };
+            let candidate = single_font_ttc_to_sfnt(&decoded).unwrap_or(decoded);
+            (
+                raw_len,
+                prepare_outline_subset(
+                    &candidate,
+                    gids,
+                    usage.cidfont_type0_only(),
+                    usage.cidfont_type2_only(),
+                    raw_len,
+                    flate_level,
+                ),
+            )
+        };
+        let Some(best) = best else {
             continue;
         };
-
         stats.programs_optimized += 1;
         stats.programs_glyph_subset += 1;
         stats.original_encoded_bytes += raw_len;
-        stats.optimized_encoded_bytes += encoded.len();
-        stats.decoded_table_bytes_removed += removed_decoded_bytes;
-        stats.glyph_subset_decoded_bytes_removed += glyph_subset_removed_bytes;
-        replace_current_stream_data(document, program, encoded, true)?;
+        stats.optimized_encoded_bytes += best.encoded.len();
+        stats.decoded_table_bytes_removed += best.table_bytes_removed;
+        stats.glyph_subset_decoded_bytes_removed += best.glyph_bytes_removed;
+        replace_current_stream_data(document, program, best.encoded, true)?;
     }
 
     Ok(stats)
