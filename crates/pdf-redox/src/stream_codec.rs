@@ -152,13 +152,52 @@ impl<'a> InlineFilterConfiguration<'a> {
         Ok(Some(output))
     }
 
+    pub(crate) fn detach(
+        self,
+        document: &EditDocument,
+        encoded: Cow<'a, [u8]>,
+    ) -> Result<DetachedStream<'a>> {
+        Ok(DetachedStream {
+            filter_dictionary: self.serialize(document)?,
+            encoded,
+        })
+    }
+
     pub fn decode(self, document: &EditDocument, encoded: Cow<'_, [u8]>) -> Result<Vec<u8>> {
         let Some(filter_dictionary) = self.serialize(document)? else {
             return Ok(encoded.into_owned());
         };
-        hayro_syntax::object::stream::decode_standalone_stream(&filter_dictionary, encoded.as_ref())
-            .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
+        decode_detached(&filter_dictionary, encoded.as_ref())
     }
+}
+
+/// Resolved filter parameters and encoded bytes only: no non-Sync PDF
+/// parser, object overlay, or cache references cross the worker boundary.
+pub(crate) struct DetachedStream<'a> {
+    filter_dictionary: Option<Vec<u8>>,
+    pub(crate) encoded: Cow<'a, [u8]>,
+}
+
+impl DetachedStream<'_> {
+    pub(crate) fn decode(&self) -> Result<Vec<u8>> {
+        match &self.filter_dictionary {
+            Some(dictionary) => decode_detached(dictionary, &self.encoded),
+            None => Ok(self.encoded.to_vec()),
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let encoded = match &self.encoded {
+            Cow::Owned(bytes) => bytes.capacity(),
+            Cow::Borrowed(_) => 0,
+        };
+        encoded.saturating_add(self.filter_dictionary.as_ref().map_or(0, Vec::capacity))
+    }
+}
+
+fn decode_detached(dictionary: &[u8], encoded: &[u8]) -> Result<Vec<u8>> {
+    hayro_syntax::object::stream::decode_standalone_stream(dictionary, encoded)
+        .map_err(|error| Error::Invalid(format!("failed to decode stream filters: {error:?}")))
 }
 
 /// Decode bytes using the stream's current `/Filter` and `/DecodeParms`.
@@ -409,62 +448,100 @@ impl FlateBatchEncoder {
         })
     }
 
-    /// Submit compact source streams together. The existing CPU worker pool
-    /// handles entropy indexing and leases independent resident CUDA lanes.
-    /// Preserve the input order, including streams routed back to CPU decode.
+    /// Run detached stream jobs on the same bounded pool as Flate
+    /// compression. A worker owns the decoded input only until its job
+    /// completes; no document-wide decoded buffer batch is needed.
+    pub(crate) fn for_each<T: Send>(&self, tasks: &mut [T], run: impl Fn(&mut T) + Sync) {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(pool) = &self.compressor {
+            pool.for_each(tasks, run);
+            return;
+        }
+        tasks.iter_mut().for_each(run);
+    }
+
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-    pub(crate) fn transcode_sources(
+    fn record_transcode(&self, result: &zlib_rs::GpuTranscodeResult) {
+        let Some(stats) = &self.stats else {
+            return;
+        };
+        if result.decoded_bytes_processed == 0 {
+            return;
+        }
+        let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+        let record = |target: &mut crate::report::FlateBatchWork| {
+            target.batches = target.batches.saturating_add(1);
+            target.streams = target.streams.saturating_add(1);
+            target.decoded_bytes = target
+                .decoded_bytes
+                .saturating_add(result.decoded_bytes_processed);
+        };
+        record(&mut stats.gpu_assisted);
+        record(&mut stats.gpu_transcoded);
+        if result.device_indexed {
+            stats.gpu_device_indexed_streams = stats.gpu_device_indexed_streams.saturating_add(1);
+        }
+        stats.gpu_device_tokens = stats
+            .gpu_device_tokens
+            .saturating_add(result.device_tokens as usize);
+        stats.gpu_transcode_source_bytes = stats
+            .gpu_transcode_source_bytes
+            .saturating_add(result.source_bytes_uploaded);
+        stats.gpu_transcode_descriptor_bytes = stats
+            .gpu_transcode_descriptor_bytes
+            .saturating_add(result.descriptor_bytes_uploaded);
+    }
+
+    /// Transcode one detached job. Independent jobs lease different CUDA
+    /// lanes concurrently, while other workers decode/encode fallback jobs.
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    pub(crate) fn transcode_source(
         &self,
-        sources: &[(&[u8], usize)],
+        source: &[u8],
+        limit: usize,
         level: crate::FlateLevel,
-    ) -> Result<Vec<FlateTranscode>> {
-        let mut outcomes = sources
-            .iter()
-            .map(|_| FlateTranscode::NotRouted)
-            .collect::<Vec<_>>();
+    ) -> Result<FlateTranscode> {
         let Some(gpu) = &self.gpu else {
-            return Ok(outcomes);
+            return Ok(FlateTranscode::NotRouted);
         };
         if !self.transcode_enabled() {
-            return Ok(outcomes);
+            return Ok(FlateTranscode::NotRouted);
         }
         let window = gpu.config.match_window_bytes.unwrap_or_else(|| {
             std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap_or(std::num::NonZeroUsize::MIN)
         });
-        // Direct input pays for a structural scan and device inflate. For
-        // single-window streams neither can overlap a preceding window's
-        // compression; retain decoded-input GPU compression for that case.
+        // Keep the measured single-window routing policy unchanged.
         let Ok(minimum_decoded_len) = u32::try_from(
             gpu.config
                 .min_stream_bytes
                 .max(window.get().saturating_add(1)),
         ) else {
-            return Ok(outcomes);
+            return Ok(FlateTranscode::NotRouted);
         };
-        // Match the standalone PDF decoder's decoded-stream resource limit.
-        // A bounded device workspace must not silently extend the document
-        // decoder's accepted logical stream size.
         let decode_bound = hayro_syntax::Limits::DEFAULT
             .max_decoded_stream_size
             .bound()
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(u32::MAX);
+        let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
+            decode_bound
+        } else {
+            u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
+                .unwrap_or(u32::MAX)
+                .min(decode_bound)
+        };
+        if minimum_decoded_len > decoded_limit
+            || minimum_decoded_len as usize > source.len().saturating_mul(1032)
+        {
+            return Ok(FlateTranscode::NotRouted);
+        }
         let config = flate_config(level);
-        let mut indices = Vec::new();
-        let mut jobs = Vec::new();
-        for (index, &(source, limit)) in sources.iter().enumerate() {
-            let decoded_limit = if gpu.config.min_cap_per_mille == 0 {
-                decode_bound
-            } else {
-                u32::try_from((limit as u128) * 1000 / u128::from(gpu.config.min_cap_per_mille))
-                    .unwrap_or(u32::MAX)
-                    .min(decode_bound)
-            };
-            if minimum_decoded_len > decoded_limit {
-                continue;
-            }
-            indices.push(index);
-            jobs.push((
+        let searcher = gpu.searcher(self.stats.as_ref())?;
+        if !searcher.supports_zlib_transcode(config) {
+            return Ok(FlateTranscode::NotRouted);
+        }
+        let result = searcher
+            .recompress_zlib(
                 source,
                 zlib_rs::GpuTranscodeOptions {
                     output_limit: limit,
@@ -474,63 +551,13 @@ impl FlateBatchEncoder {
                     search_budget: gpu.config.search_budget.get(),
                     window,
                 },
-            ));
-        }
-        if jobs.is_empty() {
-            return Ok(outcomes);
-        }
-        let searcher = gpu.searcher(self.stats.as_ref())?;
-        if !searcher.supports_zlib_transcode(config) {
-            return Ok(outcomes);
-        }
-        let results = if let Some(pool) = self.compressor.as_deref() {
-            pool.recompress_zlib_batch(&mut jobs, searcher)
-        } else {
-            jobs.iter()
-                .map(|&(source, options)| searcher.recompress_zlib(source, options))
-                .collect()
-        }
-        .map_err(|error| Error::Compression(format!("GPU Flate transcode: {error}")))?;
-        if let Some(stats) = &self.stats {
-            let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut work = crate::report::FlateBatchWork::default();
-            for result in results.iter().flatten() {
-                if result.decoded_bytes_processed != 0 {
-                    work.streams = work.streams.saturating_add(1);
-                    work.decoded_bytes = work
-                        .decoded_bytes
-                        .saturating_add(result.decoded_bytes_processed);
-                    if result.device_indexed {
-                        stats.gpu_device_indexed_streams =
-                            stats.gpu_device_indexed_streams.saturating_add(1);
-                    }
-                    stats.gpu_device_tokens = stats
-                        .gpu_device_tokens
-                        .saturating_add(result.device_tokens as usize);
-                    stats.gpu_transcode_source_bytes = stats
-                        .gpu_transcode_source_bytes
-                        .saturating_add(result.source_bytes_uploaded);
-                    stats.gpu_transcode_descriptor_bytes = stats
-                        .gpu_transcode_descriptor_bytes
-                        .saturating_add(result.descriptor_bytes_uploaded);
-                }
-            }
-            if work.streams != 0 {
-                let record = |target: &mut crate::report::FlateBatchWork| {
-                    target.batches = target.batches.saturating_add(1);
-                    target.streams = target.streams.saturating_add(work.streams);
-                    target.decoded_bytes = target.decoded_bytes.saturating_add(work.decoded_bytes);
-                };
-                record(&mut stats.gpu_assisted);
-                record(&mut stats.gpu_transcoded);
-            }
-        }
-        for (index, result) in indices.into_iter().zip(results) {
-            if let Some(result) = result {
-                outcomes[index] = gpu.classify_transcode(result, sources[index].1)?;
-            }
-        }
-        Ok(outcomes)
+            )
+            .map_err(|error| Error::Compression(format!("GPU Flate transcode: {error}")))?;
+        let Some(result) = result else {
+            return Ok(FlateTranscode::NotRouted);
+        };
+        self.record_transcode(&result);
+        gpu.classify_transcode(result, limit)
     }
 
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]

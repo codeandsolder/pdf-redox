@@ -1,4 +1,6 @@
-use crate::stream_codec::{FlateBatchEncoder, set_plain_flate};
+use crate::stream_codec::{
+    DetachedStream, FlateBatchEncoder, InlineFilterConfiguration, set_plain_flate,
+};
 use crate::{ObjectHandle, Result};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -38,6 +40,13 @@ impl FlateBatchLimits {
     const DEFAULT: Self = Self {
         max_input_bytes: 32 * 1024 * 1024,
         max_streams: 64,
+    };
+
+    // Compact borrowed source bytes need no aggregate input reservation.
+    // The owned snapshot budget remains, and decoded buffers are worker-local.
+    const FILTERED: Self = Self {
+        max_input_bytes: Self::DEFAULT.max_input_bytes,
+        max_streams: usize::MAX,
     };
 
     const fn full(self, count: usize, input_bytes: usize) -> bool {
@@ -95,17 +104,27 @@ impl FlateReuseCache {
         );
     }
 
+    fn take_entry(&mut self, handle: ObjectHandle) -> Option<FlateReuseEntry> {
+        let entry = self.entries.remove(&handle)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
+        Some(entry)
+    }
+
     fn take_matching(
         &mut self,
         handle: ObjectHandle,
         level: crate::FlateLevel,
         decoded: &[u8],
     ) -> Option<Vec<u8>> {
-        let entry = self.entries.remove(&handle)?;
-        self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
+        self.take_entry(handle)?.matching(level, decoded)
+    }
+}
+
+impl FlateReuseEntry {
+    fn matching(self, level: crate::FlateLevel, decoded: &[u8]) -> Option<Vec<u8>> {
         let decoded_sha256: [u8; 32] = Sha256::digest(decoded).into();
-        (entry.level == level && entry.decoded_sha256 == decoded_sha256)
-            .then(|| entry.encoded.into_vec())
+        (self.level == level && self.decoded_sha256 == decoded_sha256)
+            .then(|| self.encoded.into_vec())
     }
 }
 
@@ -370,13 +389,6 @@ fn is_safe_lone_flate(
         && !has_special_stream_type(document, dictionary)?)
 }
 
-struct FilteredFlateCandidate {
-    handle: ObjectHandle,
-    raw_len: usize,
-    decoded: Vec<u8>,
-    encoded: Option<AdaptiveFlateEncoding>,
-}
-
 #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
 fn identity_flate_predictor(
     document: &crate::EditDocument,
@@ -436,173 +448,154 @@ fn commit_filtered_encoding(
     Ok(())
 }
 
-fn flush_filtered_batch(
-    document: &mut crate::EditDocument,
-    candidates: &mut Vec<FilteredFlateCandidate>,
-    level: crate::FlateLevel,
-    batcher: &FlateBatchEncoder,
-    stats: &mut FlateOptimizationStats,
-) -> Result<()> {
-    if candidates.is_empty() {
-        return Ok(());
-    }
-    let indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
-        .collect::<Vec<_>>();
-    let outputs = {
-        let inputs = indices
-            .iter()
-            .map(|&index| candidates[index].decoded.as_slice())
-            .collect::<Vec<_>>();
-        // Keep only outputs satisfying both exact admission thresholds.
-        // This is especially important when a highly compressed source
-        // expands to a very large decoded buffer.
-        let limits = indices
-            .iter()
-            .map(|&index| {
-                let raw_len = candidates[index].raw_len;
-                raw_len.saturating_sub(minimum_flate_savings(raw_len))
-            })
-            .collect::<Vec<_>>();
-        batcher.encode_many_capped(&inputs, &limits, level)?
-    };
-    for (index, bytes) in indices.into_iter().zip(outputs) {
-        candidates[index].encoded = bytes.map(AdaptiveFlateEncoding::baseline);
-    }
-
-    for candidate in candidates.drain(..) {
-        if let Some(encoded) = candidate.encoded {
-            commit_filtered_encoding(
-                document,
-                candidate.handle,
-                candidate.raw_len,
-                encoded,
-                stats,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Stage only handles and encoded lengths, never another copy of an
-/// already-compressed PDF stream. Resolve source bytes for a batch under
-/// immutable document access, then commit results after releasing borrows.
-struct FilteredSourceCandidate {
+/// One fully detached input. Workers never access the document or its
+/// interior-mutable caches. Encoded input is ordinarily borrowed directly.
+struct FilteredJob<'a> {
     handle: ObjectHandle,
-    raw_len: usize,
+    input: DetachedStream<'a>,
+    cache: Option<FlateReuseEntry>,
     #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
     transcode: bool,
+    result: Result<Option<AdaptiveFlateEncoding>>,
 }
 
-#[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-fn transcode_filtered_sources(
-    document: &mut crate::EditDocument,
-    sources: &mut Vec<FilteredSourceCandidate>,
-    level: crate::FlateLevel,
-    batcher: &FlateBatchEncoder,
-    stats: &mut FlateOptimizationStats,
-) -> Result<()> {
-    use crate::stream_codec::FlateTranscode;
-
-    let indices = sources
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.transcode.then_some(i))
-        .collect::<Vec<_>>();
-    if indices.is_empty() {
-        return Ok(());
+impl FilteredJob<'_> {
+    fn raw_len(&self) -> usize {
+        self.input.encoded.len()
     }
-    let results = {
-        let objects = indices
-            .iter()
-            .map(|&i| document.current_owned_object_cow(sources[i].handle))
-            .collect::<Result<Vec<_>>>()?;
-        let bytes = objects
-            .iter()
-            .map(|object| {
-                let Some(crate::OwnedObject::Stream { data, .. }) = object.as_deref() else {
-                    return Err(crate::Error::Invalid(
-                        "staged Flate stream disappeared".to_owned(),
-                    ));
-                };
-                data.bytes(document.source())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let jobs = indices
-            .iter()
-            .zip(&bytes)
-            .map(|(&i, raw)| {
-                let len = sources[i].raw_len;
-                (raw.as_ref(), len.saturating_sub(minimum_flate_savings(len)))
-            })
-            .collect::<Vec<_>>();
-        batcher.transcode_sources(&jobs, level)?
-    };
-    for (index, outcome) in indices.into_iter().zip(results) {
-        let source = &mut sources[index];
-        // Keep only streams whose source could not be transcoded for the
-        // conventional bounded decode/recompress pass below.
-        source.transcode = !matches!(outcome, FlateTranscode::NotRouted);
-        let limit = source
-            .raw_len
-            .saturating_sub(minimum_flate_savings(source.raw_len));
-        let encoded = match outcome {
-            FlateTranscode::Accepted(bytes) => Some(bytes),
-            FlateTranscode::RetryCpu => match document.decoded_stream_data(source.handle) {
-                Ok(decoded) => batcher.retry_transcoded(&decoded, limit, level)?,
-                Err(_) => None,
-            },
-            FlateTranscode::Rejected | FlateTranscode::NotRouted => None,
-        };
-        if let Some(bytes) = encoded {
-            commit_filtered_encoding(
-                document,
-                source.handle,
-                source.raw_len,
-                AdaptiveFlateEncoding::baseline(bytes),
-                stats,
-            )?;
+
+    fn run(
+        &mut self,
+        level: crate::FlateLevel,
+        batcher: &FlateBatchEncoder,
+    ) -> Result<Option<AdaptiveFlateEncoding>> {
+        let limit = self
+            .raw_len()
+            .saturating_sub(minimum_flate_savings(self.raw_len()));
+        #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+        if self.transcode {
+            use crate::stream_codec::FlateTranscode;
+            match batcher.transcode_source(&self.input.encoded, limit, level)? {
+                FlateTranscode::Accepted(bytes) => {
+                    return Ok(Some(AdaptiveFlateEncoding::baseline(bytes)));
+                }
+                FlateTranscode::Rejected => return Ok(None),
+                FlateTranscode::RetryCpu => {
+                    return match self.input.decode() {
+                        Ok(decoded) => Ok(batcher
+                            .retry_transcoded(&decoded, limit, level)?
+                            .map(AdaptiveFlateEncoding::baseline)),
+                        Err(_) => Ok(None),
+                    };
+                }
+                FlateTranscode::NotRouted => {}
+            }
         }
+        let Ok(decoded) = self.input.decode() else {
+            return Ok(None);
+        };
+        if let Some(encoded) = self
+            .cache
+            .take()
+            .and_then(|entry| entry.matching(level, &decoded))
+        {
+            return Ok(Some(AdaptiveFlateEncoding::baseline(encoded)));
+        }
+        let mut encoded = batcher.encode_many_capped(&[&decoded], &[limit], level)?;
+        Ok(encoded.pop().flatten().map(AdaptiveFlateEncoding::baseline))
     }
-    sources.retain(|source| !source.transcode);
-    Ok(())
 }
 
-fn flush_filtered_sources(
-    document: &mut crate::EditDocument,
-    sources: &mut Vec<FilteredSourceCandidate>,
+fn collect_filtered_job<'a>(
+    document: &'a crate::EditDocument,
+    handle: ObjectHandle,
+    reuse_cache: &mut FlateReuseCache,
+    batcher: &FlateBatchEncoder,
+) -> Result<Option<FilteredJob<'a>>> {
+    let Some(object) = document.current_owned_object_cow(handle)? else {
+        return Ok(None);
+    };
+    let crate::OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
+        return Ok(None);
+    };
+    if !is_safe_lone_flate(document, dictionary)? {
+        return Ok(None);
+    }
+    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+    let transcode = batcher.transcode_enabled()
+        && !reuse_cache.entries.contains_key(&handle)
+        && identity_flate_predictor(document, dictionary)?;
+    #[cfg(not(all(feature = "cuda", not(target_family = "wasm"))))]
+    let _ = batcher;
+    drop(object);
+    let Some(stream) = document.current_value(handle)? else {
+        return Ok(None);
+    };
+    let encoded = stream.stream_bytes(document.source())?;
+    if encoded.len() < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
+        return Ok(None);
+    }
+    let Ok(input) = InlineFilterConfiguration::from_stream(&stream)
+        .and_then(|configuration| configuration.detach(document, encoded))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FilteredJob {
+        handle,
+        input,
+        cache: reuse_cache.take_entry(handle),
+        #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
+        transcode,
+        result: Ok(None),
+    }))
+}
+
+struct FilteredResult {
+    handle: ObjectHandle,
+    raw_len: usize,
+    encoded: Option<AdaptiveFlateEncoding>,
+}
+
+/// Process as much of the immutable document as the snapshot budget permits.
+/// All borrowed sources can share one queue. The worker pool bounds the
+/// number of decoded buffers, and each encode has its original exact cap.
+fn run_filtered_jobs(
+    document: &crate::EditDocument,
+    handles: &mut impl Iterator<Item = ObjectHandle>,
     level: crate::FlateLevel,
     reuse_cache: &mut FlateReuseCache,
     batcher: &FlateBatchEncoder,
     limits: FlateBatchLimits,
-    stats: &mut FlateOptimizationStats,
-) -> Result<()> {
-    #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-    transcode_filtered_sources(document, sources, level, batcher, stats)?;
-    let mut candidates = Vec::new();
-    let mut staged_bytes = 0_usize;
-    for source in sources.drain(..) {
-        let Ok(decoded) = document.decoded_stream_data(source.handle) else {
+) -> Result<Vec<FilteredResult>> {
+    let mut jobs = Vec::new();
+    let mut retained = 0_usize;
+    for handle in handles {
+        let Some(job) = collect_filtered_job(document, handle, reuse_cache, batcher)? else {
             continue;
         };
-        let encoded = reuse_cache
-            .take_matching(source.handle, level, &decoded)
-            .map(AdaptiveFlateEncoding::baseline);
-        staged_bytes = staged_bytes.saturating_add(decoded.len());
-        candidates.push(FilteredFlateCandidate {
-            handle: source.handle,
-            raw_len: source.raw_len,
-            decoded,
-            encoded,
-        });
-        if limits.full(candidates.len(), staged_bytes) {
-            flush_filtered_batch(document, &mut candidates, level, batcher, stats)?;
-            staged_bytes = 0;
+        retained = retained.saturating_add(job.input.retained_bytes());
+        jobs.push(job);
+        if limits.full(jobs.len(), retained) {
+            break;
         }
     }
-    flush_filtered_batch(document, &mut candidates, level, batcher, stats)
+    // Largest encoded inputs first: avoid starting a long tail after most
+    // workers finish. Restore deterministic document order before committing.
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.raw_len()));
+    batcher.for_each(&mut jobs, |job| job.result = job.run(level, batcher));
+    let mut results = jobs
+        .into_iter()
+        .map(|job| {
+            let raw_len = job.raw_len();
+            Ok(FilteredResult {
+                handle: job.handle,
+                raw_len,
+                encoded: job.result?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    results.sort_by_key(|result| result.handle);
+    Ok(results)
 }
 
 fn optimize_flate_streams_bounded(
@@ -612,55 +605,26 @@ fn optimize_flate_streams_bounded(
     batcher: &FlateBatchEncoder,
     limits: FlateBatchLimits,
 ) -> Result<FlateOptimizationStats> {
-    let mut sources = Vec::new();
-    let mut staged_bytes = 0_usize;
+    let mut handles = document.reachable_streams()?.into_iter();
     let mut stats = FlateOptimizationStats::default();
-    for handle in document.reachable_streams()? {
-        let Some(object) = document.current_owned_object_cow(handle)? else {
-            continue;
-        };
-        let crate::OwnedObject::Stream { dictionary, data } = object.as_ref() else {
-            continue;
-        };
-        if !is_safe_lone_flate(document, dictionary)? {
-            continue;
+    loop {
+        let results =
+            run_filtered_jobs(document, &mut handles, level, reuse_cache, batcher, limits)?;
+        if results.is_empty() {
+            break;
         }
-        let raw_len = data.bytes(document.source())?.len();
-        if raw_len < MIN_FLATE_SAVINGS_BYTES + MIN_ZLIB_WRAPPER_BYTES {
-            continue;
-        }
-        sources.push(FilteredSourceCandidate {
-            handle,
-            raw_len,
-            #[cfg(all(feature = "cuda", not(target_family = "wasm")))]
-            transcode: batcher.transcode_enabled()
-                && !reuse_cache.entries.contains_key(&handle)
-                && identity_flate_predictor(document, dictionary)?,
-        });
-        drop(object);
-        staged_bytes = staged_bytes.saturating_add(raw_len);
-        if limits.full(sources.len(), staged_bytes) {
-            flush_filtered_sources(
-                document,
-                &mut sources,
-                level,
-                reuse_cache,
-                batcher,
-                limits,
-                &mut stats,
-            )?;
-            staged_bytes = 0;
+        for result in results {
+            if let Some(encoded) = result.encoded {
+                commit_filtered_encoding(
+                    document,
+                    result.handle,
+                    result.raw_len,
+                    encoded,
+                    &mut stats,
+                )?;
+            }
         }
     }
-    flush_filtered_sources(
-        document,
-        &mut sources,
-        level,
-        reuse_cache,
-        batcher,
-        limits,
-        &mut stats,
-    )?;
     Ok(stats)
 }
 
@@ -675,7 +639,7 @@ pub fn optimize_flate_streams_with_cache(
         level,
         reuse_cache,
         batcher,
-        FlateBatchLimits::DEFAULT,
+        FlateBatchLimits::FILTERED,
     )
 }
 
