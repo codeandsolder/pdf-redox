@@ -3877,10 +3877,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Compare complete cold and warm closure transactions on one fixture"
-    )]
     fn exact_closure_reuses_only_unchanged_page_blocks() -> Result<()> {
         use crate::{FlateLevel, test_support::ClassicPdfBuilder};
 

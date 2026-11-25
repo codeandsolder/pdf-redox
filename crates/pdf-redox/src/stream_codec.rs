@@ -603,6 +603,13 @@ impl FlateBatchEncoder {
         zlib_rs::compress_slices_batch(jobs, config)
     }
 
+    #[cfg_attr(
+        not(all(feature = "gpu", not(target_family = "wasm"))),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "GPU dispatch can fail; CPU-only dispatch shares this contract"
+        )
+    )]
     fn compress_jobs(
         &self,
         mut jobs: Vec<zlib_rs::BatchJob<'_>>,
@@ -793,7 +800,7 @@ impl FlateBatchEncoder {
             .map(|(&input, &limit)| (input, limit, Ok(None)))
             .collect::<Vec<_>>();
         self.for_each(&mut jobs, |(input, limit, result)| {
-            *result = flate_capped_encoded_len(input, *limit, level)
+            *result = flate_capped_encoded_len(input, *limit, level);
         });
         if let Some(stats) = &self.stats {
             let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
