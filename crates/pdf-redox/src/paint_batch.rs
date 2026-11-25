@@ -934,6 +934,7 @@ fn apply_local_page_rewrites(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
     kind: LocalRewriteKind,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<LocalPageRewriteStats> {
     let mut stats = LocalPageRewriteStats::default();
     for &page in pages {
@@ -954,14 +955,15 @@ fn apply_local_page_rewrites(
         if operations == 0 || after.as_slice() == before.as_ref() {
             continue;
         }
-        let before_flate = crate::stream_codec::flate_encoded_len(&before, flate_level)?;
-        let Some(after_flate) =
-            crate::stream_codec::flate_capped_encoded_len(&after, before_flate, flate_level)?
+        let before_flate = reuse.page_len(document, page, &before, flate_level)?;
+        let Some(encoded) =
+            crate::stream_codec::encode_flate_capped(&after, before_flate, flate_level)?
         else {
             continue;
         };
         let removed_bytes = before.len().saturating_sub(after.len());
-        replace_page_content(document, page, after)?;
+        let after_flate = encoded.len();
+        reuse.install_page(document, page, after, encoded, flate_level)?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.operations = stats.operations.saturating_add(operations);
         stats.decoded_bytes_removed = stats.decoded_bytes_removed.saturating_add(removed_bytes);
@@ -976,12 +978,14 @@ pub fn coalesce_optional_content(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<MarkedContentCoalesceStats> {
     let stats = apply_local_page_rewrites(
         document,
         pages,
         flate_level,
         LocalRewriteKind::OptionalContent,
+        reuse,
     )?;
     Ok(MarkedContentCoalesceStats {
         pages_rewritten: stats.pages_rewritten,
@@ -1271,9 +1275,15 @@ pub fn compact_collinear_paths(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<CollinearPathStats> {
-    let page_stats =
-        apply_local_page_rewrites(document, pages, flate_level, LocalRewriteKind::Collinear)?;
+    let page_stats = apply_local_page_rewrites(
+        document,
+        pages,
+        flate_level,
+        LocalRewriteKind::Collinear,
+        reuse,
+    )?;
     let form_stats = compact_collinear_form_paths(document, flate_level)?;
     Ok(CollinearPathStats {
         pages_rewritten: page_stats.pages_rewritten,
@@ -2311,29 +2321,33 @@ fn outlined_glyph_replacements(plans: &[GlyphFontPlan]) -> Option<GlyphReplaceme
     })
 }
 
-fn outlined_glyph_estimated_after_flate(
-    rewritten: &[u8],
+fn prepare_glyph_encodings(
     plans: &[GlyphFontPlan],
     flate_level: crate::FlateLevel,
-) -> Result<usize> {
-    let mut total = crate::stream_codec::flate_encoded_len(rewritten, flate_level)?;
-    let glyphs = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
-    for plan in plans {
-        for shape in &plan.shapes {
-            total = total.saturating_add(crate::stream_codec::flate_encoded_len(
-                &shape.charproc,
-                flate_level,
-            )?);
-        }
-    }
-    Ok(total
-        .saturating_add(glyphs.saturating_mul(128))
-        .saturating_add(plans.len().saturating_mul(512)))
+) -> Result<(usize, Vec<Vec<Vec<u8>>>)> {
+    let mut total = plans.len().saturating_mul(512);
+    let encodings = plans
+        .iter()
+        .map(|plan| {
+            plan.shapes
+                .iter()
+                .map(|shape| {
+                    let bytes = crate::stream_codec::encode_flate(&shape.charproc, flate_level)?;
+                    total = total.saturating_add(bytes.len()).saturating_add(128);
+                    Ok(bytes)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, encodings))
 }
 
 fn outlined_glyph_font_dictionary(
     document: &mut EditDocument,
     plan: &GlyphFontPlan,
+    encoded: Vec<Vec<u8>>,
+    level: crate::FlateLevel,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> ObjectHandle {
     let mut charprocs = OwnedDictionary::new();
     let mut differences = vec![OwnedObject::Integer(1)];
@@ -2341,13 +2355,14 @@ fn outlined_glyph_font_dictionary(
     let mut max_width = 0i64;
     let mut max_height = 0i64;
 
-    for (index, shape) in plan.shapes.iter().enumerate() {
+    for (index, (shape, encoded)) in plan.shapes.iter().zip(encoded).enumerate() {
         let code = index.saturating_add(1);
         let glyph_name = format!("G{code}").into_bytes();
         let stream = ObjectHandle::New(document.add_object(OwnedObject::Stream {
             dictionary: OwnedDictionary::new(),
             data: StreamData::Owned(shape.charproc.clone().into()),
         }));
+        reuse.insert(stream, level, &shape.charproc, encoded);
         charprocs.insert(glyph_name.clone(), OwnedObject::Reference(stream));
         differences.push(OwnedObject::Name(glyph_name));
         widths.push(OwnedObject::Integer(0));
@@ -2407,6 +2422,7 @@ fn factor_polyline_outlined_glyphs(
     document: &mut EditDocument,
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<OutlinedGlyphFactorStats> {
     let mut stats = OutlinedGlyphFactorStats::default();
     for &page in pages {
@@ -2429,8 +2445,10 @@ fn factor_polyline_outlined_glyphs(
         else {
             continue;
         };
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
-        let after_flate = outlined_glyph_estimated_after_flate(&rewritten, &plans, flate_level)?;
+        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
+        let page_encoding = crate::stream_codec::encode_flate(&rewritten, flate_level)?;
+        let (font_cost, glyph_encodings) = prepare_glyph_encodings(&plans, flate_level)?;
+        let after_flate = page_encoding.len().saturating_add(font_cost);
         if before_flate <= after_flate
             || before_flate.saturating_sub(after_flate) < MIN_OUTLINED_GLYPH_ESTIMATED_SAVINGS
         {
@@ -2439,13 +2457,16 @@ fn factor_polyline_outlined_glyphs(
 
         let bindings = plans
             .iter()
-            .map(|plan| {
-                let font = outlined_glyph_font_dictionary(document, plan);
+            .zip(glyph_encodings)
+            .map(|(plan, encoded)| {
+                let font =
+                    outlined_glyph_font_dictionary(document, plan, encoded, flate_level, reuse);
                 (page, plan.name.as_slice(), font)
             })
             .collect::<Vec<_>>();
         install_page_resource_bindings(document, b"Font", bindings)?;
-        replace_page_content(document, page, rewritten.clone())?;
+        let rewritten_len = rewritten.len();
+        reuse.install_page(document, page, rewritten, page_encoding, flate_level)?;
 
         let glyphs_created = plans.iter().map(|plan| plan.shapes.len()).sum::<usize>();
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
@@ -2459,7 +2480,7 @@ fn factor_polyline_outlined_glyphs(
             .saturating_add(replacement_plan.source_paints_replaced);
         stats.decoded_bytes_removed = stats
             .decoded_bytes_removed
-            .saturating_add(decoded.len().saturating_sub(rewritten.len()));
+            .saturating_add(decoded.len().saturating_sub(rewritten_len));
         stats.estimated_flate_bytes_saved = stats
             .estimated_flate_bytes_saved
             .saturating_add(before_flate.saturating_sub(after_flate));
@@ -2472,9 +2493,10 @@ pub fn factor_outlined_glyphs(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
     catalog: Option<&mut crate::GlyphCatalog>,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<OutlinedGlyphFactorStats> {
-    let mut stats = factor_polyline_outlined_glyphs(doc, pages, flate_level)?;
-    let curves = curved_glyphs::factor(doc, pages, flate_level, catalog)?;
+    let mut stats = factor_polyline_outlined_glyphs(doc, pages, flate_level, reuse)?;
+    let curves = curved_glyphs::factor(doc, pages, flate_level, catalog, reuse)?;
     stats.pages_rewritten += curves.pages_rewritten;
     stats.fonts_created += curves.fonts_created;
     stats.glyphs_created += curves.glyphs_created;
@@ -3019,7 +3041,12 @@ mod tests {
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let pages = document.page_handles()?;
-        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+        let stats = compact_collinear_paths(
+            &mut document,
+            &pages,
+            crate::FlateLevel::PROCESSING,
+            &mut crate::flate::FlateReuseCache::default(),
+        )?;
         assert_eq!(stats.pages_rewritten, 1);
         assert_eq!(stats.forms_rewritten, 0);
         assert_eq!(stats.vertices_removed, 4000);
@@ -3073,7 +3100,12 @@ mod tests {
 
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let pages = document.page_handles()?;
-        let stats = compact_collinear_paths(&mut document, &pages, crate::FlateLevel::PROCESSING)?;
+        let stats = compact_collinear_paths(
+            &mut document,
+            &pages,
+            crate::FlateLevel::PROCESSING,
+            &mut crate::flate::FlateReuseCache::default(),
+        )?;
         assert_eq!(stats.pages_rewritten, 0);
         assert_eq!(stats.forms_rewritten, 1);
         assert!(stats.vertices_removed > 10_000);

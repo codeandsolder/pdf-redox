@@ -70,7 +70,6 @@ pub struct FlateReuseCache {
 }
 
 impl FlateReuseCache {
-    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         handle: ObjectHandle,
@@ -104,6 +103,44 @@ impl FlateReuseCache {
         );
     }
 
+    /// Install raw content while retaining the encoding already computed by
+    /// the admission check. Later mutators can still work on raw bytes.
+    pub(crate) fn install_page(
+        &mut self,
+        document: &mut crate::EditDocument,
+        page: ObjectHandle,
+        decoded: Vec<u8>,
+        encoded: Vec<u8>,
+        level: crate::FlateLevel,
+    ) -> Result<()> {
+        let digest = Sha256::digest(&decoded).into();
+        let handle = crate::content::replace_page_content_with_handle(document, page, decoded)?;
+        self.insert_with_digest(handle, level, digest, encoded);
+        Ok(())
+    }
+
+    /// Reuse the exact scalar encoding length from a preceding page rewrite.
+    /// A handle alone is not evidence that the bytes are unchanged.
+    pub(crate) fn page_len(
+        &self,
+        document: &crate::EditDocument,
+        page: ObjectHandle,
+        decoded: &[u8],
+        level: crate::FlateLevel,
+    ) -> Result<usize> {
+        if let Some(handle) = document
+            .current_value(page)?
+            .and_then(|value| value.dictionary_entry(b"Contents"))
+            .and_then(|value| value.reference())
+            && let Some(entry) = self.entries.get(&handle)
+            && entry.level == level
+            && entry.decoded_sha256 == <[u8; 32]>::from(Sha256::digest(decoded))
+        {
+            return Ok(entry.encoded.len());
+        }
+        crate::stream_codec::flate_encoded_len(decoded, level)
+    }
+
     fn take_entry(&mut self, handle: ObjectHandle) -> Option<FlateReuseEntry> {
         let entry = self.entries.remove(&handle)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(entry.encoded.len());
@@ -122,8 +159,7 @@ impl FlateReuseCache {
 
 impl FlateReuseEntry {
     fn matching(self, level: crate::FlateLevel, decoded: &[u8]) -> Option<Vec<u8>> {
-        let decoded_sha256: [u8; 32] = Sha256::digest(decoded).into();
-        (self.level == level && self.decoded_sha256 == decoded_sha256)
+        (self.level == level && self.decoded_sha256 == <[u8; 32]>::from(Sha256::digest(decoded)))
             .then(|| self.encoded.into_vec())
     }
 }

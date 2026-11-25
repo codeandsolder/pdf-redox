@@ -5,9 +5,8 @@ use super::{
     BTreeMap, BTreeSet, EditDocument, Event, EventTable, GlyphComponent, GlyphFontPlan,
     GlyphShapePlan, MAX_TYPE3_GLYPHS_PER_FONT, MIN_OUTLINED_GLYPH_OCCURRENCES, ObjectHandle,
     OutlinedGlyphFactorStats, Result, adjacent, effective_page_resources, events_for,
-    install_page_resource_bindings, outlined_glyph_estimated_after_flate,
-    outlined_glyph_font_dictionary, outlined_glyph_font_name, replace_page_content,
-    resolved_dictionary,
+    install_page_resource_bindings, outlined_glyph_font_dictionary, outlined_glyph_font_name,
+    prepare_glyph_encodings, resolved_dictionary,
 };
 use crate::content::page_content_if_present;
 use crate::geometry::compose_affine_matrix;
@@ -933,6 +932,7 @@ pub(super) fn factor(
     pages: &[ObjectHandle],
     flate_level: crate::FlateLevel,
     catalog: Option<&mut GlyphCatalog>,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<OutlinedGlyphFactorStats> {
     let (sources, shapes, fills) = collect_sources(doc, pages)?;
     let mut stats = OutlinedGlyphFactorStats::default();
@@ -976,13 +976,13 @@ pub(super) fn factor(
         else {
             return Ok(stats);
         };
-        before += crate::stream_codec::flate_encoded_len(&source.decoded, flate_level)?;
-        after += crate::stream_codec::flate_encoded_len(&content, flate_level)?;
-        rewritten.push(Some(content));
+        before += reuse.page_len(doc, source.page, &source.decoded, flate_level)?;
+        let encoded = crate::stream_codec::encode_flate(&content, flate_level)?;
+        after += encoded.len();
+        rewritten.push(Some((content, encoded)));
         affected_pages += 1;
     }
-    let fonts_overhead = outlined_glyph_estimated_after_flate(b"", &plans, flate_level)?
-        .saturating_sub(crate::stream_codec::flate_encoded_len(b"", flate_level)?);
+    let (fonts_overhead, glyph_encodings) = prepare_glyph_encodings(&plans, flate_level)?;
     after = after.saturating_add(fonts_overhead);
 
     // Processing values OCR-ready reusable outlines, not only compressed size.
@@ -992,8 +992,8 @@ pub(super) fn factor(
     }
 
     let mut bindings = Vec::new();
-    for (plan, users) in plans.iter().zip(&font_pages) {
-        let font = outlined_glyph_font_dictionary(doc, plan);
+    for ((plan, users), encoded) in plans.iter().zip(&font_pages).zip(glyph_encodings) {
+        let font = outlined_glyph_font_dictionary(doc, plan, encoded, flate_level, reuse);
         bindings.extend(
             users
                 .iter()
@@ -1002,9 +1002,9 @@ pub(super) fn factor(
     }
     install_page_resource_bindings(doc, b"Font", bindings)?;
     for (source, content) in sources.iter().zip(rewritten) {
-        if let Some(content) = content {
+        if let Some((content, encoded)) = content {
             stats.decoded_bytes_removed += source.decoded.len().saturating_sub(content.len());
-            replace_page_content(doc, source.page, content)?;
+            reuse.install_page(doc, source.page, content, encoded, flate_level)?;
         }
     }
     stats.pages_rewritten = affected_pages;
@@ -1341,6 +1341,7 @@ mod tests {
             &pages,
             crate::FlateLevel::PROCESSING,
             Some(&mut catalog),
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
         assert_eq!(stats.pages_rewritten, 1, "{stats:?}");
         assert_eq!(catalog.schema_version, 2);

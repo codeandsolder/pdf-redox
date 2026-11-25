@@ -10,9 +10,7 @@
 
 use crate::content::page_content_if_present;
 use crate::{
-    EditDocument, Result,
-    content::{page_user_unit, replace_page_content},
-    content_stream::instruction_number_array,
+    EditDocument, Result, content::page_user_unit, content_stream::instruction_number_array,
     geometry::Matrix,
 };
 
@@ -413,6 +411,7 @@ pub fn simplify_page_polylines(
     document: &mut EditDocument,
     pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<PolylineSimplificationStats> {
     let mut stats = PolylineSimplificationStats::default();
     for &page in pages {
@@ -434,18 +433,19 @@ pub fn simplify_page_polylines(
         else {
             continue;
         };
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
         let Some(budget) = before_flate.checked_sub(MIN_FLATE_SAVINGS_BYTES) else {
             continue;
         };
-        let Some(after_flate) =
-            crate::stream_codec::flate_capped_encoded_len(&simplified, budget, flate_level)?
+        let Some(encoded) =
+            crate::stream_codec::encode_flate_capped(&simplified, budget, flate_level)?
         else {
             continue;
         };
+        let after_flate = encoded.len();
         let savings = before_flate - after_flate;
         let removed_bytes = decoded.len().saturating_sub(simplified.len());
-        replace_page_content(document, page, simplified)?;
+        reuse.install_page(document, page, simplified, encoded, flate_level)?;
         stats.pages_rewritten = stats.pages_rewritten.saturating_add(1);
         stats.vertices_removed = stats.vertices_removed.saturating_add(vertices_removed);
         stats.cubics_simplified = stats.cubics_simplified.saturating_add(cubics_simplified);

@@ -10,10 +10,7 @@
 use crate::content::page_content_if_present;
 use crate::content_stream::trivia_only;
 
-use crate::{
-    EditDocument, OptimizationGoal, Result,
-    content::{PageRewriteResult, replace_page_content},
-};
+use crate::{EditDocument, OptimizationGoal, Result, content::PageRewriteResult};
 
 const MIN_CLIP_PREFIX_BYTES: usize = 4 * 1024;
 const MIN_RUN_BLOCKS: usize = 2;
@@ -388,6 +385,7 @@ pub fn hoist_repeated_clip_prefixes(
     pages: &[crate::ObjectHandle],
     flate_level: crate::FlateLevel,
     goal: OptimizationGoal,
+    reuse: &mut crate::flate::FlateReuseCache,
 ) -> Result<PageRewriteResult<RepeatedClipStats>> {
     let mut result: PageRewriteResult<RepeatedClipStats> = PageRewriteResult::default();
     for &page in pages {
@@ -423,17 +421,18 @@ pub fn hoist_repeated_clip_prefixes(
         else {
             continue;
         };
-        let before_flate = crate::stream_codec::flate_encoded_len(&decoded, flate_level)?;
+        let before_flate = reuse.page_len(document, page, &decoded, flate_level)?;
         let Some(budget) = clip_rewrite_budget(before_flate, goal) else {
             continue;
         };
-        let Some(after_flate) =
-            crate::stream_codec::flate_capped_encoded_len(&rewritten, budget, flate_level)?
+        let Some(encoded) =
+            crate::stream_codec::encode_flate_capped(&rewritten, budget, flate_level)?
         else {
             continue;
         };
 
-        replace_page_content(document, page, rewritten)?;
+        let after_flate = encoded.len();
+        reuse.install_page(document, page, rewritten, encoded, flate_level)?;
         result.stats.pages_rewritten = result.stats.pages_rewritten.saturating_add(1);
         result.rewritten_pages.insert(page);
         result.stats.runs_hoisted = result.stats.runs_hoisted.saturating_add(run_count);
@@ -573,6 +572,7 @@ mod tests {
             &pages,
             crate::FlateLevel::PROCESSING,
             OptimizationGoal::Processing,
+            &mut crate::flate::FlateReuseCache::default(),
         )?;
 
         assert_eq!(result.stats.pages_rewritten, 1);

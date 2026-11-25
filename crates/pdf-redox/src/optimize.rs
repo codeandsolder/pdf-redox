@@ -733,6 +733,7 @@ struct OptimizationRunStats {
     stroke_forms: StrokeFormFactorStats,
     polyline_simplification: PolylineSimplificationStats,
     resource_prune: crate::prune::ResourcePruneStats,
+    microstroke_raster: MicrostrokeRasterStats,
     flate: crate::flate::FlateOptimizationStats,
     flate_batch: crate::FlateBatchStats,
     page_content_dedup: crate::dedup::TargetedDedupStats,
@@ -905,6 +906,7 @@ fn run_vector_optimization_phase(
     catalog: Option<&mut GlyphCatalog>,
 ) -> Result<VectorPhaseResult> {
     let flate_level = cfg.optimization_goal.flate_level();
+    let mut flate_reuse_cache = FlateReuseCache::default();
     let PageRewriteResult {
         stats: repeated_clips,
         rewritten_pages: repeated_clip_rewritten_pages,
@@ -912,12 +914,17 @@ fn run_vector_optimization_phase(
         // The clip/body rewrite is exact in either mode. Size requires a
         // strictly smaller encoded stream; Processing also accepts equal-sized
         // rewrites when they eliminate redundant clipping work.
-        hoist_repeated_clip_prefixes(document, pages, flate_level, cfg.optimization_goal)
+        hoist_repeated_clip_prefixes(
+            document,
+            pages,
+            flate_level,
+            cfg.optimization_goal,
+            &mut flate_reuse_cache,
+        )
     })?;
     // Clip hoisting changes page operators, but not their resource references.
     evidence.after_page_rewrite(&repeated_clip_rewritten_pages, false);
 
-    let mut flate_reuse_cache = FlateReuseCache::default();
     let mut vector_compaction = timed(timings, "vector-compaction", || {
         let raster_proved_no_vector_candidate = cfg.optimization_goal
             != crate::OptimizationGoal::Processing
@@ -959,7 +966,7 @@ fn run_vector_optimization_phase(
 
     let marked_content = timed(timings, "marked-content-coalesce", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            coalesce_optional_content(document, pages, flate_level)
+            coalesce_optional_content(document, pages, flate_level, &mut flate_reuse_cache)
         } else {
             Ok(MarkedContentCoalesceStats::default())
         }
@@ -967,7 +974,7 @@ fn run_vector_optimization_phase(
 
     let collinear_paths = timed(timings, "collinear-path-compact", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            compact_collinear_paths(document, pages, flate_level)
+            compact_collinear_paths(document, pages, flate_level, &mut flate_reuse_cache)
         } else {
             Ok(CollinearPathStats::default())
         }
@@ -975,7 +982,13 @@ fn run_vector_optimization_phase(
 
     let outlined_glyphs = timed(timings, "outlined-glyph-factor", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            factor_outlined_glyphs(document, pages, flate_level, catalog)
+            factor_outlined_glyphs(
+                document,
+                pages,
+                flate_level,
+                catalog,
+                &mut flate_reuse_cache,
+            )
         } else {
             Ok(OutlinedGlyphFactorStats::default())
         }
@@ -1002,7 +1015,7 @@ fn run_vector_optimization_phase(
 
     let polyline_simplification = timed(timings, "polyline-simplify", || {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
-            simplify_page_polylines(document, pages, flate_level)
+            simplify_page_polylines(document, pages, flate_level, &mut flate_reuse_cache)
         } else {
             Ok(PolylineSimplificationStats::default())
         }
@@ -1021,8 +1034,7 @@ fn run_vector_optimization_phase(
     })
 }
 
-/// Late mutations must stay in this order: prune resources, establish Flate
-/// policy, canonicalize page content/graph, compress
+/// Late mutations prune resources, normalize and compact the graph, then encode
 /// remaining raw streams, remove safe CID `CMaps`, and serialize.
 #[derive(Clone, Copy)]
 struct FinalizationContext<'a> {
@@ -1072,42 +1084,21 @@ fn finalize_document(
     let flate_encoder = timed(timings, "flate-executor-init", || {
         session.flate_encoder().map(FlateBatchEncoder::for_document)
     })?;
-    let flate = timed(timings, "flate-policy", || {
-        optimize_flate_streams_with_cache(
-            document,
-            flate_level,
-            &mut flate_reuse_cache,
-            &flate_encoder,
-        )
-    })?;
     timed(timings, "content-normalize", || -> Result<()> {
         if cfg.optimization_goal == crate::OptimizationGoal::Processing {
             normalize_page_contents(document, pages)?;
         }
         Ok(())
     })?;
-    // Content streams are canonicalized only after every pass that can mutate
-    // them, including lexical normalization.
-    let page_content_dedup = timed(timings, "page-content-dedup", || {
+    let mut page_content_dedup = timed(timings, "page-content-dedup-pre", || {
         canonicalize_page_contents(document, pages)
     })?;
     let structure_compaction = timed(timings, "structure-compaction", || {
         compact_structure(document)
     })?;
 
-    // Match the historical writer's StreamDataMode::Compress policy explicitly
-    // before handing the graph to the deliberately-simple fresh writer.
-    let unfiltered_flate = timed(timings, "compress-unfiltered", || {
-        compress_unfiltered_streams(
-            document,
-            flate_level,
-            &mut flate_reuse_cache,
-            &flate_encoder,
-        )
-    })?;
-    // Cmap removal is deliberately the final graph transform. By this point
-    // resource pruning has removed dead fonts and Flate policy has established
-    // the stream bytes against which the rewrite's actual size win is gated.
+    // Usage-dependent cmap stripping runs on the final live graph, before
+    // the final encoding pass so obsolete font bytes are not recompressed.
     let cid_cmap_possible = !cfg.preservation.font_editing_support
         && (before.font_opportunity_inventory_version < 1
             || !cid_cmap_source_inventory_still_valid
@@ -1121,6 +1112,32 @@ fn finalize_document(
         timings.insert("font-cid-cmap-strip".to_owned(), 0.0);
         FontOptimizationStats::default()
     };
+    let flate = timed(timings, "flate-policy", || {
+        optimize_flate_streams_with_cache(
+            document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
+    })?;
+    // Match the historical writer's StreamDataMode::Compress policy explicitly
+    // before handing the graph to the deliberately-simple fresh writer.
+    let unfiltered_flate = timed(timings, "compress-unfiltered", || {
+        compress_unfiltered_streams(
+            document,
+            flate_level,
+            &mut flate_reuse_cache,
+            &flate_encoder,
+        )
+    })?;
+    // Canonical encodings can converge even when the original bytes differed.
+    // The prepass already eliminated byte-identical content before encoding.
+    let final_dedup = timed(timings, "page-content-dedup", || {
+        canonicalize_page_contents(document, pages)
+    })?;
+    page_content_dedup.duplicate_streams_detected += final_dedup.duplicate_streams_detected;
+    page_content_dedup.duplicate_raw_bytes += final_dedup.duplicate_raw_bytes;
+    page_content_dedup.references_canonicalized += final_dedup.references_canonicalized;
     let output = timed(timings, "writer", || {
         crate::writer::write_pdf_with_object_streams(document, flate_level)
     })?;
