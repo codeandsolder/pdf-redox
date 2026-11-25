@@ -2686,20 +2686,20 @@ fn prepare_outline_subset(
         } else {
             0
         };
-        let Ok(encoded) = encode_flate(&subset, flate_level) else {
+        let limit = best
+            .as_ref()
+            .map_or(raw_len, |best| best.encoded.len())
+            .saturating_sub(1);
+        let Ok(Some(encoded)) =
+            crate::stream_codec::encode_flate_capped(&subset, limit, flate_level)
+        else {
             continue;
         };
-        if encoded.len() < raw_len
-            && best
-                .as_ref()
-                .is_none_or(|best| encoded.len() < best.encoded.len())
-        {
-            best = Some(PreparedOutlineSubset {
-                encoded,
-                glyph_bytes_removed,
-                table_bytes_removed,
-            });
-        }
+        best = Some(PreparedOutlineSubset {
+            encoded,
+            glyph_bytes_removed,
+            table_bytes_removed,
+        });
     }
     best
 }

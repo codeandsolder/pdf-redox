@@ -13,10 +13,10 @@ use fast_image_resize::{
 };
 use libjpeg_turbo_rs::{
     Encoder, PixelFormat, Subsampling,
+    decode::marker::MarkerReader,
     encode::tables::{
         STD_CHROMINANCE_QUANT_TABLE, STD_LUMINANCE_QUANT_TABLE, quality_scale_quant_table,
     },
-    read_coefficients,
 };
 use num_traits::ToPrimitive;
 use std::{
@@ -1148,12 +1148,13 @@ fn direct_jpeg_is_strictly_finer_than_target(
     if !matches!(expected_components, 1 | 3) {
         return false;
     }
-    let Ok(coefficients) = read_coefficients(encoded) else {
+    // The old predicate entropy-decoded every coefficient merely to
+    // inspect the quantization tables. The codec's complete marker scan
+    // provides the identical frame/table metadata without coefficient buffers.
+    let Ok(metadata) = MarkerReader::new(encoded).read_markers() else {
         return false;
     };
-    if coefficients.effective_precision() != 8
-        || coefficients.components.len() != expected_components
-    {
+    if metadata.frame.precision != 8 || metadata.frame.components.len() != expected_components {
         return false;
     }
 
@@ -1162,10 +1163,11 @@ fn direct_jpeg_is_strictly_finer_than_target(
     let target_chroma =
         quality_scale_quant_table(&STD_CHROMINANCE_QUANT_TABLE, target_quality.clamp(1, 100));
     let mut strictly_finer = false;
-    for (component_index, component) in coefficients.components.iter().enumerate() {
-        let Some(source) = coefficients
+    for (component_index, component) in metadata.frame.components.iter().enumerate() {
+        let Some(source) = metadata
             .quant_tables
             .get(usize::from(component.quant_table_index))
+            .and_then(Option::as_ref)
         else {
             return false;
         };
@@ -1174,7 +1176,7 @@ fn direct_jpeg_is_strictly_finer_than_target(
         } else {
             &target_chroma
         };
-        for (&source_value, &target_value) in source.iter().zip(target.iter()) {
+        for (&source_value, &target_value) in source.values.iter().zip(target.iter()) {
             if source_value > target_value {
                 return false;
             }
