@@ -44,6 +44,17 @@ Native formatting, strict Clippy, workspace tests, Rustdoc, and the `wasm32-unkn
 
 Extending Print beyond the deliberately conservative simple JPEG/Flate Gray/RGB subset remains active optimization work. A corpus-wide scan found that almost all other oversampled non-JPEG images are bilevel, Indexed, masked, or otherwise semantically unsuitable for the current path, and found no safe Form-local-only Print candidates, so broad raster classification and Form-branch cloning are intentionally deferred. Resource pruning runs by invariant after namespace-qualified usage analysis; malformed or incompletely analyzed scopes are preserved conservatively rather than guessed at.
 
+## Experimental GPU Flate
+
+Build the native optimizer with Vulkan-assisted Deflate enabled:
+
+```sh
+cargo build --release -p pdf-redox-cli --bin pdf-redox --features gpu
+pdf-redox input.pdf --output output.pdf --optimize-for size --flate-gpu-budget 512
+```
+
+GPU matching is explicitly opt-in. The final Flate recompression and unfiltered-stream compression passes share one lazily initialized GPU context per document. Streams smaller than 1 MiB remain on the CPU by default; adjust that threshold with `--flate-gpu-min-stream-bytes`, or choose an adapter with `--flate-gpu-adapter NVIDIA`. The search budget controls the maximum number of predecessor candidates visited per byte, not the compression level. GPU and CPU encodings can differ while decoding to identical bytes, and the usual output-size acceptance limits remain in force. Size optimization (level 9) on large streams is the intended starting point; lower levels and small streams may be faster on the CPU. Other compression probes still use the CPU. Native builds without the feature and the WASM UI retain their existing CPU paths.
+
 ## Documentation scope
 
 Repository documentation is limited to material that should version with the code: user/developer behavior, build and test instructions, APIs, and provenance for vendored modifications. Architecture research, validation chronicles, benchmark history, development handoffs, infrastructure paths, and transient project state are maintained in the project Notion workspace instead.

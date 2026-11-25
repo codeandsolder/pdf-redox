@@ -486,6 +486,12 @@ fn micros_to_millis(micros: u64) -> f64 {
 }
 
 fn validate_config(cfg: &Config) -> Result<()> {
+    #[cfg(not(all(feature = "gpu", not(target_family = "wasm"))))]
+    if cfg.flate_gpu.is_some() {
+        return Err(crate::Error::Invalid(
+            "GPU Flate requires a native build with the gpu feature".to_owned(),
+        ));
+    }
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
         let effective_target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
         if effective_target_ppi == 0 {
