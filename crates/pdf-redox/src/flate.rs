@@ -44,7 +44,7 @@ impl FlateBatchLimits {
 
     // Compact borrowed source bytes need no aggregate input reservation.
     // The owned snapshot budget remains, and decoded buffers are worker-local.
-    const FILTERED: Self = Self {
+    const DETACHED: Self = Self {
         max_input_bytes: Self::DEFAULT.max_input_bytes,
         max_streams: usize::MAX,
     };
@@ -278,91 +278,68 @@ fn collect_unfiltered_candidate(
     }))
 }
 
-fn batch_missing_baselines(
-    document: &crate::EditDocument,
-    candidates: &mut [UnfilteredFlateCandidate],
-    level: crate::FlateLevel,
-    batcher: &FlateBatchEncoder,
-) -> Result<()> {
-    let indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| candidate.encoded.is_none().then_some(index))
-        .collect::<Vec<_>>();
-    let outputs = {
-        // These Cows borrow ordinary streams from SourcePdf. Keep any
-        // decryption-owned buffers alive for the full compression batch.
-        let raw_buffers = indices
-            .iter()
-            .map(|&index| candidates[index].raw_bytes(document))
-            .collect::<Result<Vec<_>>>()?;
-        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        // A new /Filter costs 21 bytes, and an equal-size rewrite is useless.
-        // No encoding longer than raw_len - 22 can ever be selected.
-        let limits = indices
-            .iter()
-            .map(|&index| {
-                candidates[index]
-                    .raw_len
-                    .saturating_sub(NEW_FLATE_FILTER_BYTES + 1)
-            })
-            .collect::<Vec<_>>();
-        batcher.encode_many_capped(&inputs, &limits, level)?
-    };
-    for (index, bytes) in indices.into_iter().zip(outputs) {
-        candidates[index].encoded = bytes.map(AdaptiveFlateEncoding::baseline);
-    }
-    Ok(())
+struct UnfilteredJob<'a> {
+    raw: std::borrow::Cow<'a, [u8]>,
+    result: Result<Option<AdaptiveFlateEncoding>>,
 }
 
-fn batch_high_effort_candidates(
-    document: &crate::EditDocument,
-    candidates: &mut [UnfilteredFlateCandidate],
-    level: crate::FlateLevel,
-    batcher: &FlateBatchEncoder,
-) -> Result<()> {
-    let indices = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            let encoded = candidate.encoded.as_ref()?;
-            should_test_high_effort(candidate.raw_len, level, encoded.bytes.len(), true)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let outputs = {
-        let raw_buffers = indices
-            .iter()
-            .map(|&index| candidates[index].raw_bytes(document))
-            .collect::<Result<Vec<_>>>()?;
-        let inputs = raw_buffers.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        // High effort is selected only if its result is strictly smaller
-        // than baseline. Cap the buffer at baseline_len - 1.
-        let limits = indices
-            .iter()
-            .map(|&index| {
-                candidates[index]
-                    .encoded
-                    .as_ref()
-                    .map_or(0, |encoded| encoded.bytes.len().saturating_sub(1))
-            })
-            .collect::<Vec<_>>();
-        batcher.encode_many_capped(&inputs, &limits, crate::FlateLevel::SIZE)?
-    };
-    for (index, bytes) in indices.into_iter().zip(outputs) {
-        if let Some(encoded) = &mut candidates[index].encoded {
-            encoded.consider_high_effort(bytes);
+impl UnfilteredJob<'_> {
+    fn run(
+        &mut self,
+        level: crate::FlateLevel,
+        batcher: &FlateBatchEncoder,
+    ) -> Result<Option<AdaptiveFlateEncoding>> {
+        let baseline = std::mem::replace(&mut self.result, Ok(None))?;
+        let mut baseline = if let Some(baseline) = baseline {
+            baseline
+        } else {
+            let limit = self.raw.len().saturating_sub(NEW_FLATE_FILTER_BYTES + 1);
+            let mut output = batcher.encode_many_capped(&[&self.raw], &[limit], level)?;
+            let Some(bytes) = output.pop().flatten() else {
+                return Ok(None);
+            };
+            AdaptiveFlateEncoding::baseline(bytes)
+        };
+        // A high-effort candidate can only improve on the baseline, so
+        // perform it immediately without waiting for every other stream.
+        if should_test_high_effort(self.raw.len(), level, baseline.bytes.len(), true) {
+            let limit = baseline.bytes.len().saturating_sub(1);
+            let mut output =
+                batcher.encode_many_capped(&[&self.raw], &[limit], crate::FlateLevel::SIZE)?;
+            baseline.consider_high_effort(output.pop().flatten());
         }
+        Ok(Some(baseline))
     }
-    Ok(())
 }
 
-// ceil(raw_len * percent / 100), split to avoid overflowing usize
-// for large inputs. The same bound is used for admission and allocation.
-fn minimum_flate_savings(raw_len: usize) -> usize {
-    let proportional = (raw_len / 100) * MIN_FLATE_SAVINGS_PERCENT
-        + ((raw_len % 100) * MIN_FLATE_SAVINGS_PERCENT).div_ceil(100);
-    MIN_FLATE_SAVINGS_BYTES.max(proportional)
+fn run_unfiltered_jobs(
+    document: &crate::EditDocument,
+    candidates: &mut [UnfilteredFlateCandidate],
+    level: crate::FlateLevel,
+    batcher: &FlateBatchEncoder,
+) -> Result<()> {
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.raw_len));
+    let results = {
+        let mut jobs = candidates
+            .iter_mut()
+            .map(|candidate| {
+                let baseline = candidate.encoded.take();
+                Ok(UnfilteredJob {
+                    raw: candidate.raw_bytes(document)?,
+                    result: Ok(baseline),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        batcher.for_each(&mut jobs, |job| job.result = job.run(level, batcher));
+        jobs.into_iter()
+            .map(|job| job.result)
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (candidate, result) in candidates.iter_mut().zip(results) {
+        candidate.encoded = result;
+    }
+    candidates.sort_by_key(|candidate| candidate.handle);
+    Ok(())
 }
 
 fn has_special_stream_type(
@@ -639,7 +616,7 @@ pub fn optimize_flate_streams_with_cache(
         level,
         reuse_cache,
         batcher,
-        FlateBatchLimits::FILTERED,
+        FlateBatchLimits::DETACHED,
     )
 }
 
@@ -653,8 +630,7 @@ fn flush_unfiltered_batch(
     if candidates.is_empty() {
         return Ok(());
     }
-    batch_missing_baselines(document, candidates, level, batcher)?;
-    batch_high_effort_candidates(document, candidates, level, batcher)?;
+    run_unfiltered_jobs(document, candidates, level, batcher)?;
 
     for candidate in candidates.drain(..) {
         let Some(encoded) = candidate.encoded else {
@@ -699,9 +675,9 @@ fn compress_unfiltered_streams_bounded(
     batcher: &FlateBatchEncoder,
     limits: FlateBatchLimits,
 ) -> Result<FlateOptimizationStats> {
-    // Preserve cached exact size-mode encodings and process the remaining
-    // streams in bounded groups, rather than holding all source and output
-    // buffers in memory until the final rewrite.
+    // Borrow ordinary raw streams for the whole-file queue. Only owned
+    // decryption snapshots count toward the staging budget; each worker
+    // finishes its baseline and optional high-effort encode before advancing.
     let mut candidates = Vec::new();
     let mut staged_bytes = 0_usize;
     let mut stats = FlateOptimizationStats::default();
@@ -710,7 +686,9 @@ fn compress_unfiltered_streams_bounded(
         else {
             continue;
         };
-        staged_bytes = staged_bytes.saturating_add(candidate.raw_len);
+        if let UnfilteredFlateInput::Decrypted(bytes) = &candidate.raw {
+            staged_bytes = staged_bytes.saturating_add(bytes.capacity());
+        }
         candidates.push(candidate);
         if limits.full(candidates.len(), staged_bytes) {
             flush_unfiltered_batch(document, &mut candidates, level, batcher, &mut stats)?;
@@ -732,7 +710,7 @@ pub fn compress_unfiltered_streams(
         level,
         reuse_cache,
         batcher,
-        FlateBatchLimits::DEFAULT,
+        FlateBatchLimits::DETACHED,
     )
 }
 
