@@ -376,7 +376,8 @@ impl FlateBatchEncoder {
             let (gpu_indices, mut gpu_jobs): (Vec<_>, Vec<_>) = gpu_jobs.into_iter().unzip();
             let cpu_results = self.compress_cpu(&mut cpu_jobs, config);
             self.record_jobs(&gpu_jobs, true);
-            let gpu_results = match (self.compressor.as_deref(), gpu.config.match_window_bytes) {
+            let mut gpu_results = match (self.compressor.as_deref(), gpu.config.match_window_bytes)
+            {
                 (Some(pool), Some(window)) => pool.compress_gpu_windowed(
                     &mut gpu_jobs,
                     config,
@@ -402,6 +403,9 @@ impl FlateBatchEncoder {
                 ),
             }
             .map_err(|error| Error::Compression(format!("GPU Flate search: {error}")))?;
+            if gpu.config.retry_rejected {
+                self.retry_rejected_gpu_jobs(gpu_jobs, &mut gpu_results, config);
+            }
             let mut results = vec![
                 zlib_rs::BatchCompressResult {
                     written: 0,
@@ -419,6 +423,38 @@ impl FlateBatchEncoder {
             return Ok(results);
         }
         Ok(self.compress_cpu(&mut jobs, config))
+    }
+
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+    fn retry_rejected_gpu_jobs(
+        &self,
+        jobs: Vec<zlib_rs::BatchJob<'_>>,
+        results: &mut [zlib_rs::BatchCompressResult],
+        config: zlib_rs::DeflateConfig,
+    ) {
+        let (indices, mut retry_jobs): (Vec<_>, Vec<_>) = jobs
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| results[*index].code == zlib_rs::ReturnCode::BufError)
+            .unzip();
+        if retry_jobs.is_empty() {
+            return;
+        }
+        let retries = self.compress_cpu(&mut retry_jobs, config);
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().unwrap_or_else(PoisonError::into_inner);
+            stats.gpu_rejected_cpu_retries =
+                stats.gpu_rejected_cpu_retries.saturating_add(retries.len());
+            stats.gpu_rejected_cpu_accepted = stats.gpu_rejected_cpu_accepted.saturating_add(
+                retries
+                    .iter()
+                    .filter(|result| result.code == zlib_rs::ReturnCode::Ok)
+                    .count(),
+            );
+        }
+        for (index, result) in indices.into_iter().zip(retries) {
+            results[index] = result;
+        }
     }
 
     // Encode directly into bounded outputs. A failed cap is a normal rejection
@@ -748,6 +784,58 @@ mod tests {
 
     #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
     #[test]
+    fn cpu_retry_replaces_only_gpu_cap_rejections() -> Result<()> {
+        let encoder = FlateBatchEncoder::new(std::num::NonZeroUsize::MIN)?.for_document();
+        let input = b"repeatable GPU test input ".repeat(2048);
+        let expected = encode_flate(&input, crate::FlateLevel::SIZE)?;
+        let mut outputs = [vec![42], vec![0], vec![0], vec![43]];
+        let mut results = [
+            zlib_rs::BatchCompressResult {
+                written: 1,
+                code: zlib_rs::ReturnCode::Ok,
+            },
+            zlib_rs::BatchCompressResult {
+                written: 1,
+                code: zlib_rs::ReturnCode::BufError,
+            },
+            zlib_rs::BatchCompressResult {
+                written: 1,
+                code: zlib_rs::ReturnCode::BufError,
+            },
+            zlib_rs::BatchCompressResult {
+                written: 1,
+                code: zlib_rs::ReturnCode::StreamError,
+            },
+        ];
+        let jobs = outputs
+            .iter_mut()
+            .zip([
+                expected.len(),
+                expected.len(),
+                expected.len() - 1,
+                expected.len(),
+            ])
+            .map(|(output, cap)| {
+                zlib_rs::BatchJob::with_vec(&input, output, cap)
+                    .map_err(|error| Error::Compression(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        encoder.retry_rejected_gpu_jobs(jobs, &mut results, flate_config(crate::FlateLevel::SIZE));
+        assert_eq!(outputs[0], [42]);
+        assert_eq!(outputs[1], expected);
+        assert_eq!(outputs[3], [43]);
+        assert_eq!(results[0].code, zlib_rs::ReturnCode::Ok);
+        assert_eq!(results[1].code, zlib_rs::ReturnCode::Ok);
+        assert_eq!(results[2].code, zlib_rs::ReturnCode::BufError);
+        assert_eq!(results[3].code, zlib_rs::ReturnCode::StreamError);
+        assert_eq!(encoder.stats().cpu.streams, 2);
+        assert_eq!(encoder.stats().gpu_rejected_cpu_retries, 2);
+        assert_eq!(encoder.stats().gpu_rejected_cpu_accepted, 1);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "gpu", not(target_family = "wasm")))]
+    #[test]
     #[ignore = "requires a Vulkan adapter"]
     fn gpu_batch_preserves_order_caps_and_decoded_bytes() -> Result<()> {
         let mut config = crate::Config {
@@ -757,6 +845,7 @@ mod tests {
                     .ok_or_else(|| Error::Invalid("zero budget".into()))?,
                 min_stream_bytes: 1024,
                 match_window_bytes: None,
+                retry_rejected: false,
             }),
             ..crate::Config::default()
         };
@@ -842,6 +931,7 @@ mod tests {
                 search_budget: std::num::NonZeroU32::MIN,
                 min_stream_bytes: 0,
                 match_window_bytes: None,
+                retry_rejected: false,
             }),
             ..crate::Config::default()
         };

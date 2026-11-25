@@ -139,6 +139,9 @@ struct Args {
     /// Resolve GPU matches on demand in windows of this many decoded bytes.
     #[arg(long, requires = "flate_gpu_budget")]
     flate_gpu_window_bytes: Option<NonZeroUsize>,
+    /// Retry GPU cap rejections on the CPU to retain compression opportunities.
+    #[arg(long, requires = "flate_gpu_budget")]
+    flate_gpu_retry_rejected: bool,
     /// Rasterize pathological fields of hundreds of tiny opaque vector strokes.
     /// Enabled automatically by Perceptual/Print profiles and the Processing objective.
     #[arg(long, conflicts_with = "keep_excessive_small_vectors")]
@@ -220,6 +223,7 @@ fn configure_flate(cfg: &mut Config, args: &Args) {
             search_budget,
             min_stream_bytes: args.flate_gpu_min_stream_bytes.unwrap_or(1024 * 1024),
             match_window_bytes: args.flate_gpu_window_bytes,
+            retry_rejected: args.flate_gpu_retry_rejected,
         });
 }
 
@@ -559,11 +563,13 @@ mod tests {
             "NVIDIA",
             "--flate-gpu-min-stream-bytes",
             "4096",
+            "--flate-gpu-retry-rejected",
         ])?;
         let gpu = config_from_args(&args).flate_gpu;
         assert!(gpu.is_some_and(|gpu| gpu.search_budget.get() == 32
             && gpu.adapter.as_deref() == Some("NVIDIA")
-            && gpu.min_stream_bytes == 4096));
+            && gpu.min_stream_bytes == 4096
+            && gpu.retry_rejected));
         assert!(
             Args::try_parse_from(["pdf-redox", "input.pdf", "--flate-gpu-budget", "0"]).is_err()
         );

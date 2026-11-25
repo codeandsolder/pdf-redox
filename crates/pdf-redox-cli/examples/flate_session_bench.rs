@@ -22,6 +22,8 @@ struct Args {
     #[arg(long)]
     window_bytes: Option<NonZeroUsize>,
     #[arg(long)]
+    retry_rejected: bool,
+    #[arg(long)]
     adapter: Option<String>,
     #[arg(long, default_value = "2")]
     rounds: NonZeroUsize,
@@ -88,6 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             search_budget: args.budget,
             min_stream_bytes: args.min_stream_bytes,
             match_window_bytes: args.window_bytes,
+            retry_rejected: args.retry_rejected,
         }),
         ..cpu_config.clone()
     };

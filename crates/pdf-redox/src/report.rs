@@ -521,6 +521,10 @@ pub struct FlateBatchStats {
     pub cpu: FlateBatchWork,
     /// Work routed to the GPU-assisted matcher (which may locally resolve cheap matches).
     pub gpu_assisted: FlateBatchWork,
+    /// CPU retries of GPU output-cap rejections, also included in CPU work.
+    pub gpu_rejected_cpu_retries: usize,
+    /// Rejected GPU attempts that the CPU subsequently admitted.
+    pub gpu_rejected_cpu_accepted: usize,
     /// Actual Vulkan context initialization time charged to this document, if any.
     pub gpu_initialization_ms: f64,
 }
