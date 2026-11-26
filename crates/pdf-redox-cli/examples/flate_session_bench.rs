@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pdf_redox::{Config, FlateGpuConfig, OptimizationSession, SourcePdf};
 use serde_json::json;
 use std::{
@@ -9,10 +9,23 @@ use std::{
     time::Instant,
 };
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Profile {
+    Optimize,
+    Perceptual,
+    Print,
+}
+
 #[derive(Parser)]
 struct Args {
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "optimize")]
+    profile: Profile,
+    #[arg(long)]
+    processing: bool,
+    #[arg(long)]
+    target_ppi: Option<u16>,
     #[arg(long, default_value = "4")]
     workers: NonZeroUsize,
     #[arg(long, default_value = "512")]
@@ -73,6 +86,15 @@ fn measure(
             "pages": page_count,
             "flate_selected": report.flate_streams_selected_for_recompression,
             "flate_batch": report.flate_batch,
+            "raster_images_transcoded": report.raster_images_transcoded,
+            "raster_images_resized": report.raster_images_resized,
+            "raster_original_encoded_bytes": report.raster_original_encoded_bytes,
+            "raster_optimized_encoded_bytes": report.raster_optimized_encoded_bytes,
+            "raster_original_pixels": report.raster_original_pixels,
+            "raster_optimized_pixels": report.raster_optimized_pixels,
+            "print_downsample_candidates": report.print_downsample_candidates,
+            "print_jpeg_resize_candidates": report.print_existing_jpeg_resize_candidates,
+            "print_flate_resize_candidates": report.print_flate_resize_candidates,
             "stages_ms": report.stage_timings_ms,
         })
     );
@@ -84,10 +106,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
     }
-    let cpu_config = Config {
-        flate_workers: args.workers,
-        ..Config::optimize_only()
+    let mut cpu_config = match args.profile {
+        Profile::Optimize => Config::optimize_only(),
+        Profile::Perceptual => Config::perceptual(),
+        Profile::Print => Config::print(),
     };
+    if args.processing {
+        cpu_config = cpu_config.for_processing();
+    }
+    if let Some(ppi) = args.target_ppi {
+        cpu_config.max_image_ppi = Some(ppi);
+    }
+    cpu_config.flate_workers = args.workers;
     let gpu_config = Config {
         flate_gpu: Some(FlateGpuConfig {
             adapter: args.adapter,
