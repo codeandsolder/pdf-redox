@@ -3,8 +3,8 @@ use crate::images::ImageResizeTarget;
 use crate::{
     Result,
     content::{
-        object_subtype, page_content, page_user_unit, page_xobject_bindings, resolved_number,
-        resolved_number_array, resource_xobject_bindings,
+        object_subtype, page_content, page_user_unit, page_xobject_bindings, resolved_number_array,
+        resolved_number_value, resource_xobject_bindings,
     },
 };
 use num_traits::ToPrimitive;
@@ -27,11 +27,11 @@ impl ImagePlacement {
     pub fn target_dimensions(self, target_ppi: u32) -> (u32, u32) {
         fn target_axis(points: f64, pixels: u32, target_ppi: u32) -> u32 {
             let desired = (points * f64::from(target_ppi) / 72.0).ceil();
-            if !desired.is_finite() || desired <= 1.0 {
-                return 1.min(pixels);
-            }
-            if desired >= f64::from(pixels) {
+            if !desired.is_finite() || desired >= f64::from(pixels) {
                 return pixels;
+            }
+            if desired <= 1.0 {
+                return 1.min(pixels);
             }
             desired.to_u32().unwrap_or(pixels)
         }
@@ -154,26 +154,33 @@ impl CowPlacementScanner {
 fn cow_form_matrix(
     document: &crate::EditDocument,
     value: Option<crate::source::CurrentValue<'_>>,
-) -> Result<Matrix> {
+) -> Result<Option<Matrix>> {
     let Some(value) = value else {
-        return Ok(Matrix::default());
+        return Ok(Some(Matrix::default()));
     };
     let Some(values) = resolved_number_array::<6>(document, value)? else {
-        return Ok(Matrix::default());
+        return Ok(None);
     };
-    Ok(Matrix::new(
-        values[0], values[1], values[2], values[3], values[4], values[5],
-    ))
+    Ok(values
+        .into_iter()
+        .all(f64::is_finite)
+        .then(|| Matrix::from(values)))
 }
 
 fn cow_image_dimensions(
     document: &crate::EditDocument,
-    dictionary: &crate::OwnedDictionary,
+    object: &crate::source::CurrentValue<'_>,
 ) -> Result<Option<(u32, u32)>> {
-    let Some(width) = resolved_number(document, dictionary.get(b"Width".as_slice()))? else {
+    let Some(width) = object.dictionary_entry(b"Width") else {
         return Ok(None);
     };
-    let Some(height) = resolved_number(document, dictionary.get(b"Height".as_slice()))? else {
+    let Some(height) = object.dictionary_entry(b"Height") else {
+        return Ok(None);
+    };
+    let Some(width) = resolved_number_value(document, width)? else {
+        return Ok(None);
+    };
+    let Some(height) = resolved_number_value(document, height)? else {
         return Ok(None);
     };
     if !width.is_finite()
@@ -193,39 +200,39 @@ fn cow_record_image(
     placements: &mut HashMap<crate::ObjectHandle, ImagePlacement>,
     handle: crate::ObjectHandle,
     ctm: Matrix,
+    complete: &mut bool,
 ) -> Result<()> {
-    let Some(object) = document.current_owned_object(handle)? else {
-        return Ok(());
-    };
-    let Some(dictionary) = object.as_dictionary() else {
-        return Ok(());
-    };
-    let Some((width_px, height_px)) = cow_image_dimensions(document, dictionary)? else {
-        return Ok(());
-    };
     let width_points = ctm.a.hypot(ctm.b);
     let height_points = ctm.c.hypot(ctm.d);
-    if !width_points.is_finite()
-        || !height_points.is_finite()
-        || width_points <= MIN_PLACEMENT_POINTS
-        || height_points <= MIN_PLACEMENT_POINTS
-    {
+    if !width_points.is_finite() || !height_points.is_finite() {
+        *complete = false;
         return Ok(());
     }
-    placements
-        .entry(handle)
-        .and_modify(|placement| {
-            placement.max_width_points = placement.max_width_points.max(width_points);
-            placement.max_height_points = placement.max_height_points.max(height_points);
-            placement.uses += 1;
-        })
-        .or_insert(ImagePlacement {
+    if width_points <= MIN_PLACEMENT_POINTS || height_points <= MIN_PLACEMENT_POINTS {
+        return Ok(());
+    }
+    if let Some(placement) = placements.get_mut(&handle) {
+        placement.max_width_points = placement.max_width_points.max(width_points);
+        placement.max_height_points = placement.max_height_points.max(height_points);
+        placement.uses = placement.uses.saturating_add(1);
+        return Ok(());
+    }
+    let Some(object) = document.current_value(handle)? else {
+        return Ok(());
+    };
+    let Some((width_px, height_px)) = cow_image_dimensions(document, &object)? else {
+        return Ok(());
+    };
+    placements.insert(
+        handle,
+        ImagePlacement {
             width_px,
             height_px,
             max_width_points: width_points,
             max_height_points: height_points,
             uses: 1,
-        });
+        },
+    );
     Ok(())
 }
 
@@ -257,10 +264,11 @@ fn cow_scan_form(
             return Ok(());
         }
         let mut base_ctm = outer_ctm;
-        base_ctm.concat(cow_form_matrix(
-            document,
-            object.dictionary_entry(b"Matrix"),
-        )?);
+        let Some(matrix) = cow_form_matrix(document, object.dictionary_entry(b"Matrix"))? else {
+            *state.complete = false;
+            return Ok(());
+        };
+        base_ctm.concat(matrix);
         let (xobjects, scope_complete) =
             if let Some(resources) = object.dictionary_entry(b"Resources") {
                 let bindings = resource_xobject_bindings(document, Some(resources))?;
@@ -271,7 +279,7 @@ fn cow_scan_form(
         if !scope_complete {
             *state.complete = false;
         }
-        let content = document.decoded_stream_data(form)?;
+        let content = document.decoded_content_stream_data(form)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
         if scanner.scan(&content).is_err() || !scanner.complete {
             *state.complete = false;
@@ -280,7 +288,13 @@ fn cow_scan_form(
         for draw in scanner.draws {
             match object_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, state.placements, draw.target, draw.ctm)?;
+                    cow_record_image(
+                        document,
+                        state.placements,
+                        draw.target,
+                        draw.ctm,
+                        state.complete,
+                    )?;
                 }
                 Some(b"Form") => {
                     cow_scan_form(document, draw.target, draw.ctm, &current, state, depth + 1)?;
@@ -305,78 +319,18 @@ fn cow_image_resize_safe(
     image: crate::ObjectHandle,
     jpeg: bool,
 ) -> Result<bool> {
-    let Some(object) = document.current_owned_object(image)? else {
+    let Some(object) = document.current_owned_object_cow(image)? else {
         return Ok(false);
     };
     let Some(dictionary) = object.as_dictionary() else {
         return Ok(false);
     };
-    // Recovered 1-bit ImageMasks are geometry-like bilevel fields, not
-    // continuous-tone images. Their native grid is intentionally preserved:
-    // generic PPI downsampling either drops subpixel features or fattens them.
-    if let Some(value) = dictionary.get(b"ImageMask".as_slice())
-        && matches!(
-            document.resolve_owned_value(value)?,
-            Some(crate::OwnedObject::Boolean(true))
-        )
-    {
-        return Ok(false);
-    }
-    for key in [
-        b"SMask".as_slice(),
-        b"Mask".as_slice(),
-        b"Decode".as_slice(),
-    ] {
-        if let Some(value) = dictionary.get(key)
-            && !matches!(
-                document.resolve_owned_value(value)?,
-                Some(crate::OwnedObject::Null) | None
-            )
-        {
-            return Ok(false);
-        }
-    }
-    if jpeg
-        && dictionary.get(b"DecodeParms".as_slice()).is_some_and(|v| {
-            !matches!(
-                document.resolve_owned_value(v),
-                Ok(Some(crate::OwnedObject::Null) | None)
-            )
-        })
-    {
-        return Ok(false);
-    }
-    if !matches!(
-        document.resolve_owned_value(
-            dictionary
-                .get(b"BitsPerComponent".as_slice())
-                .unwrap_or(&crate::OwnedObject::Null)
-        )?,
-        Some(crate::OwnedObject::Integer(8))
-    ) {
-        return Ok(false);
-    }
-    let Some(Some(crate::OwnedObject::Name(filter))) = dictionary
-        .get(b"Filter".as_slice())
-        .map(|value| document.resolve_owned_value(value))
-        .transpose()?
-    else {
-        return Ok(false);
+    let encoding = if jpeg {
+        crate::images::ImageResizeEncoding::Jpeg
+    } else {
+        crate::images::ImageResizeEncoding::Flate
     };
-    if jpeg && !matches!(filter.as_slice(), b"DCTDecode" | b"DCT") {
-        return Ok(false);
-    }
-    if !jpeg && !matches!(filter.as_slice(), b"FlateDecode" | b"Fl") {
-        return Ok(false);
-    }
-    let Some(Some(crate::OwnedObject::Name(color))) = dictionary
-        .get(b"ColorSpace".as_slice())
-        .map(|value| document.resolve_owned_value(value))
-        .transpose()?
-    else {
-        return Ok(false);
-    };
-    Ok(matches!(color.as_slice(), b"DeviceGray" | b"DeviceRGB"))
+    crate::images::resize_source_safe(document, dictionary, encoding)
 }
 
 pub fn plan_print_downsampling(
@@ -385,7 +339,8 @@ pub fn plan_print_downsampling(
     target_ppi: u32,
 ) -> Result<PrintPlanHayro> {
     let mut placements = HashMap::new();
-    let mut direct_page_bindings = HashSet::new();
+    let mut direct_page_bindings =
+        HashMap::<crate::ObjectHandle, HashSet<crate::ObjectHandle>>::new();
     let mut complete = true;
     for &page in pages {
         let bindings = page_xobject_bindings(document, page)?;
@@ -395,11 +350,17 @@ pub fn plan_print_downsampling(
         }
         for handle in xobjects.values() {
             if object_subtype(document, *handle)?.as_deref() == Some(b"Image") {
-                direct_page_bindings.insert((page, *handle));
+                direct_page_bindings
+                    .entry(*handle)
+                    .or_default()
+                    .insert(page);
             }
         }
         let mut base_ctm = Matrix::default();
-        let user_unit = page_user_unit(document, page)?.unwrap_or(1.0);
+        let user_unit = page_user_unit(document, page)?.unwrap_or_else(|| {
+            complete = false;
+            1.0
+        });
         base_ctm.scale(user_unit, user_unit);
         let content = page_content(document, page)?;
         let mut scanner = CowPlacementScanner::new(xobjects, base_ctm, scope_complete);
@@ -411,7 +372,13 @@ pub fn plan_print_downsampling(
         for draw in scanner.draws {
             match object_subtype(document, draw.target)?.as_deref() {
                 Some(b"Image") => {
-                    cow_record_image(document, &mut placements, draw.target, draw.ctm)?;
+                    cow_record_image(
+                        document,
+                        &mut placements,
+                        draw.target,
+                        draw.ctm,
+                        &mut complete,
+                    )?;
                 }
                 Some(b"Form") => {
                     let mut state = CowPlacementWalkState {
@@ -435,7 +402,7 @@ pub fn plan_print_downsampling(
         resize_targets: HashMap::new(),
     };
     for (image, placement) in placements {
-        plan.stats.image_uses += placement.uses;
+        plan.stats.image_uses = plan.stats.image_uses.saturating_add(placement.uses);
         let (target_width, target_height) = placement.target_dimensions(target_ppi);
         let source_pixels = u64::from(placement.width_px) * u64::from(placement.height_px);
         let target_pixels = u64::from(target_width) * u64::from(target_height);
@@ -443,10 +410,10 @@ pub fn plan_print_downsampling(
         if downsample {
             plan.stats.downsample_candidates += 1;
         }
-        plan.stats.source_pixels += source_pixels;
-        plan.stats.target_pixels += target_pixels;
-        let clears_gate = target_pixels.saturating_mul(100)
-            <= source_pixels.saturating_mul(100 - MIN_DOWNSAMPLE_PIXEL_REDUCTION_PERCENT);
+        plan.stats.source_pixels = plan.stats.source_pixels.saturating_add(source_pixels);
+        plan.stats.target_pixels = plan.stats.target_pixels.saturating_add(target_pixels);
+        let clears_gate = u128::from(target_pixels) * 100
+            <= u128::from(source_pixels) * u128::from(100 - MIN_DOWNSAMPLE_PIXEL_REDUCTION_PERCENT);
         if !downsample || !clears_gate || !complete {
             continue;
         }
@@ -462,11 +429,76 @@ pub fn plan_print_downsampling(
         let Some(target) = target else {
             continue;
         };
-        for &(page, binding_image) in &direct_page_bindings {
-            if binding_image == image {
+        if let Some(pages) = direct_page_bindings.get(&image) {
+            for &page in pages {
                 plan.resize_targets.insert((page, image), target);
             }
         }
     }
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonfinite_scaled_extent_never_downsamples_to_one_pixel() {
+        let placement = ImagePlacement {
+            width_px: 1000,
+            height_px: 500,
+            max_width_points: f64::MAX,
+            max_height_points: 72.0,
+            uses: 1,
+        };
+        assert_eq!(placement.target_dimensions(300), (1000, 300));
+    }
+
+    fn fixture(user_unit: &[u8], form_matrix: &[u8]) -> Result<Vec<u8>> {
+        let mut pdf = crate::test_support::ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        let mut page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /XObject << /Im0 5 0 R /Fm0 6 0 R >> >> /Contents 4 0 R ".to_vec();
+        page.extend_from_slice(user_unit);
+        page.extend_from_slice(b" >>");
+        pdf.object(3, &page)?;
+        pdf.stream(
+            4,
+            b"",
+            b"q 12 0 0 12 0 0 cm /Im0 Do Q q 24 0 0 24 0 0 cm /Fm0 Do Q",
+        )?;
+        pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 1000 /Height 1000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode", b"test")?;
+        let mut form = b"/Type /XObject /Subtype /Form /BBox [0 0 1 1] ".to_vec();
+        form.extend_from_slice(form_matrix);
+        pdf.stream(6, &form, b"/Im0 Do")?;
+        pdf.finish(1)
+    }
+
+    #[test]
+    fn print_plan_tracks_maximum_shared_image_placement_and_invalid_geometry() -> Result<()> {
+        let document =
+            crate::EditDocument::from_bytes(fixture(b"/UserUnit 2", b"/Matrix [1 0 0 1 0 0]")?)?;
+        let pages = document.page_handles()?;
+        let plan = plan_print_downsampling(&document, &pages, 600)?;
+        assert!(plan.stats.geometry_complete);
+        assert_eq!(plan.stats.image_uses, 2);
+        assert_eq!(plan.resize_targets.len(), 1);
+        assert_eq!(
+            plan.resize_targets.values().next(),
+            Some(&ImageResizeTarget::flate(400, 400))
+        );
+        for (user_unit, form_matrix) in [
+            (
+                b"/UserUnit 0".as_slice(),
+                b"/Matrix [1 0 0 1 0 0]".as_slice(),
+            ),
+            (b"/UserUnit 2".as_slice(), b"/Matrix [1 0]".as_slice()),
+        ] {
+            let document = crate::EditDocument::from_bytes(fixture(user_unit, form_matrix)?)?;
+            let plan = plan_print_downsampling(&document, &document.page_handles()?, 600)?;
+            assert!(!plan.stats.geometry_complete);
+            assert!(plan.resize_targets.is_empty());
+        }
+        Ok(())
+    }
 }

@@ -5,7 +5,9 @@ use crate::{
         resource_xobject_bindings,
     },
     paper_indexed,
-    stream_codec::{decode_image_stream, decode_stream, encode_flate, is_unfiltered_or_lone_flate},
+    stream_codec::{
+        decode_image_stream, decode_stream, encode_flate_capped, is_unfiltered_or_lone_flate,
+    },
 };
 use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
@@ -162,6 +164,7 @@ struct ImageTransform {
     height: u32,
     filter: Vec<u8>,
     color_space: Option<OwnedObject>,
+    bits_per_component: u8,
     layered_indexed: Option<LayeredIndexedTransform>,
     original_encoded_bytes: u64,
     optimized_encoded_bytes: u64,
@@ -698,6 +701,12 @@ fn install_transform(
     if let Some(color_space) = transform.color_space {
         dictionary.insert(b"ColorSpace".to_vec(), color_space);
     }
+    if transform.bits_per_component != 8 {
+        dictionary.insert(
+            b"BitsPerComponent".to_vec(),
+            OwnedObject::Integer(i64::from(transform.bits_per_component)),
+        );
+    }
     dictionary.remove(b"DecodeParms".as_slice());
     dictionary.remove(b"Length".as_slice());
     *data = StreamData::Owned(transform.encoded.into());
@@ -705,13 +714,35 @@ fn install_transform(
     Ok(())
 }
 
+fn maximum_optimized_payload(options: ImageOptimizationOptions, original: u64) -> Option<usize> {
+    let percentage_savings = u128::from(original)
+        .checked_mul(u128::from(options.min_savings_percent))?
+        .div_ceil(100);
+    let required = u64::try_from(percentage_savings)
+        .ok()?
+        .max(options.min_savings_bytes)
+        .max(1);
+    original
+        .checked_sub(required)
+        .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX))
+}
+
 fn passes_savings(options: ImageOptimizationOptions, original: u64, optimized: usize) -> bool {
-    let optimized = u64::try_from(optimized).unwrap_or(u64::MAX);
-    let savings = original.saturating_sub(optimized);
-    optimized < original
-        && savings >= options.min_savings_bytes
-        && u128::from(savings) * 100
-            >= u128::from(original) * u128::from(options.min_savings_percent)
+    maximum_optimized_payload(options, original).is_some_and(|cap| optimized <= cap)
+}
+
+/// Compress only as far as the remaining candidate budget permits. The
+/// caller accounts for palette and object overhead before invoking this.
+fn encode_candidate_flate(
+    decoded: &[u8],
+    cap: usize,
+    overhead: usize,
+    level: crate::FlateLevel,
+) -> Result<Option<Vec<u8>>> {
+    let Some(remaining) = cap.checked_sub(overhead) else {
+        return Ok(None);
+    };
+    encode_flate_capped(decoded, remaining, level)
 }
 
 fn jpeg_transcode_candidate(
@@ -734,6 +765,7 @@ fn jpeg_transcode_candidate(
         height,
         filter: b"DCTDecode".to_vec(),
         color_space: None,
+        bits_per_component: 8,
         layered_indexed: None,
         original_encoded_bytes: original,
         optimized_encoded_bytes,
@@ -841,6 +873,34 @@ fn paper_indexed_layered_source_safe(
         .all(|key| LOCAL_PALETTE_ALLOWED_SOURCE_KEYS.contains(&key.as_slice())))
 }
 
+fn pack_palette_indices(indices: &[u8], width: u32, height: u32, bits: u8) -> Option<Vec<u8>> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    if width == 0
+        || height == 0
+        || indices.len() != width.checked_mul(height)?
+        || !matches!(bits, 1 | 2 | 4)
+    {
+        return None;
+    }
+    let per_byte = 8 / usize::from(bits);
+    let stride = width.div_ceil(per_byte);
+    let mut packed = Vec::with_capacity(stride.checked_mul(height)?);
+    for row in indices.chunks_exact(width) {
+        for chunk in row.chunks(per_byte) {
+            let mut byte = 0;
+            for (index, &sample) in chunk.iter().enumerate() {
+                if sample >= 1 << bits {
+                    return None;
+                }
+                byte |= sample << (8 - (index + 1) * usize::from(bits));
+            }
+            packed.push(byte);
+        }
+    }
+    Some(packed)
+}
+
 fn paper_indexed_candidate_transform(
     candidate: paper_indexed::IndexedPaperImage,
     width: u32,
@@ -850,21 +910,38 @@ fn paper_indexed_candidate_transform(
     flate_level: crate::FlateLevel,
     base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
-    let encoded = encode_flate(&candidate.indices, flate_level)?;
     // Binary lookup strings are serialized as hexadecimal by the compact writer.
     // Account for that representation conservatively in both admission and stats.
     let palette_cost = candidate.palette.len().saturating_mul(2).saturating_add(2);
-    let optimized_payload = encoded.len().saturating_add(palette_cost);
-    if !passes_savings(options, original, optimized_payload) {
-        return Ok(None);
-    }
-    let hival = candidate.palette.len() / 3;
-    let Some(hival) = hival
-        .checked_sub(1)
-        .and_then(|value| i64::try_from(value).ok())
-    else {
+    let Some(cap) = maximum_optimized_payload(options, original) else {
         return Ok(None);
     };
+    let colors = candidate.palette.len() / 3;
+    if !(1..=256).contains(&colors) || !candidate.palette.len().is_multiple_of(3) {
+        return Ok(None);
+    }
+    let bits = match colors {
+        1..=2 => 1,
+        3..=4 => 2,
+        5..=16 => 4,
+        _ => 8,
+    };
+    let packed;
+    let samples = if bits == 8 {
+        candidate.indices.as_slice()
+    } else {
+        let Some(data) = pack_palette_indices(&candidate.indices, width, height, bits) else {
+            return Ok(None);
+        };
+        packed = data;
+        packed.as_slice()
+    };
+    let Some(encoded) = encode_candidate_flate(samples, cap, palette_cost, flate_level)? else {
+        return Ok(None);
+    };
+    let optimized_payload = encoded.len().saturating_add(palette_cost);
+    let hival =
+        i64::try_from(colors - 1).map_err(|_| Error::Invalid("palette size overflow".into()))?;
     let color_space = OwnedObject::Array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
         base_color_space,
@@ -878,6 +955,7 @@ fn paper_indexed_candidate_transform(
         height,
         filter: b"FlateDecode".to_vec(),
         color_space: Some(color_space),
+        bits_per_component: bits,
         layered_indexed: None,
         original_encoded_bytes: original,
         optimized_encoded_bytes: u64::try_from(optimized_payload).unwrap_or(u64::MAX),
@@ -955,8 +1033,6 @@ fn paper_indexed_foreground_transform(
             {
                 return Ok(None);
             }
-            let base_encoded = encode_flate(&candidate.base_indices, flate_level)?;
-            let residual_encoded = encode_flate(&candidate.residual_indices, flate_level)?;
             let base_palette_cost = candidate
                 .base_palette
                 .len()
@@ -964,16 +1040,25 @@ fn paper_indexed_foreground_transform(
                 .saturating_add(2);
             let residual_palette_bytes = candidate.residual_palette.len().saturating_add(3);
             let residual_palette_cost = residual_palette_bytes.saturating_mul(2).saturating_add(2);
-            let optimized_payload = LOCAL_PALETTE_FORM_OVERHEAD_BYTES
-                .saturating_add(base_encoded.len())
+            let overhead = LOCAL_PALETTE_FORM_OVERHEAD_BYTES
                 .saturating_add(base_palette_cost)
-                .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES)
-                .saturating_add(residual_encoded.len())
                 .saturating_add(residual_palette_cost)
-                .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES);
-            if !passes_savings(options, original, optimized_payload) {
+                .saturating_add(2 * LOCAL_PALETTE_LAYER_OVERHEAD_BYTES);
+            let Some(cap) = maximum_optimized_payload(options, original) else {
                 return Ok(None);
-            }
+            };
+            let Some(base_encoded) =
+                encode_candidate_flate(&candidate.base_indices, cap, overhead, flate_level)?
+            else {
+                return Ok(None);
+            };
+            let partial = overhead.saturating_add(base_encoded.len());
+            let Some(residual_encoded) =
+                encode_candidate_flate(&candidate.residual_indices, cap, partial, flate_level)?
+            else {
+                return Ok(None);
+            };
+            let optimized_payload = partial.saturating_add(residual_encoded.len());
             let pixels = u64::from(width) * u64::from(height);
             Ok(Some(ImageTransform {
                 encoded: Vec::new(),
@@ -981,6 +1066,7 @@ fn paper_indexed_foreground_transform(
                 height,
                 filter: Vec::new(),
                 color_space: None,
+                bits_per_component: 8,
                 layered_indexed: Some(LayeredIndexedTransform::Residual(
                     ResidualIndexedTransform {
                         base_encoded,
@@ -1019,8 +1105,11 @@ fn paper_indexed_layered_transform(
         .checked_mul(height_usize)
         .ok_or_else(|| Error::Invalid("local palette dimensions overflow".to_owned()))?;
 
+    let Some(cap) = maximum_optimized_payload(options, original) else {
+        return Ok(None);
+    };
     for layer_count in paper_indexed::LOCAL_LAYER_COUNTS {
-        for sample_factor in paper_indexed::LOCAL_QUANTIZER_SAMPLE_FACTORS {
+        'candidate: for sample_factor in paper_indexed::LOCAL_QUANTIZER_SAMPLE_FACTORS {
             let Some(candidate) = paper_indexed::quantize_rgb_layer_count_with_sample_factor(
                 decoded,
                 width,
@@ -1061,12 +1150,16 @@ fn paper_indexed_layered_transform(
                         )
                     })?;
                 }
-                let encoded = encode_flate(&full_grid, flate_level)?;
                 let palette_bytes = layer.palette.len().saturating_add(3);
                 optimized_payload = optimized_payload
-                    .saturating_add(encoded.len())
                     .saturating_add(palette_bytes.saturating_mul(2).saturating_add(2))
                     .saturating_add(LOCAL_PALETTE_LAYER_OVERHEAD_BYTES);
+                let Some(encoded) =
+                    encode_candidate_flate(&full_grid, cap, optimized_payload, flate_level)?
+                else {
+                    continue 'candidate;
+                };
+                optimized_payload = optimized_payload.saturating_add(encoded.len());
                 layers.push(LayeredIndexedLayerTransform {
                     encoded,
                     palette: layer.palette,
@@ -1082,6 +1175,7 @@ fn paper_indexed_layered_transform(
                 height,
                 filter: Vec::new(),
                 color_space: None,
+                bits_per_component: 8,
                 layered_indexed: Some(LayeredIndexedTransform::Local {
                     layers,
                     base_color_space,
@@ -1191,10 +1285,10 @@ const fn meets_image_optimization_size(
     height: u32,
     options: ImageOptimizationOptions,
 ) -> bool {
-    let area = width.wrapping_mul(height);
+    let area = (width as u64) * (height as u64);
     (options.min_width == 0 || width > options.min_width)
         && (options.min_height == 0 || height > options.min_height)
-        && (options.min_area == 0 || area > options.min_area)
+        && (options.min_area == 0 || area > options.min_area as u64)
 }
 
 fn transcode_image(
@@ -1253,6 +1347,24 @@ fn transcode_image(
         return Ok(None);
     };
     let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
+    let palette_safe = components == 3
+        && indexed_base_color_space.is_some()
+        && paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?;
+    if palette_safe
+        && let Some(base) = indexed_base_color_space.as_ref()
+        && let Some(palette) = paper_indexed::exact_rgb_palette(&decoded)
+        && let Some(candidate) = paper_indexed_candidate_transform(
+            palette,
+            width,
+            height,
+            original,
+            options,
+            flate_level,
+            base.clone(),
+        )?
+    {
+        return Ok(Some(candidate));
+    }
     if device_color_info.is_some()
         && let Some(candidate) =
             jpeg_transcode_candidate(&decoded, width, height, components, original, options)?
@@ -1265,7 +1377,7 @@ fn transcode_image(
     let Some(indexed_base_color_space) = indexed_base_color_space else {
         return Ok(None);
     };
-    if paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?
+    if palette_safe
         && let Some(candidate) = paper_indexed_transform(
             &decoded,
             width,
@@ -1303,12 +1415,17 @@ fn transcode_image(
     )
 }
 
-fn resize_source_safe(
+pub(crate) fn resize_source_safe(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     encoding: ImageResizeEncoding,
 ) -> Result<bool> {
     if !bpc_is_8(document, dictionary)? {
+        return Ok(false);
+    }
+    if crate::content::resolved_bool(document, dictionary.get(b"ImageMask".as_slice()))?
+        == Some(true)
+    {
         return Ok(false);
     }
     for key in [
@@ -1368,6 +1485,13 @@ fn resize_image(
     if target_width == width && target_height == height {
         return Ok(None);
     }
+    let original = u64::try_from(data.bytes(document.source())?.len()).unwrap_or(u64::MAX);
+    let Some(cap) = maximum_optimized_payload(options, original) else {
+        return Ok(None);
+    };
+    if cap == 0 {
+        return Ok(None);
+    }
     let Some(decoded) = decoded_pixels(document, handle, image, width, height, components)? else {
         return Ok(None);
     };
@@ -1392,12 +1516,14 @@ fn resize_image(
             )?,
             b"DCTDecode".to_vec(),
         ),
-        ImageResizeEncoding::Flate => (
-            encode_flate(destination.buffer(), flate_level)?,
-            b"FlateDecode".to_vec(),
-        ),
+        ImageResizeEncoding::Flate => {
+            let Some(encoded) = encode_candidate_flate(destination.buffer(), cap, 0, flate_level)?
+            else {
+                return Ok(None);
+            };
+            (encoded, b"FlateDecode".to_vec())
+        }
     };
-    let original = u64::try_from(data.bytes(document.source())?.len()).unwrap_or(u64::MAX);
     if !passes_savings(options, original, encoded.len()) {
         return Ok(None);
     }
@@ -1408,6 +1534,7 @@ fn resize_image(
         height: target_height,
         filter,
         color_space: None,
+        bits_per_component: 8,
         layered_indexed: None,
         original_encoded_bytes: original,
         optimized_encoded_bytes,
@@ -1606,6 +1733,192 @@ pub fn optimize_images_with_resize_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_codec::encode_flate;
+
+    #[test]
+    fn exact_palette_packs_rows_without_crossing_padding() -> Result<()> {
+        let rgb = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 255, 0],
+            [255, 0, 0],
+        ]
+        .concat();
+        let palette = paper_indexed::exact_rgb_palette(&rgb)
+            .ok_or_else(|| Error::Invalid("missing exact palette".into()))?;
+        assert_eq!(palette.palette, [255, 0, 0, 0, 255, 0]);
+        assert_eq!(palette.indices, [0, 1, 0, 1, 1, 0]);
+        assert_eq!(
+            pack_palette_indices(&palette.indices, 3, 2, 1),
+            Some(vec![0x40, 0xc0])
+        );
+        assert_eq!(
+            pack_palette_indices(&[0, 1, 2, 3, 2, 1], 3, 2, 2),
+            Some(vec![0x18, 0xe4])
+        );
+        assert_eq!(
+            pack_palette_indices(&[1, 2, 3, 4, 5, 6], 3, 2, 4),
+            Some(vec![0x12, 0x30, 0x45, 0x60])
+        );
+        let transform = paper_indexed_candidate_transform(
+            palette,
+            3,
+            2,
+            1024,
+            ImageOptimizationOptions::default(),
+            crate::FlateLevel::SIZE,
+            OwnedObject::Name(b"DeviceRGB".to_vec()),
+        )?
+        .ok_or_else(|| Error::Invalid("missing indexed transform".into()))?;
+        assert_eq!(transform.bits_per_component, 1);
+        let mut output = [0; 2];
+        let (decoded, code) = zlib_rs::decompress_slice(
+            &mut output,
+            &transform.encoded,
+            zlib_rs::InflateConfig::default(),
+        );
+        assert_eq!(code, zlib_rs::ReturnCode::Ok);
+        assert_eq!(decoded, [0x40, 0xc0]);
+        let many = (0..257_u16)
+            .flat_map(|color| {
+                let [low, high] = color.to_le_bytes();
+                [low, high, 0]
+            })
+            .collect::<Vec<_>>();
+        assert!(paper_indexed::exact_rgb_palette(&many).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn perceptual_prefers_lossless_low_color_graphics() -> Result<()> {
+        let width = 257_u32;
+        let height = 259_u32;
+        let colors = [[255, 0, 32], [0, 255, 128], [18, 40, 230], [255, 255, 255]];
+        let mut state = 0x3278_1234_u32;
+        let mut rgb = Vec::new();
+        for _ in 0..width * height {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            rgb.extend_from_slice(&colors[(state & 3) as usize]);
+        }
+        let encoded = encode_flate(&rgb, crate::FlateLevel::PROCESSING)?;
+        let mut pdf = crate::test_support::ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 257 259] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>")?;
+        pdf.stream(4, b"", b"q 257 0 0 259 0 0 cm /Im0 Do Q")?;
+        pdf.stream(5, b"/Type /XObject /Subtype /Image /Width 257 /Height 259 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode", &encoded)?;
+        let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
+        let pages = document.page_handles()?;
+        let stats = optimize_images(
+            &mut document,
+            &pages,
+            ImageOptimizationOptions {
+                jpeg_quality: 85,
+                min_savings_percent: 20,
+                ..ImageOptimizationOptions::default()
+            },
+            crate::FlateLevel::SIZE,
+        )?;
+        assert_eq!(stats.images_optimized, 1);
+        assert!(stats.saved_bytes() > 0);
+        let document = EditDocument::from_bytes(crate::writer::write_pdf(&document)?)?;
+        let handle = document
+            .reachable_streams_with_subtype(b"Image")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Invalid("missing output image".into()))?;
+        let image = document
+            .current_owned_object_cow(handle)?
+            .ok_or_else(|| Error::Invalid("missing image object".into()))?;
+        let dictionary = image
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("missing image dictionary".into()))?;
+        assert_eq!(
+            dictionary.get(b"BitsPerComponent".as_slice()),
+            Some(&OwnedObject::Integer(2))
+        );
+        let Some(OwnedObject::Array(space)) = dictionary.get(b"ColorSpace".as_slice()) else {
+            return Err(Error::Invalid("expected indexed image".into()));
+        };
+        let Some(OwnedObject::String(palette)) = space.get(3) else {
+            return Err(Error::Invalid("expected palette".into()));
+        };
+        let packed = document.decoded_stream_data(handle)?;
+        let mut reconstructed = Vec::new();
+        for row in packed.chunks_exact(
+            usize::try_from(width)
+                .map_err(|_| Error::Invalid("width overflow".into()))?
+                .div_ceil(4),
+        ) {
+            for x in 0..width as usize {
+                let index = usize::from((row[x / 4] >> (6 - 2 * (x % 4))) & 3);
+                reconstructed.extend_from_slice(&palette[index * 3..index * 3 + 3]);
+            }
+        }
+        assert_eq!(reconstructed, rgb);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_cap_matches_original_savings_gate() {
+        for original in [0, 1, 2, 19, 20, 99, 100, 101, 1024, u64::MAX] {
+            for min_savings_percent in [0, 1, 19, 20, 99, 100, 101, 255] {
+                for min_savings_bytes in [0, 1, 2, 100, u64::MAX] {
+                    let options = ImageOptimizationOptions {
+                        min_savings_percent,
+                        min_savings_bytes,
+                        ..ImageOptimizationOptions::default()
+                    };
+                    let cap = maximum_optimized_payload(options, original);
+                    for optimized in [
+                        0,
+                        1,
+                        19,
+                        20,
+                        99,
+                        100,
+                        101,
+                        1024,
+                        usize::MAX,
+                        cap.unwrap_or(0),
+                        cap.unwrap_or(0).saturating_add(1),
+                    ] {
+                        let length = u64::try_from(optimized).unwrap_or(u64::MAX);
+                        let savings = original.saturating_sub(length);
+                        let expected = length < original
+                            && savings >= min_savings_bytes
+                            && u128::from(savings) * 100
+                                >= u128::from(original) * u128::from(min_savings_percent);
+                        assert_eq!(passes_savings(options, original, optimized), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_flate_budget_includes_overhead_and_exact_boundary() -> Result<()> {
+        let bytes = b"paper indexed image sample".repeat(2000);
+        let expected = crate::stream_codec::encode_flate(&bytes, crate::FlateLevel::SIZE)?;
+        let overhead = 512;
+        let cap = expected.len() + overhead;
+        assert_eq!(
+            encode_candidate_flate(&bytes, cap, overhead, crate::FlateLevel::SIZE)?,
+            Some(expected)
+        );
+        assert!(
+            encode_candidate_flate(&bytes, cap - 1, overhead, crate::FlateLevel::SIZE)?.is_none()
+        );
+        assert!(
+            encode_candidate_flate(&bytes, overhead - 1, overhead, crate::FlateLevel::SIZE)?
+                .is_none()
+        );
+        Ok(())
+    }
 
     fn rgb_jpeg(quality: u8) -> Result<Vec<u8>> {
         let width = 64usize;
@@ -2286,6 +2599,7 @@ mod tests {
                     OwnedObject::Integer(0),
                     OwnedObject::String(vec![0, 0, 0]),
                 ])),
+                bits_per_component: 8,
                 layered_indexed: None,
                 original_encoded_bytes: u64::try_from(jpeg.len()).unwrap_or(u64::MAX),
                 optimized_encoded_bytes: 0,

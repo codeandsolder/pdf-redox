@@ -1,5 +1,5 @@
 use color_quant::NeuQuant;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 const PALETTE_COLORS: usize = 256;
 const LOCAL_PALETTE_COLORS: usize = 255;
@@ -54,6 +54,32 @@ pub struct LayeredIndexedPaperImage {
 struct PaperStats {
     background: [u8; 3],
     pixels: usize,
+}
+
+/// Lossless palette for synthetic graphics. Stop at the 257th distinct
+/// color; photographs do not incur a full quantization pass.
+pub fn exact_rgb_palette(rgb: &[u8]) -> Option<IndexedPaperImage> {
+    let (pixels, remainder) = rgb.as_chunks::<3>();
+    if pixels.is_empty() || !remainder.is_empty() {
+        return None;
+    }
+    let mut colors = HashMap::<[u8; 3], u8>::with_capacity(PALETTE_COLORS);
+    let mut palette = Vec::with_capacity(PALETTE_COLORS * 3);
+    let mut indices = Vec::with_capacity(pixels.len().min(16 * 1024));
+    for pixel in pixels {
+        let count = colors.len();
+        let index = match colors.entry(*pixel) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let index = u8::try_from(count).ok()?;
+                entry.insert(index);
+                palette.extend_from_slice(pixel);
+                index
+            }
+        };
+        indices.push(index);
+    }
+    Some(IndexedPaperImage { indices, palette })
 }
 
 pub fn quantize_rgb(rgb: &[u8]) -> Option<IndexedPaperImage> {
