@@ -82,35 +82,65 @@ pub fn exact_rgb_palette(rgb: &[u8]) -> Option<IndexedPaperImage> {
     Some(IndexedPaperImage { indices, palette })
 }
 
-pub fn quantize_rgb(rgb: &[u8]) -> Option<IndexedPaperImage> {
-    let stats = paper_stats(rgb)?;
-    let total_samples = u64::try_from(stats.pixels).ok()?.checked_mul(3)?;
-    for threshold in THRESHOLDS {
-        if flatten_sse(rgb, stats.background, threshold)? > total_samples * WHOLE_MSE_LIMIT {
-            continue;
-        }
-        if let Some(candidate) = quantize_at_threshold(rgb, stats, threshold) {
-            return Some(candidate);
-        }
-    }
-    None
+/// Shared image-wide evidence for every palette strategy. A non-paper
+/// image is rejected once rather than rescanned for every layer partition.
+pub struct PaperAnalysis<'a> {
+    rgb: &'a [u8],
+    stats: PaperStats,
 }
 
-/// Quantize one full-grid sparse Indexed layer partition.
-pub fn quantize_rgb_layer_count_with_sample_factor(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    layer_count: usize,
-    sample_factor: i32,
-) -> Option<LayeredIndexedPaperImage> {
-    let stats = paper_stats(rgb)?;
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    if width.checked_mul(height)? != stats.pixels {
-        return None;
+impl<'a> PaperAnalysis<'a> {
+    pub fn new(rgb: &'a [u8]) -> Option<Self> {
+        Some(Self {
+            rgb,
+            stats: paper_stats(rgb)?,
+        })
     }
-    quantize_local_layers(rgb, width, height, stats, layer_count, sample_factor)
+
+    pub fn quantize(&self) -> Option<IndexedPaperImage> {
+        let total_samples = u64::try_from(self.stats.pixels).ok()?.checked_mul(3)?;
+        let flatten_errors = flatten_sse_by_threshold(self.rgb, self.stats.background)?;
+        for (threshold, error) in THRESHOLDS.into_iter().zip(flatten_errors) {
+            if error > total_samples.checked_mul(WHOLE_MSE_LIMIT)? {
+                continue;
+            }
+            if let Some(candidate) = quantize_at_threshold(self.rgb, self.stats, threshold) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn layers(
+        &self,
+        width: u32,
+        height: u32,
+        layer_count: usize,
+        sample_factor: i32,
+    ) -> Option<LayeredIndexedPaperImage> {
+        let width = usize::try_from(width).ok()?;
+        let height = usize::try_from(height).ok()?;
+        if width.checked_mul(height)? != self.stats.pixels {
+            return None;
+        }
+        quantize_local_layers(
+            self.rgb,
+            width,
+            height,
+            self.stats,
+            layer_count,
+            sample_factor,
+        )
+    }
+
+    pub fn foreground(&self) -> Option<ForegroundIndexedPaperImage> {
+        let base = quantize_foreground_weighted_candidate(self.rgb, self.stats)?;
+        if indexed_quality_ok(self.rgb, self.stats, &base, 0)? {
+            return Some(ForegroundIndexedPaperImage::Weighted(base));
+        }
+        quantize_residual_from_base(self.rgb, self.stats, base)
+            .map(ForegroundIndexedPaperImage::Residual)
+    }
 }
 
 fn quantize_local_layers(
@@ -280,18 +310,33 @@ fn channel_distance(pixel: &[u8], background: [u8; 3]) -> u8 {
         .unwrap_or(0)
 }
 
-fn flatten_sse(rgb: &[u8], background: [u8; 3], threshold: u8) -> Option<u64> {
-    let mut sse = 0_u64;
+/// Accumulate squared error by maximum channel distance once. Prefix sums
+/// give the exact error for every candidate background-flattening threshold.
+fn flatten_sse_by_threshold(rgb: &[u8], background: [u8; 3]) -> Option<[u64; THRESHOLDS.len()]> {
+    let mut histogram = [0_u64; 256];
+    let max_threshold = *THRESHOLDS.first()?;
     for pixel in rgb.as_chunks::<3>().0 {
-        if channel_distance(pixel, background) <= threshold {
-            for (&sample, paper) in pixel.iter().zip(background) {
-                let delta = i16::from(sample) - i16::from(paper);
-                let square = i32::from(delta) * i32::from(delta);
-                sse = sse.checked_add(u64::try_from(square).ok()?)?;
-            }
+        let delta = [
+            pixel[0].abs_diff(background[0]),
+            pixel[1].abs_diff(background[1]),
+            pixel[2].abs_diff(background[2]),
+        ];
+        let distance = delta[0].max(delta[1]).max(delta[2]);
+        if distance <= max_threshold {
+            let square = delta
+                .into_iter()
+                .map(|channel| u64::from(channel).pow(2))
+                .sum::<u64>();
+            histogram[usize::from(distance)] =
+                histogram[usize::from(distance)].checked_add(square)?;
         }
     }
-    Some(sse)
+    let mut total = 0_u64;
+    for bucket in &mut histogram {
+        total = total.checked_add(*bucket)?;
+        *bucket = total;
+    }
+    Some(THRESHOLDS.map(|threshold| histogram[usize::from(threshold)]))
 }
 
 fn weighted_training_rgba(rgb: &[u8], background: [u8; 3]) -> Option<Vec<u8>> {
@@ -504,17 +549,6 @@ fn quantize_residual_from_base(
     })
 }
 
-pub fn quantize_rgb_foreground_weighted_or_residual(
-    rgb: &[u8],
-) -> Option<ForegroundIndexedPaperImage> {
-    let stats = paper_stats(rgb)?;
-    let base = quantize_foreground_weighted_candidate(rgb, stats)?;
-    if indexed_quality_ok(rgb, stats, &base, 0)? {
-        return Some(ForegroundIndexedPaperImage::Weighted(base));
-    }
-    quantize_residual_from_base(rgb, stats, base).map(ForegroundIndexedPaperImage::Residual)
-}
-
 fn quantize_at_threshold(
     rgb: &[u8],
     stats: PaperStats,
@@ -653,9 +687,32 @@ mod tests {
     }
 
     #[test]
+    fn flatten_histogram_matches_independent_threshold_scans() {
+        let rgb = (0..256_u16)
+            .flat_map(|value| {
+                let sample = value.to_le_bytes()[0];
+                [sample, sample.wrapping_mul(7), sample.wrapping_add(33)]
+            })
+            .collect::<Vec<_>>();
+        for background in [[0, 0, 0], [240, 230, 220], [255, 255, 255]] {
+            let actual = flatten_sse_by_threshold(&rgb, background);
+            let reference = THRESHOLDS.map(|threshold| {
+                rgb.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter(|pixel| channel_distance(pixel.as_slice(), background) <= threshold)
+                    .flat_map(|pixel| pixel.iter().zip(background))
+                    .map(|(&sample, base)| u64::from(sample.abs_diff(base)).pow(2))
+                    .sum::<u64>()
+            });
+            assert_eq!(actual, Some(reference));
+        }
+    }
+
+    #[test]
     fn paper_scan_quantizes_to_indexed_palette() {
         let rgb = paper_scan(800, 700);
-        let candidate = quantize_rgb(&rgb);
+        let candidate = PaperAnalysis::new(&rgb).and_then(|analysis| analysis.quantize());
         assert!(candidate.is_some());
         if let Some(candidate) = candidate {
             assert_eq!(candidate.indices.len(), 800 * 700);
@@ -668,14 +725,10 @@ mod tests {
         let width = 800_u32;
         let height = 700_u32;
         let rgb = paper_scan(800, 700);
-        let candidate = LOCAL_LAYER_COUNTS.iter().copied().find_map(|layer_count| {
-            quantize_rgb_layer_count_with_sample_factor(
-                &rgb,
-                width,
-                height,
-                layer_count,
-                QUANTIZER_SAMPLE_FACTOR,
-            )
+        let candidate = PaperAnalysis::new(&rgb).and_then(|analysis| {
+            LOCAL_LAYER_COUNTS.iter().copied().find_map(|layer_count| {
+                analysis.layers(width, height, layer_count, QUANTIZER_SAMPLE_FACTOR)
+            })
         });
         assert!(candidate.is_some());
         if let Some(candidate) = candidate {
@@ -710,6 +763,6 @@ mod tests {
                 rgb.push(u8::try_from((x + y) % 256).unwrap_or_default());
             }
         }
-        assert!(quantize_rgb(&rgb).is_none());
+        assert!(PaperAnalysis::new(&rgb).is_none());
     }
 }

@@ -968,7 +968,7 @@ fn paper_indexed_candidate_transform(
 }
 
 fn paper_indexed_transform(
-    decoded: &[u8],
+    analysis: &paper_indexed::PaperAnalysis<'_>,
     width: u32,
     height: u32,
     original: u64,
@@ -976,7 +976,7 @@ fn paper_indexed_transform(
     flate_level: crate::FlateLevel,
     base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
-    let Some(candidate) = paper_indexed::quantize_rgb(decoded) else {
+    let Some(candidate) = analysis.quantize() else {
         return Ok(None);
     };
     paper_indexed_candidate_transform(
@@ -991,7 +991,7 @@ fn paper_indexed_transform(
 }
 
 fn paper_indexed_foreground_transform(
-    decoded: &[u8],
+    analysis: &paper_indexed::PaperAnalysis<'_>,
     width: u32,
     height: u32,
     original: u64,
@@ -999,8 +999,7 @@ fn paper_indexed_foreground_transform(
     flate_level: crate::FlateLevel,
     base_color_space: OwnedObject,
 ) -> Result<Option<ImageTransform>> {
-    let Some(candidate) = paper_indexed::quantize_rgb_foreground_weighted_or_residual(decoded)
-    else {
+    let Some(candidate) = analysis.foreground() else {
         return Ok(None);
     };
     match candidate {
@@ -1089,7 +1088,7 @@ fn paper_indexed_foreground_transform(
 }
 
 fn paper_indexed_layered_transform(
-    decoded: &[u8],
+    analysis: &paper_indexed::PaperAnalysis<'_>,
     width: u32,
     height: u32,
     original: u64,
@@ -1110,13 +1109,7 @@ fn paper_indexed_layered_transform(
     };
     for layer_count in paper_indexed::LOCAL_LAYER_COUNTS {
         'candidate: for sample_factor in paper_indexed::LOCAL_QUANTIZER_SAMPLE_FACTORS {
-            let Some(candidate) = paper_indexed::quantize_rgb_layer_count_with_sample_factor(
-                decoded,
-                width,
-                height,
-                layer_count,
-                sample_factor,
-            ) else {
+            let Some(candidate) = analysis.layers(width, height, layer_count, sample_factor) else {
                 continue;
             };
             let mut layers = Vec::with_capacity(candidate.layers.len());
@@ -1347,12 +1340,58 @@ fn transcode_image(
         return Ok(None);
     };
     let original = u64::try_from(source_bytes.len()).unwrap_or(u64::MAX);
+    select_perceptual_candidate(
+        document,
+        dictionary,
+        PerceptualRaster {
+            decoded: &decoded,
+            width,
+            height,
+            components,
+            original,
+            device_color: device_color_info.is_some(),
+            indexed_base_color_space,
+            source_filter: source_filter.as_deref(),
+        },
+        options,
+        flate_level,
+    )
+}
+
+struct PerceptualRaster<'a> {
+    decoded: &'a [u8],
+    width: u32,
+    height: u32,
+    components: usize,
+    original: u64,
+    device_color: bool,
+    indexed_base_color_space: Option<OwnedObject>,
+    source_filter: Option<&'a [u8]>,
+}
+
+fn select_perceptual_candidate(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+    raster: PerceptualRaster<'_>,
+    options: ImageOptimizationOptions,
+    flate_level: crate::FlateLevel,
+) -> Result<Option<ImageTransform>> {
+    let PerceptualRaster {
+        decoded,
+        width,
+        height,
+        components,
+        original,
+        device_color,
+        indexed_base_color_space,
+        source_filter,
+    } = raster;
     let palette_safe = components == 3
         && indexed_base_color_space.is_some()
-        && paper_indexed_source_safe(document, dictionary, source_filter.as_deref())?;
+        && paper_indexed_source_safe(document, dictionary, source_filter)?;
     if palette_safe
         && let Some(base) = indexed_base_color_space.as_ref()
-        && let Some(palette) = paper_indexed::exact_rgb_palette(&decoded)
+        && let Some(palette) = paper_indexed::exact_rgb_palette(decoded)
         && let Some(candidate) = paper_indexed_candidate_transform(
             palette,
             width,
@@ -1365,27 +1404,32 @@ fn transcode_image(
     {
         return Ok(Some(candidate));
     }
-    if device_color_info.is_some()
+    if device_color
         && let Some(candidate) =
-            jpeg_transcode_candidate(&decoded, width, height, components, original, options)?
+            jpeg_transcode_candidate(decoded, width, height, components, original, options)?
     {
         return Ok(Some(candidate));
     }
     if components != 3 {
         return Ok(None);
     }
-    let Some(indexed_base_color_space) = indexed_base_color_space else {
+    let Some(base) = indexed_base_color_space else {
+        return Ok(None);
+    };
+    // The background histogram and paper eligibility belong to the image,
+    // not to individual strategies. Reuse them for every candidate.
+    let Some(analysis) = paper_indexed::PaperAnalysis::new(decoded) else {
         return Ok(None);
     };
     if palette_safe
         && let Some(candidate) = paper_indexed_transform(
-            &decoded,
+            &analysis,
             width,
             height,
             original,
             options,
             flate_level,
-            indexed_base_color_space.clone(),
+            base.clone(),
         )?
     {
         return Ok(Some(candidate));
@@ -1394,28 +1438,28 @@ fn transcode_image(
         return Ok(None);
     }
     if let Some(candidate) = paper_indexed_layered_transform(
-        &decoded,
+        &analysis,
         width,
         height,
         original,
         options,
         flate_level,
-        indexed_base_color_space.clone(),
+        base.clone(),
     )? {
         return Ok(Some(candidate));
     }
     paper_indexed_foreground_transform(
-        &decoded,
+        &analysis,
         width,
         height,
         original,
         options,
         flate_level,
-        indexed_base_color_space,
+        base,
     )
 }
 
-pub(crate) fn resize_source_safe(
+pub fn resize_source_safe(
     document: &EditDocument,
     dictionary: &OwnedDictionary,
     encoding: ImageResizeEncoding,
@@ -2794,8 +2838,10 @@ mod tests {
         );
         let original = u64::try_from(rgb.len())
             .map_err(|_| Error::Invalid("test RGB payload exceeds u64".to_owned()))?;
+        let analysis = paper_indexed::PaperAnalysis::new(&rgb)
+            .ok_or_else(|| Error::Invalid("paper analysis rejected test image".into()))?;
         let Some(transform) = paper_indexed_transform(
-            &rgb,
+            &analysis,
             width,
             height,
             original,
