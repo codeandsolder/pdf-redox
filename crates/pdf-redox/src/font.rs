@@ -819,6 +819,7 @@ fn cid_to_gid_mapping(
     document: &EditDocument,
     value: Option<&OwnedObject>,
 ) -> Result<Option<CidToGidMapping>> {
+    const MAX_MAPPING_BYTES: usize = (u16::MAX as usize + 1) * 2;
     let Some(value) = value else {
         return Ok(Some(CidToGidMapping::Identity));
     };
@@ -840,7 +841,6 @@ fn cid_to_gid_mapping(
     }
     // Only the 16-bit CID address space is observable. Do not retain an
     // arbitrary oversized map buffer in the resource-binding cache.
-    const MAX_MAPPING_BYTES: usize = (u16::MAX as usize + 1) * 2;
     let decoded = if decoded.capacity() > MAX_MAPPING_BYTES {
         Arc::new(decoded[..decoded.len().min(MAX_MAPPING_BYTES)].to_vec())
     } else {
