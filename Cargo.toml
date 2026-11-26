@@ -14,7 +14,7 @@ repository = "https://github.com/codeandsolder/pdf-redox"
 version = "0.1.0"
 
 [workspace.dependencies]
-hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "d07988b95efa78e8487a0ccb7bc93883d0fda874", default-features = false, features = ["std", "images"] }
+hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "68a799c971877c150c79f2adeb76b4c81e988899", default-features = false, features = ["std", "images"] }
 # Use our zlib-rs line directly so independent PDF streams can use its exact batch API.
 # Processing remains level 7; Size remains level 9.
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f", default-features = false, features = ["std"] }
