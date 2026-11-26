@@ -12,7 +12,10 @@ use crate::{
 };
 use hayro_syntax::object::{MaybeRef as HayroMaybeRef, Object as HayroObject};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FontProgramUsage {
@@ -797,7 +800,7 @@ fn union_fontfile2_program(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CidToGidMapping {
     Identity,
-    Explicit(Vec<u16>),
+    Explicit(Arc<Vec<u8>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -823,50 +826,36 @@ fn cid_to_gid_mapping(
         return Ok(Some(CidToGidMapping::Identity));
     }
 
-    let decoded = match value {
-        OwnedObject::Reference(handle) => document.decoded_stream_data(*handle),
-        OwnedObject::Stream { .. } => {
-            document.decoded_stream_value(&crate::source::CurrentValue::Owned(value))
-        }
-        _ => return Ok(None),
-    };
-    let Ok(decoded) = decoded else {
+    if !matches!(
+        value,
+        OwnedObject::Reference(_) | OwnedObject::Stream { .. }
+    ) {
+        return Ok(None);
+    }
+    let Ok(decoded) = document.decoded_reference_snapshot(value) else {
         return Ok(None);
     };
     if decoded.len() % 2 != 0 {
         return Ok(None);
     }
-    Ok(Some(CidToGidMapping::Explicit(
+    // Only the 16-bit CID address space is observable. Do not retain an
+    // arbitrary oversized map buffer in the resource-binding cache.
+    const MAX_MAPPING_BYTES: usize = (u16::MAX as usize + 1) * 2;
+    let decoded = if decoded.capacity() > MAX_MAPPING_BYTES {
+        Arc::new(decoded[..decoded.len().min(MAX_MAPPING_BYTES)].to_vec())
+    } else {
         decoded
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_be_bytes(*pair))
-            .collect(),
-    )))
+    };
+    Ok(Some(CidToGidMapping::Explicit(decoded)))
 }
 
 /// Return the embedded TrueType program and the CID-to-GID mapping required
 /// for retain-GID subsetting. Unsupported mappings remain explicitly unsafe so
 /// a program shared through another eligible font resource cannot be subset.
-fn page_font_program(
+fn cid_font_program(
     document: &EditDocument,
-    value: &OwnedObject,
+    font: &OwnedDictionary,
 ) -> Result<Option<PageCidFontProgram>> {
-    let Some(font) = resolved_dictionary(document, Some(value))? else {
-        return Ok(None);
-    };
-    let subtype = resolved_name(document, font.get(b"Subtype".as_slice()))?;
-    if subtype.as_deref() == Some(b"TrueType") {
-        return Ok(
-            descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
-                .map(PageCidFontProgram::Unsafe),
-        );
-    }
-    if subtype.as_deref() != Some(b"Type0") {
-        return Ok(None);
-    }
-
     let encoding = resolved_name(document, font.get(b"Encoding".as_slice()))?;
     let identity_encoding = matches!(encoding.as_deref(), Some(b"Identity-H" | b"Identity-V"));
     let Some(descendants) = font.get(b"DescendantFonts".as_slice()) else {
@@ -922,26 +911,6 @@ fn page_font_program(
         }
         _ => Ok(None),
     }
-}
-
-fn font_neutral_ext_gstates(
-    document: &EditDocument,
-    resources: &OwnedDictionary,
-) -> Result<BTreeSet<Vec<u8>>> {
-    let Some(ext_gstates) = resolved_dictionary(document, resources.get(b"ExtGState".as_slice()))?
-    else {
-        return Ok(BTreeSet::new());
-    };
-    let mut neutral = BTreeSet::new();
-    for (name, value) in &ext_gstates {
-        let Some(dictionary) = resolved_dictionary(document, Some(value))? else {
-            continue;
-        };
-        if !dictionary.contains_key(b"Font".as_slice()) {
-            neutral.insert(name.clone());
-        }
-    }
-    Ok(neutral)
 }
 
 struct FontSelectionState<T: Copy> {
@@ -1210,19 +1179,23 @@ impl IdentityCidGlyphScanner<'_> {
             self.unsafe_programs.insert(font.program);
             return;
         }
+        if pairs.is_empty() {
+            return;
+        }
+        let used = self.used.entry(font.program).or_default();
         for pair in pairs {
             let cid = u16::from_be_bytes(*pair);
             let gid = match &font.mapping {
                 CidToGidMapping::Identity => cid,
                 CidToGidMapping::Explicit(mapping) => {
-                    let Some(&gid) = mapping.get(usize::from(cid)) else {
+                    let Some(pair) = mapping.as_chunks::<2>().0.get(usize::from(cid)) else {
                         self.unsafe_programs.insert(font.program);
                         return;
                     };
-                    gid
+                    u16::from_be_bytes(*pair)
                 }
             };
-            self.used.entry(font.program).or_default().insert(gid);
+            used.insert(gid);
         }
     }
 
@@ -1291,25 +1264,6 @@ impl IdentityCidGlyphScanner<'_> {
             _ => {}
         }
     }
-}
-
-fn page_simple_truetype_program(
-    document: &EditDocument,
-    value: &OwnedObject,
-) -> Result<Option<(CowObjectHandle, bool)>> {
-    let Some(font) = resolved_dictionary(document, Some(value))? else {
-        return Ok(None);
-    };
-    if resolved_name(document, font.get(b"Subtype".as_slice()))?.as_deref() != Some(b"TrueType") {
-        return Ok(None);
-    }
-    let Some(program) = descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
-    else {
-        return Ok(None);
-    };
-    let winansi = resolved_name(document, font.get(b"Encoding".as_slice()))?.as_deref()
-        == Some(b"WinAnsiEncoding");
-    Ok(Some((program, winansi)))
 }
 
 struct WinAnsiCodeScanner<'a> {
@@ -1394,60 +1348,140 @@ impl WinAnsiCodeScanner<'_> {
     }
 }
 
-fn eligible_winansi_fonts(
-    document: &EditDocument,
-    resources: &OwnedDictionary,
-    unsafe_programs: &mut BTreeSet<CowObjectHandle>,
-) -> Result<HashMap<Vec<u8>, CowObjectHandle>> {
-    let Some(font_resources) = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
-    else {
-        return Ok(HashMap::new());
-    };
-    let mut eligible = HashMap::new();
-    for (name, value) in &font_resources {
-        let Some((program, winansi)) = page_simple_truetype_program(document, value)? else {
-            continue;
-        };
-        if winansi {
-            eligible.insert(name.clone(), program);
-        } else {
-            unsafe_programs.insert(program);
-        }
-    }
-    Ok(eligible)
+#[derive(Clone, Default)]
+struct ResolvedFontBinding {
+    identity: Option<PageCidFontProgram>,
+    winansi: Option<(CowObjectHandle, bool)>,
 }
 
-fn eligible_identity_fonts(
-    document: &EditDocument,
-    resources: &OwnedDictionary,
-    unsafe_programs: &mut BTreeSet<CowObjectHandle>,
-) -> Result<HashMap<Vec<u8>, CidFontGlyphSpec>> {
-    let Some(font_resources) = resolved_dictionary(document, resources.get(b"Font".as_slice()))?
-    else {
-        return Ok(HashMap::new());
-    };
-    let mut eligible = HashMap::new();
-    for (name, value) in &font_resources {
-        let Some(program) = page_font_program(document, value)? else {
-            continue;
+impl ResolvedFontBinding {
+    fn resolve(document: &EditDocument, value: &OwnedObject) -> Result<Self> {
+        let Some(object) = document.resolve_owned_value_cow(value)? else {
+            return Ok(Self::default());
         };
-        match program {
-            PageCidFontProgram::Eligible(spec) => {
-                eligible.insert(name.clone(), spec);
+        let Some(font) = object.as_dictionary() else {
+            return Ok(Self::default());
+        };
+        match resolved_name(document, font.get(b"Subtype".as_slice()))?.as_deref() {
+            Some(b"TrueType") => {
+                let Some(program) =
+                    descriptor_program_ref(document, font.get(b"FontDescriptor".as_slice()))?
+                else {
+                    return Ok(Self::default());
+                };
+                let winansi = resolved_name(document, font.get(b"Encoding".as_slice()))?.as_deref()
+                    == Some(b"WinAnsiEncoding");
+                Ok(Self {
+                    identity: Some(PageCidFontProgram::Unsafe(program)),
+                    winansi: Some((program, winansi)),
+                })
             }
-            PageCidFontProgram::Unsafe(program) => {
-                // One embedded program can be referenced through multiple font
-                // dictionaries. Any unsupported use makes retain-GID subsetting
-                // unsafe for the shared program.
-                unsafe_programs.insert(program);
-            }
+            Some(b"Type0") => Ok(Self {
+                identity: cid_font_program(document, font)?,
+                winansi: None,
+            }),
+            _ => Ok(Self::default()),
         }
     }
-    Ok(eligible)
+}
+
+#[derive(Default)]
+struct ScopeFontBindings {
+    identity: HashMap<Vec<u8>, CidFontGlyphSpec>,
+    winansi: HashMap<Vec<u8>, CowObjectHandle>,
+}
+
+/// The document is immutable for the entire glyph-usage scan. Resolve each
+/// indirect resource once, including negative results. A scope may still
+/// bind the same font under different local names; those bindings are not
+/// interchangeable and are constructed independently.
+#[derive(Default)]
+struct FontBindingCache {
+    retained_mapping_bytes: usize,
+    fonts: HashMap<CowObjectHandle, ResolvedFontBinding>,
+    ext_gstates: HashMap<CowObjectHandle, bool>,
+}
+
+impl FontBindingCache {
+    // Additional references must not defeat the decoded-stream LRU budget.
+    const MAX_RETAINED_MAPPING_BYTES: usize = 64 * 1024 * 1024;
+
+    fn font(
+        &mut self,
+        document: &EditDocument,
+        value: &OwnedObject,
+    ) -> Result<ResolvedFontBinding> {
+        if let OwnedObject::Reference(handle) = value {
+            if let Some(binding) = self.fonts.get(handle) {
+                return Ok(binding.clone());
+            }
+            let binding = ResolvedFontBinding::resolve(document, value)?;
+            let mapping_bytes = match &binding.identity {
+                Some(PageCidFontProgram::Eligible(CidFontGlyphSpec {
+                    mapping: CidToGidMapping::Explicit(bytes),
+                    ..
+                })) => bytes.capacity(),
+                _ => 0,
+            };
+            if mapping_bytes
+                <= Self::MAX_RETAINED_MAPPING_BYTES.saturating_sub(self.retained_mapping_bytes)
+            {
+                self.retained_mapping_bytes += mapping_bytes;
+                self.fonts.insert(*handle, binding.clone());
+            }
+            Ok(binding)
+        } else {
+            ResolvedFontBinding::resolve(document, value)
+        }
+    }
+
+    fn neutral_ext_gstate(&mut self, document: &EditDocument, value: &OwnedObject) -> Result<bool> {
+        let resolve = || -> Result<bool> {
+            Ok(document
+                .resolve_owned_value_cow(value)?
+                .as_deref()
+                .and_then(OwnedObject::as_dictionary)
+                .is_some_and(|dictionary| !dictionary.contains_key(b"Font".as_slice())))
+        };
+        if let OwnedObject::Reference(handle) = value {
+            if let Some(&neutral) = self.ext_gstates.get(handle) {
+                return Ok(neutral);
+            }
+            let neutral = resolve()?;
+            self.ext_gstates.insert(*handle, neutral);
+            Ok(neutral)
+        } else {
+            resolve()
+        }
+    }
+
+    fn neutral_ext_gstates(
+        &mut self,
+        document: &EditDocument,
+        resources: &OwnedDictionary,
+    ) -> Result<BTreeSet<Vec<u8>>> {
+        let Some(value) = resources.get(b"ExtGState".as_slice()) else {
+            return Ok(BTreeSet::new());
+        };
+        let Some(object) = document.resolve_owned_value_cow(value)? else {
+            return Ok(BTreeSet::new());
+        };
+        let Some(states) = object.as_dictionary() else {
+            return Ok(BTreeSet::new());
+        };
+        let mut neutral = BTreeSet::new();
+        for (name, value) in states {
+            if self.neutral_ext_gstate(document, value)? {
+                neutral.insert(name.clone());
+            }
+        }
+        Ok(neutral)
+    }
 }
 
 #[derive(Default)]
 struct FontUsageAccumulator {
+    bindings: FontBindingCache,
     identity_used: HashMap<CowObjectHandle, BTreeSet<u16>>,
     identity_unsafe: BTreeSet<CowObjectHandle>,
     winansi_used: HashMap<CowObjectHandle, BTreeSet<u8>>,
@@ -1455,6 +1489,43 @@ struct FontUsageAccumulator {
 }
 
 impl FontUsageAccumulator {
+    fn eligible_fonts(
+        &mut self,
+        document: &EditDocument,
+        resources: &OwnedDictionary,
+    ) -> Result<ScopeFontBindings> {
+        let mut bindings = ScopeFontBindings::default();
+        let Some(value) = resources.get(b"Font".as_slice()) else {
+            return Ok(bindings);
+        };
+        let Some(object) = document.resolve_owned_value_cow(value)? else {
+            return Ok(bindings);
+        };
+        let Some(fonts) = object.as_dictionary() else {
+            return Ok(bindings);
+        };
+        for (name, value) in fonts {
+            let binding = self.bindings.font(document, value)?;
+            match binding.identity {
+                Some(PageCidFontProgram::Eligible(spec)) => {
+                    bindings.identity.insert(name.clone(), spec);
+                }
+                Some(PageCidFontProgram::Unsafe(program)) => {
+                    self.identity_unsafe.insert(program);
+                }
+                None => {}
+            }
+            if let Some((program, winansi)) = binding.winansi {
+                if winansi {
+                    bindings.winansi.insert(name.clone(), program);
+                } else {
+                    self.winansi_unsafe.insert(program);
+                }
+            }
+        }
+        Ok(bindings)
+    }
+
     fn scan_scope(
         &mut self,
         content: &[u8],
@@ -1615,14 +1686,14 @@ fn scan_tiling_pattern_font_usage(
         let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
             return Ok(true);
         };
-        let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
-        let winansi_eligible =
-            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        let ScopeFontBindings {
+            identity: identity_eligible,
+            winansi: winansi_eligible,
+        } = usage.eligible_fonts(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
-        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let font_neutral_ext_gstates = usage.bindings.neutral_ext_gstates(document, &resources)?;
         let Ok(content) = document.decoded_content_stream_data(pattern) else {
             poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
             continue;
@@ -1653,14 +1724,14 @@ fn scan_type3_charproc_font_usage(
         let Some(resources) = resolved_dictionary(document, Some(resources_value))? else {
             return Ok(true);
         };
-        let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
-        let winansi_eligible =
-            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
+        let ScopeFontBindings {
+            identity: identity_eligible,
+            winansi: winansi_eligible,
+        } = usage.eligible_fonts(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
-        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let font_neutral_ext_gstates = usage.bindings.neutral_ext_gstates(document, &resources)?;
         let Some(char_procs_value) = font.get(b"CharProcs".as_slice()) else {
             poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
             continue;
@@ -1670,13 +1741,16 @@ fn scan_type3_charproc_font_usage(
             continue;
         };
         for value in char_procs.values() {
-            let Some(stream) = document.resolve_owned_value(value)? else {
+            let Some(stream) = document.resolve_owned_value_cow(value)? else {
                 poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
                 break;
             };
-            let Ok(content) =
-                document.decoded_stream_value(&crate::source::CurrentValue::Owned(&stream))
-            else {
+            let decoded = if matches!(value, OwnedObject::Reference(_)) {
+                document.decoded_reference_snapshot(value)
+            } else {
+                document.content_snapshot(&CurrentValue::Owned(&stream))
+            };
+            let Ok(content) = decoded else {
                 poison_font_usage_scope(&identity_eligible, &winansi_eligible, usage);
                 break;
             };
@@ -1714,14 +1788,14 @@ fn font_glyph_usage_with_hints(
         let Some(resources) = page_resources(document, page)? else {
             continue;
         };
-        let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
-        let winansi_eligible =
-            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
-        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let ScopeFontBindings {
+            identity: identity_eligible,
+            winansi: winansi_eligible,
+        } = usage.eligible_fonts(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
+        let font_neutral_ext_gstates = usage.bindings.neutral_ext_gstates(document, &resources)?;
         let Some(content) = page_content_if_present(document, page)? else {
             continue;
         };
@@ -1749,14 +1823,14 @@ fn font_glyph_usage_with_hints(
             // is call-graph-aware, it poisons both retain-GID proofs.
             return Ok((HashMap::new(), HashMap::new()));
         };
-        let identity_eligible =
-            eligible_identity_fonts(document, &resources, &mut usage.identity_unsafe)?;
-        let winansi_eligible =
-            eligible_winansi_fonts(document, &resources, &mut usage.winansi_unsafe)?;
-        let font_neutral_ext_gstates = font_neutral_ext_gstates(document, &resources)?;
+        let ScopeFontBindings {
+            identity: identity_eligible,
+            winansi: winansi_eligible,
+        } = usage.eligible_fonts(document, &resources)?;
         if identity_eligible.is_empty() && winansi_eligible.is_empty() {
             continue;
         }
+        let font_neutral_ext_gstates = usage.bindings.neutral_ext_gstates(document, &resources)?;
         let Ok(content) = document.decoded_content_stream_data(form) else {
             usage
                 .identity_unsafe
@@ -3874,6 +3948,50 @@ mod tests {
         let (identity, winansi) = font_glyph_usage(&document)?;
         assert!(identity.is_empty());
         assert!(winansi.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_scope_bindings_share_explicit_cid_map_snapshot() -> Result<()> {
+        let document = EditDocument::from_bytes(dense_cidfont_fixture()?)?;
+        let pages = document.page_handles()?;
+        let resources = page_resources(&document, pages[0])?
+            .ok_or_else(|| Error::Invalid("missing fixture resources".to_owned()))?;
+        let mut usage = FontUsageAccumulator::default();
+        let first = usage.eligible_fonts(&document, &resources)?;
+        let second = usage.eligible_fonts(&document, &resources)?;
+        assert_eq!(first.identity, second.identity);
+        let mut explicit = 0;
+        for (name, spec) in &first.identity {
+            if let CidToGidMapping::Explicit(a) = &spec.mapping {
+                let CidToGidMapping::Explicit(b) = &second.identity[name].mapping else {
+                    return Err(Error::Invalid("expected explicit map".to_owned()));
+                };
+                assert!(Arc::ptr_eq(a, b));
+                explicit += 1;
+            }
+        }
+        assert!(explicit > 0);
+        assert!(!usage.bindings.fonts.is_empty());
+        let program = CowObjectHandle::Existing(ObjectId::new(5, 0));
+        let neutral = BTreeSet::new();
+        assert!(!usage.scan_scope(
+            b"BT /F1 10 Tf <00030002> Tj ET",
+            &first.identity,
+            &first.winansi,
+            &neutral
+        ));
+        assert_eq!(
+            usage.identity_used.get(&program),
+            Some(&BTreeSet::from([0, 3]))
+        );
+        assert!(!usage.scan_scope(
+            b"BT /F1 10 Tf <0004> Tj ET",
+            &second.identity,
+            &second.winansi,
+            &neutral
+        ));
+        assert!(usage.identity_unsafe.contains(&program));
         Ok(())
     }
 
