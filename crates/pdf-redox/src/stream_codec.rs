@@ -250,14 +250,8 @@ fn compression_code_error(code: zlib_rs::ReturnCode) -> Error {
 
 /// Encode ordinary zlib/Flate data at an explicit PDF compression level.
 pub fn encode_flate(decoded: &[u8], level: crate::FlateLevel) -> Result<Vec<u8>> {
-    let mut output = vec![0_u8; zlib_rs::compress_bound(decoded.len())];
-    let (encoded, code) = zlib_rs::compress_slice(&mut output, decoded, flate_config(level));
-    if code != zlib_rs::ReturnCode::Ok {
-        return Err(compression_code_error(code));
-    }
-    let encoded_len = encoded.len();
-    output.truncate(encoded_len);
-    Ok(output)
+    encode_flate_capped(decoded, usize::MAX, level)?
+        .ok_or_else(|| compression_code_error(zlib_rs::ReturnCode::BufError))
 }
 
 /// Persistent whole-stream Flate executor used by document-level batch phases.
@@ -880,13 +874,12 @@ pub fn encode_flate_capped(
     maximum_length: usize,
     level: crate::FlateLevel,
 ) -> Result<Option<Vec<u8>>> {
-    let mut output = vec![0_u8; maximum_length.min(zlib_rs::compress_bound(decoded.len()))];
-    let (encoded, code) = zlib_rs::compress_slice(&mut output, decoded, flate_config(level));
-    let Some(length) = flate_length_with_limit(encoded.len(), code)? else {
-        return Ok(None);
-    };
-    output.truncate(length);
-    Ok(Some(output))
+    let mut output = Vec::new();
+    let limit = maximum_length.min(zlib_rs::compress_bound(decoded.len()));
+    let result = zlib_rs::BatchJob::with_vec(decoded, &mut output, limit)
+        .map_err(|error| Error::Compression(format!("failed to reserve Flate output: {error}")))?
+        .compress(flate_config(level));
+    Ok(flate_length_with_limit(result.written, result.code)?.map(|_| output))
 }
 
 /// Return the encoded byte length of ordinary zlib/Flate data.
@@ -1106,6 +1099,42 @@ mod tests {
                     .map(|(&input, &cap)| flate_capped_encoded_len(input, cap, level))
                     .collect::<Result<Vec<_>>>()?;
                 assert_eq!(scalar, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_vector_destination_matches_initialized_slice() -> Result<()> {
+        let mut state = 0x3278_1234_u32;
+        let random = (0..128 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        let repeated = b"Repeated PDF content stream operands and operators. ".repeat(4096);
+        for level in [crate::FlateLevel::PROCESSING, crate::FlateLevel::SIZE] {
+            for input in [b"".as_slice(), b"a", random.as_slice(), repeated.as_slice()] {
+                let mut reference = vec![0; zlib_rs::compress_bound(input.len())];
+                let (expected, code) =
+                    zlib_rs::compress_slice(&mut reference, input, flate_config(level));
+                assert_eq!(code, zlib_rs::ReturnCode::Ok);
+                for cap in [
+                    0,
+                    expected.len() - 1,
+                    expected.len(),
+                    expected.len() + 1,
+                    usize::MAX,
+                ] {
+                    let actual = encode_flate_capped(input, cap, level)?;
+                    assert_eq!(
+                        actual.as_deref(),
+                        (expected.len() <= cap).then_some(expected.as_ref())
+                    );
+                }
             }
         }
         Ok(())
