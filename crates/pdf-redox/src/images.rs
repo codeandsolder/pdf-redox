@@ -1840,13 +1840,13 @@ mod tests {
         let width = 257_u32;
         let height = 259_u32;
         let colors = [[255, 0, 32], [0, 255, 128], [18, 40, 230], [255, 255, 255]];
-        let mut state = 0x3278_1234_u32;
+        let mut rng = 0x3278_1234_u32;
         let mut rgb = Vec::new();
         for _ in 0..width * height {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            rgb.extend_from_slice(&colors[(state & 3) as usize]);
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rgb.extend_from_slice(&colors[(rng & 3) as usize]);
         }
         let encoded = encode_flate(&rgb, crate::FlateLevel::PROCESSING)?;
         let mut pdf = crate::test_support::ClassicPdfBuilder::new();
@@ -1913,8 +1913,8 @@ mod tests {
             for min_savings_percent in [0, 1, 19, 20, 99, 100, 101, 255] {
                 for min_savings_bytes in [0, 1, 2, 100, u64::MAX] {
                     let options = ImageOptimizationOptions {
-                        min_savings_percent,
                         min_savings_bytes,
+                        min_savings_percent,
                         ..ImageOptimizationOptions::default()
                     };
                     let cap = maximum_optimized_payload(options, original);
