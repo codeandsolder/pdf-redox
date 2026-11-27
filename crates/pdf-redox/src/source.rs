@@ -2421,7 +2421,9 @@ fn equal_bounded(left: &OwnedObject, right: &OwnedObject, remaining: usize) -> b
         (OwnedObject::Null, OwnedObject::Null) => true,
         (OwnedObject::Boolean(a), OwnedObject::Boolean(b)) => a == b,
         (OwnedObject::Integer(a), OwnedObject::Integer(b)) => a == b,
-        (OwnedObject::Real(a), OwnedObject::Real(b)) => a == b,
+        (OwnedObject::Real(a), OwnedObject::Real(b)) => {
+            NumericValue::Real(*a) == NumericValue::Real(*b)
+        }
         (OwnedObject::Name(a), OwnedObject::Name(b))
         | (OwnedObject::String(a), OwnedObject::String(b)) => a == b,
         (OwnedObject::Reference(a), OwnedObject::Reference(b)) => a == b,
@@ -2989,6 +2991,40 @@ mod tests {
         }
         assert!(!CurrentValue::Owned(&no_reference).contains_indirect_reference());
         assert_eq!(no_reference.references(), Vec::<ObjectHandle>::new());
+    }
+
+    #[test]
+    fn fast_and_iterative_owned_equality_agree_on_exact_numeric_and_stream_identity() {
+        let values = [
+            OwnedObject::Integer(0),
+            OwnedObject::Real(0.0),
+            OwnedObject::Real(-0.0),
+            OwnedObject::Real(f64::NAN),
+            OwnedObject::Real(f64::INFINITY),
+            OwnedObject::Real(1.0),
+            OwnedObject::Real(1.0 + f64::EPSILON),
+            OwnedObject::String(b"A".to_vec()),
+            OwnedObject::Name(b"A".to_vec()),
+            OwnedObject::Stream {
+                dictionary: OwnedDictionary::new(),
+                data: StreamData::Source(ObjectId::new(1, 0)),
+            },
+            OwnedObject::Stream {
+                dictionary: OwnedDictionary::new(),
+                data: StreamData::Owned(Arc::new(vec![1])),
+            },
+        ];
+        for left in &values {
+            for right in &values {
+                assert_eq!(left == right, equal_iterative(left, right));
+                let a = OwnedObject::array(vec![left.clone()]);
+                let b = OwnedObject::array(vec![right.clone()]);
+                assert_eq!(a == b, equal_iterative(&a, &b));
+            }
+        }
+        assert_eq!(OwnedObject::Real(0.0), OwnedObject::Real(-0.0));
+        assert_ne!(OwnedObject::Real(f64::NAN), OwnedObject::Real(f64::NAN));
+        assert_ne!(OwnedObject::Integer(0), OwnedObject::Real(0.0));
     }
 
     #[test]
