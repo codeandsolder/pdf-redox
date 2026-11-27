@@ -1661,9 +1661,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn annotation_flattening_preserves_forms_counts_real_paint_and_isolates_resources() -> Result<()>
-    {
+    fn annotation_reference_chain_fixture() -> Result<EditDocument> {
         let mut document = annotation_fixture("16 0 R", b"q 0 0 1 1 re f")?;
         let alias = document.add_object(OwnedObject::Reference(CowObjectHandle::Existing(
             crate::ObjectId::new(16, 0),
@@ -1680,6 +1678,13 @@ mod tests {
             .ok_or_else(|| Error::Invalid("fixture content not isolated".into()))?;
         assert_eq!(plan.parts.len(), 2);
         assert_eq!(plan.saves_to_restore, 3);
+        Ok(document)
+    }
+
+    #[test]
+    fn annotation_flattening_preserves_forms_counts_real_paint_and_isolates_resources() -> Result<()>
+    {
+        let mut document = annotation_reference_chain_fixture()?;
         let mut policy = PreservationConfig::visible_surface();
         policy.forms = true;
         let stats = apply_preservation_policy(&mut document, &policy)?;
