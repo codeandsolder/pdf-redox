@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@121c7f9e5f73be0b14c4dd5cb652de82f829ff1e # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@798a043851ff0ef78bd836ea791528d8ecb7c77b # main
 
   merge-gate:
     name: Strict Rust merge gate
