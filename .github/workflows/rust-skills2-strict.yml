@@ -2,6 +2,7 @@ name: Strict Rust
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -15,3 +16,12 @@ permissions:
 jobs:
   strict-rust:
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@798a043851ff0ef78bd836ea791528d8ecb7c77b # main
+
+  merge-gate:
+    name: Strict Rust merge gate
+    if: ${{ always() }}
+    needs: [strict-rust]
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
+    with:
+      needs-json: ${{ toJSON(needs) }}
+      expected-results: '[["strict-rust","success"]]'
