@@ -192,7 +192,7 @@ fn write_scalar(
         Some(CosScalar::Name(value)) => write_pdf_name(output, value),
         Some(CosScalar::String(value)) => write_pdf_string(output, value),
         Some(CosScalar::Reference(reference)) => {
-            write_reference(output, document, plan, reference)?
+            write_reference(output, document, plan, reference)?;
         }
         None => {
             return Err(Error::Invalid(
