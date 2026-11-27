@@ -78,7 +78,7 @@ pub use optimize::{
 pub use report::{
     DocumentRepresentation, HiddenTextAction, HiddenTextCategory, HiddenTextFinding,
     HiddenTextMechanism, OptimizationReport, PageRect, PageRepresentation, PdfAnalysis,
-    RiskFinding, RiskKind,
+    PreservationStats, RiskFinding, RiskKind,
 };
 pub use source::{
     EditDocument, ExistingObjectChange, NewObjectId, ObjectHandle, ObjectId, ObjectOverlay,

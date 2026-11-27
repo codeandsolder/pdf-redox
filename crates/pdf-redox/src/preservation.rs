@@ -2,7 +2,7 @@ use crate::direct_object::{
     DirectDictionaryView, DirectObjectTarget, DirectObjectVisitor, DirectPathStep,
     DirectWalkControl, value_at_direct_path, walk_direct_output_objects,
 };
-use crate::geometry::{Matrix, Rectangle};
+use crate::geometry::{Matrix, Rect, Rectangle};
 use crate::{
     AnnotationPolicy, EditDocument, Error, ObjectHandle as CowObjectHandle, OwnedDictionary,
     OwnedObject, PreservationConfig, Result, StreamData,
@@ -11,28 +11,43 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const SCREEN_HIDDEN_ANNOTATION_FLAGS: i64 = 0x02 | 0x20;
+const ANNOT_INVISIBLE: i64 = 1;
+const ANNOT_HIDDEN: i64 = 2;
+const ANNOT_PRINT: i64 = 4;
+const ANNOT_NO_ZOOM: i64 = 8;
+const ANNOT_NO_ROTATE: i64 = 16;
+const ANNOT_NO_VIEW: i64 = 32;
+const ANNOT_READ_ONLY: i64 = 64;
+const ANNOT_TOGGLE_NO_VIEW: i64 = 256;
+const VIEW_DEPENDENT_FLAGS: i64 = ANNOT_NO_ZOOM | ANNOT_NO_ROTATE | ANNOT_TOGGLE_NO_VIEW;
+
+#[derive(Clone, Copy)]
+struct AnnotationVisibility(i64);
+
+impl AnnotationVisibility {
+    const fn potentially_visible(self) -> bool {
+        self.0 & ANNOT_HIDDEN == 0
+            && (self.0 & ANNOT_NO_VIEW == 0 || self.0 & (ANNOT_PRINT | ANNOT_TOGGLE_NO_VIEW) != 0)
+    }
+
+    /// Page paint is visible both on screen and in print and cannot implement
+    /// annotation-specific zoom, rotation or toggled visibility.
+    const fn can_flatten(self) -> bool {
+        self.0 & ANNOT_PRINT != 0
+            && self.0 & (ANNOT_HIDDEN | ANNOT_INVISIBLE | ANNOT_NO_VIEW | VIEW_DEPENDENT_FLAGS) == 0
+    }
+
+    const fn fixed_bounds(self) -> bool {
+        self.0 & VIEW_DEPENDENT_FLAGS == 0
+    }
+}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PreservationScanHints {
     pub no_piece_info: bool,
     pub no_authoring_metadata: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct PreservationStats {
-    pub pages: usize,
-    pub annotation_entries_seen: usize,
-    pub annotation_entries_flattened: usize,
-    pub annotation_entries_dropped_unflattened: usize,
-    pub link_visual_shells_retained: usize,
-    pub annotation_subtypes_seen: BTreeMap<String, usize>,
-    pub unflattened_annotation_subtypes: BTreeMap<String, usize>,
-    pub dropped_page_keys: BTreeMap<String, usize>,
-    pub dropped_page_tree_keys: BTreeMap<String, usize>,
-    pub dropped_catalog_keys: BTreeMap<String, usize>,
-    pub dropped_authoring_keys: BTreeMap<String, usize>,
-    pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
-}
+pub use crate::report::PreservationStats;
 
 fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
     let Some(value) = value else {
@@ -317,7 +332,16 @@ fn filter_annotations(
 }
 
 fn link_visual_shell(dictionary: &OwnedDictionary) -> OwnedObject {
-    const LINK_VISUAL_KEYS: &[&[u8]] = &[b"Rect", b"Border", b"BS", b"C", b"F", b"CA", b"OC"];
+    const LINK_VISUAL_KEYS: &[&[u8]] = &[
+        b"Rect",
+        b"Border",
+        b"BS",
+        b"C",
+        b"F",
+        b"CA",
+        b"OC",
+        b"QuadPoints",
+    ];
     let mut shell = OwnedDictionary::from([
         (b"Type".to_vec(), OwnedObject::Name(b"Annot".to_vec())),
         (b"Subtype".to_vec(), OwnedObject::Name(b"Link".to_vec())),
@@ -701,20 +725,35 @@ enum PlannedForm {
     New(OwnedObject),
 }
 
-struct PlannedAppearance {
+struct PreparedForm {
     form: PlannedForm,
-    content: Vec<u8>,
     needs_resources: bool,
 }
 
-fn prepare_appearance(
-    document: &EditDocument,
-    annotation: &OwnedDictionary,
-    source: AppearanceSource,
-    resource_name: &str,
-    rotate: i32,
-    flags: i64,
-) -> Result<Option<PlannedAppearance>> {
+impl PreparedForm {
+    fn commit(
+        self,
+        document: &mut EditDocument,
+        scopes: &mut AppearanceScopes,
+        page_resources: &OwnedDictionary,
+        widget_defaults: Option<&OwnedDictionary>,
+    ) -> Result<CowObjectHandle> {
+        match self.form {
+            PlannedForm::Existing(handle) => Ok(handle),
+            PlannedForm::New(mut object) => {
+                if self.needs_resources {
+                    let scope = scopes.resource(document, page_resources, widget_defaults)?;
+                    if let OwnedObject::Stream { dictionary, .. } = &mut object {
+                        dictionary.insert(b"Resources".to_vec(), OwnedObject::Reference(scope));
+                    }
+                }
+                Ok(CowObjectHandle::New(document.add_object(object)))
+            }
+        }
+    }
+}
+
+fn prepare_form(document: &EditDocument, source: AppearanceSource) -> Result<Option<PreparedForm>> {
     let (handle, object) = match source {
         AppearanceSource::Handle(handle) => {
             let Some(object) = document.current_owned_object_cow(handle)? else {
@@ -727,17 +766,6 @@ fn prepare_appearance(
     let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
         return Ok(None);
     };
-    let content = appearance_content(
-        document,
-        annotation,
-        dictionary,
-        resource_name,
-        rotate,
-        flags,
-    )?;
-    if content.is_empty() {
-        return Ok(None);
-    }
     let needs_resources = match dictionary.get(b"Resources".as_slice()) {
         None => true,
         Some(value) => match document.resolve_owned_value_cow(value)?.as_deref() {
@@ -752,19 +780,106 @@ fn prepare_appearance(
     {
         PlannedForm::Existing(handle)
     } else {
-        // Never normalize a shared appearance object in-place. Its other
-        // users may still depend on the exact original dictionary.
+        // Never normalize a shared appearance object in-place.
         let mut object = object.into_owned();
         if let OwnedObject::Stream { dictionary, .. } = &mut object {
             dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
         }
         PlannedForm::New(object)
     };
-    Ok(Some(PlannedAppearance {
+    Ok(Some(PreparedForm {
         form,
-        content,
         needs_resources,
     }))
+}
+
+impl AppearanceSource {
+    fn dictionary<'a>(
+        &'a self,
+        document: &'a EditDocument,
+    ) -> Result<Option<std::borrow::Cow<'a, OwnedObject>>> {
+        match self {
+            Self::Handle(handle) => document.current_owned_object_cow(*handle),
+            Self::Direct(object) => Ok(Some(std::borrow::Cow::Borrowed(object))),
+        }
+    }
+
+    fn into_value(self) -> OwnedObject {
+        match self {
+            Self::Handle(handle) => OwnedObject::Reference(handle),
+            Self::Direct(object) => object,
+        }
+    }
+}
+
+fn appearance_visual_shell(
+    annotation: &OwnedDictionary,
+    normal: OwnedObject,
+    visibility: AnnotationVisibility,
+) -> OwnedObject {
+    // Stamp is a standard appearance-bearing non-field subtype. Keep only the
+    // selected normal appearance, never action, field, popup or reply state.
+    let mut shell = OwnedDictionary::from([
+        (b"Type".to_vec(), OwnedObject::Name(b"Annot".to_vec())),
+        (b"Subtype".to_vec(), OwnedObject::Name(b"Stamp".to_vec())),
+        (
+            b"F".to_vec(),
+            OwnedObject::Integer(visibility.0 | ANNOT_READ_ONLY),
+        ),
+        (
+            b"AP".to_vec(),
+            OwnedObject::Dictionary(OwnedDictionary::from([(b"N".to_vec(), normal)])),
+        ),
+    ]);
+    for key in [b"Rect".as_slice(), b"OC", b"CA", b"BM"] {
+        if let Some(value) = annotation.get(key) {
+            shell.insert(key.to_vec(), value.clone());
+        }
+    }
+    OwnedObject::Dictionary(shell)
+}
+
+fn annotation_bounds(
+    document: &EditDocument,
+    annotation: &OwnedDictionary,
+) -> Result<Option<Rect>> {
+    let Some(value) = annotation.get(b"Rect".as_slice()) else {
+        return Ok(None);
+    };
+    Ok(normalized_rectangle(document, value)?
+        .and_then(Rect::from_rectangle)
+        .filter(|bounds| bounds.area().is_finite()))
+}
+
+#[derive(Default)]
+struct RetainedPaint {
+    bounds: Vec<Rect>,
+    unknown: bool,
+}
+
+impl RetainedPaint {
+    fn blocks(&self, bounds: Option<Rect>) -> bool {
+        self.unknown
+            || (!self.bounds.is_empty()
+                && bounds.is_none_or(|bounds| {
+                    self.bounds
+                        .iter()
+                        .any(|previous| previous.gap(bounds) == 0.0)
+                }))
+    }
+
+    fn add(&mut self, bounds: Option<Rect>, visibility: AnnotationVisibility) {
+        if !visibility.potentially_visible() {
+            return;
+        }
+        if visibility.fixed_bounds()
+            && let Some(bounds) = bounds
+        {
+            self.bounds.push(bounds);
+        } else {
+            self.unknown = true;
+        }
+    }
 }
 
 fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<Option<Rectangle>> {
@@ -802,8 +917,6 @@ fn appearance_content(
     annotation: &OwnedDictionary,
     appearance_dictionary: &OwnedDictionary,
     resource_name: &str,
-    rotate: i32,
-    flags: i64,
 ) -> Result<Vec<u8>> {
     let Some(bbox_value) = appearance_dictionary.get(b"BBox".as_slice()) else {
         return Ok(Vec::new());
@@ -820,38 +933,6 @@ fn appearance_content(
     let Some(matrix) = appearance_matrix(document, appearance_dictionary)? else {
         return Ok(Vec::new());
     };
-    let do_rotate = rotate != 0 && (flags & 0x10) != 0;
-    let (rect, matrix) = if do_rotate {
-        let mut rotated_matrix = Matrix::default();
-        rotated_matrix.rotatex90(rotate);
-        rotated_matrix.concat(matrix);
-        let rect_width = rect.urx - rect.llx;
-        let rect_height = rect.ury - rect.lly;
-        let rotated_rect = match rotate {
-            90 => Rectangle::new(
-                rect.llx,
-                rect.ury,
-                rect.llx + rect_height,
-                rect.ury + rect_width,
-            ),
-            180 => Rectangle::new(
-                rect.llx - rect_width,
-                rect.ury,
-                rect.llx,
-                rect.ury + rect_height,
-            ),
-            270 => Rectangle::new(
-                rect.llx - rect_height,
-                rect.ury - rect_width,
-                rect.llx,
-                rect.ury,
-            ),
-            _ => rect,
-        };
-        (rotated_rect, rotated_matrix)
-    } else {
-        (rect, matrix)
-    };
     let Some(transformed_bbox) = matrix.transform_rectangle(bbox) else {
         return Ok(Vec::new());
     };
@@ -867,10 +948,7 @@ fn appearance_content(
     placement.translate(rect.x0, rect.y0);
     placement.scale((rect.x1 - rect.x0) / width, (rect.y1 - rect.y0) / height);
     placement.translate(-transformed_bbox.x0, -transformed_bbox.y0);
-    if do_rotate {
-        placement.rotatex90(rotate);
-    }
-    if !placement.is_finite() {
+    if !placement.is_finite() || placement.a == 0.0 || placement.d == 0.0 {
         return Ok(Vec::new());
     }
     let mut content = b"q\n".to_vec();
@@ -1177,6 +1255,7 @@ fn wrap_page_contents(
     Ok(())
 }
 
+#[cfg(test)]
 fn page_rotate(document: &EditDocument, page: &DirectObjectTarget) -> Result<i32> {
     let Some(object) = page.current(document)? else {
         return Ok(0);
@@ -1223,19 +1302,12 @@ impl PageAppearancePlan {
         &mut self,
         document: &mut EditDocument,
         annotation: &OwnedDictionary,
-        rotate: i32,
+        source: &AppearanceSource,
         widget_defaults: Option<&OwnedDictionary>,
     ) -> Result<bool> {
         if self.content.is_none() {
             return Ok(false);
         }
-        let flags = annotation_flags(document, annotation)?;
-        if flags & SCREEN_HIDDEN_ANNOTATION_FLAGS != 0 {
-            return Ok(false);
-        }
-        let Some(source) = selected_normal_appearance(document, annotation)? else {
-            return Ok(false);
-        };
         let optional_content = annotation.get(b"OC".as_slice());
         if let Some(value) = optional_content
             && (!self.properties_valid
@@ -1256,27 +1328,27 @@ impl PageAppearancePlan {
                 break candidate;
             }
         };
-        let Some(plan) =
-            prepare_appearance(document, annotation, source, &resource_name, rotate, flags)?
-        else {
+        let content = {
+            let Some(object) = source.dictionary(document)? else {
+                return Ok(false);
+            };
+            let Some(dictionary) = object.as_dictionary() else {
+                return Ok(false);
+            };
+            appearance_content(document, annotation, dictionary, &resource_name)?
+        };
+        if content.is_empty() {
+            return Ok(false);
+        }
+        let Some(form) = prepare_form(document, source.clone())? else {
             return Ok(false);
         };
-        let appearance = match plan.form {
-            PlannedForm::Existing(handle) => handle,
-            PlannedForm::New(mut object) => {
-                if plan.needs_resources {
-                    let scope = self.scopes.resource(
-                        document,
-                        &self.original_resources,
-                        widget_defaults,
-                    )?;
-                    if let OwnedObject::Stream { dictionary, .. } = &mut object {
-                        dictionary.insert(b"Resources".to_vec(), OwnedObject::Reference(scope));
-                    }
-                }
-                CowObjectHandle::New(document.add_object(object))
-            }
-        };
+        let appearance = form.commit(
+            document,
+            &mut self.scopes,
+            &self.original_resources,
+            widget_defaults,
+        )?;
         if let Some(oc) = optional_content {
             self.properties
                 .insert(resource_name.as_bytes().to_vec(), oc.clone());
@@ -1288,11 +1360,34 @@ impl PageAppearancePlan {
             resource_name.into_bytes(),
             OwnedObject::Reference(appearance),
         );
-        self.append_bytes.extend(plan.content);
+        self.append_bytes.extend(content);
         if optional_content.is_some() {
             self.append_bytes.extend_from_slice(b"EMC\n");
         }
         Ok(true)
+    }
+
+    fn retain_appearance(
+        &mut self,
+        document: &mut EditDocument,
+        annotation: &OwnedDictionary,
+        source: AppearanceSource,
+        visibility: AnnotationVisibility,
+        widget_defaults: Option<&OwnedDictionary>,
+    ) -> Result<OwnedObject> {
+        // Preserve the selected original appearance when even its resource
+        // dictionary is malformed. Otherwise freeze its fallback scope just
+        // as for page paint (notably when AcroForm is removed).
+        let normal = match prepare_form(document, source.clone())? {
+            Some(form) => OwnedObject::Reference(form.commit(
+                document,
+                &mut self.scopes,
+                &self.original_resources,
+                widget_defaults,
+            )?),
+            None => source.into_value(),
+        };
+        Ok(appearance_visual_shell(annotation, normal, visibility))
     }
 
     fn commit(self, document: &mut EditDocument, page: &DirectObjectTarget) -> Result<()> {
@@ -1319,6 +1414,94 @@ impl PageAppearancePlan {
     }
 }
 
+struct AnnotationPage<'a> {
+    target: &'a DirectObjectTarget,
+    policy: &'a PreservationConfig,
+    need_appearances: bool,
+    defaults: Option<&'a OwnedDictionary>,
+    retained: RetainedPaint,
+    plan: Option<PageAppearancePlan>,
+}
+
+enum AnnotationDisposition {
+    Protected(OwnedObject),
+    Flattened,
+    AppearanceShell(OwnedObject),
+    LinkShell(OwnedObject),
+    Dropped,
+}
+
+impl AnnotationPage<'_> {
+    fn plan(&mut self, document: &EditDocument) -> Result<&mut PageAppearancePlan> {
+        if self.plan.is_none() {
+            self.plan = Some(PageAppearancePlan::new(document, self.target)?);
+        }
+        self.plan
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("missing page appearance plan".into()))
+    }
+
+    fn decide(
+        &mut self,
+        document: &mut EditDocument,
+        value: OwnedObject,
+        subtype: Option<&[u8]>,
+    ) -> Result<AnnotationDisposition> {
+        let protected = annotation_is_protected(subtype, self.policy);
+        let resolved = document.resolve_owned_value(&value)?;
+        let Some(OwnedObject::Dictionary(annotation)) = resolved else {
+            if protected {
+                self.retained.unknown = true;
+                return Ok(AnnotationDisposition::Protected(value));
+            }
+            return Ok(AnnotationDisposition::Dropped);
+        };
+        let visibility = AnnotationVisibility(annotation_flags(document, &annotation)?);
+        let bounds = annotation_bounds(document, &annotation)?;
+        if protected {
+            // Explicit appearances have clipping BBoxes mapped to Rect.
+            // Synthesized appearance and unknown geometry are not bounded.
+            let fixed = selected_normal_appearance(document, &annotation)?.is_some();
+            self.retained
+                .add(if fixed { bounds } else { None }, visibility);
+            return Ok(AnnotationDisposition::Protected(value));
+        }
+        if !visibility.potentially_visible() {
+            return Ok(AnnotationDisposition::Dropped);
+        }
+        let widget = subtype == Some(b"Widget");
+        let defaults = if widget { self.defaults } else { None };
+        if !(widget && self.need_appearances || bounds.is_some_and(|bounds| bounds.area() <= 0.0))
+            && let Some(source) = selected_normal_appearance(document, &annotation)?
+        {
+            if visibility.can_flatten()
+                && !self.retained.blocks(bounds)
+                && self
+                    .plan(document)?
+                    .append(document, &annotation, &source, defaults)?
+            {
+                return Ok(AnnotationDisposition::Flattened);
+            }
+            let shell = self.plan(document)?.retain_appearance(
+                document,
+                &annotation,
+                source,
+                visibility,
+                defaults,
+            )?;
+            self.retained.add(bounds, visibility);
+            return Ok(AnnotationDisposition::AppearanceShell(shell));
+        }
+        if subtype == Some(b"Link") {
+            self.retained.add(None, visibility);
+            return Ok(AnnotationDisposition::LinkShell(link_visual_shell(
+                &annotation,
+            )));
+        }
+        Ok(AnnotationDisposition::Dropped)
+    }
+}
+
 fn flatten_annotations(
     document: &mut EditDocument,
     pages: &[DirectObjectTarget],
@@ -1331,8 +1514,8 @@ fn flatten_annotations(
     } else {
         acroform_default_resources(document)?
     };
-    for page in pages {
-        let Some(entries) = page_annotation_entries(document, page)? else {
+    for target in pages {
+        let Some(entries) = page_annotation_entries(document, target)? else {
             continue;
         };
         let AnnotationEntries::Array(items) = entries else {
@@ -1341,73 +1524,57 @@ fn flatten_annotations(
                 .entry("(non-array /Annots)".into())
                 .or_default() += 1;
             stats.annotation_entries_dropped_unflattened += 1;
-            replace_page_annotations(document, page, Vec::new())?;
+            replace_page_annotations(document, target, Vec::new())?;
             continue;
         };
         let annotations = items
             .map(|value| value.into_cow().into_owned())
             .collect::<Vec<_>>();
+        let mut page = AnnotationPage {
+            target,
+            policy,
+            need_appearances,
+            defaults: default_resources.as_ref(),
+            retained: RetainedPaint::default(),
+            plan: None,
+        };
         let mut kept = Vec::new();
-        let mut page_plan = None;
         let mut changed = false;
-        let rotate = page_rotate(document, page)?;
-        for annotation_value in annotations {
-            let subtype = annotation_subtype(document, &annotation_value)?;
-            if annotation_is_protected(subtype.as_deref(), policy) {
-                kept.push(annotation_value);
-                continue;
-            }
-            changed = true;
-            let resolved = document.resolve_owned_value(&annotation_value)?;
-            let dictionary = match resolved.as_ref() {
-                Some(OwnedObject::Dictionary(dictionary)) => Some(dictionary),
-                _ => None,
-            };
-            let widget = subtype.as_deref() == Some(b"Widget");
-            if let Some(annotation) = dictionary
-                && !(widget && need_appearances)
-                && annotation.contains_key(b"AP".as_slice())
-            {
-                if page_plan.is_none() {
-                    page_plan = Some(PageAppearancePlan::new(document, page)?);
+        for value in annotations {
+            let subtype = annotation_subtype(document, &value)?;
+            match page.decide(document, value, subtype.as_deref())? {
+                AnnotationDisposition::Protected(value) => {
+                    kept.push(value);
+                    continue;
                 }
-                if let Some(plan) = &mut page_plan
-                    && plan.append(
-                        document,
-                        annotation,
-                        rotate,
-                        if widget {
-                            default_resources.as_ref()
-                        } else {
-                            None
-                        },
-                    )?
-                {
+                AnnotationDisposition::Flattened => {
+                    changed = true;
                     stats.annotation_entries_flattened += 1;
                     continue;
                 }
+                AnnotationDisposition::AppearanceShell(shell) => {
+                    kept.push(shell);
+                    stats.appearance_visual_shells_retained += 1;
+                }
+                AnnotationDisposition::LinkShell(shell) => {
+                    kept.push(shell);
+                    stats.link_visual_shells_retained += 1;
+                }
+                AnnotationDisposition::Dropped => stats.annotation_entries_dropped_unflattened += 1,
             }
+            changed = true;
             *stats
                 .unflattened_annotation_subtypes
                 .entry(subtype_label(subtype.as_deref()))
                 .or_default() += 1;
-            if subtype.as_deref() == Some(b"Link")
-                && let Some(dictionary) = dictionary
-            {
-                kept.push(link_visual_shell(dictionary));
-                stats.link_visual_shells_retained += 1;
-            } else {
-                stats.annotation_entries_dropped_unflattened += 1;
-            }
         }
-        if let Some(plan) = page_plan {
-            plan.commit(document, page)?;
+        if let Some(plan) = page.plan {
+            plan.commit(document, target)?;
         }
         if changed {
-            replace_page_annotations(document, page, kept)?;
+            replace_page_annotations(document, target, kept)?;
         }
     }
-    // The catalog's AcroForm is handled by the independent forms policy.
     Ok(())
 }
 
@@ -1621,9 +1788,9 @@ mod tests {
         pdf.stream(4, b"", old_content)?;
         pdf.object(
             5,
-            b"<< /Type /Annot /Subtype /Widget /Rect [10 10 20 20] /AP << /N 10 0 R >> >>",
+            b"<< /Type /Annot /Subtype /Widget /F 4 /Rect [10 10 20 20] /AP << /N 10 0 R >> >>",
         )?;
-        pdf.object(6, b"<< /Type /Annot /Subtype /Stamp /Rect [40 40 60 60] /AP << /N 11 0 R >> /OC 15 0 R >>")?;
+        pdf.object(6, b"<< /Type /Annot /Subtype /Stamp /F 4 /Rect [40 40 60 60] /AP << /N 11 0 R >> /OC 15 0 R >>")?;
         pdf.object(
             7,
             b"<< /Type /Annot /Subtype /Stamp /F 2 /Rect [40 40 60 60] /AP << /N 11 0 R >> >>",
@@ -1790,7 +1957,8 @@ mod tests {
             let stats =
                 apply_preservation_policy(&mut document, &PreservationConfig::visible_surface())?;
             assert_eq!(stats.annotation_entries_flattened, 0);
-            assert_eq!(stats.annotation_entries_dropped_unflattened, 4);
+            assert_eq!(stats.annotation_entries_dropped_unflattened, 2);
+            assert_eq!(stats.appearance_visual_shells_retained, 2);
             assert_eq!(stats.link_visual_shells_retained, 1);
             let after = target
                 .current(&document)?
@@ -1851,6 +2019,87 @@ mod tests {
         .ok_or_else(|| Error::Invalid("missing widget fonts".into()))?;
         assert!(fonts.contains_key(b"PageFont".as_slice()));
         assert!(fonts.contains_key(b"DefaultFont".as_slice()));
+        Ok(())
+    }
+
+    fn set_annotation_flags(document: &mut EditDocument, number: u32, flags: i64) -> Result<()> {
+        document
+            .edit_object(crate::ObjectId::new(number, 0))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("fixture annotation not dictionary".into()))?
+            .insert(b"F".to_vec(), OwnedObject::Integer(flags));
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_retained_paint_keeps_later_appearance_in_annotation_order() -> Result<()> {
+        let mut document = annotation_fixture("4 0 R", b"q Q")?;
+        let annotation = document
+            .edit_object(crate::ObjectId::new(6, 0))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing stamp".into()))?;
+        annotation.insert(
+            b"Rect".to_vec(),
+            OwnedObject::array(vec![
+                OwnedObject::Integer(15),
+                OwnedObject::Integer(15),
+                OwnedObject::Integer(25),
+                OwnedObject::Integer(25),
+            ]),
+        );
+        annotation.insert(
+            b"A".to_vec(),
+            OwnedObject::Dictionary(OwnedDictionary::new()),
+        );
+        let mut policy = PreservationConfig::visible_surface();
+        policy.forms = true;
+        let stats = apply_preservation_policy(&mut document, &policy)?;
+        assert_eq!(stats.annotation_entries_flattened, 0);
+        assert_eq!(stats.appearance_visual_shells_retained, 1);
+        let kept = page_annotations(&document, &fixture_page())?
+            .ok_or_else(|| Error::Invalid("missing shells".into()))?;
+        assert_eq!(kept.len(), 3);
+        assert_eq!(
+            kept[0],
+            OwnedObject::Reference(CowObjectHandle::Existing(crate::ObjectId::new(5, 0)))
+        );
+        let shell = kept[1]
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("missing shell dictionary".into()))?;
+        assert!(shell.contains_key(b"AP".as_slice()));
+        assert!(shell.contains_key(b"OC".as_slice()));
+        assert!(!shell.contains_key(b"A".as_slice()));
+        assert_eq!(
+            shell.get(b"F".as_slice()),
+            Some(&OwnedObject::Integer(ANNOT_PRINT | ANNOT_READ_ONLY))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn screen_print_and_view_dependent_appearances_remain_shells() -> Result<()> {
+        for flags in [
+            0,
+            ANNOT_PRINT | ANNOT_NO_VIEW,
+            ANNOT_PRINT | ANNOT_NO_ZOOM,
+            ANNOT_PRINT | ANNOT_NO_ROTATE,
+            ANNOT_PRINT | ANNOT_TOGGLE_NO_VIEW,
+        ] {
+            let mut document = annotation_fixture("4 0 R", b"q Q")?;
+            set_annotation_flags(&mut document, 6, flags)?;
+            let stats =
+                apply_preservation_policy(&mut document, &PreservationConfig::visible_surface())?;
+            assert_eq!(stats.annotation_entries_flattened, 1);
+            assert_eq!(stats.appearance_visual_shells_retained, 1);
+            let kept = page_annotations(&document, &fixture_page())?
+                .ok_or_else(|| Error::Invalid("missing retained stamp".into()))?;
+            assert_eq!(
+                kept[0]
+                    .as_dictionary()
+                    .and_then(|shell| shell.get(b"F".as_slice())),
+                Some(&OwnedObject::Integer(flags | ANNOT_READ_ONLY))
+            );
+        }
         Ok(())
     }
 

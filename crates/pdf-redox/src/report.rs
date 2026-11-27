@@ -1152,42 +1152,41 @@ pub struct OptimizationReport {
     /// Additional encoded bytes saved by selected high-effort Flate beyond the configured baseline.
     #[serde(default)]
     pub flate_high_effort_extra_savings_bytes: usize,
+    /// Structured semantic-preservation accounting.
     #[serde(default)]
-    /// Number of preservation pages.
-    pub preservation_pages: usize,
-    #[serde(default)]
-    /// Number of preservation annotation entries seen.
-    pub preservation_annotation_entries_seen: usize,
-    #[serde(default)]
-    /// Number of preservation annotation entries flattened.
-    pub preservation_annotation_entries_flattened: usize,
-    #[serde(default)]
-    /// Number of preservation annotation entries dropped unflattened.
-    pub preservation_annotation_entries_dropped_unflattened: usize,
-    #[serde(default)]
-    /// Number of preservation link visual shells retained.
-    pub preservation_link_visual_shells_retained: usize,
-    #[serde(default)]
-    /// Annotation subtype counts observed while applying preservation policy.
-    pub preservation_annotation_subtypes_seen: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Unflattened annotation counts keyed by subtype.
-    pub preservation_unflattened_annotation_subtypes: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Dropped page-dictionary keys and their occurrence counts.
-    pub preservation_dropped_page_keys: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Dropped page-tree-node keys and their occurrence counts.
-    pub preservation_dropped_page_tree_keys: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Dropped catalog keys and their occurrence counts.
-    pub preservation_dropped_catalog_keys: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Dropped ordinary-metadata or producer-private authoring keys and their occurrence counts.
-    pub preservation_dropped_authoring_keys: BTreeMap<String, usize>,
-    #[serde(default)]
-    /// Unknown-wrapper keys promoted to a recognized parent and their occurrence counts.
-    pub preservation_spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
+    pub preservation: PreservationStats,
     /// Human-readable non-fatal notes produced during optimization.
     pub notes: Vec<String>,
+}
+
+/// Semantic-preservation changes observed during one optimization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreservationStats {
+    /// Pages inspected by the preservation pass.
+    pub pages: usize,
+    /// Original annotation entries, including malformed containers.
+    pub annotation_entries_seen: usize,
+    /// Annotation appearances actually emitted as page paint.
+    pub annotation_entries_flattened: usize,
+    /// Annotation entries removed without retaining visual ink.
+    pub annotation_entries_dropped_unflattened: usize,
+    /// Inert link shells retained for synthesized borders.
+    pub link_visual_shells_retained: usize,
+    /// Inert shells retaining selected normal appearance streams.
+    pub appearance_visual_shells_retained: usize,
+    /// Original annotation counts by subtype.
+    pub annotation_subtypes_seen: BTreeMap<String, usize>,
+    /// Unflattened, unprotected annotation counts by subtype.
+    pub unflattened_annotation_subtypes: BTreeMap<String, usize>,
+    /// Dropped leaf-page dictionary keys.
+    pub dropped_page_keys: BTreeMap<String, usize>,
+    /// Dropped page-tree dictionary keys.
+    pub dropped_page_tree_keys: BTreeMap<String, usize>,
+    /// Dropped catalog dictionary keys.
+    pub dropped_catalog_keys: BTreeMap<String, usize>,
+    /// Dropped metadata and authoring entries.
+    pub dropped_authoring_keys: BTreeMap<String, usize>,
+    /// Recognized keys promoted from unknown wrappers.
+    pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
 }

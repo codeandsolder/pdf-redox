@@ -256,15 +256,6 @@ impl Matrix {
         self.concat(Self::new(1.0, 0.0, 0.0, 1.0, tx, ty));
     }
 
-    pub fn rotatex90(&mut self, angle: i32) {
-        match angle {
-            90 => self.concat(Self::new(0.0, 1.0, -1.0, 0.0, 0.0, 0.0)),
-            180 => self.concat(Self::new(-1.0, 0.0, 0.0, -1.0, 0.0, 0.0)),
-            270 => self.concat(Self::new(0.0, -1.0, 1.0, 0.0, 0.0, 0.0)),
-            _ => {}
-        }
-    }
-
     pub const fn transform(self, x: f64, y: f64) -> (f64, f64) {
         (
             self.a.mul_add(x, self.c.mul_add(y, self.e)),

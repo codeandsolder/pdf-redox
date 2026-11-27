@@ -2274,11 +2274,11 @@ mod tests {
         let input = practical_cleanup_fixture()?;
         let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
         assert_eq!(
-            report.preservation_dropped_page_keys.get("/Thumb"),
+            report.preservation.dropped_page_keys.get("/Thumb"),
             Some(&1)
         );
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            report.preservation.dropped_authoring_keys.get("/PieceInfo"),
             Some(&1)
         );
         assert!(
@@ -2317,7 +2317,7 @@ mod tests {
         let input = indirect_array_pieceinfo_fixture()?;
         let (output, report) = optimize_pdf(&input, &Config::optimize_only())?;
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            report.preservation.dropped_authoring_keys.get("/PieceInfo"),
             Some(&1)
         );
         let analysis = crate::analyze_pdf_preflight(&output)?;
@@ -2337,12 +2337,13 @@ mod tests {
         config.preservation.private_authoring_data = true;
         let (output, report) = optimize_pdf(&input, &config)?;
         assert_eq!(
-            report.preservation_dropped_page_keys.get("/Thumb"),
+            report.preservation.dropped_page_keys.get("/Thumb"),
             Some(&1)
         );
         assert!(
             !report
-                .preservation_dropped_authoring_keys
+                .preservation
+                .dropped_authoring_keys
                 .contains_key("/PieceInfo")
         );
         let source = SourcePdf::from_bytes(output)?;
@@ -2387,11 +2388,11 @@ mod tests {
         config.preservation = crate::PreservationConfig::known_functional();
         let (output, report) = optimize_pdf_with_analysis(&input, &config, &analysis)?;
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            report.preservation.dropped_authoring_keys.get("/PieceInfo"),
             Some(&1)
         );
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/Metadata"),
+            report.preservation.dropped_authoring_keys.get("/Metadata"),
             Some(&1)
         );
         let preflight = crate::analyze_pdf_preflight(&output)?;
@@ -2413,11 +2414,11 @@ mod tests {
         config.preservation = crate::PreservationConfig::known_functional();
         let (output, report) = optimize_pdf_with_analysis(&input, &config, &analysis)?;
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/PieceInfo"),
+            report.preservation.dropped_authoring_keys.get("/PieceInfo"),
             Some(&1)
         );
         assert_eq!(
-            report.preservation_dropped_authoring_keys.get("/Metadata"),
+            report.preservation.dropped_authoring_keys.get("/Metadata"),
             Some(&1)
         );
         let preflight = crate::analyze_pdf_preflight(&output)?;
