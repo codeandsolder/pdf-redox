@@ -2,8 +2,8 @@ use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, Result,
     cos_fingerprint::{exact_projected_dictionary_equal, exact_projected_dictionary_fingerprint},
     direct_object::{
-        DirectArrayView, DirectDictionaryView, DirectObjectVisitor, DirectPathStep,
-        DirectWalkControl, object_at_direct_path_mut, walk_direct_object,
+        DirectArrayView, DirectDictionaryView, DirectObjectTarget, DirectObjectVisitor,
+        DirectPathStep, DirectWalkControl, object_at_direct_path_mut, walk_direct_object,
     },
     source::{CurrentArrayIter, CurrentValue, PAGE_INHERITABLE_KEYS},
 };
@@ -1095,74 +1095,286 @@ struct NameTreeSnapshot {
     node_count: usize,
     entry_count: usize,
     leaves: Vec<NameLeaf>,
+    // Exact structural incoming paths, including indirect Kids array chains.
+    // The catalog's name-tree entry is added when considering a mutation.
+    incoming: BTreeMap<ObjectHandle, DirectObjectTarget>,
+    can_repack: bool,
 }
 
 impl NameLeaf {
-    fn from_names(handle: ObjectHandle, names: Vec<OwnedObject>) -> Option<Self> {
+    fn from_names(
+        document: &EditDocument,
+        handle: ObjectHandle,
+        names: Vec<OwnedObject>,
+    ) -> Result<Option<Self>> {
         if names.len() % 2 != 0 {
-            return None;
+            return Ok(None);
         }
         let mut entries = Vec::with_capacity(names.len() / 2);
         let mut names = names.into_iter();
         while let Some(key) = names.next() {
-            let OwnedObject::String(key) = key else {
-                return None;
+            let key = match key {
+                OwnedObject::String(key) => key,
+                reference @ OwnedObject::Reference(_) => {
+                    let Some(OwnedObject::String(key)) =
+                        document.resolve_owned_value(&reference)?
+                    else {
+                        return Ok(None);
+                    };
+                    key
+                }
+                _ => return Ok(None),
             };
-            entries.push(NameEntry {
-                key,
-                value: names.next()?,
-            });
+            let Some(value) = names.next() else {
+                return Ok(None);
+            };
+            if entries
+                .last()
+                .is_some_and(|entry: &NameEntry| entry.key >= key)
+            {
+                return Ok(None);
+            }
+            entries.push(NameEntry { key, value });
         }
-        Some(Self {
+        Ok(Some(Self {
             handle,
             entries,
             changed: false,
-        })
+        }))
     }
+}
+
+type NameLimits = [Vec<u8>; 2];
+
+enum NameTreeWork {
+    Enter(ObjectHandle),
+    Exit {
+        first_leaf: usize,
+        limits: NameLimits,
+    },
+}
+
+fn declared_name_limits(
+    document: &EditDocument,
+    value: &OwnedObject,
+) -> Result<Option<NameLimits>> {
+    let Some(OwnedObject::Array(values)) = document.resolve_owned_value(value)? else {
+        return Ok(None);
+    };
+    let [first, last] = values.as_slice() else {
+        return Ok(None);
+    };
+    match (
+        document.resolve_owned_value(first)?,
+        document.resolve_owned_value(last)?,
+    ) {
+        (Some(OwnedObject::String(first)), Some(OwnedObject::String(last))) if first <= last => {
+            Ok(Some([first, last]))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Follow a Kids array's indirect reference chain, remembering the exact
+/// graph edges that justify editing nodes without changing unrelated aliases.
+fn name_tree_kids(
+    document: &EditDocument,
+    parent: ObjectHandle,
+    mut value: OwnedObject,
+    incoming: &mut BTreeMap<ObjectHandle, DirectObjectTarget>,
+) -> Result<Option<Vec<ObjectHandle>>> {
+    let mut origin = DirectObjectTarget {
+        root: parent,
+        path: vec![DirectPathStep::DictKey(b"Kids".to_vec())],
+    };
+    while let OwnedObject::Reference(handle) = value {
+        if incoming.insert(handle, origin).is_some() {
+            return Ok(None);
+        }
+        let Some(next) = document.current_owned_object(handle)? else {
+            return Ok(None);
+        };
+        value = next;
+        origin = DirectObjectTarget {
+            root: handle,
+            path: Vec::new(),
+        };
+    }
+    let OwnedObject::Array(kids) = value else {
+        return Ok(None);
+    };
+    if kids.is_empty() {
+        return Ok(None);
+    }
+    let mut children = Vec::with_capacity(kids.len());
+    for (index, kid) in kids.into_iter().enumerate() {
+        let OwnedObject::Reference(handle) = kid else {
+            return Ok(None);
+        };
+        let mut path = origin.path.clone();
+        path.push(DirectPathStep::ArrayIndex(index));
+        if incoming
+            .insert(
+                handle,
+                DirectObjectTarget {
+                    root: origin.root,
+                    path,
+                },
+            )
+            .is_some()
+        {
+            return Ok(None);
+        }
+        children.push(handle);
+    }
+    Ok(Some(children))
+}
+
+fn name_tree_range_matches(leaves: &[NameLeaf], limits: &NameLimits) -> bool {
+    leaves
+        .first()
+        .and_then(|leaf| leaf.entries.first())
+        .is_some_and(|entry| entry.key == limits[0])
+        && leaves
+            .last()
+            .and_then(|leaf| leaf.entries.last())
+            .is_some_and(|entry| entry.key == limits[1])
 }
 
 fn collect_name_tree(
     document: &EditDocument,
     root: ObjectHandle,
 ) -> Result<Option<NameTreeSnapshot>> {
+    let mut snapshot = NameTreeSnapshot {
+        root,
+        node_count: 0,
+        entry_count: 0,
+        leaves: Vec::new(),
+        incoming: BTreeMap::new(),
+        can_repack: true,
+    };
     let mut nodes = BTreeSet::new();
-    let mut leaves = Vec::new();
-    let mut entry_count = 0;
-    let mut pending = vec![root];
-
-    while let Some(handle) = pending.pop() {
+    let mut pending = vec![NameTreeWork::Enter(root)];
+    while let Some(work) = pending.pop() {
+        let handle = match work {
+            NameTreeWork::Enter(handle) => handle,
+            NameTreeWork::Exit { first_leaf, limits } => {
+                if !name_tree_range_matches(&snapshot.leaves[first_leaf..], &limits) {
+                    return Ok(None);
+                }
+                continue;
+            }
+        };
         if !nodes.insert(handle) {
             return Ok(None);
         }
-        let Some(mut dictionary) = current_dictionary(document, handle)? else {
+        let Some(OwnedObject::Dictionary(mut dictionary)) =
+            document.current_owned_object(handle)?
+        else {
             return Ok(None);
         };
-
-        if let Some(OwnedObject::Array(names)) = dictionary.remove(b"Names".as_slice()) {
-            let Some(leaf) = NameLeaf::from_names(handle, names.into_vec()) else {
+        if let Some(value) = dictionary.remove(b"Limits".as_slice()) {
+            let Some(limits) = declared_name_limits(document, &value)? else {
                 return Ok(None);
             };
-            entry_count += leaf.entries.len();
-            leaves.push(leaf);
-            continue;
+            pending.push(NameTreeWork::Exit {
+                first_leaf: snapshot.leaves.len(),
+                limits,
+            });
         }
-
-        let Some(OwnedObject::Array(kids)) = dictionary.get(b"Kids".as_slice()) else {
-            return Ok(None);
-        };
-        for kid in kids.iter().rev() {
-            let OwnedObject::Reference(kid) = kid else {
-                return Ok(None);
-            };
-            pending.push(*kid);
+        let names = dictionary.remove(b"Names".as_slice());
+        let kids = dictionary.remove(b"Kids".as_slice());
+        // Root extras survive an in-place rebuild. Descendant extras have
+        // unknown semantics and cannot be discarded by repacking.
+        snapshot.can_repack &= handle == root || dictionary.is_empty();
+        match (names, kids) {
+            (Some(names), None) => {
+                let names = if matches!(names, OwnedObject::Reference(_)) {
+                    document.resolve_owned_value(&names)?
+                } else {
+                    Some(names)
+                };
+                let Some(OwnedObject::Array(names)) = names else {
+                    return Ok(None);
+                };
+                let Some(leaf) = NameLeaf::from_names(document, handle, names.into_vec())? else {
+                    return Ok(None);
+                };
+                if handle != root && leaf.entries.is_empty() {
+                    return Ok(None);
+                }
+                if let (Some(previous), Some(first)) = (
+                    snapshot.leaves.last().and_then(|leaf| leaf.entries.last()),
+                    leaf.entries.first(),
+                ) && previous.key >= first.key
+                {
+                    return Ok(None);
+                }
+                snapshot.entry_count += leaf.entries.len();
+                snapshot.leaves.push(leaf);
+            }
+            (None, Some(kids)) => {
+                let Some(children) =
+                    name_tree_kids(document, handle, kids, &mut snapshot.incoming)?
+                else {
+                    return Ok(None);
+                };
+                pending.extend(children.into_iter().rev().map(NameTreeWork::Enter));
+            }
+            _ => return Ok(None),
         }
     }
+    snapshot.node_count = nodes.len();
+    Ok(Some(snapshot))
+}
 
-    Ok(Some(NameTreeSnapshot {
-        root,
-        node_count: nodes.len(),
-        entry_count,
-        leaves,
+struct NameTreeAliasVisitor<'a> {
+    incoming: &'a BTreeMap<ObjectHandle, DirectObjectTarget>,
+    aliased: bool,
+}
+
+impl DirectObjectVisitor for NameTreeAliasVisitor<'_> {
+    fn visit_reference(
+        &mut self,
+        root: ObjectHandle,
+        path: &[DirectPathStep],
+        target: ObjectHandle,
+    ) -> Result<()> {
+        if let Some(expected) = self.incoming.get(&target) {
+            self.aliased |= expected.root != root || expected.path != path;
+        }
+        Ok(())
+    }
+}
+
+/// Inspect only objects with an incoming reference to a potentially edited
+/// tree node. The exact structural path matters even within the same object.
+fn name_tree_has_aliases(
+    document: &EditDocument,
+    incoming: &BTreeMap<ObjectHandle, DirectObjectTarget>,
+) -> Result<bool> {
+    let mut visitor = NameTreeAliasVisitor {
+        incoming,
+        aliased: false,
+    };
+    for handle in document.reachable_output_objects()? {
+        if document
+            .references_for_handle(handle)?
+            .iter()
+            .any(|target| incoming.contains_key(target))
+            && let Some(value) = document.current_value(handle)?
+        {
+            walk_direct_object(document, handle, &value, &mut visitor)?;
+            if visitor.aliased {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(document.trailer().values().any(|value| {
+        value
+            .references()
+            .iter()
+            .any(|target| incoming.contains_key(target))
     }))
 }
 
@@ -1242,7 +1454,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: NameTreeSnapshot) ->
                 "name-tree root is not a dictionary".to_owned(),
             ));
         };
-        root.clear();
+        root.remove(b"Kids".as_slice());
         root.insert(b"Names".to_vec(), OwnedObject::array(names_array(entries)));
         return Ok(1);
     }
@@ -1313,7 +1525,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: NameTreeSnapshot) ->
             "name-tree root is not a dictionary".to_owned(),
         ));
     };
-    root.clear();
+    root.remove(b"Names".as_slice());
     root.insert(
         b"Kids".to_vec(),
         OwnedObject::Array(
@@ -1373,11 +1585,31 @@ fn compact_catalog_name_trees(
         if before == 0 {
             continue;
         }
+        let required = name_tree_required_nodes(snapshot.entry_count);
+        let repack = snapshot.can_repack && required < before;
         let (wrappers_inlined, arrays_inlined) = if kind.as_slice() == b"Dests" {
             inline_destination_objects(document, &mut snapshot)?
         } else {
             (0, 0)
         };
+        if repack || wrappers_inlined != 0 || arrays_inlined != 0 {
+            let root_origin = DirectObjectTarget {
+                root: names_handle,
+                path: vec![DirectPathStep::DictKey(kind)],
+            };
+            if repack {
+                // Repacking only edits the root; old child objects retain
+                // their semantics for any other incoming references.
+                if name_tree_has_aliases(document, &BTreeMap::from([(root, root_origin)]))? {
+                    continue;
+                }
+            } else {
+                snapshot.incoming.insert(root, root_origin);
+                if name_tree_has_aliases(document, &snapshot.incoming)? {
+                    continue;
+                }
+            }
+        }
         stats.named_destination_wrappers_inlined = stats
             .named_destination_wrappers_inlined
             .saturating_add(wrappers_inlined);
@@ -1385,10 +1617,9 @@ fn compact_catalog_name_trees(
             .named_destination_arrays_inlined
             .saturating_add(arrays_inlined);
 
-        let required = name_tree_required_nodes(snapshot.entry_count);
         stats.name_tree_nodes_before = stats.name_tree_nodes_before.saturating_add(before);
 
-        if required < before {
+        if repack {
             let after = replace_name_tree(document, snapshot)?;
             changed = true;
             stats.name_trees_repacked = stats.name_trees_repacked.saturating_add(1);
@@ -2700,6 +2931,112 @@ mod tests {
         }
         pdf.object(8, format!("<< /Kids [{}] >>", kids.join(" ")).as_bytes())?;
         EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    #[test]
+    fn ambiguous_name_trees_are_not_rewritten() -> Result<()> {
+        for malformed in [
+            "<< /Names [(key000) 9 0 R (key000) 10 0 R] >>",
+            "<< /Names [(key001) 9 0 R (key000) 10 0 R] >>",
+            "<< /Names [(key000) 9 0 R] /Kids [21 0 R] >>",
+            "<< /Names [(key000) 9 0 R] /Limits [(key001) (key001)] >>",
+            "<< /Names [(key999) 9 0 R] >>",
+        ] {
+            let mut document = destination_tree_fixture(&[22, 22, 21])?;
+            let mut pdf = ClassicPdfBuilder::new();
+            pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R >>")?;
+            pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+            pdf.object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>")?;
+            pdf.object(20, malformed.as_bytes())?;
+            let malformed_document = EditDocument::from_bytes(pdf.finish(1)?)?;
+            let object = malformed_document
+                .source()
+                .materialize(crate::ObjectId::new(20, 0))?;
+            *document.edit_handle(existing(20))? = object;
+            let before = document.write_compact()?;
+            assert!(!compact_catalog_name_trees(
+                &mut document,
+                &mut StructureCompactionStats::default()
+            )?);
+            assert_eq!(document.write_compact()?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indirect_name_arrays_and_root_metadata_survive_repack() -> Result<()> {
+        let mut document = destination_tree_fixture(&[22, 22, 21])?;
+        let root = document
+            .edit_handle(existing(8))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture root".into()))?;
+        let kids = root
+            .remove(b"Kids".as_slice())
+            .ok_or_else(|| Error::Invalid("missing fixture kids".into()))?;
+        root.insert(b"Custom".to_vec(), OwnedObject::Integer(42));
+        let kids = ObjectHandle::New(document.add_object(kids));
+        document
+            .edit_handle(existing(8))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture root".into()))?
+            .insert(b"Kids".to_vec(), OwnedObject::Reference(kids));
+        let leaf = document
+            .edit_handle(existing(20))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture leaf".into()))?;
+        let names = leaf
+            .remove(b"Names".as_slice())
+            .ok_or_else(|| Error::Invalid("missing fixture names".into()))?;
+        let names = ObjectHandle::New(document.add_object(names));
+        document
+            .edit_handle(existing(20))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture leaf".into()))?
+            .insert(b"Names".to_vec(), OwnedObject::Reference(names));
+        let mut stats = StructureCompactionStats::default();
+        assert!(compact_catalog_name_trees(&mut document, &mut stats)?);
+        assert_eq!(stats.name_trees_repacked, 1);
+        assert_eq!(
+            current_dictionary(&document, existing(8))?
+                .and_then(|root| root.get(b"Custom".as_slice()).cloned()),
+            Some(OwnedObject::Integer(42))
+        );
+        let tree = collect_name_tree(&document, existing(8))?
+            .ok_or_else(|| Error::Invalid("missing compact tree".into()))?;
+        assert_eq!(tree.entry_count, 65);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_tree_aliases_and_descendant_metadata_prevent_destructive_edits() -> Result<()> {
+        let mut document = destination_tree_fixture(&[22, 22, 21])?;
+        document
+            .edit_handle(existing(7))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture names".into()))?
+            .insert(b"Other".to_vec(), OwnedObject::Reference(existing(8)));
+        let before = document.write_compact()?;
+        assert!(!compact_catalog_name_trees(
+            &mut document,
+            &mut StructureCompactionStats::default()
+        )?);
+        assert_eq!(document.write_compact()?, before);
+        let mut document = destination_tree_fixture(&[22, 22, 21])?;
+        document
+            .edit_handle(existing(20))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture leaf".into()))?
+            .insert(b"Custom".to_vec(), OwnedObject::Integer(42));
+        let mut stats = StructureCompactionStats::default();
+        assert!(compact_catalog_name_trees(&mut document, &mut stats)?);
+        assert_eq!(stats.name_trees_repacked, 0);
+        assert_eq!(stats.named_destination_arrays_inlined, 1);
+        assert_eq!(
+            current_dictionary(&document, existing(20))?
+                .and_then(|leaf| leaf.get(b"Custom".as_slice()).cloned()),
+            Some(OwnedObject::Integer(42))
+        );
+        Ok(())
     }
 
     #[test]
