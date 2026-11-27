@@ -74,7 +74,7 @@ impl SourcePdf {
     /// Borrow the already parsed immutable PDF for consumers that need Hayro's
     /// page interpreter or decoded resource context. No additional document
     /// parsing, source copying or mutation is required.
-    #[must_use]
+    #[must_use = "the returned syntax tree is the document source for inspection"]
     pub const fn syntax(&self) -> &Pdf {
         &self.pdf
     }
@@ -285,7 +285,7 @@ impl SourcePdf {
     /// Return trailer entries that belong to document semantics rather than
     /// the input xref/encryption machinery.
     ///
-    /// The vendored Hayro accessor exposes the final already-parsed trailer
+    /// The Hayro accessor exposes the final already-parsed trailer
     /// dictionary, so document construction no longer reparses the PDF through
     /// a second parser merely to preserve `/Info`, `/ID`, or custom roots.
     pub(crate) fn preserved_trailer(&self) -> OwnedDictionary {
@@ -335,19 +335,19 @@ pub struct ObjectId {
 }
 
 impl ObjectId {
-    #[must_use]
+    #[must_use = "the returned identifier names the source indirect object"]
     /// Creates an identifier from a PDF object number and generation number.
     pub const fn new(number: u32, generation: i32) -> Self {
         Self { number, generation }
     }
 
-    #[must_use]
+    #[must_use = "the returned number identifies the indirect object"]
     /// Returns the PDF indirect-object number.
     pub const fn number(self) -> u32 {
         self.number
     }
 
-    #[must_use]
+    #[must_use = "the returned generation distinguishes revisions of an indirect object"]
     /// Returns the PDF indirect-object generation number.
     pub const fn generation(self) -> i32 {
         self.generation
@@ -378,7 +378,7 @@ impl From<ObjectId> for ObjectIdentifier {
 pub struct NewObjectId(usize);
 
 impl NewObjectId {
-    #[must_use]
+    #[must_use = "the returned index identifies a newly added overlay object"]
     /// Returns the zero-based overlay-object index.
     pub const fn index(self) -> usize {
         self.0
@@ -460,7 +460,7 @@ pub enum OwnedObject {
 }
 
 impl OwnedObject {
-    #[must_use]
+    #[must_use = "the returned view is needed to inspect dictionary entries"]
     /// Returns the dictionary view of a dictionary or stream object.
     pub const fn as_dictionary(&self) -> Option<&OwnedDictionary> {
         match self {
@@ -478,7 +478,7 @@ impl OwnedObject {
     }
 
     /// Collect indirect references contained in this owned COS value.
-    #[must_use]
+    #[must_use = "the returned handles identify the referenced objects"]
     pub fn references(&self) -> Vec<ObjectHandle> {
         let mut references = BTreeSet::new();
         collect_owned_references(self, &mut references);
@@ -540,7 +540,7 @@ impl ObjectOverlay {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned change determines the effective source-object state"]
     /// Returns the pending change for an existing source object, if any.
     pub fn change(&self, id: ObjectId) -> Option<&ExistingObjectChange> {
         self.existing.get(&id)
@@ -558,7 +558,7 @@ impl ObjectOverlay {
         id
     }
 
-    #[must_use]
+    #[must_use = "the returned object is the overlay entry for this identifier"]
     /// Returns a newly added overlay object by temporary identifier.
     pub fn added(&self, id: NewObjectId) -> Option<&OwnedObject> {
         self.added.get(id.index())
@@ -569,7 +569,7 @@ impl ObjectOverlay {
         self.added.get_mut(id.index())
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether there are pending overlay edits"]
     /// Returns whether the overlay contains no replacements, deletions, or newly added objects.
     pub fn is_empty(&self) -> bool {
         self.existing.is_empty() && self.added.is_empty()
