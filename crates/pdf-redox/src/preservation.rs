@@ -1651,7 +1651,6 @@ mod tests {
         )?;
         pdf.object(15, b"<< /Type /OCG /Name (Annotation layer) >>")?;
         pdf.object(16, b"[4 0 R [4 0 R]]")?;
-        pdf.object(17, b"16 0 R")?;
         EditDocument::from_bytes(pdf.finish(1)?)
     }
 
@@ -1665,7 +1664,22 @@ mod tests {
     #[test]
     fn annotation_flattening_preserves_forms_counts_real_paint_and_isolates_resources() -> Result<()>
     {
-        let mut document = annotation_fixture("17 0 R", b"q 0 0 1 1 re f")?;
+        let mut document = annotation_fixture("16 0 R", b"q 0 0 1 1 re f")?;
+        let alias = document.add_object(OwnedObject::Reference(CowObjectHandle::Existing(
+            crate::ObjectId::new(16, 0),
+        )));
+        document
+            .edit_object(crate::ObjectId::new(3, 0))?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture page dictionary".into()))?
+            .insert(
+                b"Contents".to_vec(),
+                OwnedObject::Reference(CowObjectHandle::New(alias)),
+            );
+        let plan = plan_page_contents(&document, &fixture_page())?
+            .ok_or_else(|| Error::Invalid("fixture content not isolated".into()))?;
+        assert_eq!(plan.parts.len(), 2);
+        assert_eq!(plan.saves_to_restore, 3);
         let mut policy = PreservationConfig::visible_surface();
         policy.forms = true;
         let stats = apply_preservation_policy(&mut document, &policy)?;
