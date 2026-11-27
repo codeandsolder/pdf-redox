@@ -1167,6 +1167,9 @@ pub struct OptimizationReport {
     #[serde(default)]
     /// Number of preservation link visual shells retained.
     pub preservation_link_visual_shells_retained: usize,
+    /// Number of inert appearance-bearing annotation shells retained.
+    #[serde(default)]
+    pub preservation_appearance_visual_shells_retained: usize,
     #[serde(default)]
     /// Annotation subtype counts observed while applying preservation policy.
     pub preservation_annotation_subtypes_seen: BTreeMap<String, usize>,

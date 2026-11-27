@@ -11,8 +11,8 @@ use std::{
 pub enum AnnotationPolicy {
     /// Preserve annotation dictionaries and their interactive semantics.
     Preserve,
-    /// Burn usable visible appearances into page content, retain only inert
-    /// visual shells where viewers synthesize visible ink, and discard the
+    /// Burn usable appearances into page content where stacking and screen/print
+    /// visibility permit, retain inert visual shells otherwise, and discard the
     /// remaining annotation semantics.
     AppearanceOnly,
     /// Remove annotations rather than preserving or flattening them.

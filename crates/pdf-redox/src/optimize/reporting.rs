@@ -12,11 +12,12 @@ impl OptimizationRunStats {
         let mut notes = Vec::new();
         if !self.preservation_fast_path {
             notes.push(format!(
-                "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring/metadata keys: {:?}.",
+                "Applied semantic-preservation policy: {} page(s); flattened {} of {} annotation entries into page content, retained {} inert Link visual shell(s) and {} appearance shell(s), and dropped {} unflattened annotation entries. Annotation subtypes seen: {:?}; unflattened subtypes before visual-shell pruning: {:?}. Dropped leaf-page dictionary keys: {:?}. Dropped intermediate page-tree keys: {:?}. Dropped source Catalog keys: {:?}. Dropped authoring/metadata keys: {:?}.",
                 self.preservation.pages,
                 self.preservation.annotation_entries_flattened,
                 self.preservation.annotation_entries_seen,
                 self.preservation.link_visual_shells_retained,
+                self.preservation.appearance_visual_shells_retained,
                 self.preservation.annotation_entries_dropped_unflattened,
                 self.preservation.annotation_subtypes_seen,
                 self.preservation.unflattened_annotation_subtypes,
@@ -840,6 +841,9 @@ impl OptimizationRunStats {
                 .preservation
                 .annotation_entries_dropped_unflattened,
             preservation_link_visual_shells_retained: self.preservation.link_visual_shells_retained,
+            preservation_appearance_visual_shells_retained: self
+                .preservation
+                .appearance_visual_shells_retained,
             preservation_annotation_subtypes_seen: self.preservation.annotation_subtypes_seen,
             preservation_unflattened_annotation_subtypes: self
                 .preservation
