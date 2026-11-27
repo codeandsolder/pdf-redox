@@ -61,19 +61,31 @@ impl Rect {
             .then_some(rect)
     }
 
-    pub const fn from_rectangle(rectangle: Rectangle) -> Self {
-        Self::new(rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
+    /// Validate corners before normalization: floating-point min/max can discard NaN.
+    pub fn try_from_corners(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Self> {
+        if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
+            return None;
+        }
+        Some(Self::new(x0, y0, x1, y1))
+    }
+
+    pub fn from_rectangle(rectangle: Rectangle) -> Option<Self> {
+        Self::try_from_corners(rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
     }
 
     /// Axis-aligned bounding box after applying any affine PDF matrix.
-    pub fn transformed_bounds(self, matrix: Matrix) -> Self {
+    /// Nonrepresentable geometry must not be used to prove visibility or coverage.
+    pub fn transformed_bounds(self, matrix: Matrix) -> Option<Self> {
         let points = [
             matrix.transform(self.x0, self.y0),
             matrix.transform(self.x1, self.y0),
             matrix.transform(self.x0, self.y1),
             matrix.transform(self.x1, self.y1),
         ];
-        Self {
+        if !points.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+            return None;
+        }
+        let bounds = Self {
             x0: points
                 .iter()
                 .map(|point| point.0)
@@ -90,10 +102,24 @@ impl Rect {
                 .iter()
                 .map(|point| point.1)
                 .fold(f64::NEG_INFINITY, f64::max),
-        }
+        };
+        bounds.area().is_finite().then_some(bounds)
     }
 
-    pub fn from_ctm(ctm: Matrix) -> Self {
+    pub fn scaled(self, scale: f64) -> Option<Self> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        Self::try_from_corners(
+            self.x0 * scale,
+            self.y0 * scale,
+            self.x1 * scale,
+            self.y1 * scale,
+        )
+        .filter(|bounds| bounds.area().is_finite())
+    }
+
+    pub fn from_ctm(ctm: Matrix) -> Option<Self> {
         Self::new(0.0, 0.0, 1.0, 1.0).transformed_bounds(ctm)
     }
 
@@ -246,31 +272,14 @@ impl Matrix {
         )
     }
 
-    pub fn transform_rectangle(self, rectangle: Rectangle) -> Rectangle {
-        let points = [
-            self.transform(rectangle.llx, rectangle.lly),
-            self.transform(rectangle.llx, rectangle.ury),
-            self.transform(rectangle.urx, rectangle.lly),
-            self.transform(rectangle.urx, rectangle.ury),
-        ];
-        Rectangle::new(
-            points
-                .iter()
-                .map(|point| point.0)
-                .fold(f64::INFINITY, f64::min),
-            points
-                .iter()
-                .map(|point| point.1)
-                .fold(f64::INFINITY, f64::min),
-            points
-                .iter()
-                .map(|point| point.0)
-                .fold(f64::NEG_INFINITY, f64::max),
-            points
-                .iter()
-                .map(|point| point.1)
-                .fold(f64::NEG_INFINITY, f64::max),
-        )
+    pub fn transform_rectangle(self, rectangle: Rectangle) -> Option<Rect> {
+        Rect::from_rectangle(rectangle)?.transformed_bounds(self)
+    }
+
+    pub fn is_finite(self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .into_iter()
+            .all(f64::is_finite)
     }
 
     pub fn unparse(self) -> String {
@@ -325,14 +334,37 @@ mod tests {
     }
 
     #[test]
+    fn affine_bounds_reject_nonrepresentable_geometry_without_erasing_degeneracy() {
+        let huge = Matrix::new(f64::MAX, 0.0, 0.0, 1.0, f64::MAX, 0.0);
+        let invalid = Matrix::new(1.0, 0.0, f64::NAN, 1.0, 0.0, 0.0);
+        assert!(Rect::from_ctm(huge).is_none());
+        assert!(Rect::from_ctm(invalid).is_none());
+        assert!(
+            Matrix::default()
+                .transform_rectangle(Rectangle::new(f64::NAN, 0.0, 1.0, 1.0))
+                .is_none()
+        );
+        assert!(Rect::new(1.0, 0.0, 2.0, 1.0).scaled(f64::MAX).is_none());
+        assert_eq!(
+            Matrix::new(1e-200, 0.0, 0.0, 1e-200, 0.0, 0.0)
+                .transform_rectangle(Rectangle::new(0.0, 0.0, 1e200, 1e200)),
+            Some(Rect::new(0.0, 0.0, 1.0, 1.0))
+        );
+        assert_eq!(
+            Rect::from_ctm(Matrix::new(0.0, 0.0, 0.0, 1.0, 2.0, 0.0)),
+            Some(Rect::new(2.0, 0.0, 2.0, 1.0))
+        );
+    }
+
+    #[test]
     fn transformed_rect_bounds_account_for_quarter_turns_and_unit_square() {
         let matrix = Matrix::new(0.0, 2.0, -3.0, 0.0, 5.0, 7.0);
         let rect = Rect::new(1.0, 2.0, 4.0, 6.0);
         assert_eq!(
             rect.transformed_bounds(matrix),
-            Rect::new(-13.0, 9.0, -1.0, 15.0)
+            Some(Rect::new(-13.0, 9.0, -1.0, 15.0))
         );
-        assert_eq!(Rect::from_ctm(matrix), Rect::new(2.0, 7.0, 5.0, 9.0));
+        assert_eq!(Rect::from_ctm(matrix), Some(Rect::new(2.0, 7.0, 5.0, 9.0)));
     }
 
     #[test]
@@ -341,7 +373,7 @@ mod tests {
         let rect = Rect::new(-2.0, 3.0, 4.0, 6.0);
         assert_eq!(
             rect.transformed_bounds(matrix),
-            Rect::new(-11.25, 10.0, -4.5, 16.0)
+            Some(Rect::new(-11.25, 10.0, -4.5, 16.0))
         );
     }
 }
