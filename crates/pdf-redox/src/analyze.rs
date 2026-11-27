@@ -2028,7 +2028,7 @@ mod tests {
                 assert_eq!(role.references(), object.references());
                 assert_eq!(
                     role.as_dictionary().map(<[_]>::len),
-                    object.as_dictionary().map(BTreeMap::len)
+                    object.as_dictionary().map(|dictionary| dictionary.len())
                 );
                 (*handle, role)
             })

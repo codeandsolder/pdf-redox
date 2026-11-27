@@ -1064,8 +1064,8 @@ mod tests {
             }
         };
         assert_eq!(
-            id,
-            &vec![
+            id.as_slice(),
+            &[
                 OwnedObject::String(vec![0x01, 0x02]),
                 OwnedObject::String(b"abc".to_vec()),
             ]
