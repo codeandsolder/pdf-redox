@@ -3,12 +3,16 @@
 //! Trailer semantic state is owned by the edit document; unreachable objects and
 //! incremental-update history are omitted from the rewritten output.
 
-use crate::{EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result};
+use crate::{
+    EditDocument, Error, ExistingObjectChange, ObjectHandle, OwnedObject, Result,
+    source::{CosScalar, CurrentChildKey, CurrentChildren, CurrentValue, NumericValue},
+};
 use hayro_syntax::{
     PdfVersion,
-    object::{Dict, FromBytes as _, MaybeRef, Number, Object, Stream},
+    object::{FromBytes as _, MaybeRef, Number, Object},
 };
-use std::{collections::BTreeMap, io::Write as _};
+use smallvec::SmallVec;
+use std::{borrow::Cow, collections::BTreeMap, io::Write as _};
 
 const MAX_CLASSIC_XREF_OFFSET: u64 = 9_999_999_999;
 
@@ -124,7 +128,12 @@ fn write_handle_object(
             }),
             None => {
                 let object = document.source().object(id)?;
-                write_source_object(output, &object, document, plan)
+                write_current_object(
+                    output,
+                    CurrentValue::Source(MaybeRef::NotRef(object), Some(id)),
+                    document,
+                    plan,
+                )
             }
         },
         ObjectHandle::New(id) => {
@@ -137,95 +146,60 @@ fn write_handle_object(
     }
 }
 
-fn write_source_object(
-    output: &mut Vec<u8>,
-    object: &Object<'_>,
-    document: &EditDocument,
-    plan: &OutputPlan,
-) -> Result<()> {
-    match object {
-        Object::Null(_) => output.extend_from_slice(b"null"),
-        Object::Boolean(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Object::Number(value) => write_source_number(output, value)?,
-        Object::String(value) => write_pdf_string(output, value.as_bytes()),
-        Object::Name(value) => write_pdf_name(output, value.as_ref()),
-        Object::Dict(dictionary) => {
-            write_source_dictionary(output, dictionary, document, plan, false)?;
-        }
-        Object::Array(array) => {
-            output.push(b'[');
-            for (index, value) in array.raw_iter().enumerate() {
-                if index != 0 {
-                    output.push(b' ');
-                }
-                write_source_maybe_ref(output, value, document, plan)?;
+enum ContainerEnd<'a> {
+    Array,
+    Dictionary,
+    Stream(Cow<'a, [u8]>),
+}
+
+struct WriteFrame<'a> {
+    children: CurrentChildren<'a>,
+    end: ContainerEnd<'a>,
+}
+
+impl WriteFrame<'_> {
+    fn finish(self, output: &mut Vec<u8>) {
+        match self.end {
+            ContainerEnd::Array => output.push(b']'),
+            ContainerEnd::Dictionary => output.extend_from_slice(b" >>"),
+            ContainerEnd::Stream(data) => {
+                output.extend_from_slice(b" >>\nstream\n");
+                output.extend_from_slice(data.as_ref());
+                output.extend_from_slice(b"\nendstream");
             }
-            output.push(b']');
         }
-        Object::Stream(stream) => write_source_stream(output, stream, document, plan)?,
-    }
-    Ok(())
-}
-
-fn write_source_maybe_ref(
-    output: &mut Vec<u8>,
-    value: MaybeRef<Object<'_>>,
-    document: &EditDocument,
-    plan: &OutputPlan,
-) -> Result<()> {
-    match value {
-        MaybeRef::Ref(reference) => write_reference(
-            output,
-            document,
-            plan,
-            ObjectHandle::Existing(reference.into()),
-        ),
-        MaybeRef::NotRef(object) => write_source_object(output, &object, document, plan),
     }
 }
 
-fn write_source_dictionary(
+fn write_scalar(
     output: &mut Vec<u8>,
-    dictionary: &Dict<'_>,
-    document: &EditDocument,
-    plan: &OutputPlan,
-    skip_length: bool,
-) -> Result<()> {
-    output.extend_from_slice(b"<<");
-    for (name, value) in dictionary.entries() {
-        if skip_length && name.as_ref() == b"Length" {
-            continue;
-        }
-        output.push(b' ');
-        write_pdf_name(output, name.as_ref());
-        output.push(b' ');
-        write_source_maybe_ref(output, value, document, plan)?;
-    }
-    output.extend_from_slice(b" >>");
-    Ok(())
-}
-
-fn write_source_stream(
-    output: &mut Vec<u8>,
-    stream: &Stream<'_>,
+    value: &CurrentValue<'_>,
     document: &EditDocument,
     plan: &OutputPlan,
 ) -> Result<()> {
-    let data = stream.raw_data();
-    output.extend_from_slice(b"<< /Length ");
-    write!(&mut *output, "{}", data.len())?;
-    for (name, value) in stream.dict().entries() {
-        if name.as_ref() == b"Length" {
-            continue;
-        }
-        output.push(b' ');
-        write_pdf_name(output, name.as_ref());
-        output.push(b' ');
-        write_source_maybe_ref(output, value, document, plan)?;
+    // Source numbers retain Hayro's original formatting/canonicalization,
+    // including integers that cannot round-trip through binary64.
+    if let CurrentValue::Source(MaybeRef::NotRef(Object::Number(number)), _) = value {
+        return write_source_number(output, number);
     }
-    output.extend_from_slice(b" >>\nstream\n");
-    output.extend_from_slice(data.as_ref());
-    output.extend_from_slice(b"\nendstream");
+    match value.scalar() {
+        Some(CosScalar::Null) => output.extend_from_slice(b"null"),
+        Some(CosScalar::Boolean(value)) => {
+            output.extend_from_slice(if value { b"true" } else { b"false" });
+        }
+        Some(CosScalar::Number(NumericValue::Integer(value))) => write!(&mut *output, "{value}")?,
+        Some(CosScalar::Number(NumericValue::Real(value))) => write_pdf_real(output, value)?,
+        Some(CosScalar::Name(value)) => write_pdf_name(output, value),
+        Some(CosScalar::String(value)) => write_pdf_string(output, value),
+        Some(CosScalar::Reference(reference)) => {
+            write_reference(output, document, plan, reference)?
+        }
+        None => {
+            return Err(Error::Invalid(
+                "non-scalar COS value has no child cursor".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -235,55 +209,65 @@ fn write_owned_object(
     document: &EditDocument,
     plan: &OutputPlan,
 ) -> Result<()> {
-    match object {
-        OwnedObject::Null => output.extend_from_slice(b"null"),
-        OwnedObject::Boolean(value) => {
-            output.extend_from_slice(if *value { b"true" } else { b"false" });
+    write_current_object(output, CurrentValue::Owned(object), document, plan)
+}
+
+/// One cursor per direct container, shared by source and overlay values.
+/// Stream payloads stay borrowed where possible and indirect references
+/// are serialized, never recursively resolved.
+fn write_current_object<'a>(
+    output: &mut Vec<u8>,
+    root: CurrentValue<'a>,
+    document: &'a EditDocument,
+    plan: &OutputPlan,
+) -> Result<()> {
+    let mut frames = SmallVec::<[WriteFrame<'a>; 4]>::new();
+    let mut next = root;
+    loop {
+        if let Some(children) = next.children(true) {
+            let end = if next.is_stream() {
+                let data = next.stream_bytes(document.source())?;
+                output.extend_from_slice(b"<< /Length ");
+                write!(&mut *output, "{}", data.len())?;
+                ContainerEnd::Stream(data)
+            } else if matches!(&children, CurrentChildren::Array(_)) {
+                output.push(b'[');
+                ContainerEnd::Array
+            } else {
+                output.extend_from_slice(b"<<");
+                ContainerEnd::Dictionary
+            };
+            frames.push(WriteFrame { children, end });
+        } else {
+            write_scalar(output, &next, document, plan)?;
         }
-        OwnedObject::Integer(value) => write!(&mut *output, "{value}")?,
-        OwnedObject::Real(value) => write_pdf_real(output, *value)?,
-        OwnedObject::Name(value) => write_pdf_name(output, value),
-        OwnedObject::String(value) => write_pdf_string(output, value),
-        OwnedObject::Reference(reference) => write_reference(output, document, plan, *reference)?,
-        OwnedObject::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b' ');
+
+        // Finish exhausted containers until the next sibling is found.
+        loop {
+            let Some(frame) = frames.last_mut() else {
+                return Ok(());
+            };
+            if let Some((key, child)) = frame.children.next() {
+                match key {
+                    CurrentChildKey::Array(index) => {
+                        if index != 0 {
+                            output.push(b' ');
+                        }
+                    }
+                    CurrentChildKey::Dictionary(name) => {
+                        output.push(b' ');
+                        write_pdf_name(output, name.as_ref());
+                        output.push(b' ');
+                    }
                 }
-                write_owned_object(output, value, document, plan)?;
+                next = child;
+                break;
             }
-            output.push(b']');
-        }
-        OwnedObject::Dictionary(dictionary) => {
-            output.extend_from_slice(b"<<");
-            for (name, value) in dictionary {
-                output.push(b' ');
-                write_pdf_name(output, name);
-                output.push(b' ');
-                write_owned_object(output, value, document, plan)?;
+            if let Some(frame) = frames.pop() {
+                frame.finish(output);
             }
-            output.extend_from_slice(b" >>");
-        }
-        OwnedObject::Stream { dictionary, data } => {
-            let data = data.bytes(document.source())?;
-            output.extend_from_slice(b"<< /Length ");
-            write!(&mut *output, "{}", data.len())?;
-            for (name, value) in dictionary {
-                if name.as_slice() == b"Length" {
-                    continue;
-                }
-                output.push(b' ');
-                write_pdf_name(output, name);
-                output.push(b' ');
-                write_owned_object(output, value, document, plan)?;
-            }
-            output.extend_from_slice(b" >>\nstream\n");
-            output.extend_from_slice(data.as_ref());
-            output.extend_from_slice(b"\nendstream");
         }
     }
-    Ok(())
 }
 
 fn write_reference(
@@ -810,6 +794,39 @@ pub fn write_pdf_with_object_streams(
 mod tests {
     use super::*;
     use crate::{ObjectId, OwnedDictionary, SourcePdf};
+
+    #[test]
+    fn writer_handles_deep_mixed_owned_containers_without_recursive_calls() -> crate::Result<()> {
+        let document = EditDocument::from_bytes(sample_pdf(false))?;
+        let plan = OutputPlan::new(&document)?;
+        let depth = 20_000;
+        let mut nested = OwnedObject::Integer(42);
+        for index in 0..depth {
+            nested = if index % 2 == 0 {
+                OwnedObject::Array(vec![nested])
+            } else {
+                OwnedObject::Dictionary(OwnedDictionary::from([(b"K".to_vec(), nested)]))
+            };
+        }
+        let mut output = Vec::new();
+        let result = write_owned_object(&mut output, &nested, &document, &plan);
+        let mut expected = b"<< /K [".repeat(depth / 2);
+        expected.extend_from_slice(b"42");
+        expected.extend_from_slice(&b"] >>".repeat(depth / 2));
+        // Until owned container destruction is made iterative, dismantle the
+        // fixture without recursion, including when the writer returns an error.
+        for _ in 0..depth {
+            nested = match nested {
+                OwnedObject::Array(mut values) => values.pop(),
+                OwnedObject::Dictionary(mut values) => values.remove(b"K".as_slice()),
+                _ => None,
+            }
+            .ok_or_else(|| Error::Invalid("invalid deep writer fixture".to_owned()))?;
+        }
+        result?;
+        assert_eq!(output, expected);
+        Ok(())
+    }
 
     #[test]
     fn xref_field_width_is_minimal() {
