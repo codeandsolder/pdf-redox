@@ -1797,6 +1797,7 @@ impl EditDocument {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn inherited_page_rotation_from_view(
         &self,
         object: CurrentValue<'_>,

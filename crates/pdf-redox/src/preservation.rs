@@ -47,22 +47,7 @@ pub struct PreservationScanHints {
     pub no_authoring_metadata: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct PreservationStats {
-    pub pages: usize,
-    pub annotation_entries_seen: usize,
-    pub annotation_entries_flattened: usize,
-    pub annotation_entries_dropped_unflattened: usize,
-    pub link_visual_shells_retained: usize,
-    pub appearance_visual_shells_retained: usize,
-    pub annotation_subtypes_seen: BTreeMap<String, usize>,
-    pub unflattened_annotation_subtypes: BTreeMap<String, usize>,
-    pub dropped_page_keys: BTreeMap<String, usize>,
-    pub dropped_page_tree_keys: BTreeMap<String, usize>,
-    pub dropped_catalog_keys: BTreeMap<String, usize>,
-    pub dropped_authoring_keys: BTreeMap<String, usize>,
-    pub spliced_unknown_wrapper_keys: BTreeMap<String, usize>,
-}
+pub use crate::report::PreservationStats;
 
 fn owned_name(document: &EditDocument, value: Option<&OwnedObject>) -> Result<Option<Vec<u8>>> {
     let Some(value) = value else {
@@ -1486,8 +1471,7 @@ impl AnnotationPage<'_> {
         }
         let widget = subtype == Some(b"Widget");
         let defaults = if widget { self.defaults } else { None };
-        if !(widget && self.need_appearances)
-            && !bounds.is_some_and(|bounds| bounds.area() <= 0.0)
+        if !(widget && self.need_appearances || bounds.is_some_and(|bounds| bounds.area() <= 0.0))
             && let Some(source) = selected_normal_appearance(document, &annotation)?
         {
             if visibility.can_flatten()

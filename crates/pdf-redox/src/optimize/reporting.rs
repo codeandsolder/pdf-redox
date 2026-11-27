@@ -832,29 +832,7 @@ impl OptimizationRunStats {
             flate_high_effort_streams_tested: adaptive_flate_streams_tested,
             flate_high_effort_streams_selected: adaptive_flate_streams_selected,
             flate_high_effort_extra_savings_bytes: adaptive_flate_extra_savings,
-            preservation_pages: self.preservation.pages,
-            preservation_annotation_entries_seen: self.preservation.annotation_entries_seen,
-            preservation_annotation_entries_flattened: self
-                .preservation
-                .annotation_entries_flattened,
-            preservation_annotation_entries_dropped_unflattened: self
-                .preservation
-                .annotation_entries_dropped_unflattened,
-            preservation_link_visual_shells_retained: self.preservation.link_visual_shells_retained,
-            preservation_appearance_visual_shells_retained: self
-                .preservation
-                .appearance_visual_shells_retained,
-            preservation_annotation_subtypes_seen: self.preservation.annotation_subtypes_seen,
-            preservation_unflattened_annotation_subtypes: self
-                .preservation
-                .unflattened_annotation_subtypes,
-            preservation_dropped_page_keys: self.preservation.dropped_page_keys,
-            preservation_dropped_page_tree_keys: self.preservation.dropped_page_tree_keys,
-            preservation_dropped_catalog_keys: self.preservation.dropped_catalog_keys,
-            preservation_dropped_authoring_keys: self.preservation.dropped_authoring_keys,
-            preservation_spliced_unknown_wrapper_keys: self
-                .preservation
-                .spliced_unknown_wrapper_keys,
+            preservation: self.preservation,
             notes,
         }
     }
