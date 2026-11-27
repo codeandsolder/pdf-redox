@@ -654,10 +654,10 @@ fn selected_normal_appearance(
         return Ok(Some(stream));
     }
     // Match the source interpreter's fallback to an explicit Off state.
-    match states.get(b"Off".as_slice()) {
-        Some(value) => stream_source_from_value(document, value),
-        None => Ok(None),
-    }
+    states.get(b"Off".as_slice()).map_or_else(
+        || Ok(None),
+        |value| stream_source_from_value(document, value),
+    )
 }
 
 fn annotation_flags(document: &EditDocument, annotation: &OwnedDictionary) -> Result<i64> {
