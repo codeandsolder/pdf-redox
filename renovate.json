@@ -3,9 +3,6 @@
   "extends": [
     "github>codeandsolder/ci-workflows:renovate-fleet"
   ],
-  "ignorePaths": [
-    "third_party/hayro-syntax/**"
-  ],
   "packageRules": [
     {
       "description": "Update crates sharing version-specific Rust types together",
@@ -20,8 +17,7 @@
         "skera"
       ],
       "groupName": "Fontations crates",
-      "groupSlug": "fontations-crates",
-      "automerge": false
+      "groupSlug": "fontations-crates"
     }
   ]
 }

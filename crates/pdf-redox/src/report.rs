@@ -116,19 +116,19 @@ pub struct PageRect {
 }
 
 impl PageRect {
-    #[must_use]
+    #[must_use = "the returned width is needed for rectangle geometry"]
     /// Returns the non-negative rectangle width in PDF user-space units.
     pub fn width(self) -> f64 {
         (self.x1 - self.x0).max(0.0)
     }
 
-    #[must_use]
+    #[must_use = "the returned height is needed for rectangle geometry"]
     /// Returns the non-negative rectangle height in PDF user-space units.
     pub fn height(self) -> f64 {
         (self.y1 - self.y0).max(0.0)
     }
 
-    #[must_use]
+    #[must_use = "the returned area is needed for rectangle geometry"]
     /// Returns the non-negative rectangle area in squared PDF user-space units.
     pub fn area(self) -> f64 {
         self.width() * self.height()
@@ -497,7 +497,7 @@ pub struct PdfAnalysis {
 
 impl PdfAnalysis {
     /// Returns whether this analysis belongs to these exact input bytes.
-    #[must_use]
+    #[must_use = "the result determines whether the report belongs to this exact input"]
     pub fn matches_input(&self, input: &[u8]) -> bool {
         self.input_bytes == input.len() && self.input_sha256 == crate::analyze::input_sha256(input)
     }

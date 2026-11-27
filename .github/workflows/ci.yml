@@ -17,7 +17,7 @@ permissions:
 jobs:
   rust:
     name: Rust pinned nightly
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@097cc824fc551bce6708700117f796c746689faa # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
     with:
       command: |
         # Check the compiler actually selected, rather than the workflow's environment label.
@@ -34,7 +34,7 @@ jobs:
 
   wasm:
     name: WASM compatibility
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@097cc824fc551bce6708700117f796c746689faa # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
     with:
       command: |
         declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"

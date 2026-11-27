@@ -69,7 +69,7 @@ pub struct PreservationConfig {
 }
 
 impl PreservationConfig {
-    #[must_use]
+    #[must_use = "use this policy to retain normal document functionality and metadata"]
     /// Returns the practical preservation policy for normal document functionality and ordinary metadata.
     ///
     /// Embedded fonts are preserved for faithful PDF rendering and text extraction,
@@ -95,7 +95,7 @@ impl PreservationConfig {
     /// Preserve standardized interactive/document semantics while dropping
     /// authoring-only metadata, editing support, and unclassified extensions.
     /// This is the processing-oriented baseline for a known-semantics graph.
-    #[must_use]
+    #[must_use = "use this policy to preserve known standardized document semantics"]
     pub const fn known_functional() -> Self {
         Self {
             links: true,
@@ -114,7 +114,7 @@ impl PreservationConfig {
         }
     }
 
-    #[must_use]
+    #[must_use = "use this policy to retain the visible page surface"]
     /// Returns the policy that retains what can affect the default visible page surface while dropping non-visual semantics.
     pub const fn visible_surface() -> Self {
         Self {
@@ -437,7 +437,7 @@ pub struct Config {
 }
 
 impl Config {
-    #[must_use]
+    #[must_use = "use the returned configuration to select lossless structural optimization"]
     /// Returns the lossless structural-optimization baseline configuration.
     pub fn optimize_only() -> Self {
         Self {
@@ -463,7 +463,7 @@ impl Config {
     /// intentionally permits microstroke rasterization and eligible ICC
     /// alternate substitution. Apply explicit preservation or color-policy
     /// overrides after selecting the objective.
-    #[must_use]
+    #[must_use = "the returned configuration contains the changed processing objective"]
     pub const fn for_processing(mut self) -> Self {
         self.optimization_goal = OptimizationGoal::Processing;
         self.preservation = PreservationConfig::known_functional();
@@ -475,7 +475,7 @@ impl Config {
         self
     }
 
-    #[must_use]
+    #[must_use = "use the returned configuration to enable perceptual image optimization"]
     /// Returns the perceptual preset with size-gated JPEG optimization enabled.
     pub fn perceptual() -> Self {
         Self {
@@ -489,7 +489,7 @@ impl Config {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the returned configuration to select print-oriented raster optimization"]
     /// Returns the print preset with resolution-aware raster optimization enabled.
     pub fn print() -> Self {
         Self {
