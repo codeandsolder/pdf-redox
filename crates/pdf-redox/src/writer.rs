@@ -12,7 +12,11 @@ use hayro_syntax::{
     object::{FromBytes as _, MaybeRef, Number, Object},
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, collections::BTreeMap, io::Write as _};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, VecDeque},
+    io::Write as _,
+};
 
 const MAX_CLASSIC_XREF_OFFSET: u64 = 9_999_999_999;
 
@@ -26,15 +30,46 @@ struct OutputPlan {
     catalog: OutputObjectId,
 }
 
+const MAX_OUTPUT_OBJECTS: usize = i32::MAX as usize;
+
+fn output_object_count(count: usize) -> Result<u32> {
+    if count > MAX_OUTPUT_OBJECTS {
+        return Err(Error::TooManyOutputObjects { count });
+    }
+    u32::try_from(count).map_err(|_| Error::TooManyOutputObjects { count })
+}
+
+/// PDF stream objects must be indirect, even when the edit graph contains a
+/// direct stream in an array, dictionary or trailer value. Assign their IDs
+/// monotonically after the ordinary output objects and drain the queue in
+/// encounter order. Borrow overlay/source values until they are serialized.
+struct DirectStreams<'a> {
+    last_id: u32,
+    pending: VecDeque<(OutputObjectId, CurrentValue<'a>)>,
+}
+
+impl<'a> DirectStreams<'a> {
+    fn new(base_count: usize) -> Result<Self> {
+        Ok(Self {
+            last_id: output_object_count(base_count)?,
+            pending: VecDeque::new(),
+        })
+    }
+
+    fn promote(&mut self, stream: CurrentValue<'a>) -> Result<OutputObjectId> {
+        let next = output_object_count(self.last_id as usize + 1)?;
+        let id = OutputObjectId(next);
+        self.last_id = next;
+        self.pending.push_back((id, stream));
+        Ok(id)
+    }
+}
+
 impl OutputPlan {
     fn new(document: &EditDocument) -> Result<Self> {
         let catalog_handle = ObjectHandle::Existing(document.source().catalog_id());
         let reachable = document.reachable_output_objects()?;
-        if reachable.len() > i32::MAX as usize {
-            return Err(Error::TooManyOutputObjects {
-                count: reachable.len(),
-            });
-        }
+        output_object_count(reachable.len())?;
 
         let mut order = Vec::with_capacity(reachable.len());
         order.push(catalog_handle);
@@ -67,8 +102,44 @@ impl OutputPlan {
     }
 }
 
+fn validate_trailer(document: &EditDocument) -> Result<()> {
+    for name in document.trailer().keys() {
+        if crate::source::is_writer_owned_trailer_key(name, false) {
+            return Err(Error::Invalid(format!(
+                "writer-owned trailer entry /{}",
+                String::from_utf8_lossy(name)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_trailer_entries<'a>(
+    document: &'a EditDocument,
+    plan: &OutputPlan,
+    streams: &mut DirectStreams<'a>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    for (name, value) in document.trailer() {
+        output.push(b' ');
+        write_pdf_name(&mut output, name);
+        output.push(b' ');
+        write_current_object(
+            &mut output,
+            CurrentValue::Owned(value),
+            document,
+            plan,
+            streams,
+            false,
+        )?;
+    }
+    Ok(output)
+}
+
 pub fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
+    validate_trailer(document)?;
     let plan = OutputPlan::new(document)?;
+    let mut streams = DirectStreams::new(plan.order.len())?;
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
     output.extend_from_slice(version_bytes(document.source().version()));
@@ -81,7 +152,17 @@ pub fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
         check_xref_offset(offset)?;
         offsets[id.0 as usize] = offset;
         writeln!(&mut output, "{} 0 obj", id.0)?;
-        write_handle_object(&mut output, document, &plan, handle)?;
+        write_handle_object(&mut output, document, &plan, handle, &mut streams)?;
+        output.extend_from_slice(b"\nendobj\n");
+    }
+    let trailer = write_trailer_entries(document, &plan, &mut streams)?;
+    while let Some((id, stream)) = streams.pending.pop_front() {
+        let offset = output.len();
+        check_xref_offset(offset)?;
+        debug_assert_eq!(id.0 as usize, offsets.len());
+        offsets.push(offset);
+        writeln!(&mut output, "{} 0 obj", id.0)?;
+        write_current_object(&mut output, stream, document, &plan, &mut streams, true)?;
         output.extend_from_slice(b"\nendobj\n");
     }
 
@@ -89,6 +170,7 @@ pub fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
     check_xref_offset(xref_offset)?;
     writeln!(&mut output, "xref")?;
     writeln!(&mut output, "0 {}", offsets.len())?;
+    let size = offsets.len();
     output.extend_from_slice(b"0000000000 65535 f \n");
     for offset in offsets.into_iter().skip(1) {
         check_xref_offset(offset)?;
@@ -96,32 +178,33 @@ pub fn write_pdf(document: &EditDocument) -> Result<Vec<u8>> {
     }
 
     output.extend_from_slice(b"trailer\n<< /Size ");
-    write!(&mut output, "{}", plan.order.len() + 1)?;
+    write!(&mut output, "{size}")?;
     output.extend_from_slice(b" /Root ");
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
-    for (name, value) in document.trailer() {
-        output.push(b' ');
-        write_pdf_name(&mut output, name);
-        output.push(b' ');
-        write_owned_object(&mut output, value, document, &plan)?;
-    }
+    output.extend_from_slice(&trailer);
     output.extend_from_slice(b" >>\nstartxref\n");
     writeln!(&mut output, "{xref_offset}")?;
     output.extend_from_slice(b"%%EOF\n");
     Ok(output)
 }
 
-fn write_handle_object(
+fn write_handle_object<'a>(
     output: &mut Vec<u8>,
-    document: &EditDocument,
+    document: &'a EditDocument,
     plan: &OutputPlan,
     handle: ObjectHandle,
+    streams: &mut DirectStreams<'a>,
 ) -> Result<()> {
     match handle {
         ObjectHandle::Existing(id) => match document.overlay().change(id) {
-            Some(ExistingObjectChange::Replace(object)) => {
-                write_owned_object(output, object, document, plan)
-            }
+            Some(ExistingObjectChange::Replace(object)) => write_current_object(
+                output,
+                CurrentValue::Owned(object),
+                document,
+                plan,
+                streams,
+                true,
+            ),
             Some(ExistingObjectChange::Delete) => Err(Error::DeletedReferencedObject {
                 number: id.number(),
                 generation: id.generation(),
@@ -133,6 +216,8 @@ fn write_handle_object(
                     CurrentValue::Source(MaybeRef::NotRef(object), Some(id)),
                     document,
                     plan,
+                    streams,
+                    true,
                 )
             }
         },
@@ -141,7 +226,14 @@ fn write_handle_object(
                 .overlay()
                 .added(id)
                 .ok_or_else(|| Error::MissingNewObject { index: id.index() })?;
-            write_owned_object(output, object, document, plan)
+            write_current_object(
+                output,
+                CurrentValue::Owned(object),
+                document,
+                plan,
+                streams,
+                true,
+            )
         }
     }
 }
@@ -203,15 +295,6 @@ fn write_scalar(
     Ok(())
 }
 
-fn write_owned_object(
-    output: &mut Vec<u8>,
-    object: &OwnedObject,
-    document: &EditDocument,
-    plan: &OutputPlan,
-) -> Result<()> {
-    write_current_object(output, CurrentValue::Owned(object), document, plan)
-}
-
 /// One cursor per direct container, shared by source and overlay values.
 /// Stream payloads stay borrowed where possible and indirect references
 /// are serialized, never recursively resolved.
@@ -220,11 +303,16 @@ fn write_current_object<'a>(
     root: CurrentValue<'a>,
     document: &'a EditDocument,
     plan: &OutputPlan,
+    streams: &mut DirectStreams<'a>,
+    indirect_root: bool,
 ) -> Result<()> {
     let mut frames = SmallVec::<[WriteFrame<'a>; 4]>::new();
     let mut next = root;
     loop {
-        if let Some(children) = next.children(true) {
+        if next.is_stream() && (!indirect_root || !frames.is_empty()) {
+            let id = streams.promote(next)?;
+            write!(&mut *output, "{} 0 R", id.0)?;
+        } else if let Some(children) = next.children(true) {
             let end = if next.is_stream() {
                 let data = next.stream_bytes(document.source())?;
                 output.extend_from_slice(b"<< /Length ");
@@ -388,7 +476,7 @@ const fn is_direct_name_byte(byte: u8) -> bool {
     matches!(byte, b'!'..=b'~')
         && !matches!(
             byte,
-            b'#' | b'%' | b'(' | b')' | b'/' | b'<' | b'>' | b'[' | b']'
+            b'#' | b'%' | b'(' | b')' | b'/' | b'<' | b'>' | b'[' | b']' | b'{' | b'}'
         )
 }
 
@@ -477,19 +565,20 @@ fn current_handle_is_stream(document: &EditDocument, handle: ObjectHandle) -> Re
     })
 }
 
-fn write_objstm(
+fn write_objstm<'a>(
     output: &mut Vec<u8>,
-    document: &EditDocument,
+    document: &'a EditDocument,
     plan: &OutputPlan,
     handles: &[ObjectHandle],
     level: crate::FlateLevel,
+    streams: &mut DirectStreams<'a>,
 ) -> Result<()> {
     let mut body = Vec::new();
     let mut header = Vec::new();
     for handle in handles {
         let id = plan.id(*handle)?;
         write!(&mut header, "{} {} ", id.0, body.len())?;
-        write_handle_object(&mut body, document, plan, *handle)?;
+        write_handle_object(&mut body, document, plan, *handle, streams)?;
         body.push(b'\n');
     }
     let first = header.len();
@@ -615,6 +704,16 @@ pub fn write_pdf_with_object_streams(
     document: &EditDocument,
     level: crate::FlateLevel,
 ) -> Result<Vec<u8>> {
+    validate_trailer(document)?;
+    if document
+        .trailer()
+        .keys()
+        .any(|name| crate::source::is_writer_owned_trailer_key(name, true))
+    {
+        // A classic input may use an xref-stream dictionary key as custom
+        // trailer metadata. It cannot coexist with xref stream mechanics.
+        return write_pdf(document);
+    }
     let plan = OutputPlan::new(document)?;
     let mut compressed = BTreeMap::<ObjectHandle, (u32, u16)>::new();
     let mut objstm_groups = Vec::<Vec<ObjectHandle>>::new();
@@ -633,44 +732,31 @@ pub fn write_pdf_with_object_streams(
         objstm_groups.push(current);
     }
 
-    let output_object_count = plan
+    let planned_count = plan
         .order
         .len()
         .saturating_add(objstm_groups.len())
         .saturating_add(1);
-    let base_count = u32::try_from(plan.order.len()).map_err(|_| Error::TooManyOutputObjects {
-        count: output_object_count,
-    })?;
+    output_object_count(planned_count)?;
+    let base_count = output_object_count(plan.order.len())?;
     for (group_index, group) in objstm_groups.iter().enumerate() {
         let group_index = u32::try_from(group_index).map_err(|_| Error::TooManyOutputObjects {
-            count: output_object_count,
+            count: planned_count,
         })?;
         let objstm_id = base_count
             .checked_add(group_index)
             .and_then(|id| id.checked_add(1))
             .ok_or(Error::TooManyOutputObjects {
-                count: output_object_count,
+                count: planned_count,
             })?;
         for (index, handle) in group.iter().copied().enumerate() {
             let index = u16::try_from(index).map_err(|_| Error::TooManyOutputObjects {
-                count: output_object_count,
+                count: planned_count,
             })?;
             compressed.insert(handle, (objstm_id, index));
         }
     }
-    let group_count =
-        u32::try_from(objstm_groups.len()).map_err(|_| Error::TooManyOutputObjects {
-            count: output_object_count,
-        })?;
-    let xref_id = base_count
-        .checked_add(group_count)
-        .and_then(|id| id.checked_add(1))
-        .ok_or(Error::TooManyOutputObjects {
-            count: output_object_count,
-        })?;
-    let size = xref_id.checked_add(1).ok_or(Error::TooManyOutputObjects {
-        count: output_object_count,
-    })?;
+    let mut streams = DirectStreams::new(plan.order.len() + objstm_groups.len())?;
 
     let mut output = Vec::with_capacity(document.source().bytes().len());
     output.extend_from_slice(b"%PDF-");
@@ -686,26 +772,35 @@ pub fn write_pdf_with_object_streams(
         let id = plan.id(handle)?;
         normal_offsets.insert(id.0, output.len());
         writeln!(&mut output, "{} 0 obj", id.0)?;
-        write_handle_object(&mut output, document, &plan, handle)?;
+        write_handle_object(&mut output, document, &plan, handle, &mut streams)?;
         output.extend_from_slice(b"\nendobj\n");
     }
 
     for (group_index, group) in objstm_groups.iter().enumerate() {
         let group_index = u32::try_from(group_index).map_err(|_| Error::TooManyOutputObjects {
-            count: output_object_count,
+            count: planned_count,
         })?;
         let id = base_count
             .checked_add(group_index)
             .and_then(|id| id.checked_add(1))
             .ok_or(Error::TooManyOutputObjects {
-                count: output_object_count,
+                count: planned_count,
             })?;
         normal_offsets.insert(id, output.len());
         writeln!(&mut output, "{id} 0 obj")?;
-        write_objstm(&mut output, document, &plan, group, level)?;
+        write_objstm(&mut output, document, &plan, group, level, &mut streams)?;
         output.extend_from_slice(b"\nendobj\n");
     }
 
+    let trailer = write_trailer_entries(document, &plan, &mut streams)?;
+    while let Some((id, stream)) = streams.pending.pop_front() {
+        normal_offsets.insert(id.0, output.len());
+        writeln!(&mut output, "{} 0 obj", id.0)?;
+        write_current_object(&mut output, stream, document, &plan, &mut streams, true)?;
+        output.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_id = output_object_count(streams.last_id as usize + 1)?;
+    let size = xref_id + 1;
     let xref_offset = output.len();
     normal_offsets.insert(xref_id, xref_offset);
     let mut compressed_by_id = BTreeMap::<u32, (u32, u16)>::new();
@@ -770,12 +865,7 @@ pub fn write_pdf_with_object_streams(
         widths[0], widths[1], widths[2]
     )?;
     write!(&mut output, "{} 0 R", plan.catalog.0)?;
-    for (name, value) in document.trailer() {
-        output.push(b' ');
-        write_pdf_name(&mut output, name);
-        output.push(b' ');
-        write_owned_object(&mut output, value, document, &plan)?;
-    }
+    output.extend_from_slice(&trailer);
     output.extend_from_slice(b" /Filter /FlateDecode");
     if let Some(decode_parms) = xref_decode_parms {
         output.extend_from_slice(decode_parms.as_bytes());
@@ -809,12 +899,153 @@ mod tests {
             };
         }
         let mut output = Vec::new();
-        let result = write_owned_object(&mut output, &nested, &document, &plan);
+        let mut streams = DirectStreams::new(plan.order.len())?;
+        let result = write_current_object(
+            &mut output,
+            CurrentValue::Owned(&nested),
+            &document,
+            &plan,
+            &mut streams,
+            true,
+        );
+        assert!(streams.pending.is_empty());
         let mut expected = b"<< /K [".repeat(depth / 2);
         expected.extend_from_slice(b"42");
         expected.extend_from_slice(&b"] >>".repeat(depth / 2));
         result?;
         assert_eq!(output, expected);
+        Ok(())
+    }
+
+    fn direct_stream(data: &[u8]) -> OwnedObject {
+        OwnedObject::Stream {
+            dictionary: OwnedDictionary::new(),
+            data: crate::StreamData::Owned(data.to_vec().into()),
+        }
+    }
+
+    #[test]
+    fn both_writers_promote_direct_streams_in_containers_and_trailer() -> crate::Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf(false))?;
+        let mut outer = direct_stream(b"outer");
+        outer
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture stream dictionary".into()))?
+            .insert(b"Nested".to_vec(), direct_stream(b"inner"));
+        let array = OwnedObject::array(vec![outer, direct_stream(b"sibling")]);
+        let catalog = document.source().catalog_id();
+        document
+            .edit_object(catalog)?
+            .as_dictionary_mut()
+            .ok_or_else(|| Error::Invalid("missing fixture catalog".into()))?
+            .insert(b"Custom".to_vec(), array);
+        document
+            .trailer_mut()
+            .insert(b"TrailerStream".to_vec(), direct_stream(b"trailer"));
+        for output in [
+            write_pdf(&document)?,
+            write_pdf_with_object_streams(&document, crate::FlateLevel::PROCESSING)?,
+        ] {
+            let rewritten = EditDocument::from_bytes(output)?;
+            let catalog = rewritten
+                .source()
+                .materialize(rewritten.source().catalog_id())?;
+            let Some(OwnedObject::Array(values)) = catalog
+                .as_dictionary()
+                .and_then(|d| d.get(b"Custom".as_slice()))
+            else {
+                return Err(Error::Invalid("missing promoted stream array".into()));
+            };
+            let [
+                OwnedObject::Reference(outer),
+                OwnedObject::Reference(sibling),
+            ] = values.as_slice()
+            else {
+                return Err(Error::Invalid("direct stream survived in array".into()));
+            };
+            assert_eq!(
+                rewritten.decoded_content_stream_data(*outer)?.as_slice(),
+                b"outer"
+            );
+            assert_eq!(
+                rewritten.decoded_content_stream_data(*sibling)?.as_slice(),
+                b"sibling"
+            );
+            let outer = rewritten
+                .current_owned_object(*outer)?
+                .ok_or_else(|| Error::Invalid("missing outer stream".into()))?;
+            let Some(OwnedObject::Reference(inner)) = outer
+                .as_dictionary()
+                .and_then(|d| d.get(b"Nested".as_slice()))
+            else {
+                return Err(Error::Invalid("nested direct stream survived".into()));
+            };
+            assert_eq!(
+                rewritten.decoded_content_stream_data(*inner)?.as_slice(),
+                b"inner"
+            );
+            let Some(OwnedObject::Reference(trailer)) =
+                rewritten.trailer().get(b"TrailerStream".as_slice())
+            else {
+                return Err(Error::Invalid("direct stream survived in trailer".into()));
+            };
+            assert_eq!(
+                rewritten.decoded_content_stream_data(*trailer)?.as_slice(),
+                b"trailer"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn xref_stream_writer_preserves_conflicting_classic_trailer_metadata() -> crate::Result<()> {
+        let mut document = EditDocument::from_bytes(sample_pdf(false))?;
+        document.trailer_mut().insert(
+            b"Type".to_vec(),
+            OwnedObject::Name(b"CustomTrailer".to_vec()),
+        );
+        let bytes = write_pdf_with_object_streams(&document, crate::FlateLevel::PROCESSING)?;
+        assert!(
+            bytes
+                .windows(b"trailer\n".len())
+                .any(|window| window == b"trailer\n")
+        );
+        let rewritten = EditDocument::from_bytes(bytes)?;
+        assert_eq!(
+            rewritten.trailer().get(b"Type".as_slice()),
+            Some(&OwnedObject::Name(b"CustomTrailer".to_vec()))
+        );
+        document
+            .trailer_mut()
+            .insert(b"Root".to_vec(), OwnedObject::Null);
+        assert!(write_pdf(&document).is_err());
+        assert!(write_pdf_with_object_streams(&document, crate::FlateLevel::PROCESSING).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pdf_name_escapes_all_delimiters_and_roundtrips_decoded_bytes() -> crate::Result<()> {
+        let bytes = (1_u8..=u8::MAX).collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        write_pdf_name(&mut encoded, &bytes);
+        assert!(!encoded.contains(&b'{') && !encoded.contains(&b'}'));
+        let name = hayro_syntax::object::Name::from_bytes(&encoded)
+            .ok_or_else(|| Error::Invalid("generated name could not be parsed".into()))?;
+        assert_eq!(name.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_output_ids_respect_signed_pdf_object_domain() -> crate::Result<()> {
+        assert_eq!(output_object_count(MAX_OUTPUT_OBJECTS)?, i32::MAX as u32);
+        assert!(output_object_count(MAX_OUTPUT_OBJECTS + 1).is_err());
+        let mut streams = DirectStreams::new(MAX_OUTPUT_OBJECTS - 1)?;
+        let stream = direct_stream(b"x");
+        assert_eq!(
+            streams.promote(CurrentValue::Owned(&stream))?.0,
+            i32::MAX as u32
+        );
+        assert!(streams.promote(CurrentValue::Owned(&stream)).is_err());
         Ok(())
     }
 
