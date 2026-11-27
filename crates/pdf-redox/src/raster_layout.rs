@@ -708,12 +708,13 @@ impl RasterScanner {
             self.path_rect = None;
             return;
         }
-        let rect = Rect::new(x, y, x + width, y + height).transformed_bounds(self.ctm);
-        if self.path_rect.is_some() || self.path_complex {
+        let rect = Rect::try_from_corners(x, y, x + width, y + height)
+            .and_then(|rect| rect.transformed_bounds(self.ctm));
+        if self.path_rect.is_some() || self.path_complex || rect.is_none() {
             self.path_complex = true;
             self.path_rect = None;
         } else {
-            self.path_rect = Some(rect);
+            self.path_rect = rect;
         }
     }
 
@@ -1805,7 +1806,7 @@ struct DeferredTile {
 
 impl DeferredTile {
     fn from_draw(draw_index: usize, draw: &RasterDraw, image: &SampleImage) -> Option<Self> {
-        let page_rect = Rect::from_ctm(draw.ctm);
+        let page_rect = Rect::from_ctm(draw.ctm)?;
         let width_pt = (page_rect.x1 - page_rect.x0).abs();
         let height_pt = (page_rect.y1 - page_rect.y0).abs();
         if !width_pt.is_finite()
@@ -2775,7 +2776,9 @@ fn axis_aligned_candidate_rect(draw: &RasterDraw) -> CandidateRect {
     if draw.ctm.b.abs() > MATRIX_EPSILON || draw.ctm.c.abs() > MATRIX_EPSILON {
         return CandidateRect::Unsupported;
     }
-    let rect = Rect::from_ctm(draw.ctm);
+    let Some(rect) = Rect::from_ctm(draw.ctm) else {
+        return CandidateRect::Unsupported;
+    };
     if draw.clip_complex {
         return CandidateRect::Visible(rect);
     }
@@ -2801,7 +2804,7 @@ fn axis_aligned_opaque_cover_rect(draw: &RasterDraw) -> Option<Rect> {
     if draw.ctm.b.abs() > MATRIX_EPSILON || draw.ctm.c.abs() > MATRIX_EPSILON || draw.clip_complex {
         return None;
     }
-    let rect = Rect::from_ctm(draw.ctm);
+    let rect = Rect::from_ctm(draw.ctm)?;
     let rect = match draw.clip {
         Some(clip) => rect.intersection(clip)?,
         None => rect,
@@ -4319,7 +4322,7 @@ fn build_pixel_cluster_plan(
 ) -> Option<MergePlan> {
     let first = *members.first()?;
     let first_info = infos.get(&draws[first].target)?;
-    let mut bounds = Rect::from_ctm(draws[first].ctm);
+    let mut bounds = Rect::from_ctm(draws[first].ctm)?;
     let mut pitch_x = Vec::new();
     let mut pitch_y = Vec::new();
     let mut min_extent_x = f64::INFINITY;
@@ -4341,7 +4344,7 @@ fn build_pixel_cluster_plan(
         {
             return None;
         }
-        let rect = Rect::from_ctm(draw.ctm);
+        let rect = Rect::from_ctm(draw.ctm)?;
         bounds = bounds.union(rect);
         let extent_x = rect.x1 - rect.x0;
         let extent_y = rect.y1 - rect.y0;
@@ -4384,7 +4387,7 @@ fn build_pixel_cluster_plan(
     for &index in members {
         let draw = &draws[index];
         let info = infos.get(&draw.target)?;
-        let rect = Rect::from_ctm(draw.ctm);
+        let rect = Rect::from_ctm(draw.ctm)?;
         let x0 = rounded_nonnegative_u32((rect.x0 - bounds.x0) / pitch_x)?;
         let x1 = rounded_nonnegative_u32((rect.x1 - bounds.x0) / pitch_x)?;
         let y_from_top = rounded_nonnegative_u32((bounds.y1 - rect.y1) / pitch_y)?;
@@ -4478,12 +4481,8 @@ fn raster_draw_insertion_member(draws: &[RasterDraw], members: &[usize]) -> Opti
     let member_set = members.iter().copied().collect::<HashSet<_>>();
     let member_rects = members
         .iter()
-        .filter_map(|&index| {
-            draws
-                .get(index)
-                .map(|draw| (index, Rect::from_ctm(draw.ctm)))
-        })
-        .collect::<Vec<_>>();
+        .map(|&index| Some((index, Rect::from_ctm(draws.get(index)?.ctm)?)))
+        .collect::<Option<Vec<_>>>()?;
 
     // The merged image may move across an interleaved raster only when every
     // constituent it actually overlaps was originally on the same side of that
@@ -4497,7 +4496,7 @@ fn raster_draw_insertion_member(draws: &[RasterDraw], members: &[usize]) -> Opti
             continue;
         }
         let draw = draws.get(index)?;
-        let rect = Rect::from_ctm(draw.ctm);
+        let rect = Rect::from_ctm(draw.ctm)?;
         let mut before = 0usize;
         let mut after = 0usize;
         for &(member_index, member_rect) in &member_rects {
@@ -4598,8 +4597,7 @@ fn native_fragment_axis_roles(
     ]
 }
 
-fn native_pixel_pitch(draw: &RasterDraw, info: &SampleImage) -> Option<(f64, f64)> {
-    let rect = Rect::from_ctm(draw.ctm);
+fn native_pixel_pitch(rect: Rect, info: &SampleImage) -> Option<(f64, f64)> {
     let x = (rect.x1 - rect.x0) / f64::from(info.width);
     let y = (rect.y1 - rect.y0) / f64::from(info.height);
     (x.is_finite() && y.is_finite() && x > MATRIX_EPSILON && y > MATRIX_EPSILON).then_some((x, y))
@@ -4631,7 +4629,8 @@ fn find_native_fragment_plans(
     // heavily fragmented component with many mutually coherent strips may self-anchor
     // from their common pitch. This remains separate from the generic <=5x5 sprite
     // path, which may need to infer a placement lattice unrelated to source pixels.
-    let mut groups: HashMap<NativeFragmentGroupKey, Vec<NativeFragmentEntry>> = HashMap::new();
+    let mut groups: HashMap<NativeFragmentGroupKey, Vec<(NativeFragmentEntry, Rect)>> =
+        HashMap::new();
     for (index, draw) in draws.iter().enumerate() {
         if used.contains(&index) {
             continue;
@@ -4647,7 +4646,10 @@ fn find_native_fragment_plans(
         {
             continue;
         }
-        let Some(pitch) = native_pixel_pitch(draw, info) else {
+        let Some(rect) = Rect::from_ctm(draw.ctm) else {
+            continue;
+        };
+        let Some(pitch) = native_pixel_pitch(rect, info) else {
             continue;
         };
         for (axis, is_fragment, is_anchor) in native_fragment_axis_roles(info, config) {
@@ -4666,32 +4668,21 @@ fn find_native_fragment_plans(
                     },
                 ))
                 .or_default()
-                .push((index, is_fragment, is_anchor, pitch));
+                .push(((index, is_fragment, is_anchor, pitch), rect));
         }
     }
 
     let max_gap = f64::from(config.pixel_cluster_max_gap_mm) * POINTS_PER_MM;
     let mut candidates = Vec::<MergePlan>::new();
     for ((_, _, _, _, axis_id), mut entries) in groups {
+        entries.sort_by(|a, b| a.1.x0.total_cmp(&b.1.x0));
+        let (entries, rects): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .filter_map(|(entry, rect)| Some((entry, rect.scaled(user_unit)?)))
+            .unzip();
         if !entries.iter().any(|entry| entry.1) {
             continue;
         }
-        entries.sort_by(|a, b| {
-            let ar = Rect::from_ctm(draws[a.0].ctm);
-            let br = Rect::from_ctm(draws[b.0].ctm);
-            ar.x0.total_cmp(&br.x0)
-        });
-        let rects = entries
-            .iter()
-            .map(|entry| {
-                let mut rect = Rect::from_ctm(draws[entry.0].ctm);
-                rect.x0 *= user_unit;
-                rect.x1 *= user_unit;
-                rect.y0 *= user_unit;
-                rect.y1 *= user_unit;
-                rect
-            })
-            .collect::<Vec<_>>();
         let mut dsu = Dsu::new(entries.len());
         for left in 0..entries.len() {
             for right in left + 1..entries.len() {
@@ -4815,7 +4806,7 @@ fn find_pixel_cluster_plans(
     if !config.reconstruct_pixel_clusters || !matches!(target, ContentTarget::Page(_)) {
         return Vec::new();
     }
-    let mut groups: HashMap<PixelGroupKey, Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<PixelGroupKey, Vec<(usize, Rect)>> = HashMap::new();
     for tile in deferred_tiles {
         let index = tile.draw_index;
         if used.contains(&index) {
@@ -4835,6 +4826,9 @@ fn find_pixel_cluster_plans(
         {
             continue;
         }
+        let Some(rect) = Rect::from_ctm(draw.ctm) else {
+            continue;
+        };
         groups
             .entry((
                 draw.epoch,
@@ -4842,31 +4836,20 @@ fn find_pixel_cluster_plans(
                 draw.rendering_intent.clone(),
             ))
             .or_default()
-            .push(index);
+            .push((index, rect));
     }
 
     let max_gap = f64::from(config.pixel_cluster_max_gap_mm) * POINTS_PER_MM;
     let mut plans = Vec::new();
     for (_, mut indices) in groups {
+        indices.sort_by(|a, b| a.1.x0.total_cmp(&b.1.x0));
+        let (indices, rects): (Vec<_>, Vec<_>) = indices
+            .into_iter()
+            .filter_map(|(index, rect)| Some((index, rect.scaled(user_unit)?)))
+            .unzip();
         if indices.len() < config.pixel_cluster_min_paints {
             continue;
         }
-        indices.sort_by(|&a, &b| {
-            let ar = Rect::from_ctm(draws[a].ctm);
-            let br = Rect::from_ctm(draws[b].ctm);
-            ar.x0.total_cmp(&br.x0)
-        });
-        let rects = indices
-            .iter()
-            .map(|&index| {
-                let mut rect = Rect::from_ctm(draws[index].ctm);
-                rect.x0 *= user_unit;
-                rect.x1 *= user_unit;
-                rect.y0 *= user_unit;
-                rect.y1 *= user_unit;
-                rect
-            })
-            .collect::<Vec<_>>();
         let mut dsu = Dsu::new(indices.len());
         for left in 0..indices.len() {
             for right in left + 1..indices.len() {
@@ -6977,6 +6960,19 @@ mod tests {
             test_draw(5, 20.0),
         ];
         assert_eq!(raster_draw_insertion_member(&draws, &[0, 2, 4]), Some(4));
+    }
+
+    #[test]
+    fn invalid_raster_placement_is_not_invisible_or_a_crossable_barrier() {
+        let mut draws = vec![test_draw(1, 0.0), test_draw(2, 20.0), test_draw(3, 10.0)];
+        draws[1].ctm = Matrix::new(f64::MAX, 0.0, 0.0, 1.0, f64::MAX, 0.0);
+        assert!(matches!(
+            axis_aligned_candidate_rect(&draws[1]),
+            CandidateRect::Unsupported
+        ));
+        assert!(axis_aligned_opaque_cover_rect(&draws[1]).is_none());
+        assert_eq!(raster_draw_insertion_member(&draws, &[0, 2]), None);
+        assert_eq!(raster_draw_insertion_member(&draws, &[0, 1]), None);
     }
 
     #[test]
