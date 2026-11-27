@@ -309,7 +309,7 @@ impl SourcePdf {
     }
 }
 
-pub(crate) const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
+pub const fn is_writer_owned_trailer_key(name: &[u8], xref_stream: bool) -> bool {
     matches!(name, b"Size" | b"Root" | b"Encrypt" | b"Prev" | b"XRefStm")
         || xref_stream
             && matches!(
