@@ -461,6 +461,47 @@ mod tests {
     }
 
     #[test]
+    fn identical_group4_rows_reuse_reference_with_padding_and_budget_ties() -> Result<()> {
+        for width in [1_u32, 7, 8, 9, 16, 17, 63, 64, 65, 257] {
+            let stride = usize::try_from(width.div_ceil(8)).unwrap_or_default();
+            let active_mask = u8::MAX << ((8 - width % 8) % 8);
+            for pattern in [0_u8, 0xff, 0x55, 0xaa, 0xe7] {
+                let mut packed = Vec::new();
+                let mut reference = Encoder::new(VecWriter::new());
+                for index in 0..35_u8 {
+                    let byte = if (17..=18).contains(&index) {
+                        !pattern
+                    } else {
+                        pattern
+                    };
+                    let mut row = vec![byte; stride];
+                    row[stride - 1] = (byte & active_mask) | (index & !active_mask);
+                    infallible(reference.encode_line(
+                        (0..width).map(|x| {
+                            if row[usize::try_from(x / 8).unwrap_or_default()] & (0x80 >> (x % 8))
+                                == 0
+                            {
+                                Color::Black
+                            } else {
+                                Color::White
+                            }
+                        }),
+                        width,
+                    ));
+                    packed.extend_from_slice(&row);
+                }
+                let expected = infallible(reference.finish()).finish();
+                assert_eq!(
+                    encode_ccitt_group4(&packed, width, 35, expected.len())?,
+                    Some(expected.clone())
+                );
+                assert!(encode_ccitt_group4(&packed, width, 35, expected.len() - 1)?.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn capped_group4_preserves_original_bytes_and_codec_selection() -> Result<()> {
         for width in [1u32, 7, 8, 9, 31, 63, 64, 65, 127, 128, 129, 257, 2625] {
             let height = 32;

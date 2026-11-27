@@ -171,13 +171,51 @@ impl PackedEncoder {
         Ok(())
     }
 
+    /// With an identical reference row, each transition (including the
+    /// terminal width) is encoded as vertical zero, whose code is one bit.
+    /// Leave the reference transitions in place and emit these bits in batches.
+    fn encode_identical_row(&mut self) -> EncodeResult<()> {
+        let mut count = self.reference.len() + 1;
+        while count >= 16 {
+            self.write_bits(Bits {
+                data: u16::MAX,
+                len: 16,
+            })?;
+            count -= 16;
+        }
+        if count != 0 {
+            self.write_bits(Bits {
+                data: u16::MAX >> (16 - count),
+                len: u8::try_from(count).map_err(|_| EncodeError::InvalidCode)?,
+            })?;
+        }
+        Ok(())
+    }
+
     fn encode(&mut self, packed: &[u8], stride: usize, width: u32) -> EncodeResult<()> {
+        let mut previous = None;
         for row in packed.chunks_exact(stride) {
-            self.encode_row(row, width)?;
+            if previous.is_some_and(|reference| equal_active_row(reference, row, width)) {
+                self.encode_identical_row()?;
+            } else {
+                self.encode_row(row, width)?;
+            }
+            previous = Some(row);
         }
         self.write_bits(EDFB_HALF)?;
         self.write_bits(EDFB_HALF)
     }
+}
+
+/// Padding bits are not pixels and do not participate in Group 4 encoding.
+fn equal_active_row(left: &[u8], right: &[u8], width: u32) -> bool {
+    let (Some((&left_tail, left_prefix)), Some((&right_tail, right_prefix))) =
+        (left.split_last(), right.split_last())
+    else {
+        return left == right;
+    };
+    let active_mask = u8::MAX << ((8 - width % 8) % 8);
+    (left_tail ^ right_tail) & active_mask == 0 && left_prefix == right_prefix
 }
 
 pub(super) fn encode_ccitt_group4(
