@@ -469,7 +469,7 @@ mod tests {
                 let mut packed = Vec::new();
                 let mut reference = Encoder::new(VecWriter::new());
                 for index in 0..35_u8 {
-                    let byte = if index < 17 || index > 18 {
+                    let byte = if !(17..=18).contains(&index) {
                         pattern
                     } else {
                         !pattern
