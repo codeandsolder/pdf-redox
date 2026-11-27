@@ -153,20 +153,20 @@ pub enum ImagePolicy {
     Preserve,
     /// Permit size-gated lossy image transcoding while retaining the configured resolution policy.
     Perceptual {
-        /// JPEG quality used when encoding eligible photographic raster data.
+        /// JPEG quality (1–100) used when encoding eligible photographic raster data.
         jpeg_quality: u8,
-        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
+        /// Minimum encoded-size reduction (0–100 percent) required to accept the transform.
         min_savings_percent: u8,
         /// Whether perceptual optimization must retain the original pixel dimensions.
         preserve_resolution: bool,
     },
     /// Permit print-oriented raster downsampling and recompression.
     Print {
-        /// JPEG quality used when encoding eligible photographic raster data.
+        /// JPEG quality (1–100) used when encoding eligible photographic raster data.
         jpeg_quality: u8,
         /// Target effective pixels per inch for eligible print-oriented downsampling.
         target_ppi: u16,
-        /// Minimum encoded-size reduction, as a percentage, required to accept the transform.
+        /// Minimum encoded-size reduction (0–100 percent) required to accept the transform.
         min_savings_percent: u8,
     },
 }
@@ -207,7 +207,7 @@ pub struct RasterLayoutConfig {
     pub background_tolerance: u8,
     /// Reconstruct clusters of tiny images that are being used as scalar raster pixels/sprites.
     pub reconstruct_pixel_clusters: bool,
-    /// Maximum page-space gap between tiny-image paint rectangles in one connected component.
+    /// Maximum finite, nonnegative page-space gap between tiny-image paint rectangles in one connected component.
     /// Five millimetres is deliberately generous enough to bridge sparse plot/image pixels
     /// while still keeping unrelated figures apart in ordinary datasheet layouts.
     pub pixel_cluster_max_gap_mm: f32,
@@ -225,7 +225,7 @@ pub struct RasterLayoutConfig {
     pub merge_stripes: bool,
     /// Minimum number of compatible strips required before replacing them with one image.
     pub stripe_min_paints: usize,
-    /// Maximum placement error, measured in source pixels along the strip-join axis.
+    /// Maximum finite, nonnegative placement error, measured in source pixels along the strip-join axis.
     pub stripe_max_gap_pixels: f32,
     /// Inline images are first externalized only in scopes this fragmented, so normal PDFs do
     /// not gain thousands of transient `XObjects` merely to discover there is nothing to merge.

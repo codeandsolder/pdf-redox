@@ -486,12 +486,55 @@ fn micros_to_millis(micros: u64) -> f64 {
 }
 
 fn validate_config(cfg: &Config) -> Result<()> {
+    match &cfg.image_policy {
+        ImagePolicy::Preserve => {}
+        ImagePolicy::Perceptual {
+            jpeg_quality,
+            min_savings_percent,
+            ..
+        }
+        | ImagePolicy::Print {
+            jpeg_quality,
+            min_savings_percent,
+            ..
+        } => {
+            if !(1..=100).contains(jpeg_quality) {
+                return Err(crate::Error::Invalid(
+                    "JPEG quality must be from 1 through 100".to_owned(),
+                ));
+            }
+            if *min_savings_percent > 100 {
+                return Err(crate::Error::Invalid(
+                    "minimum image savings percentage must be from 0 through 100".to_owned(),
+                ));
+            }
+        }
+    }
     if let ImagePolicy::Print { target_ppi, .. } = &cfg.image_policy {
         let effective_target_ppi = cfg.max_image_ppi.unwrap_or(*target_ppi);
         if effective_target_ppi == 0 {
             return Err(crate::Error::Invalid(
                 "print image PPI target must be greater than zero".to_owned(),
             ));
+        }
+    }
+    let layout = &cfg.raster_layout;
+    for (enabled, value, name) in [
+        (
+            layout.reconstruct_pixel_clusters,
+            layout.pixel_cluster_max_gap_mm,
+            "pixel cluster maximum gap",
+        ),
+        (
+            layout.enabled && layout.merge_stripes,
+            layout.stripe_max_gap_pixels,
+            "stripe maximum gap",
+        ),
+    ] {
+        if enabled && (!value.is_finite() || value < 0.0) {
+            return Err(crate::Error::Invalid(format!(
+                "{name} must be finite and nonnegative"
+            )));
         }
     }
     Ok(())
@@ -1456,6 +1499,50 @@ fn optimize_pdf_with_document(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_config_domains_match_the_effective_image_and_layout_policy() {
+        for quality in [0, 1, 100, 101, 255] {
+            for savings in [0, 100, 101, 255] {
+                for image_policy in [
+                    ImagePolicy::Perceptual {
+                        jpeg_quality: quality,
+                        min_savings_percent: savings,
+                        preserve_resolution: true,
+                    },
+                    ImagePolicy::Print {
+                        jpeg_quality: quality,
+                        min_savings_percent: savings,
+                        target_ppi: 600,
+                    },
+                ] {
+                    let config = Config {
+                        image_policy,
+                        ..Config::optimize_only()
+                    };
+                    assert_eq!(
+                        validate_config(&config).is_ok(),
+                        (1..=100).contains(&quality) && savings <= 100
+                    );
+                }
+            }
+        }
+
+        for gap in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0, 1.0] {
+            let valid = gap.is_finite() && gap >= 0.0;
+            let mut config = Config::optimize_only();
+            config.raster_layout.pixel_cluster_max_gap_mm = gap;
+            assert_eq!(validate_config(&config).is_ok(), valid);
+            config.raster_layout.reconstruct_pixel_clusters = false;
+            assert!(validate_config(&config).is_ok());
+            config.raster_layout.stripe_max_gap_pixels = gap;
+            assert!(validate_config(&config).is_ok());
+            config.raster_layout.enabled = true;
+            assert_eq!(validate_config(&config).is_ok(), valid);
+            config.raster_layout.merge_stripes = false;
+            assert!(validate_config(&config).is_ok());
+        }
+    }
+
     #[test]
     fn font_dedup_proofs_preserve_fresh_and_cached_results_in_both_goals() -> Result<()> {
         for (label, input) in [
