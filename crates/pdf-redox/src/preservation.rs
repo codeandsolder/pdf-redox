@@ -184,6 +184,7 @@ fn page_annotation_entries<'a>(
     Ok(Some(entries))
 }
 
+#[cfg(test)]
 fn page_annotations(
     document: &EditDocument,
     page: &DirectObjectTarget,
@@ -236,16 +237,19 @@ fn annotation_subtype(
     current_annotation_subtype(document, CurrentValue::Owned(annotation))
 }
 
-fn annotation_is_protected(
-    document: &EditDocument,
-    annotation: &OwnedObject,
-    policy: &PreservationConfig,
-) -> Result<bool> {
-    Ok(match annotation_subtype(document, annotation)?.as_deref() {
+fn annotation_is_protected(subtype: Option<&[u8]>, policy: &PreservationConfig) -> bool {
+    match subtype {
         Some(b"Link") => policy.links,
         Some(b"Widget") => policy.forms,
         _ => false,
-    })
+    }
+}
+
+fn subtype_label(subtype: Option<&[u8]>) -> String {
+    subtype.map_or_else(
+        || "(missing/non-name subtype)".to_owned(),
+        |name| format!("/{}", String::from_utf8_lossy(name)),
+    )
 }
 
 fn annotation_subtypes(
@@ -262,10 +266,7 @@ fn annotation_subtypes(
             continue;
         };
         for annotation in annotations {
-            let label = current_annotation_subtype(document, annotation)?.map_or_else(
-                || "(missing/non-name subtype)".to_owned(),
-                |name| format!("/{}", String::from_utf8_lossy(&name)),
-            );
+            let label = subtype_label(current_annotation_subtype(document, annotation)?.as_deref());
             *counts.entry(label).or_default() += 1;
         }
     }
@@ -280,104 +281,52 @@ fn filter_annotations(
 ) -> Result<usize> {
     let mut kept_total = 0;
     for page in pages {
-        let Some(items) = page_annotations(document, page)? else {
+        let Some(entries) = page_annotation_entries(document, page)? else {
+            continue;
+        };
+        let AnnotationEntries::Array(items) = entries else {
+            if preserve_other_annotations {
+                // Preserve reader recovery behavior for malformed annotation
+                // containers when the caller requests preservation.
+                kept_total += 1;
+            } else {
+                replace_page_annotations(document, page, Vec::new())?;
+            }
             continue;
         };
         let mut kept = Vec::new();
+        let mut changed = false;
         for annotation in items {
-            let subtype = annotation_subtype(document, &annotation)?;
-            let protected = annotation_is_protected(document, &annotation, policy)?;
+            let subtype = current_annotation_subtype(document, annotation.clone())?;
+            let protected = annotation_is_protected(subtype.as_deref(), policy);
             let explicitly_disabled = matches!(subtype.as_deref(), Some(b"Link")) && !policy.links
                 || matches!(subtype.as_deref(), Some(b"Widget")) && !policy.forms;
             if protected || (preserve_other_annotations && !explicitly_disabled) {
-                kept.push(annotation);
+                kept.push(annotation.into_cow().into_owned());
+            } else {
+                changed = true;
             }
         }
         kept_total += kept.len();
-        replace_page_annotations(document, page, kept)?;
+        if changed {
+            replace_page_annotations(document, page, kept)?;
+        }
     }
     Ok(kept_total)
 }
 
-fn detach_protected_annotations(
-    document: &mut EditDocument,
-    pages: &[DirectObjectTarget],
-    policy: &PreservationConfig,
-) -> Result<Vec<Vec<OwnedObject>>> {
-    let mut protected_by_page = Vec::with_capacity(pages.len());
-    for page in pages {
-        let Some(items) = page_annotations(document, page)? else {
-            protected_by_page.push(Vec::new());
-            continue;
-        };
-        let mut protected = Vec::new();
-        let mut processable = Vec::new();
-        for annotation in items {
-            if annotation_is_protected(document, &annotation, policy)? {
-                protected.push(annotation);
-            } else {
-                processable.push(annotation);
-            }
+fn link_visual_shell(dictionary: &OwnedDictionary) -> OwnedObject {
+    const LINK_VISUAL_KEYS: &[&[u8]] = &[b"Rect", b"Border", b"BS", b"C", b"F", b"CA", b"OC"];
+    let mut shell = OwnedDictionary::from([
+        (b"Type".to_vec(), OwnedObject::Name(b"Annot".to_vec())),
+        (b"Subtype".to_vec(), OwnedObject::Name(b"Link".to_vec())),
+    ]);
+    for &key in LINK_VISUAL_KEYS {
+        if let Some(value) = dictionary.get(key) {
+            shell.insert(key.to_vec(), value.clone());
         }
-        replace_page_annotations(document, page, processable)?;
-        protected_by_page.push(protected);
     }
-    Ok(protected_by_page)
-}
-
-fn restore_protected_annotations(
-    document: &mut EditDocument,
-    pages: &[DirectObjectTarget],
-    protected_by_page: Vec<Vec<OwnedObject>>,
-) -> Result<()> {
-    for (page, protected) in pages.iter().zip(protected_by_page) {
-        if protected.is_empty() {
-            continue;
-        }
-        let mut items = page_annotations(document, page)?.unwrap_or_default();
-        items.extend(protected);
-        replace_page_annotations(document, page, items)?;
-    }
-    Ok(())
-}
-
-fn retain_link_visual_shells(
-    document: &mut EditDocument,
-    pages: &[DirectObjectTarget],
-) -> Result<usize> {
-    const LINK_VISUAL_KEYS: &[&[u8]] = &[b"Rect", b"Border", b"BS", b"C", b"F", b"CA"];
-    let mut retained = 0;
-    for page in pages {
-        let Some(items) = page_annotations(document, page)? else {
-            continue;
-        };
-        let mut shells = Vec::new();
-        for annotation in items {
-            let Some(resolved) = document.resolve_owned_value(&annotation)? else {
-                continue;
-            };
-            let Some(dictionary) = resolved.as_dictionary() else {
-                continue;
-            };
-            if owned_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref()
-                != Some(b"Link")
-            {
-                continue;
-            }
-            let mut shell = OwnedDictionary::new();
-            shell.insert(b"Type".to_vec(), OwnedObject::Name(b"Annot".to_vec()));
-            shell.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Link".to_vec()));
-            for &key in LINK_VISUAL_KEYS {
-                if let Some(value) = dictionary.get(key) {
-                    shell.insert(key.to_vec(), value.clone());
-                }
-            }
-            shells.push(OwnedObject::Dictionary(shell));
-            retained += 1;
-        }
-        replace_page_annotations(document, page, shells)?;
-    }
-    Ok(retained)
+    OwnedObject::Dictionary(shell)
 }
 
 const fn keep_page_key(key: &[u8], policy: &PreservationConfig) -> bool {
@@ -651,48 +600,63 @@ fn stream_source_from_value(
     document: &EditDocument,
     value: &OwnedObject,
 ) -> Result<Option<AppearanceSource>> {
-    Ok(match value {
-        OwnedObject::Reference(handle) => match document.current_owned_object(*handle)? {
-            Some(OwnedObject::Stream { .. }) => Some(AppearanceSource::Handle(*handle)),
-            _ => None,
-        },
-        OwnedObject::Stream { .. } => Some(AppearanceSource::Direct(value.clone())),
-        _ => None,
-    })
+    let mut current = CurrentValue::Owned(value);
+    let mut seen = BTreeSet::new();
+    let mut source = None;
+    while let Some(handle) = current.reference() {
+        if !seen.insert(handle) {
+            return Ok(None);
+        }
+        let Some(next) = document.current_value(handle)? else {
+            return Ok(None);
+        };
+        current = next;
+        source = Some(handle);
+    }
+    Ok(current.is_stream().then(|| {
+        source.map_or_else(
+            || AppearanceSource::Direct(current.into_cow().into_owned()),
+            AppearanceSource::Handle,
+        )
+    }))
 }
 
 fn selected_normal_appearance(
     document: &EditDocument,
     annotation: &OwnedDictionary,
-) -> Result<(bool, Option<AppearanceSource>)> {
+) -> Result<Option<AppearanceSource>> {
     let Some(ap_value) = annotation.get(b"AP".as_slice()) else {
-        return Ok((false, None));
+        return Ok(None);
     };
-    let Some(ap_object) = document.resolve_owned_value(ap_value)? else {
-        return Ok((false, None));
+    let Some(ap_object) = document.resolve_owned_value_cow(ap_value)? else {
+        return Ok(None);
     };
-    let Some(ap) = ap_object.as_dictionary() else {
-        return Ok((true, None));
+    let OwnedObject::Dictionary(ap) = ap_object.as_ref() else {
+        return Ok(None);
     };
     let Some(normal) = ap.get(b"N".as_slice()) else {
-        return Ok((true, None));
+        return Ok(None);
     };
     if let Some(stream) = stream_source_from_value(document, normal)? {
-        return Ok((true, Some(stream)));
+        return Ok(Some(stream));
     }
-    let Some(normal_object) = document.resolve_owned_value(normal)? else {
-        return Ok((true, None));
+    let Some(normal_object) = document.resolve_owned_value_cow(normal)? else {
+        return Ok(None);
     };
-    let Some(states) = normal_object.as_dictionary() else {
-        return Ok((true, None));
+    let OwnedObject::Dictionary(states) = normal_object.as_ref() else {
+        return Ok(None);
     };
-    let Some(state) = owned_name(document, annotation.get(b"AS".as_slice()))? else {
-        return Ok((true, None));
-    };
-    let Some(value) = states.get(state.as_slice()) else {
-        return Ok((true, None));
-    };
-    Ok((true, stream_source_from_value(document, value)?))
+    if let Some(state) = owned_name(document, annotation.get(b"AS".as_slice()))?
+        && let Some(value) = states.get(state.as_slice())
+        && let Some(stream) = stream_source_from_value(document, value)?
+    {
+        return Ok(Some(stream));
+    }
+    // Match the source interpreter's fallback to an explicit Off state.
+    match states.get(b"Off".as_slice()) {
+        Some(value) => stream_source_from_value(document, value),
+        None => Ok(None),
+    }
 }
 
 fn annotation_flags(document: &EditDocument, annotation: &OwnedDictionary) -> Result<i64> {
@@ -731,31 +695,75 @@ fn acroform_need_appearances(document: &EditDocument) -> Result<bool> {
     ))
 }
 
-fn appearance_as_form(
-    document: &mut EditDocument,
+enum PlannedForm {
+    Existing(CowObjectHandle),
+    New(OwnedObject),
+}
+
+struct PlannedAppearance {
+    form: PlannedForm,
+    content: Vec<u8>,
+    needs_resources: bool,
+}
+
+fn prepare_appearance(
+    document: &EditDocument,
+    annotation: &OwnedDictionary,
     source: AppearanceSource,
-) -> Result<CowObjectHandle> {
-    match source {
+    resource_name: &str,
+    rotate: i32,
+    flags: i64,
+) -> Result<Option<PlannedAppearance>> {
+    let (handle, object) = match source {
         AppearanceSource::Handle(handle) => {
-            let object = document.edit_handle(handle)?;
-            let Some(dictionary) = object.as_dictionary_mut() else {
-                return Err(Error::Invalid(
-                    "annotation appearance is not a stream".to_owned(),
-                ));
+            let Some(object) = document.current_owned_object_cow(handle)? else {
+                return Ok(None);
             };
-            dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
-            Ok(handle)
+            (Some(handle), object)
         }
-        AppearanceSource::Direct(mut object) => {
-            let Some(dictionary) = object.as_dictionary_mut() else {
-                return Err(Error::Invalid(
-                    "direct annotation appearance is not a stream".to_owned(),
-                ));
-            };
-            dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
-            Ok(CowObjectHandle::New(document.add_object(object)))
-        }
+        AppearanceSource::Direct(object) => (None, std::borrow::Cow::Owned(object)),
+    };
+    let OwnedObject::Stream { dictionary, .. } = object.as_ref() else {
+        return Ok(None);
+    };
+    let content = appearance_content(
+        document,
+        annotation,
+        dictionary,
+        resource_name,
+        rotate,
+        flags,
+    )?;
+    if content.is_empty() {
+        return Ok(None);
     }
+    let needs_resources = match dictionary.get(b"Resources".as_slice()) {
+        None => true,
+        Some(value) => match document.resolve_owned_value_cow(value)?.as_deref() {
+            Some(OwnedObject::Dictionary(_)) => false,
+            Some(OwnedObject::Null) => true,
+            _ => return Ok(None),
+        },
+    };
+    let form = if let Some(handle) = handle
+        && !needs_resources
+        && owned_name(document, dictionary.get(b"Subtype".as_slice()))?.as_deref() == Some(b"Form")
+    {
+        PlannedForm::Existing(handle)
+    } else {
+        // Never normalize a shared appearance object in-place. Its other
+        // users may still depend on the exact original dictionary.
+        let mut object = object.into_owned();
+        if let OwnedObject::Stream { dictionary, .. } = &mut object {
+            dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Form".to_vec()));
+        }
+        PlannedForm::New(object)
+    };
+    Ok(Some(PlannedAppearance {
+        form,
+        content,
+        needs_resources,
+    }))
 }
 
 fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<Option<Rectangle>> {
@@ -774,30 +782,28 @@ fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<
     )))
 }
 
-fn appearance_matrix(document: &EditDocument, dictionary: &OwnedDictionary) -> Result<Matrix> {
+fn appearance_matrix(
+    document: &EditDocument,
+    dictionary: &OwnedDictionary,
+) -> Result<Option<Matrix>> {
     let Some(value) = dictionary.get(b"Matrix".as_slice()) else {
-        return Ok(Matrix::default());
+        return Ok(Some(Matrix::default()));
     };
     Ok(
         resolved_number_array::<6>(document, CurrentValue::Owned(value))?
-            .map_or_default(Matrix::from),
+            .map(Matrix::from)
+            .filter(|matrix| matrix.is_finite()),
     )
 }
 
 fn appearance_content(
     document: &EditDocument,
     annotation: &OwnedDictionary,
-    appearance: CowObjectHandle,
+    appearance_dictionary: &OwnedDictionary,
     resource_name: &str,
     rotate: i32,
     flags: i64,
 ) -> Result<Vec<u8>> {
-    let Some(appearance_object) = document.current_owned_object(appearance)? else {
-        return Ok(Vec::new());
-    };
-    let Some(appearance_dictionary) = appearance_object.as_dictionary() else {
-        return Ok(Vec::new());
-    };
     let Some(bbox_value) = appearance_dictionary.get(b"BBox".as_slice()) else {
         return Ok(Vec::new());
     };
@@ -810,7 +816,9 @@ fn appearance_content(
     let Some(rect) = normalized_rectangle(document, rect_value)? else {
         return Ok(Vec::new());
     };
-    let matrix = appearance_matrix(document, appearance_dictionary)?;
+    let Some(matrix) = appearance_matrix(document, appearance_dictionary)? else {
+        return Ok(Vec::new());
+    };
     let do_rotate = rotate != 0 && (flags & 0x10) != 0;
     let (rect, matrix) = if do_rotate {
         let mut rotated_matrix = Matrix::default();
@@ -851,7 +859,7 @@ fn appearance_content(
     };
     let width = transformed_bbox.x1 - transformed_bbox.x0;
     let height = transformed_bbox.y1 - transformed_bbox.y0;
-    if width == 0.0 || height == 0.0 || !rect.area().is_finite() {
+    if width <= 0.0 || height <= 0.0 || rect.area() <= 0.0 || !rect.area().is_finite() {
         return Ok(Vec::new());
     }
     let mut placement = Matrix::default();
@@ -864,8 +872,25 @@ fn appearance_content(
     if !placement.is_finite() {
         return Ok(Vec::new());
     }
-    let placement = placement.unparse();
-    Ok(format!("q\n{placement} cm\n/{resource_name} Do\nQ\n").into_bytes())
+    let mut content = b"q\n".to_vec();
+    for (index, value) in [
+        placement.a,
+        placement.b,
+        placement.c,
+        placement.d,
+        placement.e,
+        placement.f,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index != 0 {
+            content.push(b' ');
+        }
+        crate::writer::write_pdf_real(&mut content, value)?;
+    }
+    content.extend_from_slice(format!(" cm\n/{resource_name} Do\nQ\n").as_bytes());
+    Ok(content)
 }
 
 fn page_resources(document: &EditDocument, page: &DirectObjectTarget) -> Result<OwnedDictionary> {
@@ -878,17 +903,18 @@ fn page_resources(document: &EditDocument, page: &DirectObjectTarget) -> Result<
         .unwrap_or_default())
 }
 
-fn resource_dictionary(
+fn resolved_resource_category(
     document: &EditDocument,
     resources: &OwnedDictionary,
     key: &[u8],
-) -> Result<OwnedDictionary> {
+) -> Result<Option<OwnedDictionary>> {
     let Some(value) = resources.get(key) else {
-        return Ok(OwnedDictionary::new());
+        return Ok(Some(OwnedDictionary::new()));
     };
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Dictionary(dictionary)) => dictionary,
-        _ => OwnedDictionary::new(),
+        Some(OwnedObject::Dictionary(dictionary)) => Some(dictionary),
+        Some(OwnedObject::Null) => Some(OwnedDictionary::new()),
+        _ => None,
     })
 }
 
@@ -918,99 +944,226 @@ fn acroform_default_resources(document: &EditDocument) -> Result<Option<OwnedDic
     })
 }
 
-fn merge_resource_dictionaries(destination: &mut OwnedDictionary, source: OwnedDictionary) {
+fn merge_resource_dictionaries(
+    document: &EditDocument,
+    destination: &mut OwnedDictionary,
+    source: &OwnedDictionary,
+) -> Result<()> {
     for (category, source_value) in source {
-        match (destination.get_mut(category.as_slice()), source_value) {
-            (None, source_value) => {
-                destination.insert(category, source_value);
-            }
+        let Some(destination_value) = destination.get(category.as_slice()) else {
+            destination.insert(category.clone(), source_value.clone());
+            continue;
+        };
+        let merged = match (
+            document.resolve_owned_value(destination_value)?,
+            document.resolve_owned_value(source_value)?,
+        ) {
             (
-                Some(OwnedObject::Dictionary(destination_dict)),
-                OwnedObject::Dictionary(source_dict),
+                Some(OwnedObject::Dictionary(mut destination_dict)),
+                Some(OwnedObject::Dictionary(source_dict)),
             ) => {
                 for (name, value) in source_dict {
                     destination_dict.entry(name).or_insert(value);
                 }
+                Some(OwnedObject::Dictionary(destination_dict))
             }
-            (Some(OwnedObject::Array(destination_items)), OwnedObject::Array(source_items)) => {
+            (
+                Some(OwnedObject::Array(mut destination_items)),
+                Some(OwnedObject::Array(source_items)),
+            ) => {
                 for item in source_items {
                     if !destination_items.contains(&item) {
                         destination_items.push(item);
                     }
                 }
+                Some(OwnedObject::Array(destination_items))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(merged) = merged {
+            destination.insert(category.clone(), merged);
         }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct AppearanceScopes {
+    page: Option<CowObjectHandle>,
+    widget: Option<CowObjectHandle>,
+}
+
+impl AppearanceScopes {
+    fn resource(
+        &mut self,
+        document: &mut EditDocument,
+        page_resources: &OwnedDictionary,
+        widget_defaults: Option<&OwnedDictionary>,
+    ) -> Result<CowObjectHandle> {
+        let slot = if widget_defaults.is_some() {
+            &mut self.widget
+        } else {
+            &mut self.page
+        };
+        if let Some(handle) = *slot {
+            return Ok(handle);
+        }
+        let mut resources = page_resources.clone();
+        if let Some(defaults) = widget_defaults {
+            merge_resource_dictionaries(document, &mut resources, defaults)?;
+        }
+        let handle = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(resources)));
+        *slot = Some(handle);
+        Ok(handle)
     }
 }
 
+struct PageContentPlan {
+    parts: Vec<OwnedObject>,
+    saves_to_restore: usize,
+}
+
+enum ContentTask<'a> {
+    Visit(CurrentValue<'a>),
+    Array(CurrentArrayIter<'a>),
+    Leave(CowObjectHandle),
+}
+
 fn content_references(
-    document: &mut EditDocument,
-    value: Option<OwnedObject>,
-) -> Result<Vec<OwnedObject>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    match value {
-        OwnedObject::Reference(handle) => match document.current_owned_object(handle)? {
-            Some(OwnedObject::Array(values)) => {
-                let mut output = Vec::new();
-                for value in values {
-                    match value {
-                        OwnedObject::Reference(_) => output.push(value),
-                        OwnedObject::Stream { .. } => {
-                            output.push(OwnedObject::Reference(ensure_indirect_owned(
-                                document, value,
-                            )));
-                        }
-                        _ => {}
-                    }
+    document: &EditDocument,
+    root: CurrentValue<'_>,
+) -> Result<Option<Vec<OwnedObject>>> {
+    let mut output = Vec::new();
+    let mut pending = vec![ContentTask::Visit(root)];
+    let mut active = BTreeSet::new();
+    while let Some(task) = pending.pop() {
+        let value = match task {
+            ContentTask::Visit(value) => value,
+            ContentTask::Array(mut items) => {
+                if let Some(value) = items.next() {
+                    pending.push(ContentTask::Array(items));
+                    pending.push(ContentTask::Visit(value));
                 }
-                Ok(output)
+                continue;
             }
-            Some(OwnedObject::Stream { .. }) => Ok(vec![OwnedObject::Reference(handle)]),
-            _ => Ok(Vec::new()),
-        },
-        OwnedObject::Array(values) => {
-            let mut output = Vec::new();
-            for value in values {
-                match value {
-                    OwnedObject::Reference(_) => output.push(value),
-                    OwnedObject::Stream { .. } => {
-                        output.push(OwnedObject::Reference(ensure_indirect_owned(
-                            document, value,
-                        )));
-                    }
-                    _ => {}
-                }
+            ContentTask::Leave(handle) => {
+                active.remove(&handle);
+                continue;
             }
-            Ok(output)
+        };
+        if let Some(handle) = value.reference() {
+            if !active.insert(handle) {
+                return Ok(None);
+            }
+            let Some(resolved) = document.current_value(handle)? else {
+                return Ok(None);
+            };
+            if resolved.is_stream() {
+                output.push(OwnedObject::Reference(handle));
+                active.remove(&handle);
+            } else {
+                pending.push(ContentTask::Leave(handle));
+                pending.push(ContentTask::Visit(resolved));
+            }
+        } else if let Some(items) = value.array_items() {
+            pending.push(ContentTask::Array(items));
+        } else if value.is_stream() {
+            output.push(value.into_cow().into_owned());
+        } else if !value.is_null() {
+            return Ok(None);
         }
-        OwnedObject::Stream { .. } => Ok(vec![OwnedObject::Reference(ensure_indirect_owned(
-            document, value,
-        ))]),
-        _ => Ok(Vec::new()),
     }
+    Ok(Some(output))
+}
+
+/// Existing content must finish outside text, marked-content and
+/// compatibility scopes and never underflow its graphics-state stack.
+/// Unmatched saves can be closed after the original paint without changing it.
+fn content_isolation_depth(bytes: &[u8]) -> Result<Option<usize>> {
+    let (mut saves, mut marked, mut compatibility) = (0_usize, 0_usize, 0_usize);
+    let mut text = false;
+    let mut valid = true;
+    let incomplete = crate::content_stream::visit_instructions(bytes, |instruction| {
+        match &instruction.operator[..] {
+            b"q" => saves += 1,
+            b"Q" if saves != 0 => saves -= 1,
+            b"BT" if !text => text = true,
+            b"ET" if text => text = false,
+            b"BMC" | b"BDC" => marked += 1,
+            b"EMC" if marked != 0 => marked -= 1,
+            b"BX" => compatibility += 1,
+            b"EX" if compatibility != 0 => compatibility -= 1,
+            b"Q" | b"BT" | b"ET" | b"EMC" | b"EX" => valid = false,
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((!incomplete && valid && !text && marked == 0 && compatibility == 0).then_some(saves + 1))
+}
+
+fn plan_page_contents(
+    document: &EditDocument,
+    page: &DirectObjectTarget,
+) -> Result<Option<PageContentPlan>> {
+    let Some(old) = page
+        .current(document)?
+        .and_then(|object| object.dictionary_entry(b"Contents"))
+    else {
+        return Ok(Some(PageContentPlan {
+            parts: Vec::new(),
+            saves_to_restore: 0,
+        }));
+    };
+    let Some(parts) = content_references(document, old.clone())? else {
+        return Ok(None);
+    };
+    if parts.is_empty() {
+        return Ok(Some(PageContentPlan {
+            parts,
+            saves_to_restore: 0,
+        }));
+    }
+    let decoded = match crate::content::decoded_content_value(document, old) {
+        Ok(decoded) => decoded,
+        Err(Error::Invalid(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(
+        content_isolation_depth(&decoded)?.map(|saves_to_restore| PageContentPlan {
+            parts,
+            saves_to_restore,
+        }),
+    )
 }
 
 fn wrap_page_contents(
     document: &mut EditDocument,
     page: &DirectObjectTarget,
-    append_bytes: &[u8],
+    plan: PageContentPlan,
+    append_bytes: Vec<u8>,
 ) -> Result<()> {
-    let old = page
-        .current(document)?
-        .and_then(|object| object.dictionary_entry(b"Contents"))
-        .map(|value| value.into_cow().into_owned());
-    let before = new_content_stream(document, b"q\n".to_vec());
-    let mut after_bytes = b"\nQ\n".to_vec();
-    after_bytes.extend_from_slice(append_bytes);
-    let after = new_content_stream(document, after_bytes);
-    let mut contents = vec![OwnedObject::Reference(before)];
-    contents.extend(content_references(document, old)?);
-    contents.push(OwnedObject::Reference(after));
+    let contents = if plan.parts.is_empty() {
+        OwnedObject::Reference(new_content_stream(document, append_bytes))
+    } else {
+        let before = new_content_stream(document, b"q\n".to_vec());
+        let mut after_bytes = b"\nn\n".to_vec();
+        for _ in 0..plan.saves_to_restore {
+            after_bytes.extend_from_slice(b"Q\n");
+        }
+        after_bytes.extend(append_bytes);
+        let after = new_content_stream(document, after_bytes);
+        let mut contents = Vec::with_capacity(plan.parts.len() + 2);
+        contents.push(OwnedObject::Reference(before));
+        contents.extend(
+            plan.parts
+                .into_iter()
+                .map(|value| OwnedObject::Reference(ensure_indirect_owned(document, value))),
+        );
+        contents.push(OwnedObject::Reference(after));
+        OwnedObject::array(contents)
+    };
     if let Some(dictionary) = page.dictionary_mut(document)? {
-        dictionary.insert(b"Contents".to_vec(), OwnedObject::array(contents));
+        dictionary.insert(b"Contents".to_vec(), contents);
     }
     Ok(())
 }
@@ -1022,109 +1175,231 @@ fn page_rotate(document: &EditDocument, page: &DirectObjectTarget) -> Result<i32
     document.inherited_page_rotation_from_view(object)
 }
 
+struct PageAppearancePlan {
+    content: Option<PageContentPlan>,
+    original_resources: OwnedDictionary,
+    xobjects: OwnedDictionary,
+    properties: OwnedDictionary,
+    properties_valid: bool,
+    properties_changed: bool,
+    scopes: AppearanceScopes,
+    append_bytes: Vec<u8>,
+    counter: usize,
+}
+
+impl PageAppearancePlan {
+    fn new(document: &EditDocument, page: &DirectObjectTarget) -> Result<Self> {
+        let original_resources = page_resources(document, page)?;
+        let xobjects = resolved_resource_category(document, &original_resources, b"XObject")?;
+        let properties = resolved_resource_category(document, &original_resources, b"Properties")?;
+        let content = if xobjects.is_some() {
+            plan_page_contents(document, page)?
+        } else {
+            None
+        };
+        Ok(Self {
+            content,
+            original_resources,
+            xobjects: xobjects.unwrap_or_default(),
+            properties_valid: properties.is_some(),
+            properties: properties.unwrap_or_default(),
+            properties_changed: false,
+            scopes: AppearanceScopes::default(),
+            append_bytes: Vec::new(),
+            counter: 1,
+        })
+    }
+
+    fn append(
+        &mut self,
+        document: &mut EditDocument,
+        annotation: &OwnedDictionary,
+        rotate: i32,
+        widget_defaults: Option<&OwnedDictionary>,
+    ) -> Result<bool> {
+        if self.content.is_none() {
+            return Ok(false);
+        }
+        let flags = annotation_flags(document, annotation)?;
+        if flags & SCREEN_HIDDEN_ANNOTATION_FLAGS != 0 {
+            return Ok(false);
+        }
+        let Some(source) = selected_normal_appearance(document, annotation)? else {
+            return Ok(false);
+        };
+        let optional_content = annotation.get(b"OC".as_slice());
+        if let Some(value) = optional_content
+            && (!self.properties_valid
+                || !matches!(
+                    document.resolve_owned_value_cow(value)?.as_deref(),
+                    Some(OwnedObject::Dictionary(_))
+                ))
+        {
+            return Ok(false);
+        }
+        let resource_name = loop {
+            let candidate = format!("Fxo{}", self.counter);
+            self.counter += 1;
+            if !self.xobjects.contains_key(candidate.as_bytes())
+                && (optional_content.is_none()
+                    || !self.properties.contains_key(candidate.as_bytes()))
+            {
+                break candidate;
+            }
+        };
+        let Some(plan) =
+            prepare_appearance(document, annotation, source, &resource_name, rotate, flags)?
+        else {
+            return Ok(false);
+        };
+        let appearance = match plan.form {
+            PlannedForm::Existing(handle) => handle,
+            PlannedForm::New(mut object) => {
+                if plan.needs_resources {
+                    let scope = self.scopes.resource(
+                        document,
+                        &self.original_resources,
+                        widget_defaults,
+                    )?;
+                    if let OwnedObject::Stream { dictionary, .. } = &mut object {
+                        dictionary.insert(b"Resources".to_vec(), OwnedObject::Reference(scope));
+                    }
+                }
+                CowObjectHandle::New(document.add_object(object))
+            }
+        };
+        if let Some(oc) = optional_content {
+            self.properties
+                .insert(resource_name.as_bytes().to_vec(), oc.clone());
+            self.properties_changed = true;
+            self.append_bytes
+                .extend_from_slice(format!("/OC /{resource_name} BDC\n").as_bytes());
+        }
+        self.xobjects.insert(
+            resource_name.into_bytes(),
+            OwnedObject::Reference(appearance),
+        );
+        self.append_bytes.extend(plan.content);
+        if optional_content.is_some() {
+            self.append_bytes.extend_from_slice(b"EMC\n");
+        }
+        Ok(true)
+    }
+
+    fn commit(self, document: &mut EditDocument, page: &DirectObjectTarget) -> Result<()> {
+        if self.append_bytes.is_empty() {
+            return Ok(());
+        }
+        let Some(content) = self.content else {
+            return Err(Error::Invalid(
+                "annotation paint lacks page content plan".into(),
+            ));
+        };
+        let mut resources = self.original_resources;
+        resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(self.xobjects));
+        if self.properties_changed {
+            resources.insert(
+                b"Properties".to_vec(),
+                OwnedObject::Dictionary(self.properties),
+            );
+        }
+        if let Some(dictionary) = page.dictionary_mut(document)? {
+            dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
+        }
+        wrap_page_contents(document, page, content, self.append_bytes)
+    }
+}
+
 fn flatten_annotations(
     document: &mut EditDocument,
     pages: &[DirectObjectTarget],
-    required_flags: i64,
-    forbidden_flags: i64,
-) -> Result<usize> {
+    policy: &PreservationConfig,
+    stats: &mut PreservationStats,
+) -> Result<()> {
     let need_appearances = acroform_need_appearances(document)?;
-    let default_resources = if need_appearances {
+    let default_resources = if need_appearances || policy.forms {
         None
     } else {
         acroform_default_resources(document)?
     };
-    let mut flattened_total = 0;
     for page in pages {
-        let Some(annotations) = page_annotations(document, page)? else {
+        let Some(entries) = page_annotation_entries(document, page)? else {
             continue;
         };
-        let rotate = page_rotate(document, page)?;
-        let mut resources = page_resources(document, page)?;
-        let has_widget = annotations.iter().any(|annotation| {
-            matches!(annotation_subtype(document, annotation), Ok(Some(name)) if name == b"Widget")
-        });
-        if has_widget && let Some(default_resources) = default_resources.clone() {
-            merge_resource_dictionaries(&mut resources, default_resources);
-        }
-        let mut xobjects = resource_dictionary(document, &resources, b"XObject")?;
+        let AnnotationEntries::Array(items) = entries else {
+            *stats
+                .unflattened_annotation_subtypes
+                .entry("(non-array /Annots)".into())
+                .or_default() += 1;
+            stats.annotation_entries_dropped_unflattened += 1;
+            replace_page_annotations(document, page, Vec::new())?;
+            continue;
+        };
+        let annotations = items
+            .map(|value| value.into_cow().into_owned())
+            .collect::<Vec<_>>();
         let mut kept = Vec::new();
-        let mut append_bytes = Vec::new();
-        let mut changed_annotations = false;
-        let mut counter = 1_u32;
-
+        let mut page_plan = None;
+        let mut changed = false;
+        let rotate = page_rotate(document, page)?;
         for annotation_value in annotations {
-            let Some(annotation_object) = document.resolve_owned_value(&annotation_value)? else {
-                kept.push(annotation_value);
-                continue;
-            };
-            let Some(annotation) = annotation_object.as_dictionary() else {
-                kept.push(annotation_value);
-                continue;
-            };
-            let (has_appearance, appearance) = selected_normal_appearance(document, annotation)?;
-            let subtype = owned_name(document, annotation.get(b"Subtype".as_slice()))?;
-            if need_appearances && subtype.as_deref() == Some(b"Widget") {
+            let subtype = annotation_subtype(document, &annotation_value)?;
+            if annotation_is_protected(subtype.as_deref(), policy) {
                 kept.push(annotation_value);
                 continue;
             }
-            if !has_appearance {
-                kept.push(annotation_value);
-                continue;
-            }
-            changed_annotations = true;
-            let Some(appearance) = appearance else {
-                continue;
+            changed = true;
+            let resolved = document.resolve_owned_value(&annotation_value)?;
+            let dictionary = match resolved.as_ref() {
+                Some(OwnedObject::Dictionary(dictionary)) => Some(dictionary),
+                _ => None,
             };
-            let flags = annotation_flags(document, annotation)?;
-            if (flags & forbidden_flags) != 0 || (flags & required_flags) != required_flags {
-                continue;
-            }
-            let resource_name = loop {
-                let candidate = format!("Fxo{counter}");
-                counter += 1;
-                if !xobjects.contains_key(candidate.as_bytes()) {
-                    break candidate;
+            let widget = subtype.as_deref() == Some(b"Widget");
+            if let Some(annotation) = dictionary
+                && !(widget && need_appearances)
+                && annotation.contains_key(b"AP".as_slice())
+            {
+                if page_plan.is_none() {
+                    page_plan = Some(PageAppearancePlan::new(document, page)?);
                 }
-            };
-            let appearance = appearance_as_form(document, appearance)?;
-            let content = appearance_content(
-                document,
-                annotation,
-                appearance,
-                &resource_name,
-                rotate,
-                flags,
-            )?;
-            if content.is_empty() {
-                continue;
+                if let Some(plan) = &mut page_plan
+                    && plan.append(
+                        document,
+                        annotation,
+                        rotate,
+                        if widget {
+                            default_resources.as_ref()
+                        } else {
+                            None
+                        },
+                    )?
+                {
+                    stats.annotation_entries_flattened += 1;
+                    continue;
+                }
             }
-            xobjects.insert(
-                resource_name.into_bytes(),
-                OwnedObject::Reference(appearance),
-            );
-            append_bytes.extend_from_slice(&content);
-            flattened_total += 1;
+            *stats
+                .unflattened_annotation_subtypes
+                .entry(subtype_label(subtype.as_deref()))
+                .or_default() += 1;
+            if subtype.as_deref() == Some(b"Link")
+                && let Some(dictionary) = dictionary
+            {
+                kept.push(link_visual_shell(dictionary));
+                stats.link_visual_shells_retained += 1;
+            } else {
+                stats.annotation_entries_dropped_unflattened += 1;
+            }
         }
-
-        if !xobjects.is_empty() {
-            resources.insert(b"XObject".to_vec(), OwnedObject::Dictionary(xobjects));
+        if let Some(plan) = page_plan {
+            plan.commit(document, page)?;
         }
-        if let Some(page_dictionary) = page.dictionary_mut(document)? {
-            page_dictionary.insert(b"Resources".to_vec(), OwnedObject::Dictionary(resources));
-        }
-        if changed_annotations {
-            wrap_page_contents(document, page, &append_bytes)?;
+        if changed {
             replace_page_annotations(document, page, kept)?;
         }
     }
-    if !need_appearances {
-        let catalog_id = document.source().catalog_id();
-        if let Some(catalog) = document.edit_object(catalog_id)?.as_dictionary_mut() {
-            catalog.remove(b"AcroForm".as_slice());
-        }
-    }
-    Ok(flattened_total)
+    // The catalog's AcroForm is handled by the independent forms policy.
+    Ok(())
 }
 
 fn process_annotations(
@@ -1136,6 +1411,7 @@ fn process_annotations(
     stats.annotation_subtypes_seen = annotation_subtypes(document, pages)?;
     stats.annotation_entries_seen = stats.annotation_subtypes_seen.values().sum();
     match policy.annotations {
+        AnnotationPolicy::Preserve if policy.links && policy.forms => {}
         AnnotationPolicy::Preserve => {
             let kept = filter_annotations(document, pages, policy, true)?;
             stats.annotation_entries_dropped_unflattened =
@@ -1147,18 +1423,7 @@ fn process_annotations(
                 stats.annotation_entries_seen.saturating_sub(kept);
         }
         AnnotationPolicy::AppearanceOnly => {
-            let protected = detach_protected_annotations(document, pages, policy)?;
-            let processable_before: usize = annotation_subtypes(document, pages)?.values().sum();
-            if processable_before > 0 {
-                flatten_annotations(document, pages, 0, SCREEN_HIDDEN_ANNOTATION_FLAGS)?;
-            }
-            stats.unflattened_annotation_subtypes = annotation_subtypes(document, pages)?;
-            let unflattened: usize = stats.unflattened_annotation_subtypes.values().sum();
-            stats.annotation_entries_flattened = processable_before.saturating_sub(unflattened);
-            stats.link_visual_shells_retained = retain_link_visual_shells(document, pages)?;
-            stats.annotation_entries_dropped_unflattened =
-                unflattened.saturating_sub(stats.link_visual_shells_retained);
-            restore_protected_annotations(document, pages, protected)?;
+            flatten_annotations(document, pages, policy, stats)?;
         }
     }
     Ok(())
@@ -1336,6 +1601,225 @@ mod tests {
         assert!(!dictionary.contains_key(b"Ignored".as_slice()));
         assert_eq!(spliced.get("/Wrapper -> /MediaBox"), Some(&1));
         assert_eq!(removed.get("/Wrapper"), Some(&1));
+        Ok(())
+    }
+
+    fn annotation_fixture(contents: &str, old_content: &[u8]) -> Result<EditDocument> {
+        let mut pdf = ClassicPdfBuilder::new();
+        pdf.object(1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 12 0 R >>")?;
+        pdf.object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")?;
+        pdf.object(3, format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font 13 0 R >> /Contents {contents} /Annots [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R] >>").as_bytes())?;
+        pdf.stream(4, b"", old_content)?;
+        pdf.object(
+            5,
+            b"<< /Type /Annot /Subtype /Widget /Rect [10 10 20 20] /AP << /N 10 0 R >> >>",
+        )?;
+        pdf.object(6, b"<< /Type /Annot /Subtype /Stamp /Rect [40 40 60 60] /AP << /N 11 0 R >> /OC 15 0 R >>")?;
+        pdf.object(
+            7,
+            b"<< /Type /Annot /Subtype /Stamp /F 2 /Rect [40 40 60 60] /AP << /N 11 0 R >> >>",
+        )?;
+        pdf.object(
+            8,
+            b"<< /Type /Annot /Subtype /Stamp /Rect [0 0 0 0] /AP << /N 11 0 R >> >>",
+        )?;
+        pdf.object(9, b"<< /Type /Annot /Subtype /Link /Rect [70 70 80 80] /A << /S /URI /URI (https://example.invalid) >> >>")?;
+        pdf.stream(10, b"/Subtype /Form /BBox [0 0 10 10]", b"0 0 10 10 re f")?;
+        // Untyped stream shared outside its appearance use: never edit it.
+        pdf.stream(
+            11,
+            b"/BBox [0 0 10000000 10000000]",
+            b"0 0 10000000 10000000 re f",
+        )?;
+        pdf.object(12, b"<< /Fields [5 0 R] /DR << /Font 14 0 R >> >>")?;
+        pdf.object(
+            13,
+            b"<< /PageFont << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>",
+        )?;
+        pdf.object(
+            14,
+            b"<< /DefaultFont << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >>",
+        )?;
+        pdf.object(15, b"<< /Type /OCG /Name (Annotation layer) >>")?;
+        pdf.object(16, b"[4 0 R [4 0 R]]")?;
+        pdf.object(17, b"16 0 R")?;
+        EditDocument::from_bytes(pdf.finish(1)?)
+    }
+
+    fn fixture_page() -> DirectObjectTarget {
+        DirectObjectTarget {
+            root: CowObjectHandle::Existing(crate::ObjectId::new(3, 0)),
+            path: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn annotation_flattening_preserves_forms_counts_real_paint_and_isolates_resources() -> Result<()>
+    {
+        let mut document = annotation_fixture("17 0 R", b"q 0 0 1 1 re f")?;
+        let mut policy = PreservationConfig::visible_surface();
+        policy.forms = true;
+        let stats = apply_preservation_policy(&mut document, &policy)?;
+        assert_eq!(stats.annotation_entries_seen, 5);
+        assert_eq!(stats.annotation_entries_flattened, 1);
+        assert_eq!(stats.annotation_entries_dropped_unflattened, 2);
+        assert_eq!(stats.link_visual_shells_retained, 1);
+        assert_eq!(
+            stats.unflattened_annotation_subtypes.get("/Stamp"),
+            Some(&2)
+        );
+        let catalog = document
+            .current_value(CowObjectHandle::Existing(document.source().catalog_id()))?
+            .ok_or_else(|| Error::Invalid("missing fixture catalog".into()))?;
+        assert!(catalog.dictionary_entry(b"AcroForm").is_some());
+        assert!(
+            document
+                .overlay()
+                .change(crate::ObjectId::new(11, 0))
+                .is_none()
+        );
+        let target = fixture_page();
+        let annotations = page_annotations(&document, &target)?
+            .ok_or_else(|| Error::Invalid("missing retained annotations".into()))?;
+        assert_eq!(annotations.len(), 2);
+        assert_eq!(
+            annotations[0],
+            OwnedObject::Reference(CowObjectHandle::Existing(crate::ObjectId::new(5, 0)))
+        );
+        assert!(
+            annotations[1]
+                .as_dictionary()
+                .is_some_and(|shell| !shell.contains_key(b"A".as_slice()))
+        );
+        let page = target
+            .current(&document)?
+            .ok_or_else(|| Error::Invalid("missing fixture page".into()))?;
+        let contents = page
+            .dictionary_entry(b"Contents")
+            .ok_or_else(|| Error::Invalid("missing flattened contents".into()))?;
+        let parts = content_references(&document, contents.clone())?
+            .ok_or_else(|| Error::Invalid("invalid content parts".into()))?;
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[1], parts[2]);
+        let decoded = crate::content::decoded_content_value(&document, contents)?;
+        let decoded = String::from_utf8_lossy(&decoded);
+        assert!(decoded.contains("n\nQ\nQ\nQ\n"));
+        assert!(decoded.contains("/OC /Fxo1 BDC"));
+        assert!(decoded.contains("0.000002 0 0 0.000002 40 40 cm"));
+        assert!(decoded.contains("/Fxo1 Do\nQ\nEMC"));
+        let resources = page_resources(&document, &target)?;
+        let props = resolved_resource_category(&document, &resources, b"Properties")?
+            .ok_or_else(|| Error::Invalid("missing Properties".into()))?;
+        assert_eq!(
+            props.get(b"Fxo1".as_slice()),
+            Some(&OwnedObject::Reference(CowObjectHandle::Existing(
+                crate::ObjectId::new(15, 0)
+            )))
+        );
+        let xobjects = resolved_resource_category(&document, &resources, b"XObject")?
+            .ok_or_else(|| Error::Invalid("missing XObjects".into()))?;
+        let appearance = xobjects
+            .get(b"Fxo1".as_slice())
+            .ok_or_else(|| Error::Invalid("missing appearance".into()))?;
+        let appearance = document
+            .resolve_owned_value(appearance)?
+            .ok_or_else(|| Error::Invalid("missing appearance stream".into()))?;
+        let dictionary = appearance
+            .as_dictionary()
+            .ok_or_else(|| Error::Invalid("missing appearance dictionary".into()))?;
+        let scope = document
+            .resolve_owned_value(
+                dictionary
+                    .get(b"Resources".as_slice())
+                    .ok_or_else(|| Error::Invalid("missing appearance resources".into()))?,
+            )?
+            .ok_or_else(|| Error::Invalid("missing scope".into()))?;
+        assert!(
+            scope
+                .as_dictionary()
+                .is_some_and(|scope| !scope.contains_key(b"XObject".as_slice())
+                    && !scope.contains_key(b"Properties".as_slice()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_content_state_does_not_mutate_original_contents_or_appearances() -> Result<()> {
+        for old_content in [
+            b"Q".as_slice(),
+            b"BT".as_slice(),
+            b"/OC /hidden BDC".as_slice(),
+        ] {
+            let mut document = annotation_fixture("4 0 R", old_content)?;
+            let target = fixture_page();
+            let before = target
+                .current(&document)?
+                .and_then(|page| page.dictionary_entry(b"Contents"))
+                .map(|value| value.into_cow().into_owned());
+            let stats =
+                apply_preservation_policy(&mut document, &PreservationConfig::visible_surface())?;
+            assert_eq!(stats.annotation_entries_flattened, 0);
+            assert_eq!(stats.annotation_entries_dropped_unflattened, 4);
+            assert_eq!(stats.link_visual_shells_retained, 1);
+            let after = target
+                .current(&document)?
+                .and_then(|page| page.dictionary_entry(b"Contents"))
+                .map(|value| value.into_cow().into_owned());
+            assert_eq!(before, after);
+            assert!(
+                document
+                    .overlay()
+                    .change(crate::ObjectId::new(10, 0))
+                    .is_none()
+            );
+            assert!(
+                document
+                    .overlay()
+                    .change(crate::ObjectId::new(11, 0))
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn widget_defaults_do_not_change_page_font_bindings() -> Result<()> {
+        let mut document = annotation_fixture("4 0 R", b"q Q")?;
+        let stats =
+            apply_preservation_policy(&mut document, &PreservationConfig::visible_surface())?;
+        assert_eq!(stats.annotation_entries_flattened, 2);
+        let resources = page_resources(&document, &fixture_page())?;
+        let page_fonts = resolved_resource_category(&document, &resources, b"Font")?
+            .ok_or_else(|| Error::Invalid("missing page fonts".into()))?;
+        assert!(page_fonts.contains_key(b"PageFont".as_slice()));
+        assert!(!page_fonts.contains_key(b"DefaultFont".as_slice()));
+        let xobjects = resolved_resource_category(&document, &resources, b"XObject")?
+            .ok_or_else(|| Error::Invalid("missing XObjects".into()))?;
+        let widget = document
+            .resolve_owned_value(
+                xobjects
+                    .get(b"Fxo1".as_slice())
+                    .ok_or_else(|| Error::Invalid("missing widget appearance".into()))?,
+            )?
+            .ok_or_else(|| Error::Invalid("missing widget stream".into()))?;
+        let scope = document
+            .resolve_owned_value(
+                widget
+                    .as_dictionary()
+                    .and_then(|dict| dict.get(b"Resources".as_slice()))
+                    .ok_or_else(|| Error::Invalid("missing widget resources".into()))?,
+            )?
+            .ok_or_else(|| Error::Invalid("missing widget scope".into()))?;
+        let fonts = resolved_resource_category(
+            &document,
+            scope
+                .as_dictionary()
+                .ok_or_else(|| Error::Invalid("invalid widget scope".into()))?,
+            b"Font",
+        )?
+        .ok_or_else(|| Error::Invalid("missing widget fonts".into()))?;
+        assert!(fonts.contains_key(b"PageFont".as_slice()));
+        assert!(fonts.contains_key(b"DefaultFont".as_slice()));
         Ok(())
     }
 
