@@ -803,7 +803,7 @@ mod tests {
         let mut nested = OwnedObject::Integer(42);
         for index in 0..depth {
             nested = if index % 2 == 0 {
-                OwnedObject::Array(vec![nested])
+                OwnedObject::array(vec![nested])
             } else {
                 OwnedObject::Dictionary(OwnedDictionary::from([(b"K".to_vec(), nested)]))
             };
@@ -813,16 +813,6 @@ mod tests {
         let mut expected = b"<< /K [".repeat(depth / 2);
         expected.extend_from_slice(b"42");
         expected.extend_from_slice(&b"] >>".repeat(depth / 2));
-        // Until owned container destruction is made iterative, dismantle the
-        // fixture without recursion, including when the writer returns an error.
-        for _ in 0..depth {
-            nested = match nested {
-                OwnedObject::Array(mut values) => values.pop(),
-                OwnedObject::Dictionary(mut values) => values.remove(b"K".as_slice()),
-                _ => None,
-            }
-            .ok_or_else(|| Error::Invalid("invalid deep writer fixture".to_owned()))?;
-        }
         result?;
         assert_eq!(output, expected);
         Ok(())

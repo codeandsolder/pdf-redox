@@ -2156,36 +2156,38 @@ enum BuildFrame<'a> {
     },
 }
 
-enum BuildStep<'a> {
-    Descend(BuildFrame<'a>, CurrentValue<'a>),
-    Complete(OwnedObject),
-}
+type BuildFrames<'a> = SmallVec<[BuildFrame<'a>; 4]>;
+type BuildStep<'a> = std::result::Result<OwnedObject, CurrentValue<'a>>;
 
-fn build_array(mut rest: CurrentArrayIter<'_>, values: OwnedArray) -> BuildStep<'_> {
+fn build_array<'a>(
+    mut rest: CurrentArrayIter<'a>,
+    values: OwnedArray,
+    frames: &mut BuildFrames<'a>,
+) -> BuildStep<'a> {
     if let Some(child) = rest.next() {
-        BuildStep::Descend(BuildFrame::Array { rest, values }, child)
+        frames.push(BuildFrame::Array { rest, values });
+        Err(child)
     } else {
-        BuildStep::Complete(OwnedObject::Array(values))
+        Ok(OwnedObject::Array(values))
     }
 }
 
-fn build_dictionary(
-    mut rest: CurrentDictionaryIter<'_>,
+fn build_dictionary<'a>(
+    mut rest: CurrentDictionaryIter<'a>,
     values: OwnedDictionary,
     data: Option<StreamData>,
-) -> BuildStep<'_> {
+    frames: &mut BuildFrames<'a>,
+) -> BuildStep<'a> {
     if let Some((key, child)) = rest.next() {
-        BuildStep::Descend(
-            BuildFrame::Dictionary {
-                rest,
-                values,
-                key,
-                data,
-            },
-            child,
-        )
+        frames.push(BuildFrame::Dictionary {
+            rest,
+            values,
+            key,
+            data,
+        });
+        Err(child)
     } else {
-        BuildStep::Complete(match data {
+        Ok(match data {
             Some(data) => OwnedObject::Stream {
                 dictionary: values,
                 data,
@@ -2196,11 +2198,11 @@ fn build_dictionary(
 }
 
 impl<'a> BuildFrame<'a> {
-    fn resume(self, child: OwnedObject) -> BuildStep<'a> {
+    fn resume(self, child: OwnedObject, frames: &mut BuildFrames<'a>) -> BuildStep<'a> {
         match self {
             Self::Array { rest, mut values } => {
                 values.push(child);
-                build_array(rest, values)
+                build_array(rest, values, frames)
             }
             Self::Dictionary {
                 rest,
@@ -2209,13 +2211,17 @@ impl<'a> BuildFrame<'a> {
                 data,
             } => {
                 values.insert(key.as_ref().to_vec(), child);
-                build_dictionary(rest, values, data)
+                build_dictionary(rest, values, data, frames)
             }
         }
     }
 }
 
-fn build_source_dictionary<'a>(dictionary: &Dict<'a>, data: Option<StreamData>) -> BuildStep<'a> {
+fn build_source_dictionary<'a>(
+    dictionary: &Dict<'a>,
+    data: Option<StreamData>,
+    frames: &mut BuildFrames<'a>,
+) -> BuildStep<'a> {
     build_dictionary(
         CurrentDictionaryIter {
             entries: DictionaryEntries::Source(dictionary.entries()),
@@ -2223,10 +2229,15 @@ fn build_source_dictionary<'a>(dictionary: &Dict<'a>, data: Option<StreamData>) 
         },
         OwnedDictionary::new(),
         data,
+        frames,
     )
 }
 
-fn build_owned_dictionary(dictionary: &OwnedDictionary, data: Option<StreamData>) -> BuildStep<'_> {
+fn build_owned_dictionary<'a>(
+    dictionary: &'a OwnedDictionary,
+    data: Option<StreamData>,
+    frames: &mut BuildFrames<'a>,
+) -> BuildStep<'a> {
     build_dictionary(
         CurrentDictionaryIter {
             entries: DictionaryEntries::Owned(dictionary.iter()),
@@ -2234,10 +2245,11 @@ fn build_owned_dictionary(dictionary: &OwnedDictionary, data: Option<StreamData>
         },
         OwnedDictionary::new(),
         data,
+        frames,
     )
 }
 
-fn begin_build(value: CurrentValue<'_>) -> BuildStep<'_> {
+fn begin_build<'a>(value: CurrentValue<'a>, frames: &mut BuildFrames<'a>) -> BuildStep<'a> {
     let scalar = match value {
         CurrentValue::Owned(object) => match object {
             OwnedObject::Null => OwnedObject::Null,
@@ -2251,13 +2263,14 @@ fn begin_build(value: CurrentValue<'_>) -> BuildStep<'_> {
                 return build_array(
                     CurrentArrayIter::Owned(values.iter()),
                     Vec::with_capacity(values.len()).into(),
+                    frames,
                 );
             }
             OwnedObject::Dictionary(dictionary) => {
-                return build_owned_dictionary(dictionary, None);
+                return build_owned_dictionary(dictionary, None, frames);
             }
             OwnedObject::Stream { dictionary, data } => {
-                return build_owned_dictionary(dictionary, Some(data.clone()));
+                return build_owned_dictionary(dictionary, Some(data.clone()), frames);
             }
         },
         CurrentValue::Source(MaybeRef::Ref(reference), _) => {
@@ -2272,11 +2285,12 @@ fn begin_build(value: CurrentValue<'_>) -> BuildStep<'_> {
             },
             Object::String(value) => OwnedObject::String(value.as_bytes().to_vec()),
             Object::Name(value) => OwnedObject::Name(value.as_ref().to_vec()),
-            Object::Dict(value) => return build_source_dictionary(&value, None),
+            Object::Dict(value) => return build_source_dictionary(&value, None, frames),
             Object::Array(value) => {
                 return build_array(
                     CurrentArrayIter::Source(value.raw_iter()),
                     OwnedArray::new(),
+                    frames,
                 );
             }
             Object::Stream(value) => {
@@ -2284,11 +2298,11 @@ fn begin_build(value: CurrentValue<'_>) -> BuildStep<'_> {
                     || StreamData::Owned(value.raw_data().into_owned().into()),
                     StreamData::Source,
                 );
-                return build_source_dictionary(value.dict(), Some(data));
+                return build_source_dictionary(value.dict(), Some(data), frames);
             }
         },
     };
-    BuildStep::Complete(scalar)
+    Ok(scalar)
 }
 
 /// Materialize source values or clone owned values using the same ordered,
@@ -2296,18 +2310,15 @@ fn begin_build(value: CurrentValue<'_>) -> BuildStep<'_> {
 /// graph, and owned stream payloads retain their shared allocation.
 fn materialize_current(root: CurrentValue<'_>) -> OwnedObject {
     let mut frames = SmallVec::<[BuildFrame<'_>; 4]>::new();
-    let mut step = begin_build(root);
+    let mut step = begin_build(root, &mut frames);
     loop {
         step = match step {
-            BuildStep::Descend(frame, child) => {
-                frames.push(frame);
-                begin_build(child)
-            }
-            BuildStep::Complete(value) => {
+            Err(child) => begin_build(child, &mut frames),
+            Ok(value) => {
                 let Some(frame) = frames.pop() else {
                     return value;
                 };
-                frame.resume(value)
+                frame.resume(value, &mut frames)
             }
         };
     }
@@ -2417,7 +2428,7 @@ impl std::fmt::Debug for OwnedObject {
                     Some(CosScalar::Null) => f.write_str("Null")?,
                     Some(CosScalar::Boolean(v)) => write!(f, "Boolean({v:?})")?,
                     Some(CosScalar::Number(NumericValue::Integer(v))) => {
-                        write!(f, "Integer({v:?})")?
+                        write!(f, "Integer({v:?})")?;
                     }
                     Some(CosScalar::Number(NumericValue::Real(v))) => write!(f, "Real({v:?})")?,
                     Some(CosScalar::Name(v)) => write!(f, "Name({v:?})")?,
