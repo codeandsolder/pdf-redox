@@ -15,3 +15,12 @@ permissions:
 jobs:
   strict-rust:
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@121c7f9e5f73be0b14c4dd5cb652de82f829ff1e # main
+
+  merge-gate:
+    name: Strict Rust merge gate
+    if: ${{ always() }}
+    needs: [strict-rust]
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
+    with:
+      needs-json: ${{ toJSON(needs) }}
+      expected-results: '[["strict-rust","success"]]'
