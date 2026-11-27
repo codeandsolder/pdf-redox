@@ -31,6 +31,7 @@ mod jpeg_optimize;
 mod microstroke;
 mod ocr_overlay;
 mod optimize;
+mod owned_containers;
 mod page_representation;
 mod paint_batch;
 mod paper_indexed;
@@ -81,5 +82,5 @@ pub use report::{
 };
 pub use source::{
     EditDocument, ExistingObjectChange, NewObjectId, ObjectHandle, ObjectId, ObjectOverlay,
-    OwnedDictionary, OwnedObject, SourcePdf, StreamData,
+    OwnedArray, OwnedDictionary, OwnedObject, SourcePdf, StreamData,
 };

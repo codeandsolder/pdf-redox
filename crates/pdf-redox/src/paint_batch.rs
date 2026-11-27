@@ -1932,7 +1932,7 @@ fn stroke_form_dictionary(bounds: GridBounds, margin_grid: i64) -> Option<OwnedD
     dictionary.insert(b"FormType".to_vec(), OwnedObject::Integer(1));
     dictionary.insert(
         b"BBox".to_vec(),
-        OwnedObject::Array(vec![
+        OwnedObject::array(vec![
             OwnedObject::Real(structural_grid_real(x0)?),
             OwnedObject::Real(structural_grid_real(y0)?),
             OwnedObject::Real(structural_grid_real(x1)?),
@@ -2357,14 +2357,14 @@ fn outlined_glyph_font_dictionary(
 
     let mut encoding = OwnedDictionary::new();
     encoding.insert(b"Type".to_vec(), OwnedObject::Name(b"Encoding".to_vec()));
-    encoding.insert(b"Differences".to_vec(), OwnedObject::Array(differences));
+    encoding.insert(b"Differences".to_vec(), OwnedObject::array(differences));
 
     let mut dictionary = OwnedDictionary::new();
     dictionary.insert(b"Type".to_vec(), OwnedObject::Name(b"Font".to_vec()));
     dictionary.insert(b"Subtype".to_vec(), OwnedObject::Name(b"Type3".to_vec()));
     dictionary.insert(
         b"FontBBox".to_vec(),
-        OwnedObject::Array(vec![
+        OwnedObject::array(vec![
             OwnedObject::Real(-1.0),
             OwnedObject::Real(-1.0),
             OwnedObject::Real(
@@ -2379,7 +2379,7 @@ fn outlined_glyph_font_dictionary(
     );
     dictionary.insert(
         b"FontMatrix".to_vec(),
-        OwnedObject::Array(vec![
+        OwnedObject::array(vec![
             OwnedObject::Integer(1),
             OwnedObject::Integer(0),
             OwnedObject::Integer(0),
@@ -2395,7 +2395,7 @@ fn outlined_glyph_font_dictionary(
         b"LastChar".to_vec(),
         OwnedObject::Integer(i64::try_from(plan.shapes.len()).unwrap_or(i64::MAX)),
     );
-    dictionary.insert(b"Widths".to_vec(), OwnedObject::Array(widths));
+    dictionary.insert(b"Widths".to_vec(), OwnedObject::array(widths));
     dictionary.insert(
         b"Resources".to_vec(),
         OwnedObject::Dictionary(OwnedDictionary::new()),

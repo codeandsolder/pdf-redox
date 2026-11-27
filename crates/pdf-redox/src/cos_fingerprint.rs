@@ -487,7 +487,7 @@ mod tests {
         assert!(
             resolved_digest(
                 &document,
-                &dict(OwnedObject::Array(vec![reference(3), reference(3)]))
+                &dict(OwnedObject::array(vec![reference(3), reference(3)]))
             )?
             .is_some()
         );
@@ -499,7 +499,7 @@ mod tests {
         let nested = |depth| {
             let mut value = OwnedObject::Null;
             for _ in 0..depth {
-                value = OwnedObject::Array(vec![value]);
+                value = OwnedObject::array(vec![value]);
             }
             dict(value)
         };

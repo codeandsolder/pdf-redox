@@ -1559,7 +1559,7 @@ fn resolved_array(
         return Ok(Vec::new());
     };
     Ok(match document.resolve_owned_value(value)? {
-        Some(OwnedObject::Array(values)) => values,
+        Some(OwnedObject::Array(values)) => values.into_vec(),
         _ => Vec::new(),
     })
 }

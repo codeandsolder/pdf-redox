@@ -209,7 +209,7 @@ fn replace_page_annotations(
     if annotations.is_empty() {
         dictionary.remove(b"Annots".as_slice());
     } else {
-        dictionary.insert(b"Annots".to_vec(), OwnedObject::Array(annotations));
+        dictionary.insert(b"Annots".to_vec(), OwnedObject::array(annotations));
     }
     Ok(())
 }
@@ -1010,7 +1010,7 @@ fn wrap_page_contents(
     contents.extend(content_references(document, old)?);
     contents.push(OwnedObject::Reference(after));
     if let Some(dictionary) = page.dictionary_mut(document)? {
-        dictionary.insert(b"Contents".to_vec(), OwnedObject::Array(contents));
+        dictionary.insert(b"Contents".to_vec(), OwnedObject::array(contents));
     }
     Ok(())
 }
@@ -1407,7 +1407,7 @@ mod tests {
                 (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
                 (
                     b"Kids".to_vec(),
-                    OwnedObject::Array(vec![direct_page, OwnedObject::Reference(leaf)]),
+                    OwnedObject::array(vec![direct_page, OwnedObject::Reference(leaf)]),
                 ),
             ]),
         )));
@@ -1419,7 +1419,7 @@ mod tests {
                     (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
                     (
                         b"Kids".to_vec(),
-                        OwnedObject::Array(vec![OwnedObject::Reference(child)]),
+                        OwnedObject::array(vec![OwnedObject::Reference(child)]),
                     ),
                 ]),
             )));
@@ -1429,7 +1429,7 @@ mod tests {
         };
         root_dictionary.insert(
             b"Kids".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Reference(child)]),
+            OwnedObject::array(vec![OwnedObject::Reference(child)]),
         );
 
         let target = DirectObjectTarget {
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(page_rotate(&document, &target(8))?, 270);
         *document.edit_handle(existing(9))? = OwnedObject::Real(f64::INFINITY);
         assert_eq!(page_rotate(&document, &target(8))?, 90);
-        let direct = CowObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+        let direct = CowObjectHandle::New(document.add_object(OwnedObject::array(vec![
             OwnedObject::Dictionary(OwnedDictionary::from([
                 (b"Parent".to_vec(), OwnedObject::Reference(existing(2))),
                 (b"Rotate".to_vec(), OwnedObject::Real(540.5)),

@@ -1330,8 +1330,8 @@ mod tests {
         let filter = match case {
             0 | 10 | 11 | 12 => OwnedObject::Name(b"FlateDecode".to_vec()),
             1 => OwnedObject::Name(b"Fl".to_vec()),
-            2 | 13 => OwnedObject::Array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
-            3 => OwnedObject::Array(vec![OwnedObject::Name(b"Fl".to_vec())]),
+            2 | 13 => OwnedObject::array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
+            3 => OwnedObject::array(vec![OwnedObject::Name(b"Fl".to_vec())]),
             4 | 6 => {
                 let name = ObjectHandle::New(
                     document.add_object(OwnedObject::Name(b"FlateDecode".to_vec())),
@@ -1339,14 +1339,14 @@ mod tests {
                 if case == 4 {
                     OwnedObject::Reference(name)
                 } else {
-                    OwnedObject::Array(vec![OwnedObject::Reference(name)])
+                    OwnedObject::array(vec![OwnedObject::Reference(name)])
                 }
             }
             5 => OwnedObject::Reference(ObjectHandle::New(document.add_object(
-                OwnedObject::Array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
+                OwnedObject::array(vec![OwnedObject::Name(b"FlateDecode".to_vec())]),
             ))),
             7 => OwnedObject::Null,
-            8 => OwnedObject::Array(vec![
+            8 => OwnedObject::array(vec![
                 OwnedObject::Name(b"FlateDecode".to_vec()),
                 OwnedObject::Name(b"FlateDecode".to_vec()),
             ]),
@@ -1368,7 +1368,7 @@ mod tests {
             dictionary.insert(
                 b"DecodeParms".to_vec(),
                 if case == 13 {
-                    OwnedObject::Array(vec![params])
+                    OwnedObject::array(vec![params])
                 } else {
                     params
                 },

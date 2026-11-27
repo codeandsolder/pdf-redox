@@ -456,7 +456,7 @@ fn indexed_color_space(base_color_space: OwnedObject, palette: &[u8]) -> Result<
     }
     let hival = i64::try_from(colors - 1)
         .map_err(|_| Error::Invalid("Indexed palette size exceeds i64".to_owned()))?;
-    Ok(OwnedObject::Array(vec![
+    Ok(OwnedObject::array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
         base_color_space,
         OwnedObject::Integer(hival),
@@ -480,7 +480,7 @@ fn indexed_color_space_with_transparent_zero(
             "Indexed palette exceeds 256 colors".to_owned(),
         ));
     }
-    Ok(OwnedObject::Array(vec![
+    Ok(OwnedObject::array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
         base_color_space,
         OwnedObject::Integer(hival),
@@ -502,7 +502,7 @@ fn install_indexed_form_wrapper(
             (b"FormType".to_vec(), OwnedObject::Integer(1)),
             (
                 b"BBox".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Integer(0),
                     OwnedObject::Integer(0),
                     OwnedObject::Integer(1),
@@ -546,7 +546,7 @@ fn install_indexed_image_layer(
     if transparent_zero {
         dictionary.insert(
             b"Mask".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
+            OwnedObject::array(vec![OwnedObject::Integer(0), OwnedObject::Integer(0)]),
         );
     }
     ObjectHandle::New(document.add_object(OwnedObject::Stream {
@@ -872,7 +872,7 @@ fn paper_indexed_candidate_transform(
     else {
         return Ok(None);
     };
-    let color_space = OwnedObject::Array(vec![
+    let color_space = OwnedObject::array(vec![
         OwnedObject::Name(b"Indexed".to_vec()),
         base_color_space,
         OwnedObject::Integer(hival),
@@ -2246,7 +2246,7 @@ mod tests {
                 width: 64,
                 height: 64,
                 filter: b"FlateDecode".to_vec(),
-                color_space: Some(OwnedObject::Array(vec![
+                color_space: Some(OwnedObject::array(vec![
                     OwnedObject::Name(b"Indexed".to_vec()),
                     OwnedObject::Name(b"DeviceRGB".to_vec()),
                     OwnedObject::Integer(0),

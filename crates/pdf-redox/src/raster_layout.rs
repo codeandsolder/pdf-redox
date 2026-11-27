@@ -3532,7 +3532,7 @@ fn install_prepared_image(
     height: u32,
 ) -> (ObjectHandle, ImageEncodingStats) {
     if let Some(alpha) = prepared.alpha.take() {
-        let mut alpha_dictionary = BTreeMap::from([
+        let mut alpha_dictionary = OwnedDictionary::from([
             (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
             (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
             (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),
@@ -8502,7 +8502,7 @@ mod tests {
             (b"A".to_vec(), OwnedObject::Integer(7)),
             (
                 b"B".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Name(b"DeviceRGB".to_vec()),
                     OwnedObject::Real(1.25),
                 ]),

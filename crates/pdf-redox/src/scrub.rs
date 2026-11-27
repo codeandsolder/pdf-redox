@@ -814,7 +814,7 @@ mod tests {
     fn action_scanner_handles_destination_arrays_and_owned_next_references() -> Result<()> {
         let mut document = EditDocument::from_bytes(chained_actions_fixture()?)?;
         let page = CowObjectHandle::Existing(crate::ObjectId::new(3, 0));
-        let destination = OwnedObject::Array(vec![
+        let destination = OwnedObject::array(vec![
             OwnedObject::Reference(page),
             OwnedObject::Name(b"Fit".to_vec()),
         ]);
@@ -825,7 +825,7 @@ mod tests {
         let second = CowObjectHandle::New(document.add_object(OwnedObject::Dictionary(
             OwnedDictionary::from([(b"S".to_vec(), OwnedObject::Name(b"JavaScript".to_vec()))]),
         )));
-        let next_actions = CowObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+        let next_actions = CowObjectHandle::New(document.add_object(OwnedObject::array(vec![
             OwnedObject::Reference(first),
             OwnedObject::Reference(second),
         ])));

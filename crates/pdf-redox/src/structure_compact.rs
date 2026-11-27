@@ -653,7 +653,7 @@ fn rebuild_compact_page_tree_levels(
         for chunk in level.chunks(PAGE_TREE_FANOUT) {
             let count = chunk.iter().map(|child| child.pages).sum::<usize>();
             let node = ObjectHandle::New(
-                document.add_object(OwnedObject::Dictionary(BTreeMap::from([
+                document.add_object(OwnedObject::Dictionary(OwnedDictionary::from([
                     (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
                     (
                         b"Kids".to_vec(),
@@ -1139,7 +1139,7 @@ fn collect_name_tree(
         };
 
         if let Some(OwnedObject::Array(names)) = dictionary.remove(b"Names".as_slice()) {
-            let Some(leaf) = NameLeaf::from_names(handle, names) else {
+            let Some(leaf) = NameLeaf::from_names(handle, names.into_vec()) else {
                 return Ok(None);
             };
             entry_count += leaf.entries.len();
@@ -1243,7 +1243,7 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: NameTreeSnapshot) ->
             ));
         };
         root.clear();
-        root.insert(b"Names".to_vec(), OwnedObject::Array(names_array(entries)));
+        root.insert(b"Names".to_vec(), OwnedObject::array(names_array(entries)));
         return Ok(1);
     }
 
@@ -1253,17 +1253,18 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: NameTreeSnapshot) ->
         let chunk = entries.by_ref().take(NAME_TREE_FANOUT).collect::<Vec<_>>();
         let first = chunk.first().map_or_default(|entry| entry.key.clone());
         let last = chunk.last().map_or_default(|entry| entry.key.clone());
-        let handle =
-            ObjectHandle::New(document.add_object(OwnedObject::Dictionary(BTreeMap::from([
+        let handle = ObjectHandle::New(document.add_object(OwnedObject::Dictionary(
+            OwnedDictionary::from([
                 (
                     b"Limits".to_vec(),
-                    OwnedObject::Array(vec![
+                    OwnedObject::array(vec![
                         OwnedObject::String(first.clone()),
                         OwnedObject::String(last.clone()),
                     ]),
                 ),
-                (b"Names".to_vec(), OwnedObject::Array(names_array(chunk))),
-            ]))));
+                (b"Names".to_vec(), OwnedObject::array(names_array(chunk))),
+            ]),
+        )));
         level.push(NameChild {
             handle,
             first,
@@ -1278,10 +1279,10 @@ fn replace_name_tree(document: &mut EditDocument, snapshot: NameTreeSnapshot) ->
             let first = chunk.first().map_or_default(|child| child.first.clone());
             let last = chunk.last().map_or_default(|child| child.last.clone());
             let handle = ObjectHandle::New(
-                document.add_object(OwnedObject::Dictionary(BTreeMap::from([
+                document.add_object(OwnedObject::Dictionary(OwnedDictionary::from([
                     (
                         b"Limits".to_vec(),
-                        OwnedObject::Array(vec![
+                        OwnedObject::array(vec![
                             OwnedObject::String(first.clone()),
                             OwnedObject::String(last.clone()),
                         ]),
@@ -1334,7 +1335,7 @@ fn apply_leaf_inlining(document: &mut EditDocument, snapshot: NameTreeSnapshot) 
         };
         dictionary.insert(
             b"Names".to_vec(),
-            OwnedObject::Array(names_array(leaf.entries)),
+            OwnedObject::array(names_array(leaf.entries)),
         );
     }
     Ok(())
@@ -1695,7 +1696,7 @@ mod tests {
             .ok_or_else(|| Error::Invalid("missing fixture resources".to_owned()))?;
         resources.insert(
             b"BackReference".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Reference(existing(5))]),
+            OwnedObject::array(vec![OwnedObject::Reference(existing(5))]),
         );
         let inherited = plan_page_inheritance(&document, &plan)?;
         assert!(matches!(
@@ -1812,7 +1813,7 @@ mod tests {
     #[test]
     fn independently_reachable_indirect_kids_keep_old_branches() -> Result<()> {
         let mut document = ordered_page_tree_fixture()?;
-        let root = ObjectHandle::New(document.add_object(OwnedObject::Array(vec![
+        let root = ObjectHandle::New(document.add_object(OwnedObject::array(vec![
             OwnedObject::Reference(existing(5)),
             OwnedObject::Reference(existing(3)),
         ])));
@@ -1865,7 +1866,7 @@ mod tests {
             (
                 2,
                 b"Kids".as_slice(),
-                OwnedObject::Array(
+                OwnedObject::array(
                     [5, 3, 9]
                         .map(|n| OwnedObject::Reference(existing(n)))
                         .to_vec(),
@@ -1874,13 +1875,13 @@ mod tests {
             (
                 3,
                 b"Kids".as_slice(),
-                OwnedObject::Array(vec![OwnedObject::Reference(existing(4)); 2]),
+                OwnedObject::array(vec![OwnedObject::Reference(existing(4)); 2]),
             ),
             (6, b"Parent".as_slice(), OwnedObject::Reference(existing(3))),
             (
                 5,
                 b"Kids".as_slice(),
-                OwnedObject::Array(vec![OwnedObject::Reference(existing(2))]),
+                OwnedObject::array(vec![OwnedObject::Reference(existing(2))]),
             ),
         ];
         for (number, key, value) in edits {
@@ -2055,7 +2056,7 @@ mod tests {
         let Some(dictionary) = document.edit_handle(root)?.as_dictionary_mut() else {
             return Err(Error::Invalid("missing page-tree root".to_owned()));
         };
-        dictionary.insert(b"Kids".to_vec(), OwnedObject::Array(Vec::new()));
+        dictionary.insert(b"Kids".to_vec(), OwnedObject::array(Vec::new()));
 
         assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 0);
         let Some(dictionary) = current_dictionary(&document, root)? else {
@@ -2088,7 +2089,7 @@ mod tests {
             let node = ObjectHandle::New(document.add_object(OwnedObject::Dictionary(
                 OwnedDictionary::from([
                     (b"Type".to_vec(), OwnedObject::Name(b"Pages".to_vec())),
-                    (b"Kids".to_vec(), OwnedObject::Array(Vec::new())),
+                    (b"Kids".to_vec(), OwnedObject::array(Vec::new())),
                     (b"Count".to_vec(), OwnedObject::Integer(1)),
                     (b"Parent".to_vec(), OwnedObject::Reference(parent)),
                 ]),
@@ -2098,7 +2099,7 @@ mod tests {
             };
             dictionary.insert(
                 b"Kids".to_vec(),
-                OwnedObject::Array(vec![OwnedObject::Reference(node)]),
+                OwnedObject::array(vec![OwnedObject::Reference(node)]),
             );
             parent = node;
         }
@@ -2107,7 +2108,7 @@ mod tests {
         };
         dictionary.insert(
             b"Kids".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Reference(leaf)]),
+            OwnedObject::array(vec![OwnedObject::Reference(leaf)]),
         );
         let Some(dictionary) = document.edit_handle(leaf)?.as_dictionary_mut() else {
             return Err(Error::Invalid("missing page-tree leaf".to_owned()));
@@ -2167,7 +2168,7 @@ mod tests {
             (b"Parent".to_vec(), OwnedObject::Reference(root)),
             (
                 b"Kids".to_vec(),
-                OwnedObject::Array(vec![OwnedObject::Reference(root)]),
+                OwnedObject::array(vec![OwnedObject::Reference(root)]),
             ),
         ]));
         assert_eq!(prune_shadowed_page_tree_inheritance(&mut document)?, 0);
@@ -2238,7 +2239,7 @@ mod tests {
             dictionary: OwnedDictionary::from([
                 (
                     b"Dest".to_vec(),
-                    OwnedObject::Array(vec![
+                    OwnedObject::array(vec![
                         OwnedObject::Reference(existing(9)),
                         OwnedObject::Name(b"XYZ".to_vec()),
                     ]),
@@ -2335,12 +2336,12 @@ mod tests {
             edits: Vec::new(),
         };
         let depth = 20_000;
-        let mut value = OwnedObject::Array(vec![
+        let mut value = OwnedObject::array(vec![
             OwnedObject::Reference(existing(9)),
             OwnedObject::Name(b"Fit".to_vec()),
         ]);
         for _ in 0..depth {
-            value = OwnedObject::Array(vec![value]);
+            value = OwnedObject::array(vec![value]);
         }
         walk_direct_object(
             &document,
@@ -2374,10 +2375,10 @@ mod tests {
         let mut document = ordered_page_tree_fixture()?;
         assert!(plan_page_tree(&document)?.is_some());
         *document.edit_handle(existing(8))? =
-            OwnedObject::Array(vec![OwnedObject::Reference(existing(6)), OwnedObject::Null]);
+            OwnedObject::array(vec![OwnedObject::Reference(existing(6)), OwnedObject::Null]);
         assert!(plan_page_tree(&document)?.is_none());
         *document.edit_handle(existing(8))? =
-            OwnedObject::Array(vec![OwnedObject::Reference(existing(6))]);
+            OwnedObject::array(vec![OwnedObject::Reference(existing(6))]);
         assert!(plan_page_tree(&document)?.is_some());
         *document.edit_handle(existing(7))? = OwnedObject::Name(b"Page".to_vec());
         let Some(plan) = plan_page_tree(&document)? else {
@@ -2403,7 +2404,7 @@ mod tests {
         };
         root.insert(
             b"Kids".to_vec(),
-            OwnedObject::Array(vec![
+            OwnedObject::array(vec![
                 OwnedObject::Reference(existing(3)),
                 OwnedObject::Reference(existing(3)),
             ]),
@@ -2809,7 +2810,7 @@ mod tests {
                 } else {
                     assert_eq!(
                         pair[1],
-                        OwnedObject::Array(vec![
+                        OwnedObject::array(vec![
                             OwnedObject::Reference(existing(3)),
                             OwnedObject::Name(b"Fit".to_vec())
                         ])
@@ -2820,7 +2821,7 @@ mod tests {
             let last = format!("key{:03}", index - 1).into_bytes();
             assert_eq!(
                 dictionary.get(b"Limits".as_slice()),
-                Some(&OwnedObject::Array(vec![
+                Some(&OwnedObject::array(vec![
                     OwnedObject::String(first),
                     OwnedObject::String(last)
                 ]))
