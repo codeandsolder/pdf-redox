@@ -374,9 +374,11 @@ struct TextEvent {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct PathState {
-    single_rect: Option<Rect>,
-    only_single_rect: bool,
+enum PathState {
+    #[default]
+    Empty,
+    Rect(Rect),
+    Complex,
 }
 
 impl PathState {
@@ -385,16 +387,14 @@ impl PathState {
     }
 
     const fn set_rect(&mut self, rect: Rect) {
-        if self.single_rect.is_none() {
-            self.single_rect = Some(rect);
-            self.only_single_rect = true;
-        } else {
-            self.only_single_rect = false;
-        }
+        *self = match self {
+            Self::Empty => Self::Rect(rect),
+            Self::Rect(_) | Self::Complex => Self::Complex,
+        };
     }
 
     const fn mark_complex(&mut self) {
-        self.only_single_rect = false;
+        *self = Self::Complex;
     }
 }
 
@@ -504,8 +504,7 @@ impl<'a> PageScanner<'a> {
             0.0_f64.max(advance),
             0.9_f64.mul_add(size, self.text.rise),
         );
-        let transformed = self.combined_text_matrix().transform_rectangle(local);
-        let rect = Rect::from_rectangle(transformed);
+        let rect = self.combined_text_matrix().transform_rectangle(local)?;
         (rect.area().is_finite() && rect.area() > 1e-12).then_some(rect)
     }
 
@@ -657,8 +656,7 @@ impl<'a> PageScanner<'a> {
 
     fn finish_path(&mut self, fill: bool) {
         if self.pending_clip {
-            if self.path.only_single_rect
-                && let Some(rect) = self.path.single_rect
+            if let PathState::Rect(rect) = self.path
                 && let Some(intersection) = self.graphics.clip.intersection(rect)
             {
                 self.graphics.clip = intersection;
@@ -666,10 +664,9 @@ impl<'a> PageScanner<'a> {
             self.pending_clip = false;
         }
         if fill
-            && self.path.only_single_rect
             && self.graphics.fill_alpha >= ALPHA_OPAQUE
             && self.graphics.normal_blend
-            && let Some(bounds) = self.path.single_rect
+            && let PathState::Rect(bounds) = self.path
         {
             self.paints.push(PaintEvent {
                 order: self.operator_index,
@@ -837,9 +834,13 @@ impl<'a> PageScanner<'a> {
             b"re" => {
                 if let Some(v) = self.numbers().filter(|v| v.len() >= 4) {
                     let rect = Rectangle::new(v[0], v[1], v[0] + v[2], v[1] + v[3]);
-                    self.path.set_rect(Rect::from_rectangle(
-                        self.graphics.ctm.transform_rectangle(rect),
-                    ));
+                    if let Some(bounds) = self.graphics.ctm.transform_rectangle(rect) {
+                        self.path.set_rect(bounds);
+                    } else {
+                        self.path.mark_complex();
+                    }
+                } else {
+                    self.path.mark_complex();
                 }
             }
             b"m" | b"l" | b"c" | b"v" | b"y" | b"h" => self.path.mark_complex(),
@@ -856,12 +857,8 @@ impl<'a> PageScanner<'a> {
                         .get(name.as_ref())
                         .copied()
                         .unwrap_or(false)
+                    && let Some(bounds) = Rect::from_ctm(self.graphics.ctm)
                 {
-                    let bounds = Rect::from_rectangle(
-                        self.graphics
-                            .ctm
-                            .transform_rectangle(Rectangle::new(0.0, 0.0, 1.0, 1.0)),
-                    );
                     self.paints.push(PaintEvent {
                         order: self.operator_index,
                         bounds,
@@ -2166,6 +2163,17 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complex_path_cannot_be_reclassified_as_single_rectangle() {
+        let mut path = PathState::default();
+        path.mark_complex();
+        path.set_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        assert!(matches!(path, PathState::Complex));
+        path.reset();
+        path.set_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        assert!(matches!(path, PathState::Rect(_)));
+    }
 
     fn large_diagonal_ranges(input: &[u8]) -> Vec<(usize, usize)> {
         let mut scanner = LargeDiagonalTextScanner::default();

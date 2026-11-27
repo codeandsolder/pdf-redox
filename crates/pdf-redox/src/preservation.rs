@@ -763,6 +763,9 @@ fn normalized_rectangle(document: &EditDocument, value: &OwnedObject) -> Result<
     else {
         return Ok(None);
     };
+    if ![x0, y0, x1, y1].into_iter().all(f64::is_finite) {
+        return Ok(None);
+    }
     Ok(Some(Rectangle::new(
         x0.min(x1),
         y0.min(y1),
@@ -840,21 +843,26 @@ fn appearance_content(
     } else {
         (rect, matrix)
     };
-    let transformed_bbox = matrix.transform_rectangle(bbox);
-    let width = transformed_bbox.urx - transformed_bbox.llx;
-    let height = transformed_bbox.ury - transformed_bbox.lly;
-    if width == 0.0 || height == 0.0 {
+    let Some(transformed_bbox) = matrix.transform_rectangle(bbox) else {
+        return Ok(Vec::new());
+    };
+    let Some(rect) = crate::geometry::Rect::from_rectangle(rect) else {
+        return Ok(Vec::new());
+    };
+    let width = transformed_bbox.x1 - transformed_bbox.x0;
+    let height = transformed_bbox.y1 - transformed_bbox.y0;
+    if width == 0.0 || height == 0.0 || !rect.area().is_finite() {
         return Ok(Vec::new());
     }
     let mut placement = Matrix::default();
-    placement.translate(rect.llx, rect.lly);
-    placement.scale(
-        (rect.urx - rect.llx) / width,
-        (rect.ury - rect.lly) / height,
-    );
-    placement.translate(-transformed_bbox.llx, -transformed_bbox.lly);
+    placement.translate(rect.x0, rect.y0);
+    placement.scale((rect.x1 - rect.x0) / width, (rect.y1 - rect.y0) / height);
+    placement.translate(-transformed_bbox.x0, -transformed_bbox.y0);
     if do_rotate {
         placement.rotatex90(rotate);
+    }
+    if !placement.is_finite() {
+        return Ok(Vec::new());
     }
     let placement = placement.unparse();
     Ok(format!("q\n{placement} cm\n/{resource_name} Do\nQ\n").into_bytes())

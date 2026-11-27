@@ -722,7 +722,7 @@ fn axis_aligned_transformed_rect(matrix: Matrix, rect: Rect) -> Option<Rect> {
     if !ordinary && !quarter_turn {
         return None;
     }
-    Some(rect.transformed_bounds(matrix))
+    rect.transformed_bounds(matrix)
 }
 
 fn union_coverage(rects: &[Rect], target: Rect) -> f64 {
