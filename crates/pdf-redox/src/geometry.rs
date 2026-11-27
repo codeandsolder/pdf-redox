@@ -55,7 +55,10 @@ impl Rect {
         {
             return None;
         }
-        Some(Self::new(x, y, x + width, y + height))
+        let (end_x, end_y) = (x + width, y + height);
+        let rect = Self::new(x, y, end_x, end_y);
+        (end_x.is_finite() && end_y.is_finite() && rect.x1 > rect.x0 && rect.y1 > rect.y0)
+            .then_some(rect)
     }
 
     pub const fn from_rectangle(rectangle: Rectangle) -> Self {
@@ -302,6 +305,22 @@ mod tests {
         assert_eq!(
             compose_affine_matrix(a, b),
             [0.0, 3.0, -2.0, 0.0, 18.0, 38.0]
+        );
+    }
+
+    #[test]
+    fn xywh_rejects_nonrepresentable_endpoints_and_preserves_negative_extents() {
+        for (x, y, width, height) in [
+            (f64::MAX, 0.0, f64::MAX, 1.0),
+            (0.0, -f64::MAX, 1.0, -f64::MAX),
+            (1e20, 0.0, 1.0, 1.0),
+            (0.0, -1e20, 1.0, -1.0),
+        ] {
+            assert!(Rect::from_xywh(x, y, width, height).is_none());
+        }
+        assert_eq!(
+            Rect::from_xywh(4.0, 6.0, -3.0, -4.0),
+            Some(Rect::new(1.0, 2.0, 4.0, 6.0))
         );
     }
 
