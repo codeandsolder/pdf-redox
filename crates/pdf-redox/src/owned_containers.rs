@@ -161,10 +161,33 @@ impl DropChildren {
     }
 }
 
-/// Drain one owning iterator per depth, rather than queueing all siblings.
-/// Once a child's storage has been moved out, dropping its empty wrapper
-/// takes the fast path, so destructor call depth remains bounded.
-fn drop_children(root: DropChildren) {
+fn take_children(value: OwnedObject) -> Option<DropChildren> {
+    match value {
+        OwnedObject::Array(mut array) if !array.is_empty() => {
+            Some(DropChildren::Array(mem::take(&mut array.0).into_iter()))
+        }
+        OwnedObject::Dictionary(mut dictionary) | OwnedObject::Stream { mut dictionary, .. }
+            if !dictionary.is_empty() =>
+        {
+            Some(DropChildren::Dictionary(
+                mem::take(&mut dictionary.0).into_values(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Drain one owning iterator per nested level. Flat containers avoid
+/// constructing a frame stack at all. Emptied child wrappers drop normally.
+fn drop_children(mut root: DropChildren) {
+    while let Some(value) = root.next() {
+        if let Some(children) = take_children(value) {
+            drop_nested(children);
+        }
+    }
+}
+
+fn drop_nested(root: DropChildren) {
     let mut frames = SmallVec::<[DropChildren; 4]>::new();
     frames.push(root);
     while let Some(frame) = frames.last_mut() {
@@ -172,19 +195,8 @@ fn drop_children(root: DropChildren) {
             frames.pop();
             continue;
         };
-        match value {
-            OwnedObject::Array(mut array) if !array.is_empty() => {
-                frames.push(DropChildren::Array(mem::take(&mut array.0).into_iter()));
-            }
-            OwnedObject::Dictionary(mut dictionary)
-            | OwnedObject::Stream { mut dictionary, .. }
-                if !dictionary.is_empty() =>
-            {
-                frames.push(DropChildren::Dictionary(
-                    mem::take(&mut dictionary.0).into_values(),
-                ));
-            }
-            _ => {}
+        if let Some(children) = take_children(value) {
+            frames.push(children);
         }
     }
 }

@@ -2157,7 +2157,73 @@ enum BuildFrame<'a> {
 }
 
 type BuildFrames<'a> = SmallVec<[BuildFrame<'a>; 4]>;
-type BuildStep<'a> = std::result::Result<OwnedObject, CurrentValue<'a>>;
+
+enum BuildStep<'a> {
+    Descend(CurrentValue<'a>),
+    Complete(OwnedObject),
+}
+
+// Common COS objects are shallow. Use bulk container collection on a fixed
+// number of native stack levels, then hand the remaining subtree to the
+// unbounded explicit-stack builder. This is not an admission depth limit.
+const INLINE_MATERIALIZATION_DEPTH: usize = 4;
+
+trait BuildSink<'a> {
+    type Output;
+
+    fn complete(self, value: OwnedObject) -> Self::Output;
+    fn array(self, rest: CurrentArrayIter<'a>, capacity: usize) -> Self::Output;
+    fn dictionary(self, rest: CurrentDictionaryIter<'a>, data: Option<StreamData>) -> Self::Output;
+}
+
+struct InlineBuild(usize);
+
+impl<'a> BuildSink<'a> for InlineBuild {
+    type Output = OwnedObject;
+
+    fn complete(self, value: OwnedObject) -> Self::Output {
+        value
+    }
+
+    fn array(self, rest: CurrentArrayIter<'a>, capacity: usize) -> Self::Output {
+        let mut values = Vec::with_capacity(capacity);
+        values.extend(rest.map(|value| materialize_bounded(value, self.0 - 1)));
+        OwnedObject::array(values)
+    }
+
+    fn dictionary(self, rest: CurrentDictionaryIter<'a>, data: Option<StreamData>) -> Self::Output {
+        let dictionary = rest
+            .map(|(key, value)| {
+                (
+                    key.as_ref().to_vec(),
+                    materialize_bounded(value, self.0 - 1),
+                )
+            })
+            .collect();
+        match data {
+            Some(data) => OwnedObject::Stream { dictionary, data },
+            None => OwnedObject::Dictionary(dictionary),
+        }
+    }
+}
+
+struct IterativeBuild<'a, 'b>(&'b mut BuildFrames<'a>);
+
+impl<'a> BuildSink<'a> for IterativeBuild<'a, '_> {
+    type Output = BuildStep<'a>;
+
+    fn complete(self, value: OwnedObject) -> Self::Output {
+        BuildStep::Complete(value)
+    }
+
+    fn array(self, rest: CurrentArrayIter<'a>, capacity: usize) -> Self::Output {
+        build_array(rest, Vec::with_capacity(capacity).into(), self.0)
+    }
+
+    fn dictionary(self, rest: CurrentDictionaryIter<'a>, data: Option<StreamData>) -> Self::Output {
+        build_dictionary(rest, OwnedDictionary::new(), data, self.0)
+    }
+}
 
 fn build_array<'a>(
     mut rest: CurrentArrayIter<'a>,
@@ -2166,9 +2232,9 @@ fn build_array<'a>(
 ) -> BuildStep<'a> {
     if let Some(child) = rest.next() {
         frames.push(BuildFrame::Array { rest, values });
-        Err(child)
+        BuildStep::Descend(child)
     } else {
-        Ok(OwnedObject::Array(values))
+        BuildStep::Complete(OwnedObject::Array(values))
     }
 }
 
@@ -2185,9 +2251,9 @@ fn build_dictionary<'a>(
             key,
             data,
         });
-        Err(child)
+        BuildStep::Descend(child)
     } else {
-        Ok(match data {
+        BuildStep::Complete(match data {
             Some(data) => OwnedObject::Stream {
                 dictionary: values,
                 data,
@@ -2217,39 +2283,21 @@ impl<'a> BuildFrame<'a> {
     }
 }
 
-fn build_source_dictionary<'a>(
-    dictionary: &Dict<'a>,
-    data: Option<StreamData>,
-    frames: &mut BuildFrames<'a>,
-) -> BuildStep<'a> {
-    build_dictionary(
-        CurrentDictionaryIter {
-            entries: DictionaryEntries::Source(dictionary.entries()),
-            skip_length: data.is_some(),
-        },
-        OwnedDictionary::new(),
-        data,
-        frames,
-    )
+fn source_build_entries<'a>(dictionary: &Dict<'a>, skip_length: bool) -> CurrentDictionaryIter<'a> {
+    CurrentDictionaryIter {
+        entries: DictionaryEntries::Source(dictionary.entries()),
+        skip_length,
+    }
 }
 
-fn build_owned_dictionary<'a>(
-    dictionary: &'a OwnedDictionary,
-    data: Option<StreamData>,
-    frames: &mut BuildFrames<'a>,
-) -> BuildStep<'a> {
-    build_dictionary(
-        CurrentDictionaryIter {
-            entries: DictionaryEntries::Owned(dictionary.iter()),
-            skip_length: false,
-        },
-        OwnedDictionary::new(),
-        data,
-        frames,
-    )
+fn owned_build_entries(dictionary: &OwnedDictionary) -> CurrentDictionaryIter<'_> {
+    CurrentDictionaryIter {
+        entries: DictionaryEntries::Owned(dictionary.iter()),
+        skip_length: false,
+    }
 }
 
-fn begin_build<'a>(value: CurrentValue<'a>, frames: &mut BuildFrames<'a>) -> BuildStep<'a> {
+fn begin_build<'a, B: BuildSink<'a>>(value: CurrentValue<'a>, sink: B) -> B::Output {
     let scalar = match value {
         CurrentValue::Owned(object) => match object {
             OwnedObject::Null => OwnedObject::Null,
@@ -2260,17 +2308,13 @@ fn begin_build<'a>(value: CurrentValue<'a>, frames: &mut BuildFrames<'a>) -> Bui
             OwnedObject::String(value) => OwnedObject::String(value.clone()),
             OwnedObject::Reference(value) => OwnedObject::Reference(*value),
             OwnedObject::Array(values) => {
-                return build_array(
-                    CurrentArrayIter::Owned(values.iter()),
-                    Vec::with_capacity(values.len()).into(),
-                    frames,
-                );
+                return sink.array(CurrentArrayIter::Owned(values.iter()), values.len());
             }
             OwnedObject::Dictionary(dictionary) => {
-                return build_owned_dictionary(dictionary, None, frames);
+                return sink.dictionary(owned_build_entries(dictionary), None);
             }
             OwnedObject::Stream { dictionary, data } => {
-                return build_owned_dictionary(dictionary, Some(data.clone()), frames);
+                return sink.dictionary(owned_build_entries(dictionary), Some(data.clone()));
             }
         },
         CurrentValue::Source(MaybeRef::Ref(reference), _) => {
@@ -2285,36 +2329,34 @@ fn begin_build<'a>(value: CurrentValue<'a>, frames: &mut BuildFrames<'a>) -> Bui
             },
             Object::String(value) => OwnedObject::String(value.as_bytes().to_vec()),
             Object::Name(value) => OwnedObject::Name(value.as_ref().to_vec()),
-            Object::Dict(value) => return build_source_dictionary(&value, None, frames),
+            Object::Dict(value) => {
+                return sink.dictionary(source_build_entries(&value, false), None);
+            }
             Object::Array(value) => {
-                return build_array(
-                    CurrentArrayIter::Source(value.raw_iter()),
-                    OwnedArray::new(),
-                    frames,
-                );
+                return sink.array(CurrentArrayIter::Source(value.raw_iter()), 0);
             }
             Object::Stream(value) => {
                 let data = stream_id.map_or_else(
                     || StreamData::Owned(value.raw_data().into_owned().into()),
                     StreamData::Source,
                 );
-                return build_source_dictionary(value.dict(), Some(data), frames);
+                return sink.dictionary(source_build_entries(value.dict(), true), Some(data));
             }
         },
     };
-    Ok(scalar)
+    sink.complete(scalar)
 }
 
 /// Materialize source values or clone owned values using the same ordered,
 /// depth-independent construction. Indirect references never expand the
 /// graph, and owned stream payloads retain their shared allocation.
-fn materialize_current(root: CurrentValue<'_>) -> OwnedObject {
+fn materialize_iterative(root: CurrentValue<'_>) -> OwnedObject {
     let mut frames = SmallVec::<[BuildFrame<'_>; 4]>::new();
-    let mut step = begin_build(root, &mut frames);
+    let mut step = begin_build(root, IterativeBuild(&mut frames));
     loop {
         step = match step {
-            Err(child) => begin_build(child, &mut frames),
-            Ok(value) => {
+            BuildStep::Descend(child) => begin_build(child, IterativeBuild(&mut frames)),
+            BuildStep::Complete(value) => {
                 let Some(frame) = frames.pop() else {
                     return value;
                 };
@@ -2322,6 +2364,18 @@ fn materialize_current(root: CurrentValue<'_>) -> OwnedObject {
             }
         };
     }
+}
+
+fn materialize_bounded(root: CurrentValue<'_>, remaining: usize) -> OwnedObject {
+    if remaining == 0 {
+        materialize_iterative(root)
+    } else {
+        begin_build(root, InlineBuild(remaining))
+    }
+}
+
+fn materialize_current(root: CurrentValue<'_>) -> OwnedObject {
+    materialize_bounded(root, INLINE_MATERIALIZATION_DEPTH)
 }
 
 impl Clone for OwnedObject {
@@ -2332,54 +2386,97 @@ impl Clone for OwnedObject {
 
 impl PartialEq for OwnedObject {
     fn eq(&self, other: &Self) -> bool {
-        let mut frames = SmallVec::<[(CurrentChildren<'_>, CurrentChildren<'_>); 4]>::new();
-        let mut next = (CurrentValue::Owned(self), CurrentValue::Owned(other));
+        equal_bounded(self, other, INLINE_MATERIALIZATION_DEPTH)
+    }
+}
+
+fn equal_bounded(left: &OwnedObject, right: &OwnedObject, remaining: usize) -> bool {
+    if remaining == 0 {
+        return equal_iterative(left, right);
+    }
+    let same_dictionary = |a: &OwnedDictionary, b: &OwnedDictionary| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|((ka, va), (kb, vb))| ka == kb && equal_bounded(va, vb, remaining - 1))
+    };
+    match (left, right) {
+        (OwnedObject::Array(a), OwnedObject::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| equal_bounded(a, b, remaining - 1))
+        }
+        (OwnedObject::Dictionary(a), OwnedObject::Dictionary(b)) => same_dictionary(a, b),
+        (
+            OwnedObject::Stream {
+                dictionary: a,
+                data: ad,
+            },
+            OwnedObject::Stream {
+                dictionary: b,
+                data: bd,
+            },
+        ) => ad == bd && same_dictionary(a, b),
+        (OwnedObject::Null, OwnedObject::Null) => true,
+        (OwnedObject::Boolean(a), OwnedObject::Boolean(b)) => a == b,
+        (OwnedObject::Integer(a), OwnedObject::Integer(b)) => a == b,
+        (OwnedObject::Real(a), OwnedObject::Real(b)) => a == b,
+        (OwnedObject::Name(a), OwnedObject::Name(b))
+        | (OwnedObject::String(a), OwnedObject::String(b)) => a == b,
+        (OwnedObject::Reference(a), OwnedObject::Reference(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn equal_iterative(left: &OwnedObject, right: &OwnedObject) -> bool {
+    let mut frames = SmallVec::<[(CurrentChildren<'_>, CurrentChildren<'_>); 4]>::new();
+    let mut next = (CurrentValue::Owned(left), CurrentValue::Owned(right));
+    loop {
+        let (left, right) = next;
+        match (left.scalar(), right.scalar()) {
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => {
+                if left.is_stream() != right.is_stream()
+                    || left.stream_identity() != right.stream_identity()
+                {
+                    return false;
+                }
+                let (Some(a), Some(b)) = (left.children(false), right.children(false)) else {
+                    return false;
+                };
+                if matches!(&a, CurrentChildren::Array(_))
+                    != matches!(&b, CurrentChildren::Array(_))
+                {
+                    return false;
+                }
+                frames.push((a, b));
+            }
+            _ => return false,
+        }
         loop {
-            let (left, right) = next;
-            match (left.scalar(), right.scalar()) {
-                (Some(a), Some(b)) if a == b => {}
+            let Some((a, b)) = frames.last_mut() else {
+                return true;
+            };
+            match (a.next(), b.next()) {
                 (None, None) => {
-                    if left.is_stream() != right.is_stream()
-                        || left.stream_identity() != right.stream_identity()
-                    {
-                        return false;
-                    }
-                    let (Some(a), Some(b)) = (left.children(false), right.children(false)) else {
-                        return false;
+                    frames.pop();
+                }
+                (Some((key_a, value_a)), Some((key_b, value_b))) => {
+                    let same_key = match (key_a, key_b) {
+                        (CurrentChildKey::Array(a), CurrentChildKey::Array(b)) => a == b,
+                        (CurrentChildKey::Dictionary(a), CurrentChildKey::Dictionary(b)) => {
+                            a.as_ref() == b.as_ref()
+                        }
+                        _ => false,
                     };
-                    if matches!(&a, CurrentChildren::Array(_))
-                        != matches!(&b, CurrentChildren::Array(_))
-                    {
+                    if !same_key {
                         return false;
                     }
-                    frames.push((a, b));
+                    next = (value_a, value_b);
+                    break;
                 }
                 _ => return false,
-            }
-            loop {
-                let Some((a, b)) = frames.last_mut() else {
-                    return true;
-                };
-                match (a.next(), b.next()) {
-                    (None, None) => {
-                        frames.pop();
-                    }
-                    (Some((key_a, value_a)), Some((key_b, value_b))) => {
-                        let same_key = match (key_a, key_b) {
-                            (CurrentChildKey::Array(a), CurrentChildKey::Array(b)) => a == b,
-                            (CurrentChildKey::Dictionary(a), CurrentChildKey::Dictionary(b)) => {
-                                a.as_ref() == b.as_ref()
-                            }
-                            _ => false,
-                        };
-                        if !same_key {
-                            return false;
-                        }
-                        next = (value_a, value_b);
-                        break;
-                    }
-                    _ => return false,
-                }
             }
         }
     }
@@ -2910,6 +3007,9 @@ mod tests {
         }
         let cloned = root.clone();
         assert_eq!(root, cloned);
+        let iterative = materialize_iterative(CurrentValue::Owned(&root));
+        assert!(equal_iterative(&cloned, &iterative));
+        drop(iterative);
         // Debug formatting must not recurse either; use a shallower payload-free
         // tree to exercise depth without generating megabytes of stream debug data.
         let mut debug_root = OwnedObject::Null;
