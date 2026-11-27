@@ -297,12 +297,13 @@ fn filter_annotations(
         let mut kept = Vec::new();
         let mut changed = false;
         for annotation in items {
-            let subtype = current_annotation_subtype(document, annotation.clone())?;
+            let annotation = annotation.into_cow().into_owned();
+            let subtype = annotation_subtype(document, &annotation)?;
             let protected = annotation_is_protected(subtype.as_deref(), policy);
             let explicitly_disabled = matches!(subtype.as_deref(), Some(b"Link")) && !policy.links
                 || matches!(subtype.as_deref(), Some(b"Widget")) && !policy.forms;
             if protected || (preserve_other_annotations && !explicitly_disabled) {
-                kept.push(annotation.into_cow().into_owned());
+                kept.push(annotation);
             } else {
                 changed = true;
             }
@@ -1114,7 +1115,7 @@ fn plan_page_contents(
             saves_to_restore: 0,
         }));
     };
-    let Some(parts) = content_references(document, old.clone())? else {
+    let Some(parts) = content_references(document, old)? else {
         return Ok(None);
     };
     if parts.is_empty() {
@@ -1123,6 +1124,14 @@ fn plan_page_contents(
             saves_to_restore: 0,
         }));
     }
+    let Some(old) = page
+        .current(document)?
+        .and_then(|object| object.dictionary_entry(b"Contents"))
+    else {
+        return Err(Error::Invalid(
+            "page content changed during read-only planning".into(),
+        ));
+    };
     let decoded = match crate::content::decoded_content_value(document, old) {
         Ok(decoded) => decoded,
         Err(Error::Invalid(_)) => return Ok(None),
@@ -1697,10 +1706,13 @@ mod tests {
         let contents = page
             .dictionary_entry(b"Contents")
             .ok_or_else(|| Error::Invalid("missing flattened contents".into()))?;
-        let parts = content_references(&document, contents.clone())?
+        let parts = content_references(&document, contents)?
             .ok_or_else(|| Error::Invalid("invalid content parts".into()))?;
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[1], parts[2]);
+        let contents = page
+            .dictionary_entry(b"Contents")
+            .ok_or_else(|| Error::Invalid("missing flattened contents".into()))?;
         let decoded = crate::content::decoded_content_value(&document, contents)?;
         let decoded = String::from_utf8_lossy(&decoded);
         assert!(decoded.contains("n\nQ\nQ\nQ\n"));
