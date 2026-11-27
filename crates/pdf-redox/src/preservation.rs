@@ -1270,6 +1270,14 @@ fn wrap_page_contents(
     Ok(())
 }
 
+#[cfg(test)]
+fn page_rotate(document: &EditDocument, page: &DirectObjectTarget) -> Result<i32> {
+    let Some(object) = page.current(document)? else {
+        return Ok(0);
+    };
+    document.inherited_page_rotation_from_view(object)
+}
+
 struct PageAppearancePlan {
     content: Option<PageContentPlan>,
     original_resources: OwnedDictionary,
@@ -1457,6 +1465,10 @@ impl AnnotationPage<'_> {
         let protected = annotation_is_protected(subtype, self.policy);
         let resolved = document.resolve_owned_value(&value)?;
         let Some(OwnedObject::Dictionary(annotation)) = resolved else {
+            if protected {
+                self.retained.unknown = true;
+                return Ok(AnnotationDisposition::Protected(value));
+            }
             return Ok(AnnotationDisposition::Dropped);
         };
         let visibility = AnnotationVisibility(annotation_flags(document, &annotation)?);
