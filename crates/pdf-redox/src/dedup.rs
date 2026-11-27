@@ -2149,7 +2149,7 @@ mod tests {
         let value = OwnedObject::Dictionary(OwnedDictionary::from([
             (
                 b"A".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Null,
                     OwnedObject::Boolean(true),
                     OwnedObject::Integer(-123),
@@ -2223,10 +2223,10 @@ mod tests {
     #[test]
     fn cos_container_framing_distinguishes_nested_empty_values_and_marker_bytes() {
         let values = [
-            OwnedObject::Array(vec![OwnedObject::Array(vec![]), OwnedObject::Null]),
-            OwnedObject::Array(vec![OwnedObject::Array(vec![OwnedObject::Null])]),
-            OwnedObject::Array(vec![OwnedObject::Array(vec![])]),
-            OwnedObject::Array(vec![OwnedObject::String(vec![0x09, 0x0a, 0x00])]),
+            OwnedObject::array(vec![OwnedObject::array(vec![]), OwnedObject::Null]),
+            OwnedObject::array(vec![OwnedObject::array(vec![OwnedObject::Null])]),
+            OwnedObject::array(vec![OwnedObject::array(vec![])]),
+            OwnedObject::array(vec![OwnedObject::String(vec![0x09, 0x0a, 0x00])]),
             OwnedObject::Dictionary(OwnedDictionary::new()),
             OwnedObject::Dictionary(OwnedDictionary::from([(vec![], OwnedObject::Null)])),
             OwnedObject::Dictionary(OwnedDictionary::from([(
@@ -2330,7 +2330,7 @@ mod tests {
         let depth = 20_000;
         let mut value = OwnedObject::Null;
         for _ in 0..depth {
-            value = OwnedObject::Array(vec![value]);
+            value = OwnedObject::array(vec![value]);
         }
         let mut expected = Sha256::new();
         for _ in 0..depth {

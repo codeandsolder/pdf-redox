@@ -1687,7 +1687,7 @@ fn path_form_dictionary(bounds: Rect) -> OwnedDictionary {
     dictionary.insert(b"FormType".to_vec(), OwnedObject::Integer(1));
     dictionary.insert(
         b"BBox".to_vec(),
-        OwnedObject::Array(vec![
+        OwnedObject::array(vec![
             OwnedObject::Real(bounds.x0 - PATH_FORM_BBOX_MARGIN),
             OwnedObject::Real(bounds.y0 - PATH_FORM_BBOX_MARGIN),
             OwnedObject::Real(bounds.x1 + PATH_FORM_BBOX_MARGIN),

@@ -1,5 +1,4 @@
 use crate::{OwnedDictionary, OwnedObject, Result};
-use std::collections::BTreeMap;
 
 mod ccitt;
 use ccitt::encode_ccitt_group4;
@@ -260,7 +259,7 @@ pub fn set_bilevel_filter(
             );
             dictionary.insert(
                 b"DecodeParms".to_vec(),
-                OwnedObject::Dictionary(BTreeMap::from([
+                OwnedObject::Dictionary(OwnedDictionary::from([
                     (b"K".to_vec(), OwnedObject::Integer(-1)),
                     (b"Columns".to_vec(), OwnedObject::Integer(i64::from(width))),
                     (b"Rows".to_vec(), OwnedObject::Integer(i64::from(height))),
@@ -272,7 +271,7 @@ pub fn set_bilevel_filter(
 }
 
 fn image_mask_dictionary(width: u32, height: u32, codec: BilevelCodec) -> OwnedDictionary {
-    let mut dictionary = BTreeMap::from([
+    let mut dictionary = OwnedDictionary::from([
         (b"Type".to_vec(), OwnedObject::Name(b"XObject".to_vec())),
         (b"Subtype".to_vec(), OwnedObject::Name(b"Image".to_vec())),
         (b"Width".to_vec(), OwnedObject::Integer(i64::from(width))),

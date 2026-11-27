@@ -186,7 +186,7 @@ mod tests {
         dictionary.insert(b"N".to_vec(), OwnedObject::Integer(4));
         dictionary.insert(
             b"Range".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Integer(0), OwnedObject::Integer(1)]),
+            OwnedObject::array(vec![OwnedObject::Integer(0), OwnedObject::Integer(1)]),
         );
         assert_eq!(
             profile_alternate(
@@ -202,17 +202,17 @@ mod tests {
     fn rewrite_replaces_only_eligible_iccbased_arrays() {
         let profile = ObjectHandle::Existing(crate::ObjectId::new(7, 0));
         let other = ObjectHandle::Existing(crate::ObjectId::new(8, 0));
-        let mut value = OwnedObject::Dictionary(BTreeMap::from([
+        let mut value = OwnedObject::Dictionary(OwnedDictionary::from([
             (
                 b"CS".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Name(b"ICCBased".to_vec()),
                     OwnedObject::Reference(profile),
                 ]),
             ),
             (
                 b"Other".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Name(b"ICCBased".to_vec()),
                     OwnedObject::Reference(other),
                 ]),

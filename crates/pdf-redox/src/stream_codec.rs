@@ -482,8 +482,8 @@ mod tests {
         for (filter, parms) in [
             (filter.clone(), parms.clone()),
             (
-                OwnedObject::Array(vec![filter]),
-                OwnedObject::Array(vec![parms]),
+                OwnedObject::array(vec![filter]),
+                OwnedObject::array(vec![parms]),
             ),
         ] {
             let dictionary = OwnedDictionary::from([

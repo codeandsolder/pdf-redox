@@ -1985,19 +1985,19 @@ fn analyze_document_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OwnedObject, test_support::ClassicPdfBuilder};
+    use crate::{OwnedDictionary, OwnedObject, test_support::ClassicPdfBuilder};
 
     #[test]
     fn packed_role_topology_preserves_nested_references_and_incoming_roles() {
         let page = CowObjectHandle::Existing(crate::ObjectId::new(3, 0));
         let contents = CowObjectHandle::Existing(crate::ObjectId::new(4, 0));
         let metadata = CowObjectHandle::Existing(crate::ObjectId::new(5, 0));
-        let page_object = OwnedObject::Dictionary(BTreeMap::from([
+        let page_object = OwnedObject::Dictionary(OwnedDictionary::from([
             (b"Contents".to_vec(), OwnedObject::Reference(contents)),
             (b"Metadata".to_vec(), OwnedObject::Reference(metadata)),
             (
                 b"Private".to_vec(),
-                OwnedObject::Array(vec![
+                OwnedObject::array(vec![
                     OwnedObject::Name(b"private".to_vec()),
                     OwnedObject::String(vec![7_u8; 128]),
                     OwnedObject::Integer(42),
@@ -2005,12 +2005,15 @@ mod tests {
                 ]),
             ),
         ]));
-        let metadata_object = OwnedObject::Dictionary(BTreeMap::from([(
+        let metadata_object = OwnedObject::Dictionary(OwnedDictionary::from([(
             b"Nested".to_vec(),
-            OwnedObject::Array(vec![OwnedObject::Reference(contents)]),
+            OwnedObject::array(vec![OwnedObject::Reference(contents)]),
         )]));
         let content_object = OwnedObject::Stream {
-            dictionary: BTreeMap::from([(b"Length".to_vec(), OwnedObject::Reference(metadata))]),
+            dictionary: OwnedDictionary::from([(
+                b"Length".to_vec(),
+                OwnedObject::Reference(metadata),
+            )]),
             data: crate::StreamData::Owned(vec![0_u8; 1024].into()),
         };
         let objects = [

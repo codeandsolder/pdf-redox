@@ -593,11 +593,11 @@ mod tests {
         let mut document = EditDocument::from_bytes(pdf.finish(1)?)?;
         let alias = document.add_object(content_reference(4));
         let second_alias = document.add_object(OwnedObject::Reference(ObjectHandle::New(alias)));
-        let array = document.add_object(OwnedObject::Array(vec![
+        let array = document.add_object(OwnedObject::array(vec![
             content_reference(4),
             OwnedObject::Reference(ObjectHandle::New(second_alias)),
         ]));
-        let contents = OwnedObject::Array(vec![
+        let contents = OwnedObject::array(vec![
             OwnedObject::Reference(ObjectHandle::New(array)),
             OwnedObject::Reference(ObjectHandle::New(second_alias)),
             OwnedObject::Stream {
@@ -699,7 +699,7 @@ mod tests {
             data: StreamData::Owned(b"q Q".to_vec().into()),
         };
         for _ in 0..2048 {
-            content = OwnedObject::Array(vec![content]);
+            content = OwnedObject::array(vec![content]);
         }
         let decoded = decoded_content_value(&document, CurrentValue::Owned(&content))?;
         assert_eq!(decoded.as_slice(), b"q Q");
@@ -916,7 +916,7 @@ mod tests {
             Some([0.0, 0.0, 300.0, 400.0])
         );
         // A wholly owned array uses identical prefix and reference semantics.
-        *document.edit_handle(existing(4))? = OwnedObject::Array(vec![
+        *document.edit_handle(existing(4))? = OwnedObject::array(vec![
             OwnedObject::Integer(-4),
             OwnedObject::Integer(6),
             OwnedObject::Integer(70),
