@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ["*"]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -28,7 +29,6 @@ jobs:
         cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo test --locked --workspace --all-features
         cargo --config 'build.rustdocflags=["-Dwarnings"]' doc --locked --workspace --all-features --no-deps
-      rust-toolchain: "nightly-2026-11-22"
       rust-components: "rustfmt clippy"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -40,6 +40,14 @@ jobs:
         declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
         test "$(rustc --version)" = "$(rustup run "$declared" rustc --version)"
         cargo check --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
-      rust-toolchain: "nightly-2026-11-22"
       rust-targets: "wasm32-unknown-unknown"
       rustflags: ""
+
+  merge-gate:
+    name: Rust CI merge gate
+    if: ${{ always() }}
+    needs: [rust, wasm]
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@4c7fc62a9f9ec37aaa7c155d263cd5025e446a53 # main
+    with:
+      needs-json: ${{ toJSON(needs) }}
+      expected-results: '[["rust","success"],["wasm","success"]]'
