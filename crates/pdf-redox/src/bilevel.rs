@@ -469,10 +469,10 @@ mod tests {
                 let mut packed = Vec::new();
                 let mut reference = Encoder::new(VecWriter::new());
                 for index in 0..35_u8 {
-                    let byte = if !(17..=18).contains(&index) {
-                        pattern
-                    } else {
+                    let byte = if (17..=18).contains(&index) {
                         !pattern
+                    } else {
+                        pattern
                     };
                     let mut row = vec![byte; stride];
                     row[stride - 1] = (byte & active_mask) | (index & !active_mask);
