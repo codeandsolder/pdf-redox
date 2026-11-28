@@ -1,10 +1,13 @@
 # pdf-redox fuzzing
 
-This standalone cargo-fuzz workspace exercises the complete analysis and
+This cargo-fuzz workspace member shares the root Cargo.lock and exercises the complete analysis and
 processing-mode optimization pipeline.
 
 Run: cargo install cargo-fuzz
 Then: cargo fuzz run pipeline
+
+Ordinary Cargo commands use the default production members. The fuzz target
+uses the same dependency versions as production, including the Git codec pins.
 
 For useful depth, seed fuzz/corpus/pipeline/ with representative PDFs from the
 cleaned/diverse corpus before running. Malformed arbitrary bytes are still

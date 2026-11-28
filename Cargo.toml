@@ -4,6 +4,12 @@ members = [
   "crates/pdf-redox",
   "crates/pdf-redox-cli",
   "crates/pdf-redox-wasm",
+  "fuzz",
+]
+default-members = [
+  "crates/pdf-redox",
+  "crates/pdf-redox-cli",
+  "crates/pdf-redox-wasm",
 ]
 
 [workspace.package]
@@ -14,7 +20,7 @@ repository = "https://github.com/codeandsolder/pdf-redox"
 version = "0.1.0"
 
 [workspace.dependencies]
-hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "c90e8b85aaf69afcc8764b91793885e05e16b775", default-features = false, features = ["std", "images"] }
+hayro-syntax = { git = "https://github.com/codeandsolder/hayro", rev = "954e01aab6754ae6d86d1c535fbcd1e4ff09db1d", default-features = false, features = ["std", "images"] }
 # Use our zlib-rs line directly so independent PDF streams can use its exact batch API.
 # Processing remains level 7; Size remains level 9.
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "1f746b2e90019666a0afadfb49740a5d13908296", default-features = false, features = ["std"] }

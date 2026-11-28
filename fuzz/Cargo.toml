@@ -2,7 +2,10 @@
 name = "pdf-redox-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [package.metadata]
 cargo-fuzz = true
@@ -18,6 +21,6 @@ test = false
 doc = false
 bench = false
 
-[workspace]
-members = ["."]
+[lints]
+workspace = true
 
