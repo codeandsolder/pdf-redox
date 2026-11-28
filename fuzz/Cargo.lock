@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "adler2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
-
-[[package]]
 name = "arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,12 +188,12 @@ checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 [[package]]
 name = "hayro-ccitt"
 version = "0.5.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=68a799c971877c150c79f2adeb76b4c81e988899#68a799c971877c150c79f2adeb76b4c81e988899"
+source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
 
 [[package]]
 name = "hayro-jbig2"
 version = "0.4.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=68a799c971877c150c79f2adeb76b4c81e988899#68a799c971877c150c79f2adeb76b4c81e988899"
+source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
 dependencies = [
  "hayro-ccitt",
 ]
@@ -207,19 +201,19 @@ dependencies = [
 [[package]]
 name = "hayro-jpeg2000"
 version = "0.5.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=68a799c971877c150c79f2adeb76b4c81e988899#68a799c971877c150c79f2adeb76b4c81e988899"
+source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
 
 [[package]]
 name = "hayro-syntax"
 version = "0.9.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=68a799c971877c150c79f2adeb76b4c81e988899#68a799c971877c150c79f2adeb76b4c81e988899"
+source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
 dependencies = [
  "hayro-ccitt",
  "hayro-jbig2",
  "hayro-jpeg2000",
- "miniz_oxide",
  "rustc-hash",
  "smallvec",
+ "zlib-rs",
  "zune-jpeg",
 ]
 
@@ -278,15 +272,6 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
-
-[[package]]
-name = "miniz_oxide"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
-dependencies = [
- "adler2",
-]
 
 [[package]]
 name = "num-traits"
