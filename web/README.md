@@ -14,6 +14,6 @@ Runtime regression test (from the repository root, using the matching wasm-bindg
 
 ```sh
 cargo build --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
-wasm-bindgen --target nodejs --out-dir web/pkg-node target/wasm32-unknown-unknown/debug/pdf_redox_wasm.wasm
-node web/test-wasm.cjs web/pkg-node
+wasm-bindgen --target nodejs --out-dir target/wasm-node target/wasm32-unknown-unknown/debug/pdf_redox_wasm.wasm
+node web/test-wasm.cjs target/wasm-node
 ```

@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const pkg = path.resolve(process.argv[2] ?? 'web/pkg-node');
+const pkg = path.resolve(process.argv[2] ?? 'target/wasm-node');
 const { analyze, optimize_with_hidden_text } = require(path.join(pkg, 'pdf_redox_wasm.js'));
 const objects = [
   '<< /Type /Catalog /Pages 2 0 R >>',
