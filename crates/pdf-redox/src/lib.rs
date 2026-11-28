@@ -68,6 +68,11 @@ pub use glyph_catalog::{
     GlyphCatalog, GlyphLabelOverride, GlyphLabelReport, GlyphLabels, GlyphOccurrence, GlyphTemplate,
 };
 pub use glyph_labels::apply_glyph_labels;
+/// PDF interpretation using the same parser revision as the optimizer.
+#[cfg(feature = "interpret")]
+pub use hayro_interpret;
+/// PDF syntax types shared with the optimizer.
+pub use hayro_syntax;
 pub use microstroke::MicrostrokeRasterStats;
 pub use ocr_overlay::{
     OcrDocument, OcrLine, OcrOverlayOptions, OcrOverlayReport, OcrPage, apply_ocr_overlay,
