@@ -14,6 +14,8 @@ Design goals:
 
 Hayro is the source parser and codec layer. Source bytes stay immutable and lazily parsed, mutations live in a sparse copy-on-write object overlay, and reachable objects are serialized through the compact fresh writer. Fresh rewrites discard incremental-update history and unreachable objects instead of appending another revision. OpenType parsing, rebuilding, and glyph subsetting are delegated to Fontations (`write-fonts` and `skera`, with `skrifa` transitively); the required Skera glyph-mapping API is available in upstream Skera 0.9, so Fontations is consumed directly from crates.io.
 
+Rust integrations use `pdf_redox::hayro_syntax` for shared parser types and, with the `interpret` feature, `pdf_redox::hayro_interpret` for the interpreter. Both are pinned to the same Hayro revision as the optimizer; downstream consumers must not independently resolve another Hayro revision. The interpreter is not enabled by default.
+
 ## Workspace
 
 - `pdf-redox`: core library

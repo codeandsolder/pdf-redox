@@ -10,8 +10,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+interpret = ["dep:hayro-interpret"]
+
 [dependencies]
 hayro-syntax.workspace = true
+hayro-interpret = { workspace = true, optional = true }
 zlib-rs.workspace = true
 libjpeg-turbo-rs.workspace = true
 fast_image_resize.workspace = true
