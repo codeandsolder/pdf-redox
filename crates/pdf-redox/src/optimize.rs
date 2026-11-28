@@ -1,3 +1,4 @@
+use crate::clock::Instant;
 use crate::{
     Config, EditDocument, GlyphCatalog, ImagePolicy, OptimizationReport, PdfAnalysis, Result,
     analyze::{OptimizationAnalysis, analyze_document_for_optimization},
@@ -61,10 +62,7 @@ use crate::{
         factor_size_shared_forms, processing_factor_candidate,
     },
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 mod reporting;
 

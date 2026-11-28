@@ -1,3 +1,4 @@
+use crate::clock::Instant;
 use crate::geometry::{Matrix, Rect};
 use crate::{
     EditDocument, Error, ObjectHandle, OwnedDictionary, OwnedObject, RasterLayoutConfig, Result,
@@ -34,7 +35,6 @@ use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
-    time::Instant,
 };
 
 const POINTS_PER_MM: f64 = 72.0 / 25.4;
