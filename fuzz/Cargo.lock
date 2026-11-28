@@ -74,12 +74,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00c1c79b421ca69d94677a49b2ccf389dab3409952aed790594de8fa03b07989"
 
 [[package]]
-name = "const-oid"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -129,7 +123,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
- "const-oid",
  "crypto-common",
 ]
 
@@ -323,7 +316,6 @@ dependencies = [
  "serde",
  "sha2",
  "skera",
- "skrifa",
  "smallvec",
  "thiserror",
  "write-fonts",
@@ -590,7 +582,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=98f76b3a242099f2229b048360eeb4707246a68f#98f76b3a242099f2229b048360eeb4707246a68f"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=1f746b2e90019666a0afadfb49740a5d13908296#1f746b2e90019666a0afadfb49740a5d13908296"
 dependencies = [
  "rayon-core",
 ]
