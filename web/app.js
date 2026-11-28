@@ -1,4 +1,4 @@
-import init, { analyze, optimize_with_hidden_text } from './pkg/pdf_deshit_wasm.js';
+import init, { analyze, optimize_with_hidden_text } from './pkg/pdf_redox_wasm.js';
 
 await init();
 
@@ -268,7 +268,7 @@ async function optimizeSelected(bytes) {
     document.querySelector('#privacy').value,
     policy,
   );
-  const output = new Uint8Array(r.pdf);
+  const output = r.pdf;
   if (downloadUrl) URL.revokeObjectURL(downloadUrl);
   downloadUrl = URL.createObjectURL(new Blob([output], { type: 'application/pdf' }));
 

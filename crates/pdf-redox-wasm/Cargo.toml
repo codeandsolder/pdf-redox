@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pdf-redox = { path = "../pdf-redox" }
 wasm-bindgen.workspace = true
-serde-wasm-bindgen.workspace = true
+js-sys.workspace = true
+serde_json.workspace = true
 serde.workspace = true
 console_error_panic_hook.workspace = true

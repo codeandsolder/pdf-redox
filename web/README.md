@@ -7,3 +7,5 @@ python3 -m http.server -d web 8080
 ```
 
 The site has no backend. The PDF bytes stay in the browser process.
+
+The WASM API returns ordinary JSON-compatible report objects and a `Uint8Array` for the optimized PDF. Hidden-text policies are JSON-compatible objects. No dynamic JavaScript evaluation is required.

@@ -1,3 +1,4 @@
+use js_sys::{JSON, Object, Reflect, Uint8Array};
 use pdf_redox::{
     Config, HiddenTextPolicy, PdfAnalysis, PrivacyLevel, analyze_pdf, optimize_pdf,
     optimize_pdf_with_analysis,
@@ -10,10 +11,17 @@ thread_local! {
     static LAST_ANALYSIS: RefCell<Option<PdfAnalysis>> = const { RefCell::new(None) };
 }
 
-#[derive(Serialize)]
-struct WasmResult {
-    pdf: Vec<u8>,
-    report: pdf_redox::OptimizationReport,
+fn json_to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    let json = serde_json::to_string(value).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    JSON::parse(&json)
+}
+
+fn hidden_text_from_js(value: &JsValue) -> Result<HiddenTextPolicy, JsValue> {
+    let json = JSON::stringify(value)?
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("hidden-text policy is not JSON serializable"))?;
+    serde_json::from_str(&json)
+        .map_err(|e| JsValue::from_str(&format!("invalid hidden-text policy: {e}")))
 }
 
 #[wasm_bindgen(start)]
@@ -29,8 +37,7 @@ pub fn start() {
 #[wasm_bindgen]
 pub fn analyze(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let report = analyze_pdf(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let value =
-        serde_wasm_bindgen::to_value(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let value = json_to_js(&report)?;
     LAST_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(report));
     Ok(value)
 }
@@ -65,8 +72,14 @@ fn run(bytes: &[u8], cfg: &Config) -> Result<JsValue, JsValue> {
     });
     let (pdf, report) = optimized.map_err(|e| JsValue::from_str(&e.to_string()))?;
     LAST_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(report.before.clone()));
-    serde_wasm_bindgen::to_value(&WasmResult { pdf, report })
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+    let result = Object::new();
+    let pdf = Uint8Array::from(pdf.as_slice());
+    if !Reflect::set(&result, &JsValue::from_str("pdf"), &pdf)?
+        || !Reflect::set(&result, &JsValue::from_str("report"), &json_to_js(&report)?)?
+    {
+        return Err(JsValue::from_str("cannot construct optimization result"));
+    }
+    Ok(result.into())
 }
 
 /// Optimize a PDF using the named profile and privacy mode.
@@ -95,8 +108,7 @@ pub fn optimize_with_hidden_text(
     cfg.hidden_text = if hidden_text_policy.is_null() || hidden_text_policy.is_undefined() {
         HiddenTextPolicy::default()
     } else {
-        serde_wasm_bindgen::from_value(hidden_text_policy)
-            .map_err(|e| JsValue::from_str(&format!("invalid hidden-text policy: {e}")))?
+        hidden_text_from_js(&hidden_text_policy)?
     };
     run(bytes, &cfg)
 }
