@@ -102,13 +102,13 @@ pub fn optimize_with_hidden_text(
     bytes: &[u8],
     profile: &str,
     privacy: &str,
-    hidden_text_policy: JsValue,
+    hidden_text_policy: &JsValue,
 ) -> Result<JsValue, JsValue> {
     let mut cfg = config(profile, privacy);
     cfg.hidden_text = if hidden_text_policy.is_null() || hidden_text_policy.is_undefined() {
         HiddenTextPolicy::default()
     } else {
-        hidden_text_from_js(&hidden_text_policy)?
+        hidden_text_from_js(hidden_text_policy)?
     };
     run(bytes, &cfg)
 }
