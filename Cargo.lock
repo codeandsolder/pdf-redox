@@ -401,6 +401,7 @@ dependencies = [
  "skera",
  "smallvec",
  "thiserror",
+ "wasm-bindgen",
  "write-fonts",
  "zlib-rs",
 ]

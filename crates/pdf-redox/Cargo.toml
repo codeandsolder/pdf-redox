@@ -28,5 +28,8 @@ num-traits.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zlib-rs = { workspace = true, features = ["parallel"] }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true

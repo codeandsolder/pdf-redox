@@ -4,6 +4,7 @@
 mod analyze;
 mod bilevel;
 mod cff_cid;
+mod clock;
 mod compression_corpus;
 mod config;
 mod content;
