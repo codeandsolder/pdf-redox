@@ -53,6 +53,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -91,6 +97,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "cc"
+version = "1.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
+dependencies = [
+ "find-msvc-tools",
+ "jobserver",
+ "libc",
+ "shlex",
 ]
 
 [[package]]
@@ -242,6 +260,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70ed8646f3993cad0585c6669ffba6f7e5440a0bfb0a1f16600cae33ce7cf307"
 
 [[package]]
+name = "find-msvc-tools"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,6 +281,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -265,12 +300,12 @@ checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 [[package]]
 name = "hayro-ccitt"
 version = "0.5.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
+source = "git+https://github.com/codeandsolder/hayro?rev=954e01aab6754ae6d86d1c535fbcd1e4ff09db1d#954e01aab6754ae6d86d1c535fbcd1e4ff09db1d"
 
 [[package]]
 name = "hayro-jbig2"
 version = "0.4.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
+source = "git+https://github.com/codeandsolder/hayro?rev=954e01aab6754ae6d86d1c535fbcd1e4ff09db1d#954e01aab6754ae6d86d1c535fbcd1e4ff09db1d"
 dependencies = [
  "hayro-ccitt",
 ]
@@ -278,12 +313,12 @@ dependencies = [
 [[package]]
 name = "hayro-jpeg2000"
 version = "0.5.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
+source = "git+https://github.com/codeandsolder/hayro?rev=954e01aab6754ae6d86d1c535fbcd1e4ff09db1d#954e01aab6754ae6d86d1c535fbcd1e4ff09db1d"
 
 [[package]]
 name = "hayro-syntax"
 version = "0.9.0"
-source = "git+https://github.com/codeandsolder/hayro?rev=c90e8b85aaf69afcc8764b91793885e05e16b775#c90e8b85aaf69afcc8764b91793885e05e16b775"
+source = "git+https://github.com/codeandsolder/hayro?rev=954e01aab6754ae6d86d1c535fbcd1e4ff09db1d#954e01aab6754ae6d86d1c535fbcd1e4ff09db1d"
 dependencies = [
  "hayro-ccitt",
  "hayro-jbig2",
@@ -322,6 +357,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,6 +381,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libfuzzer-sys"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
+dependencies = [
+ "arbitrary",
+ "cc",
+]
 
 [[package]]
 name = "libjpeg-turbo-rs"
@@ -417,6 +472,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-redox-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "pdf-redox",
+]
+
+[[package]]
 name = "pdf-redox-wasm"
 version = "0.1.0"
 dependencies = [
@@ -445,6 +508,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rayon-core"
@@ -535,6 +604,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "skera"

@@ -26,7 +26,7 @@ jobs:
         test "$(rustc --version)" = "$(rustup run "$declared" rustc --version)"
         cargo fmt --all -- --check
         git diff --check
-        cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+        cargo metadata --locked --format-version 1 > /dev/null
         cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         cargo test --locked --workspace --all-features
         cargo --config 'build.rustdocflags=["-Dwarnings"]' doc --locked --workspace --all-features --no-deps
