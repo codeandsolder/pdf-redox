@@ -1,5 +1,5 @@
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use std::time::Instant;
+pub use std::time::Instant;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod browser {
@@ -13,14 +13,14 @@ mod browser {
     }
 
     #[derive(Clone, Copy)]
-    pub(crate) struct Instant(f64);
+    pub struct Instant(f64);
 
     impl Instant {
-        pub(crate) fn now() -> Self {
+        pub fn now() -> Self {
             Self(performance_now())
         }
 
-        pub(crate) fn elapsed(self) -> Duration {
+        pub fn elapsed(self) -> Duration {
             Duration::try_from_secs_f64((performance_now() - self.0).max(0.0) / 1000.0)
                 .unwrap_or_default()
         }
@@ -28,4 +28,4 @@ mod browser {
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub(crate) use browser::Instant;
+pub use browser::Instant;
