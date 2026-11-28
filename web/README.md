@@ -10,7 +10,13 @@ The site has no backend. The PDF bytes stay in the browser process.
 
 The WASM API returns ordinary JSON-compatible report objects and a `Uint8Array` for the optimized PDF. Hidden-text policies are JSON-compatible objects. No dynamic JavaScript evaluation is required.
 
-Runtime regression test (from the repository root, using the matching wasm-bindgen CLI):
+Runtime regression test (from the repository root; the CI script fetches the CLI matching Cargo.lock, verifies the release checksum and runs the actual generated Node bindings):
+
+```sh
+bash .github/scripts/test-wasm.sh
+```
+
+To run the individual steps with an already installed matching CLI:
 
 ```sh
 cargo build --locked -p pdf-redox-wasm --target wasm32-unknown-unknown
