@@ -18,7 +18,7 @@ permissions:
 jobs:
   rust:
     name: Rust pinned nightly
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@db22785ec97c653cf0ec96b6964ded8158436f3c # main
     with:
       command: |
         # Check the compiler actually selected, rather than the workflow's environment label.
@@ -35,7 +35,7 @@ jobs:
 
   wasm:
     name: WASM compatibility
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@db22785ec97c653cf0ec96b6964ded8158436f3c # main
     with:
       command: |
         declared="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -48,7 +48,7 @@ jobs:
     name: Rust CI merge gate
     if: ${{ always() }}
     needs: [rust, wasm]
-    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@1293f1c247f07a14a85859f908b4f6b7e2553922 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-gate.yml@db22785ec97c653cf0ec96b6964ded8158436f3c # main
     with:
       needs-json: ${{ toJSON(needs) }}
       expected-results: '[["rust","success"],["wasm","success"]]'
